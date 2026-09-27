@@ -392,10 +392,13 @@
 
     setNode('settings-bot', (bot) => {
       bot.innerHTML = '';
-      [['机器人', status.botName], ['提示词归属', status.scope], ['监听端口', status.webPort],
+      const rows = [['机器人', status.botName], ['提示词归属', status.scope], ['监听端口', status.webPort],
         ['待领取图片', status.pendingImages], ['聊天全局', status.chat?.global ? '开启' : '关闭'],
         ['每分钟上限', status.chat?.frequency], ['性格字数', status.chat?.personalityChars],
-        ['提示词词条', status.promptTerms], ['LoRA', status.loraStatus]].forEach(([key, value]) => {
+        ['提示词词条', status.promptTerms], ['LoRA', status.loraStatus]];
+      // 禁言中的群：只影响"能不能发出去"，不影响指令执行与队列。
+      (status.mutes || []).forEach((mute) => rows.push(['禁言', '群 ' + mute.group + ' ' + mute.reason + '，到 ' + mute.untilText]));
+      rows.forEach(([key, value]) => {
         bot.appendChild(el('div', null, key));
         bot.appendChild(el('div', null, String(value ?? '')));
       });
@@ -460,8 +463,77 @@
     });
   }
 
-  /** Stable Diffusion 卡片：是否在跑、启动入口、自启动开关。 */
-  function renderSd(sd) {
+  /**
+   * DeepSeek 通道卡片：地址与密钥都能改，改完立刻生效（不用重启）。
+   * 密钥只回显掩码——读接口永远不回传原文，输入框留空就表示"不改"。
+   */
+  async function loadChannels() {
+    try {
+      renderChannels(await api('/api/config/state'));
+    } catch (error) {
+      if (String(error.message) !== 'unauthorized') setText('channel-note', '读取通道配置失败：' + error.message);
+    }
+  }
+
+  function renderChannels(config) {
+    const channels = (config && config.values && config.values.channels) || {};
+    const image = channels.image || {}, chat = channels.chat || {};
+    setValue('channel-image-base', image.base || '');
+    setValue('channel-chat-base', chat.base || '');
+    setNode('channel-image-base', (node) => { node.placeholder = image.official || '留空用官方 api.deepseek.com'; });
+    setNode('channel-chat-base', (node) => { node.placeholder = chat.official || '留空用官方 api.deepseek.com'; });
+    setText('channel-note', [image, chat].map((channel) => channel.label + '：'
+      + (channel.keySet ? '密钥已配置 ' + channel.keyMasked : '密钥未配置')
+      + '　当前生效地址 ' + channel.effective).join('　|　'));
+  }
+
+  /** 保存两条通道的地址与密钥（只提交改动过的字段）。 */
+  async function saveChannels() {
+    const channels = {};
+    for (const name of ['image', 'chat']) {
+      const patch = { base: ($('channel-' + name + '-base').value || '').trim() };
+      const key = ($('channel-' + name + '-key').value || '').trim();
+      if (key) patch.key = key;
+      channels[name] = patch;
+    }
+    try {
+      const saved = await api('/api/config/apply', { body: { channels } });
+      setValue('channel-image-key', '');
+      setValue('channel-chat-key', '');
+      renderChannels(saved);
+      toast(saved.notice || '通道设置已保存');
+      await loadStatus();
+    } catch (error) {
+      if (String(error.message) !== 'unauthorized') toast('保存失败：' + error.message);
+    }
+  }
+
+  async function testChannel(name) {
+    try {
+      const result = await api('/api/config/test', { body: { channel: name } });
+      toast(result.label + '：' + result.message);
+      setText('channel-note', result.label + '：' + result.message);
+    } catch (error) {
+      if (String(error.message) !== 'unauthorized') toast('测试失败：' + error.message);
+    }
+  }
+
+  async function clearChannelKey(name) {
+    const label = name === 'image' ? '生图频道' : '聊天频道';
+    if (!await askConfirm('清空' + label + '的 API 密钥？\n清空后这条通道的聊天/改写会不可用，直到重新填入。',
+        { title: '清空密钥', confirmText: '清空', danger: true })) return;
+    const channels = {};
+    channels[name] = { clearKey: true };
+    try {
+      renderChannels(await api('/api/config/apply', { body: { channels } }));
+      toast('已清空' + label + '密钥');
+      await loadStatus();
+    } catch (error) {
+      if (String(error.message) !== 'unauthorized') toast('清空失败：' + error.message);
+    }
+  }
+
+  /** Stable Diffusion 卡片：是否在跑、启动入口、自启动开关。 */  function renderSd(sd) {
     const stateNode = $('sd-state');
     if (!stateNode) return;
     stateNode.textContent = sd.reachable ? '运行中' : '未运行';
@@ -1664,6 +1736,12 @@
       await loadStatus();
     });
     on('console-form', 'submit', (event) => { event.preventDefault(); const text = $('console-input').value.trim(); if (text) runCommands([text]); });
+    // DeepSeek 通道：地址与密钥直接写本机配置，不拼指令、不用轮询回执。
+    on('channel-save', 'click', saveChannels);
+    on('channel-test-image', 'click', () => testChannel('image'));
+    on('channel-test-chat', 'click', () => testChannel('chat'));
+    on('channel-clear-image', 'click', () => clearChannelKey('image'));
+    on('channel-clear-chat', 'click', () => clearChannelKey('chat'));
     on('tasks-reload', 'click', loadTasks);
     on('tasks-cancel-all', 'click', async () => {
       if (!await askConfirm('取消队列里的全部任务？\n已经生成的图片仍可领取。',
@@ -1729,6 +1807,7 @@
         await loadLogs();
         if ($('terminal-input')) $('terminal-input').focus();
       } else if (PAGE === 'help') await loadHelp();
+      else if (PAGE === 'system') await loadChannels();
       // chatcfg / system 只要状态，上面已经拉过
       if (state.options) {
         fillSelect('set-sampler', state.options.samplers, state.status?.generation?.sampler || '');

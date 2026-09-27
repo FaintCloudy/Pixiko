@@ -35,10 +35,16 @@ public final class QqClientTest {
 
                 JsonObject own = event("private", 0, 999);
                 first.send(own.toString());
-                first.send("{\"post_type\":\"notice\",\"message_type\":\"group\"}");
+                // 群禁言通知必须送到机器人：它据此决定"还能不能发消息"，不能再当噪声丢掉。
+                first.send("{\"post_type\":\"notice\",\"notice_type\":\"group_ban\",\"sub_type\":\"ban\","
+                        + "\"group_id\":123,\"user_id\":0,\"duration\":60,\"self_id\":999}");
                 first.send("not JSON");
                 JsonObject privateEvent = event("private", 4455, 2233);
                 first.send(privateEvent.toString());
+                JsonObject noticeReceived = events.poll(3, TimeUnit.SECONDS);
+                check(noticeReceived != null && "notice".equals(noticeReceived.get("post_type").getAsString())
+                                && "group_ban".equals(noticeReceived.get("notice_type").getAsString()),
+                        "群禁言通知要送到机器人：" + noticeReceived);
                 JsonObject privateReceived = events.poll(3, TimeUnit.SECONDS);
                 check(privateReceived != null && privateReceived.get("user_id").getAsLong() == 2233, "self/notice filters failed");
                 check(events.isEmpty(), "unexpected event delivered");

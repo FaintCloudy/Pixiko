@@ -1,0 +1,274 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Pixiko · 配置</title>
+<link rel="icon" href="/favicon.ico">
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: #0b1220; color: #e9eff8;
+         font: 15px/1.65 -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif; }
+  main { max-width: 860px; margin: 0 auto; padding: 26px 18px 72px; }
+  h1 { font-size: 21px; margin: 0 0 4px; }
+  h2 { font-size: 15px; margin: 0 0 2px; }
+  a { color: #5aa2ff; }
+  .card { background: rgba(23,33,51,.82); border: 1px solid rgba(120,150,200,.18);
+          border-radius: 18px; padding: 16px; margin: 14px 0; }
+  .card .lead { color: #8ea2bf; font-size: 13px; margin: 2px 0 12px; }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px 14px; }
+  @media (max-width: 640px) { .grid { grid-template-columns: 1fr; } }
+  label.field { display: block; }
+  label.field span { display: block; font-size: 13px; color: #9fb3d0; margin-bottom: 4px; }
+  input, select { width: 100%; background: rgba(9,15,27,.66); color: inherit;
+                  border: 1px solid rgba(120,150,200,.22); border-radius: 12px; padding: 9px 11px; font: 14px/1.4 inherit; }
+  input:focus { outline: none; border-color: #5aa2ff; }
+  input[type=password] { font-family: ui-monospace, Consolas, monospace; }
+  button { background: linear-gradient(135deg,#5aa2ff,#b98bff); color: #05101d; border: 0;
+           border-radius: 12px; padding: 10px 16px; font-weight: 650; cursor: pointer; }
+  button.ghost { background: transparent; color: #cfe0f7; border: 1px solid rgba(120,150,200,.3); }
+  button:disabled { opacity: .5; cursor: default; }
+  .row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+  .spread { display: flex; justify-content: space-between; align-items: center; gap: 12px; }
+  code { background: rgba(120,160,220,.14); padding: 1px 5px; border-radius: 6px; font-size: 13px; }
+  .muted { color: #8ea2bf; font-size: 13px; }
+  .ok { color: #4fd7a8; } .bad { color: #ff7d8a; } .warn { color: #ffc46b; }
+  .banner { border-radius: 14px; padding: 12px 14px; margin: 12px 0; font-size: 14px;
+            border: 1px solid rgba(120,150,200,.22); background: rgba(23,33,51,.6); }
+  .banner.good { border-color: rgba(79,215,168,.4); }
+  .banner.bad { border-color: rgba(255,125,138,.4); }
+  .chips { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 8px; }
+  .chip { font-size: 12px; padding: 3px 9px; border-radius: 999px; background: rgba(120,160,220,.14); }
+  pre { white-space: pre-wrap; word-break: break-all; background: rgba(9,15,27,.6); border-radius: 12px;
+        padding: 10px; margin: 8px 0 0; font-size: 12.5px; }
+  .foot { color: #8ea2bf; font-size: 12.5px; margin-top: 18px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Pixiko · 配置</h1>
+  <p class="muted">在这里完成首次配置，也可以随时回来改。密钥只写进本机文件，页面只回显掩码。</p>
+  <div id="banner" class="banner">正在读取当前配置…</div>
+
+  <form id="form">
+    <section class="card">
+      <div class="spread"><h2>机器人</h2><span class="muted">这两个是 owner 指令的前提</span></div>
+      <p class="lead">owner 是自己用的 QQ 号：地图、婚姻、admin、设置类指令只认它。</p>
+      <div class="grid">
+        <label class="field"><span>机器人名字</span><input id="bot_name" placeholder="神户小鸟"></label>
+        <label class="field"><span>owner QQ（纯数字）</span><input id="owner_user_id" inputmode="numeric" placeholder="例如 10001"></label>
+      </div>
+    </section>
+
+    <section class="card">
+      <div class="spread"><h2>DeepSeek · 生图频道</h2><span class="muted" id="image-state"></span></div>
+      <p class="lead">负责提示词改写、拆解与生成；两条频道各自独立计费，改一条不影响另一条。</p>
+      <div class="grid">
+        <label class="field"><span>API 地址（留空用官方 api.deepseek.com）</span>
+          <input id="image_base" placeholder="https://api.deepseek.com/chat/completions"></label>
+        <label class="field"><span>API 密钥（sk-…；留空表示不改）</span>
+          <input id="image_key" type="password" autocomplete="off" placeholder="sk-…"></label>
+      </div>
+      <div class="row" style="margin-top:10px">
+        <button type="button" class="ghost" data-test="image">测试连接</button>
+        <span class="muted" id="image-test"></span>
+      </div>
+    </section>
+
+    <section class="card">
+      <div class="spread"><h2>DeepSeek · 聊天频道</h2><span class="muted" id="chat-state"></span></div>
+      <p class="lead">负责日常聊天、性格改写与意图规划；密钥与生图频道分开，两边额度各算各的。</p>
+      <div class="grid">
+        <label class="field"><span>API 地址（留空用官方 api.deepseek.com）</span>
+          <input id="chat_base" placeholder="https://api.deepseek.com/chat/completions"></label>
+        <label class="field"><span>API 密钥（sk-…；留空表示不改）</span>
+          <input id="chat_key" type="password" autocomplete="off" placeholder="sk-…"></label>
+      </div>
+      <div class="row" style="margin-top:10px">
+        <button type="button" class="ghost" data-test="chat">测试连接</button>
+        <span class="muted" id="chat-test"></span>
+      </div>
+    </section>
+
+    <section class="card">
+      <div class="spread"><h2>Stable Diffusion 与 NapCat</h2><span class="muted">改完要重启机器人才生效</span></div>
+      <p class="lead">SD WebUI 必须带 <code>--api</code> 启动；不接 QQ 也能先用网页控制台和出图。</p>
+      <div class="grid">
+        <label class="field"><span>Stable Diffusion 地址</span><input id="sd_base_url" placeholder="http://127.0.0.1:7860"></label>
+        <label class="field"><span>Stable Diffusion 安装目录</span><input id="sd_root" placeholder="例如 F:/sd/sd-webui"></label>
+        <label class="field"><span>NapCat 正向 WebSocket 地址</span><input id="qq_ws_url" placeholder="ws://127.0.0.1:3001"></label>
+        <label class="field"><span>NapCat 访问令牌（留空表示不改）</span><input id="qq_access_token" type="password" autocomplete="off"></label>
+      </div>
+    </section>
+
+    <section class="card">
+      <div class="spread"><h2>网页控制台</h2><span class="muted" id="token-state"></span></div>
+      <p class="lead">令牌至少 8 位，改完就用新令牌登录；留空表示保持现在的令牌。</p>
+      <div class="grid">
+        <label class="field"><span>访问令牌</span><input id="webui_access_token" autocomplete="off" placeholder="至少 8 位"></label>
+        <label class="field"><span>当前访问地址</span><input id="webui_url" disabled></label>
+      </div>
+    </section>
+
+    <div class="row" style="margin:18px 0">
+      <button type="submit" id="save">保存</button>
+      <button type="button" class="ghost" id="reload">重新读取</button>
+      <span id="result"></span>
+    </div>
+  </form>
+
+  <div id="tokenbox" class="card" hidden>
+    <h2>需要访问令牌</h2>
+    <p class="lead">这台机器人的首次配置已经完成，改配置要带令牌；令牌在 config.json 的 <code>webui.access_token</code>，
+      启动日志里也打印过一次。本机首次配置期间则不需要令牌。</p>
+    <div class="row"><input id="token" type="password" placeholder="访问令牌" style="max-width:320px">
+      <button type="button" id="token-use">使用</button></div>
+  </div>
+
+  <p class="foot">配置完成后直接去 <a href="/">网页控制台</a>；命令行向导仍然可用：<code>run.bat --setup</code>。</p>
+</main>
+<script>
+  const TOKEN_KEY = 'kotori-webui-token';
+  const FIELDS = ['bot_name', 'owner_user_id', 'sd_base_url', 'sd_root', 'qq_ws_url',
+    'qq_access_token', 'webui_access_token', 'image_base', 'image_key', 'chat_base', 'chat_key'];
+  let token = localStorage.getItem(TOKEN_KEY) || '';
+  let state = null;
+  let loadedToken = '';
+
+  const $ = (id) => document.getElementById(id);
+  const banner = (text, kind) => { const node = $('banner'); node.textContent = text; node.className = 'banner' + (kind ? ' ' + kind : ''); };
+
+  async function call(path, body) {
+    const response = await fetch(path, {
+      method: body ? 'POST' : 'GET',
+      headers: Object.assign({ 'Content-Type': 'application/json' }, token ? { Authorization: 'Bearer ' + token } : {}),
+      body: body ? JSON.stringify(body) : undefined,
+    });
+    const text = await response.text();
+    let payload = {};
+    try { payload = text ? JSON.parse(text) : {}; } catch { payload = { error: text }; }
+    if (response.status === 401) { $('tokenbox').hidden = false; throw new Error(payload.error || '需要访问令牌。'); }
+    if (!response.ok) throw new Error(payload.error || ('HTTP ' + response.status));
+    return payload;
+  }
+
+  function fill(values) {
+    $('bot_name').value = values.bot_name || '';
+    $('owner_user_id').value = values.owner_user_id || '';
+    $('sd_base_url').value = values.sd_base_url || '';
+    $('sd_root').value = values.sd_root || '';
+    $('qq_ws_url').value = values.qq_ws_url || '';
+    $('webui_url').value = location.origin;
+    loadedToken = values.webui_access_token || '';
+    $('webui_access_token').value = loadedToken;
+    const image = values.channels.image, chat = values.channels.chat;
+    $('image_base').value = image.base || '';
+    $('chat_base').value = chat.base || '';
+    $('image_base').placeholder = image.official;
+    $('chat_base').placeholder = chat.official;
+    $('image-state').innerHTML = keyState(image);
+    $('chat-state').innerHTML = keyState(chat);
+    $('token-state').innerHTML = values.webui_token_set ? '令牌已配置' : '还没有令牌（保存时会自动生成）';
+  }
+
+  function keyState(channel) {
+    const mask = channel.keyMasked ? '已配置 <code>' + channel.keyMasked + '</code>' : '<span class="warn">未配置密钥</span>';
+    return mask + '<br><span class="muted">生效地址 ' + channel.effective + '</span>';
+  }
+
+  async function load() {
+    try {
+      state = await call('/api/config/state');
+      fill(state.values);
+      // 首次配置期间服务端会把当前访问令牌给本页（本机免令牌）：直接记住，
+      // 免得用户配完还要去 config.json 里翻令牌才能进控制台。
+      if (state.needed && state.values.webui_access_token) {
+        token = state.values.webui_access_token;
+        localStorage.setItem(TOKEN_KEY, token);
+      }
+      $('tokenbox').hidden = !state.needed && !token;
+      if (state.needed) {
+        banner('首次配置：' + (state.missingText || '') + ' 本机访问免令牌，本页填好保存即可。', 'bad');
+      } else {
+        banner('配置已完成。这里改的 DeepSeek 地址与密钥立刻生效；SD 与 NapCat 的地址重启后生效。', 'good');
+      }
+    } catch (error) {
+      banner('读取配置失败：' + error.message, 'bad');
+    }
+  }
+
+  function payload() {
+    const channels = {};
+    for (const name of ['image', 'chat']) {
+      const patch = {};
+      patch.base = $(name + '_base').value.trim();
+      const key = $(name + '_key').value.trim();
+      if (key) patch.key = key;
+      channels[name] = patch;
+    }
+    const body = { channels };
+    for (const name of ['bot_name', 'owner_user_id', 'sd_base_url', 'sd_root', 'qq_ws_url']) body[name] = $(name).value.trim();
+    const qqToken = $('qq_access_token').value.trim();
+    if (qqToken) body.qq_access_token = qqToken;
+    const webToken = $('webui_access_token').value.trim();
+    if (webToken && webToken !== loadedToken) body.webui_access_token = webToken;
+    return body;
+  }
+
+  $('form').onsubmit = async (event) => {
+    event.preventDefault();
+    $('save').disabled = true;
+    $('result').textContent = '正在保存…';
+    $('result').className = 'muted';
+    try {
+      const saved = await call('/api/config/apply', payload());
+      state = saved;
+      fill(saved.values);
+      $('image_key').value = ''; $('chat_key').value = ''; $('qq_access_token').value = ''; $('webui_access_token').value = '';
+      const changed = (saved.changed || []).join('；');
+      $('result').textContent = changed ? '已保存：' + changed : '没有改动。';
+      $('result').className = 'ok';
+      banner(saved.needed ? ('还差：' + (saved.missingText || '')) : '配置完成，可以去控制台了。', saved.needed ? 'bad' : 'good');
+      // 用户自己换了令牌就立刻记住：配置完成后接口恢复要令牌，刷新也不会被挡在外面。
+      if ($('webui_access_token').value.trim().length >= 8) {
+        token = $('webui_access_token').value.trim();
+        localStorage.setItem(TOKEN_KEY, token);
+      }
+    } catch (error) {
+      $('result').textContent = '保存失败：' + error.message;
+      $('result').className = 'bad';
+    } finally {
+      $('save').disabled = false;
+    }
+  };
+
+  document.querySelectorAll('button[data-test]').forEach((button) => {
+    button.onclick = async () => {
+      const channel = button.dataset.test;
+      const note = $(channel + '-test');
+      note.textContent = '正在测试…';
+      note.className = 'muted';
+      try {
+        const result = await call('/api/config/test', { channel });
+        note.textContent = result.message;
+        note.className = result.ok ? 'ok' : 'bad';
+      } catch (error) {
+        note.textContent = error.message;
+        note.className = 'bad';
+      }
+    };
+  });
+
+  $('reload').onclick = load;
+  $('token-use').onclick = () => {
+    token = $('token').value.trim();
+    if (token) localStorage.setItem(TOKEN_KEY, token);
+    $('tokenbox').hidden = true;
+    load();
+  };
+
+  load();
+</script>
+</body>
+</html>

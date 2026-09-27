@@ -499,6 +499,35 @@ public final class DeepSeekPrompts {
         });
         return response;
     }
+    /**
+     * 网页「测试连接」按钮：拿当前配置与密钥发一条最小请求，只回报能不能连通、密钥是否有效，
+     * 不回显密钥本身。地址与密钥都是每次调用现读，所以改完立刻生效、不用重启。
+     */
+    public JsonObject verify() {
+        JsonObject result = new JsonObject();
+        result.addProperty("url", apiUrl(config));
+        result.addProperty("model", Json.str(config, "model", "deepseek-flash"));
+        JsonObject body = new JsonObject();
+        body.addProperty("model", Json.str(config, "model", "deepseek-flash"));
+        body.addProperty("max_tokens", 8);
+        body.addProperty("stream", false);
+        JsonArray messages = new JsonArray();
+        messages.add(chatMessage("user", "ping"));
+        body.add("messages", messages);
+        long started = System.nanoTime();
+        try {
+            Response response = exchange(body);
+            result.addProperty("ok", true);
+            result.addProperty("status", response.status());
+            result.addProperty("message", "连接成功（HTTP " + response.status() + "，耗时 "
+                    + Math.round((System.nanoTime() - started) / 1_000_000.0) + " ms）。");
+        } catch (Exception error) {
+            result.addProperty("ok", false);
+            String message = error.getMessage();
+            result.addProperty("message", message == null || message.isBlank() ? "连接失败。" : message);
+        }
+        return result;
+    }
     public String chat(String personality, JsonArray history, String message) throws Exception {
         return chat(personality, history, message, "");
     }

@@ -1,9 +1,25 @@
-# Pixiko v1.0.0 发行说明
+# Pixiko v1.0.1 发行说明
 
-- **版本**：v1.0.0
+- **版本**：v1.0.1
 - **日期**：2026-09-27
 - **作者**：loriko（deloriko@outlook.com）
 - **当前实现**：Java 版（`src/`）。另有一次**未完成的** Next.js 重构，见 `nextjs-wip/`，**不可运行**。
+
+---
+
+## 〇、本版新增（v1.0.1）
+
+1. **首次配置改到网页端**：第一次启动不再停在命令行等输入，而是自动打开
+   `http://127.0.0.1:8787/setup`（缺 DeepSeek 密钥时本机免令牌），一页填完机器人名字、owner QQ、
+   两条 DeepSeek 通道、SD 与 NapCat 地址。命令行向导保留为 `run.bat --setup`。
+2. **网页端可改 DeepSeek 地址与密钥**：控制台「系统 → DeepSeek 通道」直接改两条通道的
+   `api_base` 与密钥，带「测试连接」与「清空密钥」；**改完立刻生效，不用重启**。
+   密钥只写进 `data/*-api-key.txt`，接口只回显掩码（`sk-6…222`），任何响应里都不出现原文。
+3. **第一次运行自动生成 `config.json`**：解压后直接双击 `start.bat` 即可（包内没有 `config.json`，
+   也没有任何真实凭据）；有 `config.example.json` 就照它起一份。
+4. **识别群禁言，不再硬发**：全员禁言或机器人自己被禁言时不再尝试发送，日志里只记一次
+   「禁言中，跳过发送」，不再刷一屏 `retcode=1200`；解除通知 / 到期 / 每分钟回查三条路自动恢复，
+   禁言期间聊天不发起模型调用（省额度）。见 `README.md`「被禁言时不会硬发」。
 
 ---
 
@@ -39,16 +55,17 @@
 
 ## 三、安装与启动（三步）
 
-### 开箱即用包 `pixiko-v1.0.0-runnable.zip`
+### 开箱即用包 `pixiko-v1.0.1-runnable.zip`
 
 1. 装好 **JDK 17+**。
-2. 解压后，在解压目录里 `copy config.example.json config.json`，然后填好配置
-   （**最少要改 `owner_user_id` 为你自己的 QQ**；或运行 `run.bat --setup` 走向导）。
-3. **双击 `start.bat`** 直接启动（预编译 jar，**无需编译**）。
+2. **双击 `start.bat`**。第一次运行会自动生成 `config.json`（照 `config.example.json` 起一份），
+   并在浏览器打开配置页 `http://127.0.0.1:8787/setup`；在那里填 owner QQ 与两条 DeepSeek 通道即可。
+   没有浏览器时也可以先 `copy config.example.json config.json` 手动填，或运行 `run.bat --setup` 用命令行向导。
+3. 配好即用；之后要改 DeepSeek 地址/密钥，直接在控制台「系统 → DeepSeek 通道」改。
 
 > `start.bat` 跑的是包内已编译好的 `build/pixiko.jar`；只有需要改代码时才用 `build.ps1` + `run.bat`。
 
-### 源码包 `pixiko-v1.0.0.zip`
+### 源码包 `pixiko-v1.0.1.zip`
 
 1. 装好 **JDK 17+**。
 2. 在项目根目录准备好依赖 jar：`lib/gson-2.13.1.jar` 由 `build.ps1` **自动下载并校验**，
@@ -68,7 +85,7 @@ copy config.example.json config.json
 | 脚本 | 作用 |
 |---|---|
 | `start.bat` | **开箱即用包专用**：跳过编译，直接用预编译 jar 启动 |
-| `run.bat` | 源码包：先 `build.ps1` 构建再启动；`run.bat --setup` 进配置向导 |
+| `run.bat` | 源码包：先 `build.ps1` 构建再启动；`run.bat --setup` 进命令行配置向导（网页配置页 `/setup` 是默认入口） |
 | `build.ps1` | 编译 `src/main/java` 并打包 `build/pixiko.jar`；`-Test` 连测试一起跑 |
 | `test.bat` | 等价于 `build.ps1 -Test`：编译并逐个运行全部 `*Test` |
 | `stop-bot.ps1` | 停止正在运行的机器人 |
@@ -76,7 +93,7 @@ copy config.example.json config.json
 | `eval-chain.ps1` / `eval-effect.ps1` / `eval-scale.ps1` / `eval-decompose.ps1` | 提示词链路评测脚本 |
 | `node tools\webui-selfcheck.mjs --token <令牌>` | 网页控制台自检（令牌用 `webui.access_token`，或设环境变量 `PIXIKO_WEBUI_TOKEN`） |
 
-其他启动参数：`run.bat --help`（指令总表）、`--check`（只测 SD 连通性）、`--setup`（配置向导）、
+其他启动参数：`run.bat --help`（指令总表）、`--check`（只测 SD 连通性）、`--setup`（命令行配置向导）、
 `--set-map yh "路径"`（命令行设地图）。这四个参数由 `Main` 解析，`start.bat` 同样透传。
 完整指令总表见 `README.md` 第五节。
 
@@ -96,10 +113,10 @@ copy config.example.json config.json
    `config.json` 与整个 `data/` 都不在包里（只有空的 `data/`、`logs/`、`maps/` 占位目录）。
    **第一次运行必须自己配置**，否则 owner 指令无法使用。
 5. **默认没有 owner。** 公开代码里 `Settings.DEFAULT_OWNER` 是空字符串（原版本内置了作者 QQ，
-   属于个人信息，已移除）。**务必在 `config.json` 里设置 `owner_user_id`**，否则所有 owner 专属指令都会被拒绝。
+   属于个人信息，已移除）。**务必在配置页或 `config.json` 里设置 `owner_user_id`**，否则所有 owner 专属指令都会被拒绝。
 6. **`test.bat` 的行为依赖工作目录。** `WebUiTest` 通过「进程工作目录下的 `webui/`」找页面资源
    （见 `WebPageController` 的回退逻辑），所以请在**项目根目录**运行 `test.bat`，
-   不要从别的目录调用。在项目根目录运行，44 个测试全部通过。
+   不要从别的目录调用。在项目根目录运行，46 个测试全部通过。
 7. **Logback 两个 jar 内不含许可文本**（上游如此），其 EPL-1.0 / LGPL-2.1 全文需查
    `THIRD-PARTY-LICENSES.md` 里给出的官方链接；`gson` 与 `snakeyaml` 的 jar 内同样没有许可文件，
    但二者均为 Apache-2.0，文本已随包提供。
@@ -108,8 +125,8 @@ copy config.example.json config.json
 
 ## 六、在 GitHub Releases 里发布这个 zip
 
-1. 打开仓库 → 右侧 **Releases** → **Draft a new release**，Tag 填 `v1.0.0`（新建 tag），标题填 `Pixiko v1.0.0`。
-2. 把 `pixiko-v1.0.0.zip` 与 `pixiko-v1.0.0-runnable.zip`（以及各自的 `.sha256`）拖进附件区，
+1. 打开仓库 → 右侧 **Releases** → **Draft a new release**，Tag 填 `v1.0.1`（新建 tag），标题填 `Pixiko v1.0.1`。
+2. 把 `pixiko-v1.0.1.zip` 与 `pixiko-v1.0.1-runnable.zip`（以及各自的 `.sha256`）拖进附件区，
    正文粘贴本文件内容后点 **Publish release**。
 
 > 建仓库时 License 请选 **None**（本项目保留所有权利，不使用开源许可证）。

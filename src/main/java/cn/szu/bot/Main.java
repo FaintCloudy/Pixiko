@@ -53,11 +53,9 @@ public final class Main {
              FileLock lock = lockFile.tryLock()) {
             if (lock == null) throw new IllegalStateException("此目录已有机器人运行，请先关闭旧实例。");
             settings = new Settings(root);
-            if (Setup.needed(settings)) {
-                Log.info("检测到还没配置完（缺 DeepSeek 密钥或网页令牌），先进入配置向导；之后可用 run.bat --setup 修改。");
-                try { new Setup(root, settings).run(); }
-                catch (Exception error) { Log.warn("配置向导未完成（可以继续，之后用 run.bat --setup 重来）：" + Bot.error(error)); }
-            }
+            // 首次配置放在网页端（见 openSetupPage）：命令行向导只在显式 run.bat --setup 时出现，
+            // 否则第一次运行会停在这个窗口等输入，而用户很可能根本没在看它。
+            boolean setupNeeded = Setup.needed(settings);
             settings.botName();
             config = settings.snapshot();
             SdClient sd = new SdClient(root, Json.obj(config, "sd"));
@@ -82,6 +80,7 @@ public final class Main {
                         new java.util.concurrent.atomic.AtomicReference<>();
                 try { web.set(new cn.szu.bot.web.WebUiServer(noticeSettings, bot)); web.get().start(); }
                 catch (Exception webError) { Log.error("Web 管理界面启动失败（QQ 侧不受影响）：" + Bot.error(webError)); }
+                if (setupNeeded) openSetupPage(web.get());
                 Thread hook = new Thread(() -> {
                     Log.info("收到退出信号，正在关闭机器人。");
                     if (web.get() != null) web.get().close();
@@ -102,6 +101,25 @@ public final class Main {
                 announce(transport, noticeConfig, true, noticeSettings);
                 stop.await();
             }
+        }
+    }
+    /**
+     * 首次配置：打印配置页地址，并尽量直接打开浏览器。
+     *
+     * <p>首次配置期间 {@code /api/config/**} 对本机免令牌（见 WebAuthFilter），所以用户不用先知道令牌；
+     * 配好之后这些接口就和别的接口一样要令牌了。
+     */
+    private static void openSetupPage(cn.szu.bot.web.WebUiServer web) {
+        if (web == null) {
+            Log.warn("网页控制台没起来，首次配置请用 run.bat --setup 在命令行完成。");
+            return;
+        }
+        String url = "http://127.0.0.1:" + web.actualPort() + "/setup";
+        Log.info("首次配置在网页端进行：" + url + "（缺 DeepSeek 密钥；本机访问免令牌，配置完就恢复要令牌）");
+        try {
+            if (java.awt.Desktop.isDesktopSupported()) java.awt.Desktop.getDesktop().browse(java.net.URI.create(url));
+        } catch (Exception error) {
+            Log.warn("没能自动打开浏览器，请手动访问：" + url);
         }
     }
     /**

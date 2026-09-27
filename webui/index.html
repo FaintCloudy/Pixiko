@@ -357,6 +357,23 @@
       <div class="kv" id="endpoint-list"></div>
     </div>
     <div class="card">
+      <div class="card-head"><b>DeepSeek 通道</b><span class="muted">地址与密钥改完立刻生效</span></div>
+      <div class="grid-2">
+        <label class="field"><span>生图频道 API 地址</span><input id="channel-image-base" placeholder="留空用官方 api.deepseek.com"></label>
+        <label class="field"><span>生图频道 API 密钥</span><input id="channel-image-key" type="password" autocomplete="off" placeholder="留空表示不改"></label>
+        <label class="field"><span>聊天频道 API 地址</span><input id="channel-chat-base" placeholder="留空用官方 api.deepseek.com"></label>
+        <label class="field"><span>聊天频道 API 密钥</span><input id="channel-chat-key" type="password" autocomplete="off" placeholder="留空表示不改"></label>
+      </div>
+      <div class="row wrap">
+        <button type="button" id="channel-save">保存通道设置</button>
+        <button class="ghost" type="button" id="channel-test-image">测试生图频道</button>
+        <button class="ghost" type="button" id="channel-test-chat">测试聊天频道</button>
+        <button class="ghost" type="button" id="channel-clear-image">清空生图密钥</button>
+        <button class="ghost" type="button" id="channel-clear-chat">清空聊天密钥</button>
+      </div>
+      <div class="muted" id="channel-note"></div>
+    </div>
+    <div class="card">
       <div class="card-head"><b>Stable Diffusion</b><span class="muted" id="sd-state"></span></div>
       <div class="muted" id="sd-detail"></div>
       <div class="row wrap">

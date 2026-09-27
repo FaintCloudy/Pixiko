@@ -64,6 +64,8 @@ public final class Bot implements AutoCloseable {
     private final LoraDownloader loraDownloader;
     /** SD WebUI 自启动：生成前发现 SD 没在跑就把它拉起来。 */
     private final cn.szu.bot.sd.SdLauncher sdLauncher;
+    /** 群禁言识别：被禁言时不再尝试发送（见 {@link MuteGuard}）。 */
+    private final MuteGuard mute = new MuteGuard();
     private final ExecutorService generation = Executors.newSingleThreadExecutor();
     private final ExecutorService progenIO = Executors.newSingleThreadExecutor();
     private final AtomicBoolean progenBusy = new AtomicBoolean();
@@ -1169,14 +1171,14 @@ public final class Bot implements AutoCloseable {
         this(settings, sd, sender, (url, stage, meter) -> new CivitaiClient(settings.root,
                 Json.obj(settings.snapshot(), "civitai")).download(url, stage, meter));
     }
-    public Bot(Settings settings, SdClient sd, Sender sender, LoraDownloader loraDownloader) {        this.settings = settings; this.sd = sd; this.sender = webAware(sender); this.loraDownloader = Objects.requireNonNull(loraDownloader);
+    public Bot(Settings settings, SdClient sd, Sender sender, LoraDownloader loraDownloader) {        this.settings = settings; this.sd = sd; this.sender = muteAware(webAware(sender)); this.loraDownloader = Objects.requireNonNull(loraDownloader);
         this.sdLauncher = new cn.szu.bot.sd.SdLauncher(cn.szu.bot.sd.SdLauncher.root(Json.obj(settings.snapshot(), "sd")),
                 () -> Json.obj(settings.snapshot(), "sd"), sd::reachable);
         // SD 的启动输出写进机器人自己的 logs 目录，和别的日志放在一起看。
         sdLauncher.logTo(settings.root.resolve("logs/sd-autostart.log"));
         // SD 正在运行时顺手学一次它的启动参数（绘世启动器的 --xformers 之类），下次自启动照原样起。
         if (sd.reachable()) learnSdStartArgs();
-        this.chat = new ChatService(settings, sender, this::chatPlan, this::executeChatCommands, this::selectionContext, System::nanoTime);
+        this.chat = new ChatService(settings, this.sender, this::chatPlan, this::executeChatCommands, this::selectionContext, System::nanoTime);
         this.userPrompts = new UserPromptStore(settings.root);
         this.localStyles = new cn.szu.bot.sd.LocalStyles(settings.root);
         // Personal prompt copies are created lazily; the owner inherits the pre-existing shared prompt once.
@@ -1247,10 +1249,16 @@ public final class Bot implements AutoCloseable {
     private volatile long lastLogMirrorNanos;
     public void accept(JsonObject event) {
         try {
-            if (!Json.str(event, "post_type", "").equals("message") || !settings.allowed(event)) {
-                if (Json.str(event, "post_type", "").equals("message")) Log.info("消息被白名单拒绝：" + describeConversation(event));
+            String postType = Json.str(event, "post_type", "");
+            if (!"message".equals(postType)) {
+                observeNotice(event);
                 return;
             }
+            if (!settings.allowed(event)) {
+                Log.info("消息被白名单拒绝：" + describeConversation(event));
+                return;
+            }
+            mute.selfId(Json.str(event, "self_id", ""));
             if (Json.str(event, "user_id", "!").equals(Json.str(event, "self_id", "?"))) return;
             String text = messageText(event.has("message") ? event.get("message") : event.get("raw_message"));
             if (duplicate(event)) { Log.info("忽略重复事件：" + describeConversation(event)); return; }
@@ -1264,6 +1272,9 @@ public final class Bot implements AutoCloseable {
             if (!text.startsWith("/")) {
                 // A plain "同意" answers a pending proposal; without one the message stays ordinary chat.
                 if (marriageConsent(event, text)) return;
+                // 群禁言期间连规划都不做：回复发不出去，只会白花一次模型调用。
+                String mutedGroup = Json.str(event, "group_id", "");
+                if (!mutedGroup.isEmpty() && mute.skip(mutedGroup, "聊天回复")) return;
                 // "下载第一个" 但搜索结果已失效时如实说明，不要改派给本机 LoRA 列表。
                 String stale = staleDownloadGuidance(event, text);
                 if (stale != null) { reply(event, stale); return; }
@@ -4107,6 +4118,111 @@ public final class Bot implements AutoCloseable {
         WebCapture current = webCurrent.get(ChatService.conversationKey(event));
         return current == null || current.closed() ? null : current;
     }
+    /**
+     * 出站消息的中转：<b>禁言期间直接不发</b>，其余情况交给网页捕获器或传输层。
+     *
+     * <p>这里是所有出站消息唯一的必经之路（聊天回复、指令回执、生成好的图片、回执失败提示），
+     * 所以禁言判断放在这一层就够，业务分支不用各自判断。
+     */
+    private Sender muteAware(Sender transport) {
+        return new Sender() {
+            @Override public CompletableFuture<Void> send(JsonObject event, JsonArray segments) {
+                if (skipMuted(event, segments, "消息")) return CompletableFuture.completedFuture(null);
+                return transport.send(event, segments).whenComplete((ignored, error) -> verifyMute(event, error));
+            }
+            @Override public CompletableFuture<Void> sendMap(JsonObject event, JsonArray segments) {
+                if (skipMuted(event, segments, "地图")) return CompletableFuture.completedFuture(null);
+                return transport.sendMap(event, segments).whenComplete((ignored, error) -> verifyMute(event, error));
+            }
+            @Override public CompletableFuture<Void> sendRecord(JsonObject event, List<JsonArray> messages) {
+                if (skipMuted(event, messages.isEmpty() ? new JsonArray() : messages.get(0), "聊天记录")) {
+                    return CompletableFuture.completedFuture(null);
+                }
+                return transport.sendRecord(event, messages).whenComplete((ignored, error) -> verifyMute(event, error));
+            }
+            @Override public CompletableFuture<JsonElement> callApi(String action, JsonObject params) { return transport.callApi(action, params); }
+        };
+    }
+
+    /** true = 这个群正在禁言，这次不发送（日志由 MuteGuard 去重）。 */
+    private boolean skipMuted(JsonObject event, JsonArray segments, String what) {
+        String group = Json.str(event, "group_id", "");
+        if (group.isEmpty() || !mute.muted(group)) return false;
+        String summary = segments == null ? "" : Log.text(Bot.messageText(segments));
+        return mute.skip(group, what + (summary.isEmpty() ? "" : "：" + summary));
+    }
+
+    /** 群禁言通知：只认 group_ban；全员禁言与"机器人自己被禁言"都算，别人的禁言不关机器人的事。 */
+    private void observeNotice(JsonObject event) {
+        mute.selfId(Json.str(event, "self_id", ""));
+        mute.observe(event);
+    }
+
+    /**
+     * 发送失败之后回查一次：真的被禁言就静音到解除，只是别的失败（网络、风控、消息被拒）就照旧如实报错。
+     * 回查按群每分钟最多一次，所以不会因为连续失败去刷 NapCat。
+     */
+    private void verifyMute(JsonObject event, Throwable error) {
+        if (error == null) return;
+        String group = Json.str(event, "group_id", "");
+        if (group.isEmpty() || !"group".equals(Json.str(event, "message_type", ""))) return;
+        if (!mute.shouldRecheck(group)) return;
+        mute.markChecked(group);
+        String self = mute.selfId().isEmpty() ? Json.str(event, "self_id", "") : mute.selfId();
+        JsonObject member = new JsonObject();
+        member.addProperty("group_id", group);
+        if (!self.isEmpty()) member.addProperty("user_id", self);
+        member.addProperty("no_cache", true);
+        sender.callApi("get_group_member_info", member).whenComplete((data, failure) -> {
+            if (failure == null && data != null && data.isJsonObject()) {
+                Long until = shutUpUntil(data.getAsJsonObject());
+                if (until != null) {
+                    mute.learned(group, until, until > System.currentTimeMillis() ? "机器人被禁言中" : "");
+                    return;
+                }
+            }
+            // 成员信息里没有禁言字段时，再看看整个群是不是全员禁言。
+            JsonObject params = new JsonObject();
+            params.addProperty("group_id", group);
+            sender.callApi("get_group_info", params).whenComplete((info, groupFailure) -> {
+                if (groupFailure == null && info != null && info.isJsonObject() && groupAllShut(info.getAsJsonObject()))
+                    mute.learned(group, System.currentTimeMillis() + MuteGuard.UNKNOWN_BAN_MILLIS, "全群禁言中");
+            });
+        });
+    }
+
+    /** 成员信息里的禁言截止时间（秒 → 毫秒）；没有这个字段返回 null（而不是"没禁言"）。 */
+    static Long shutUpUntil(JsonObject member) {
+        for (String key : new String[]{"shut_up_timestamp", "shutup_timestamp", "shut_up_time"}) {
+            JsonElement value = member.get(key);
+            if (value == null || !value.isJsonPrimitive()) continue;
+            try {
+                long seconds = value.getAsLong();
+                if (seconds <= 0) return 0L;
+                return seconds > 1_000_000_000_000L ? seconds : seconds * 1000L;
+            } catch (RuntimeException ignored) { /* 换个字段名再试 */ }
+        }
+        return null;
+    }
+
+    /** 群信息里的"全员禁言"标记（不同实现对字段的叫法不一样，认识的都认）。 */
+    static boolean groupAllShut(JsonObject group) {
+        for (String key : new String[]{"all_shut", "group_all_shut", "all_shutup", "shut_all"}) {
+            JsonElement value = group.get(key);
+            if (value == null || !value.isJsonPrimitive()) continue;
+            try {
+                if (value.getAsJsonPrimitive().isBoolean() ? value.getAsBoolean() : value.getAsInt() != 0) return true;
+            } catch (RuntimeException ignored) { /* 换个字段名再试 */ }
+        }
+        Long until = shutUpUntil(group);
+        return until != null && until > System.currentTimeMillis();
+    }
+
+    /** 禁言状态（网页与日志用）。 */
+    public JsonArray muteStatus() { return mute.snapshot(); }
+
+    /** 测试用：直接拿到禁言守卫。 */
+    MuteGuard muteGuard() { return mute; }
     /** 网页指令事件里带回执 id 的键（异步步骤据此把回执送回原来那条指令）。 */
     static final String WEB_CAPTURE_KEY = "_web_capture";
     /**
@@ -4363,6 +4479,7 @@ public final class Bot implements AutoCloseable {
         result.add("civitai", civitaiStatus());
         result.add("sd", sdStatus());
         result.add("endpoints", endpointStatus());
+        result.add("mutes", mute.snapshot());
         // 这里只要词条个数：以前为了一个数字把整份提示词的"词条 + 中文释义"都算了一遍（几万条词库全表扫），
         // /api/status 因此要半秒——出图面板点「开始生成」先发 /api/generation，前摇就是这么来的。
         result.addProperty("promptTerms", promptTerms(effectivePrompts(settings.webScope()).positive()).size());

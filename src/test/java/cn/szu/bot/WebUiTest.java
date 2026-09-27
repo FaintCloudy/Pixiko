@@ -134,7 +134,8 @@ public final class WebUiTest {
                     generationProgress(base);
                     consoleCommands(base, root);
                     imageGuard(base, root);
-                    System.out.println("WebUiTest: " + checks + " assertions passed：鉴权、静态页、状态、列表、提示词编辑、内部面板接口、生成参数即时生效、控制台并发指令、图片路径校验");
+                    configEndpoints(base, root, sd.getAddress().getPort());
+                    System.out.println("WebUiTest: " + checks + " assertions passed：鉴权、静态页、状态、列表、提示词编辑、内部面板接口、生成参数即时生效、控制台并发指令、图片路径校验、网页端配置");
                 }
             }
         } finally {
@@ -767,6 +768,61 @@ public final class WebUiTest {
         check(postRaw(base, "/api/image", token, path("config.json")).has("error"), "工作目录里非缓存图片不可读");
         check(postRaw(base, "/api/image", token, path("data/generated/evil.txt")).has("error"), "非图片扩展名被拒绝");
         check(postRaw(base, "/api/image", token, path("data/generated/missing.png")).has("error"), "不存在的图片返回错误");
+    }
+
+    /**
+     * 网页端配置：首次配置期间本机免令牌、配置完成后恢复要令牌；两条通道的地址与密钥能改、能测、能清空，
+     * 而且任何响应里都不出现密钥原文。测试 root 只放了生图密钥，所以起点正好是"还没配置完"。
+     */
+    private static void configEndpoints(String base, Path root, int sdPort) throws Exception {
+        String token = "test-token-123456";
+        JsonObject open = get(base, "/api/config/state", null);
+        check(open.get("needed").getAsBoolean(), "缺聊天频道密钥时算首次配置");
+        JsonObject channels = open.getAsJsonObject("values").getAsJsonObject("channels");
+        check(channels.getAsJsonObject("image").get("keySet").getAsBoolean(), "生图频道密钥已配置");
+        check(!channels.getAsJsonObject("chat").get("keySet").getAsBoolean(), "聊天频道密钥未配置");
+        check(!open.toString().contains("test-key-not-real"), "首次配置读接口不回显密钥原文");
+        check(open.getAsJsonObject("values").getAsJsonObject("channels").getAsJsonObject("chat")
+                .get("effective").getAsString().endsWith("/chat/completions"), "接口给出补齐后的完整地址");
+
+        HttpResponse<String> page = HTTP.send(HttpRequest.newBuilder(URI.create(base + "/setup")).GET().build(),
+                HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+        check(page.statusCode() == 200 && page.body().contains("/api/config/state"), "配置页免令牌可打开");
+
+        // 首次配置：不带令牌就能填密钥与地址（本机回环）
+        JsonObject filled = post(base, "/api/config/apply", null, Json.parse(
+                "{\"owner_user_id\":\"10001\",\"channels\":{\"chat\":{\"base\":\"http://127.0.0.1:" + sdPort
+                        + "/v1\",\"key\":\"sk-chat-test-abcdef\"}}}"));
+        check(!filled.get("needed").getAsBoolean(), "两条密钥齐了就不再是首次配置");
+        check(Files.readString(root.resolve("data/deepseek-chat-api-key.txt"), StandardCharsets.UTF_8).strip()
+                .equals("sk-chat-test-abcdef"), "聊天密钥写进自己的文件");
+        check(Json.str(Json.parse(Files.readString(root.resolve("config.json"), StandardCharsets.UTF_8)), "owner_user_id", "")
+                .equals("10001"), "owner QQ 落盘");
+
+        // 配置完成后：同样的接口恢复要令牌
+        check(status(base, "/api/config/state", null, null) == 401, "配置完成后配置接口要令牌");
+        check(status(base, "/api/config/state", token, null) == 200, "带令牌可以读配置");
+        JsonObject state = get(base, "/api/config/state", token);
+        check(!state.toString().contains("sk-chat-test-abcdef"), "带令牌读配置也不回显密钥原文");
+        check(state.getAsJsonObject("values").getAsJsonObject("channels").getAsJsonObject("chat")
+                .get("keyMasked").getAsString().contains("…"), "密钥只给掩码");
+
+        // 测试连接：真的发一条请求给本机桩（桩对所有 /chat/completions 回 200）
+        JsonObject tested = post(base, "/api/config/test", token, panel("channel", "chat"));
+        check(tested.get("ok").getAsBoolean(), "测试连接成功：" + tested.get("message").getAsString());
+        check(tested.get("url").getAsString().equals("http://127.0.0.1:" + sdPort + "/v1/chat/completions"),
+                "测试用的是补齐后的地址：" + tested.get("url").getAsString());
+
+        // 清空密钥 → 重新回到首次配置（本机又可以免令牌进来重填），随后还原测试数据
+        JsonObject cleared = post(base, "/api/config/apply", token, Json.parse("{\"channels\":{\"chat\":{\"clearKey\":true}}}"));
+        check(cleared.get("needed").getAsBoolean(), "清空聊天密钥后重新算首次配置");
+        post(base, "/api/config/apply", null, Json.parse("{\"channels\":{\"chat\":{\"key\":\"sk-chat-test-abcdef\"}}}"));
+
+        // 坏输入：报 400，且不落盘
+        check(status(base, "/api/config/apply", token, Json.parse("{\"owner_user_id\":\"abc\"}")) == 400, "非法 owner 报 400");
+        check(status(base, "/api/config/test", token, panel("channel", "nope")) == 400, "未知通道报 400");
+        check(Json.str(Json.parse(Files.readString(root.resolve("config.json"), StandardCharsets.UTF_8)), "owner_user_id", "")
+                .equals("10001"), "被拒绝的请求不改配置");
     }
 
     /** 与 post 相同，但把 4xx/5xx 的 JSON 也返回，便于断言错误内容。 */

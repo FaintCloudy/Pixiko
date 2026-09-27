@@ -1,13 +1,13 @@
-Pixiko v1.0.0 —— 第一次运行，三步走
+Pixiko v1.0.1 —— 第一次运行，三步走
 ====================================
 
 【你下载的是哪个包？】
 
-  pixiko-v1.0.0-runnable.zip   ← 开箱即用。里面已经带好了编译好的 jar 和全部依赖，
+  pixiko-v1.0.1-runnable.zip   ← 开箱即用。里面已经带好了编译好的 jar 和全部依赖，
                                  只要有 JDK 17+，双击 start.bat 就能启动。
                                  （就选这个，除非你要改代码。）
 
-  pixiko-v1.0.0.zip            ← 源码包。给要编译、要改代码的人用，
+  pixiko-v1.0.1.zip            ← 源码包。给要编译、要改代码的人用，
                                  需要自己补 lib\spring\ 里的 Spring Boot 依赖，
                                  再用 run.bat 构建并启动。
 
@@ -18,21 +18,28 @@ Pixiko v1.0.0 —— 第一次运行，三步走
      检查方法：打开命令行，敲  java -version  能看到版本号就行。
 
   2. 双击 start.bat。
-     第一次运行会自动生成 config.json 并进入配置向导，问你要填的东西：
+     第一次运行会自动生成 config.json，并自动打开浏览器里的配置页：
+       http://127.0.0.1:8787/setup
+     在那一页填这些东西，保存就行（密钥只写进本机文件，页面只回显掩码）：
        - owner_user_id ：你自己的 QQ 号（这一个是必填，其它可以留空）
-       - DeepSeek API Key（生图通道 / 聊天通道，各一条）
+       - DeepSeek 通道：生图频道与聊天频道各一份「地址 + 密钥」，各填各的
+                        （地址留空就用官方 api.deepseek.com）
        - SD WebUI 地址（默认 http://127.0.0.1:7860，记得给 WebUI 加 --api 启动参数）
        - NapCat 正向 WebSocket 地址与 Token（默认 ws://127.0.0.1:3001，不接 QQ 也能用网页控制台）
-     配置向导走完，机器人就起来了。
+     首次配置期间这一页对本机免令牌；配好之后就和别的接口一样要令牌了。
 
   3. 打开网页控制台： http://127.0.0.1:8787
-     默认访问令牌在 config.json 的 webui.access_token 里（首次启动会生成）。
+     访问令牌在 config.json 的 webui.access_token 里（首次启动会生成，启动日志里也打印过）。
      想让它连 QQ，先启动 NapCat 并开好正向 WebSocket，再双击 start.bat。
 
+     以后想换 DeepSeek 的地址或密钥：控制台「系统 → DeepSeek 通道」直接改，带「测试连接」，
+     改完立刻生效，不用重启（SD 与 NapCat 的地址要重启才生效）。
 
-【不想用向导？】
 
-  把 config.example.json 复制成 config.json，自己填好，再双击 start.bat 即可。
+【不想用配置页？】
+
+  把 config.example.json 复制成 config.json，自己填好，再双击 start.bat 即可；
+  没有浏览器的环境可以用命令行向导：run.bat --setup。
 
 
 【出图相关的额外要求】
@@ -49,7 +56,7 @@ Pixiko v1.0.0 —— 第一次运行，三步走
      这样报错信息会留在屏幕上。最常见的原因是没装 JDK，或 java.exe 不在 PATH 里。
 
   Q: 提示 build\pixiko.jar not found？
-  A: 你下的是源码包（pixiko-v1.0.0.zip）。源码包请用 run.bat（它会先编译再启动），
+  A: 你下的是源码包（pixiko-v1.0.1.zip）。源码包请用 run.bat（它会先编译再启动），
      或者改用开箱即用包。
 
   Q: 提示 lib\spring not found？
@@ -58,6 +65,14 @@ Pixiko v1.0.0 —— 第一次运行，三步走
 
   Q: 端口 8787 被占用？
   A: config.json 里 webui.port 改一个数字，重新启动。
+
+  Q: 浏览器没自动打开配置页？
+  A: 手动访问 http://127.0.0.1:8787/setup 即可（启动日志里也打印了这个地址）。
+     没有浏览器的环境用命令行向导：run.bat --setup。
+
+  Q: 群里被禁言了，日志里一直报发送失败？
+  A: 不会了。识别到禁言（全员禁言或机器人自己被禁言）就停止发送，只记一条日志，
+     解除后自动恢复；这期间聊天也不会去调模型。
 
 
 【版权与声明（请务必读一下）】

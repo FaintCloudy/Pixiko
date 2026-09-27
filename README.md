@@ -5,7 +5,7 @@ Pixiko 是一个自用的 QQ 机器人：接 **NapCat** 收消息，接 **Stable
 领图；机器人自己把生成好的图片发回对话。
 
 - **作者**：loriko（deloriko@outlook.com）
-- **版本**：v1.0.0（发行说明见 [`RELEASE.md`](RELEASE.md)）
+- **版本**：v1.0.1（发行说明见 [`RELEASE.md`](RELEASE.md)）
 - **当前实现**：**Java 版**（`src/`）——这是线上一直在跑的那一份
 - **网页控制台**：`webui/`（纯静态 HTML/CSS/JS，随机器人一起由内嵌 Spring Boot 提供）
 - **SD WebUI 桥接扩展**：`webui-extension/pixiko-bridge/`（把文生图页正在编辑的提示词同步给机器人）
@@ -91,8 +91,12 @@ copy config.example.json config.json
 .\run.bat
 ```
 
-第一次启动如果检测到还没配好（缺 DeepSeek 密钥或网页令牌），会自动进入**配置向导**；
-之后想改配置随时：
+第一次启动如果检测到还没配好（缺 DeepSeek 密钥或网页令牌），会**自动在浏览器打开配置页**
+`http://127.0.0.1:8787/setup`：填好机器人名字、owner QQ、两条 DeepSeek 通道（地址 + 密钥）、
+SD 与 NapCat 地址即可，密钥只写进本机文件、页面只回显掩码。首次配置期间这个配置页对本机免令牌，
+配好之后就和其它接口一样要令牌（也可以随时从控制台「系统 → DeepSeek 通道」改地址与密钥）。
+
+命令行向导仍然保留，适合没有浏览器的环境：
 
 ```powershell
 .\run.bat --setup
@@ -104,14 +108,24 @@ copy config.example.json config.json
    留空时所有 owner 专属指令都会被拒绝（这是刻意为之：公开仓库不发布个人 QQ 号）。
 2. `sd.root` —— 你的 SD WebUI 根目录（示例写的是 `F:/sd/sd-webui`）。
 3. `civitai.lora_dir` —— LoRA 目录（示例 `F:/sd/sd-webui/models/Lora`）。
-4. `data/deepseek-api-key.txt` 与 `data/deepseek-chat-api-key.txt` —— 各放一个 DeepSeek Key。
+4. 两条 DeepSeek 通道的地址与密钥 —— 配置页里填（`api_base` 留空即官方 `api.deepseek.com`）；
+   也可以手动放 `data/deepseek-api-key.txt`（生图）与 `data/deepseek-chat-api-key.txt`（聊天）。
 5. `qq.ws_url` —— NapCat 正向 WebSocket 地址。
+
+> 这两条通道互相独立：地址、密钥、模型、额度都是分开的，改一条不影响另一条。
+> DeepSeek 的地址与密钥改完**立刻生效**（不用重启）；SD 与 NapCat 的地址要重启机器人才生效。
+
+### 被禁言时不会硬发
+
+群禁言（全员禁言或机器人自己被禁言）会被识别出来：禁言期间**不再尝试发送**消息，
+只在日志里记一次「禁言中，跳过发送」，不会刷一屏 `retcode=1200` 的报错。
+解除通知、到期、以及每隔一分钟的回查三条路都能让它自己恢复；聊天在这期间也不发起模型调用。
 
 ### 常用脚本
 
 | 脚本 | 作用 |
 |---|---|
-| `run.bat` | 先构建（`build.ps1`）再启动机器人；`run.bat --setup` 进配置向导 |
+| `run.bat` | 先构建（`build.ps1`）再启动机器人；`run.bat --setup` 进命令行配置向导（网页配置页是默认入口） |
 | `build.ps1` | 编译 `src/main/java` 并打包成 `build/pixiko.jar`；`-Test` 连测试一起编译并运行 |
 | `test.bat` | 等价于 `build.ps1 -Test`：编译全部测试并逐个运行 `*Test` |
 | `stop-bot.ps1` | 停止正在运行的机器人 |
@@ -124,7 +138,7 @@ copy config.example.json config.json
 ```
 run.bat --help                    # 打印指令总表
 run.bat --check                   # 只检查 SD WebUI 连通性，不启动机器人
-run.bat --setup                   # 配置向导（需先停止机器人）
+run.bat --setup                   # 命令行配置向导（网页配置页是默认入口；需先停止机器人）
 run.bat --set-map yh "路径"       # 命令行设置地图（需先停止机器人）
 ```
 
@@ -299,13 +313,13 @@ run.bat --set-map yh "路径"       # 命令行设置地图（需先停止机器
 ```
 pixiko\
 ├─ README.md                       本文件
-├─ RELEASE.md                      v1.0.0 发行说明（含版权声明与已知限制）
+├─ RELEASE.md                      v1.0.1 发行说明（含版权声明与已知限制）
 ├─ THIRD-PARTY-LICENSES.md         随二进制包分发的第三方组件与许可
 ├─ config.example.json             脱敏配置模板（复制成 config.json 再改）
 ├─ .gitignore                      config.json / data / logs / lib jar 等一律不入库
 │
 ├─ start.bat                       开箱即用包：跳过编译，直接启动预编译 jar
-├─ run.bat                         构建 + 启动（--setup 走配置向导）
+├─ run.bat                         构建 + 启动（--setup 走命令行配置向导）
 ├─ build.ps1                       编译打包到 build/pixiko.jar（-Test 连带跑测试）
 ├─ test.bat                        等价于 build.ps1 -Test
 ├─ stop-bot.ps1                    停止机器人
@@ -320,7 +334,7 @@ pixiko\
 │  │  ├─ Main.java                 入口：--setup / --check / --set-map / --help
 │  │  ├─ Bot.java                  指令分发、生成队列、Civitai 登录、网页接口聚合
 │  │  ├─ Settings.java             config.json 读写与校验
-│  │  ├─ Setup.java                首次运行的配置向导
+│  │  ├─ Setup.java                命令行配置向导（网页配置页见 WebConfigController / WebSetup）
 │  │  ├─ Json.java / Log.java / Maps.java / Marriage.java
 │  │  ├─ chat\                     ChatService / DeepSeekPrompts / PersonaState / 原作语料索引
 │  │  ├─ civitai\                  CivitaiClient / 样式同步

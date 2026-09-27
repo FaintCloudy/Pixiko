@@ -183,7 +183,8 @@ public final class Setup {
         return value;
     }
 
-    private static String randomToken() {
+    /** 网页端配置页也用同一套令牌规则，所以这里不是 private。 */
+    static String randomToken() {
         String alphabet = "abcdefghijkmnpqrstuvwxyz23456789";
         StringBuilder token = new StringBuilder();
         Random random = new Random();
@@ -198,7 +199,8 @@ public final class Setup {
         } catch (Exception error) { return ""; }
     }
 
-    private static String mask(String key) {
+    /** 密钥只回显成这样：够本人确认是哪一条，又不足以被抄走。 */
+    static String mask(String key) {
         return key.length() <= 8 ? "已配置" : key.substring(0, 4) + "…" + key.substring(key.length() - 3);
     }
 

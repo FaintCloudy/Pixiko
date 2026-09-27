@@ -431,11 +431,15 @@ public final class QqClient implements AutoCloseable {
                 }
                 return;
             }
-            if (!"message".equals(string(packet, "post_type", ""))) return;
-            String type = string(packet, "message_type", "");
-            if (!"group".equals(type) && !"private".equals(type)) return;
-            String self = string(packet, "self_id", "");
-            if (!self.isEmpty() && self.equals(string(packet, "user_id", ""))) return;
+            String postType = string(packet, "post_type", "");
+            // 通知事件（群禁言之类）也要送到机器人：它决定"现在能不能发消息"，不能在这里被丢掉。
+            if (!"message".equals(postType) && !"notice".equals(postType)) return;
+            if ("message".equals(postType)) {
+                String type = string(packet, "message_type", "");
+                if (!"group".equals(type) && !"private".equals(type)) return;
+                String self = string(packet, "self_id", "");
+                if (!self.isEmpty() && self.equals(string(packet, "user_id", ""))) return;
+            }
         } catch (RuntimeException ex) {
             Log.warn("忽略无法解析的 QQ 消息。");
             return;
