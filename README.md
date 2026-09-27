@@ -5,6 +5,7 @@ Pixiko 是一个自用的 QQ 机器人：接 **NapCat** 收消息，接 **Stable
 领图；机器人自己把生成好的图片发回对话。
 
 - **作者**：loriko（deloriko@outlook.com）
+- **版本**：v1.0.0（发行说明见 [`RELEASE.md`](RELEASE.md)）
 - **当前实现**：**Java 版**（`src/`）——这是线上一直在跑的那一份
 - **网页控制台**：`webui/`（纯静态 HTML/CSS/JS，随机器人一起由内嵌 Spring Boot 提供）
 - **SD WebUI 桥接扩展**：`webui-extension/pixiko-bridge/`（把文生图页正在编辑的提示词同步给机器人）
@@ -295,9 +296,12 @@ run.bat --set-map yh "路径"       # 命令行设置地图（需先停止机器
 ```
 pixiko\
 ├─ README.md                       本文件
+├─ RELEASE.md                      v1.0.0 发行说明（含版权声明与已知限制）
+├─ THIRD-PARTY-LICENSES.md         随二进制包分发的第三方组件与许可
 ├─ config.example.json             脱敏配置模板（复制成 config.json 再改）
 ├─ .gitignore                      config.json / data / logs / lib jar 等一律不入库
 │
+├─ start.bat                       开箱即用包：跳过编译，直接启动预编译 jar
 ├─ run.bat                         构建 + 启动（--setup 走配置向导）
 ├─ build.ps1                       编译打包到 build/pixiko.jar（-Test 连带跑测试）
 ├─ test.bat                        等价于 build.ps1 -Test
@@ -360,8 +364,18 @@ pixiko\
 
 ## 七、许可与免责
 
-- 本项目代码**仅供个人自用与研究**，作者未授予任何商业使用许可，也未附带 OSI 认证的开源许可证文件。
-  你要用就自己承担后果。
+### 版权声明
+
+**代码版权归 loriko（deloriko@outlook.com）所有，保留所有权利（All Rights Reserved）。**
+本仓库**未使用任何开源许可证**（GitHub 上 License 一栏就是 None）。
+
+- 代码**仅供个人自用与研究**。未经作者书面许可，**不得再分发、不得商用、不得用于任何在线服务**
+  （包括但不限于把它跑成对公众开放的服务、把二进制或源码重新打包发布）。
+- 二次分发（在获得许可的前提下）请**先取得作者许可并完整保留作者信息**与本声明。
+- 作者未授予任何商业使用许可，也未附带 OSI 认证的开源许可证文件。你要用就自己承担后果。
+
+### 免责
+
 - 使用本项目时请遵守所依赖服务的服务条款：**NapCat / OneBot**、**Stable Diffusion WebUI (A1111)**
   以及 **Civitai**，包括它们的速率限制与账号规则。用 `civitai.session_cookie` 抓取与下载模型
   属于自动化访问，风险自负。
@@ -374,6 +388,9 @@ pixiko\
   文件不存在时该功能静默失效，其余功能不受影响。
 - 仓库中不包含任何真实凭据：Civitai Cookie、网页访问令牌、DeepSeek 密钥、真实 QQ 号
   与个人目录路径都已被移除或替换为占位符。
+
+> 随二进制发行包一起分发的第三方组件（Spring Boot 系列、gson）均为 Apache-2.0，
+> 清单见 [`THIRD-PARTY-LICENSES.md`](THIRD-PARTY-LICENSES.md)。
 
 ---
 

@@ -165,7 +165,7 @@ public final class ChainScaleEval {
                     .append(" | ").append(cell(String.join("<br>", outcome.commands())))
                     .append(" | ").append(cell(String.join("；", outcome.problems()))).append(" |\n");
         if (failed.size() > 80) out.append("\n（其余 ").append(failed.size() - 80).append(" 条见 chain-scale-failures.log）\n");
-        out.append("\n## 复现\n\n```powershell\npowershell -NoProfile -ExecutionPolicy Bypass -File .\eval-scale.ps1\n```\n");
+        out.append("\n## 复现\n\n```powershell\npowershell -NoProfile -ExecutionPolicy Bypass -File .\\eval-scale.ps1\n```\n");
         return out.toString();
     }
 

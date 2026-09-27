@@ -64,6 +64,8 @@ public final class InfixBackfillTest {
         sdConfig.addProperty("base_url", "http://127.0.0.1:9/");
         JsonObject config = new JsonObject();
         config.add("sd", sdConfig);
+        // 公开仓库不含默认 owner（不发布真实 QQ 号），所以测试自己指定一个测试用 owner。
+        config.addProperty("owner_user_id", "10000001");
         Json.atomicWrite(root.resolve("config.json"), config);
         Files.createDirectories(root.resolve("data"));
         Files.copy(Path.of("data/prompt-tags.txt"), root.resolve("data/prompt-tags.txt"));

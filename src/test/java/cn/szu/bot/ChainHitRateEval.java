@@ -320,7 +320,7 @@ public final class ChainHitRateEval {
                 out.append("\n```\n[调用 ").append(i + 1).append("] ").append(truncate(outcome.raw().get(i))).append("\n```\n");
             out.append("\n");
         }
-        out.append("\n## 复现\n\n```powershell\npowershell -NoProfile -ExecutionPolicy Bypass -File .\eval-chain.ps1\n```\n");
+        out.append("\n## 复现\n\n```powershell\npowershell -NoProfile -ExecutionPolicy Bypass -File .\\eval-chain.ps1\n```\n");
         return out.toString();
     }
 

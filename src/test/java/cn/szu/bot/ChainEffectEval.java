@@ -641,7 +641,7 @@ public final class ChainEffectEval {
                     .append(" | ").append(ChainEvalSupport.cell(shorten(outcome.prompt(), 220)))
                     .append(" | ").append(ChainEvalSupport.cell(String.join("；", outcome.problems()))).append(" |\n");
         if (failed.size() > 80) out.append("\n（其余 ").append(failed.size() - 80).append(" 条见 chain-effect-failures.log）\n");
-        out.append("\n## 复现\n\n```powershell\npowershell -NoProfile -ExecutionPolicy Bypass -File .\eval-effect.ps1\n```\n");
+        out.append("\n## 复现\n\n```powershell\npowershell -NoProfile -ExecutionPolicy Bypass -File .\\eval-effect.ps1\n```\n");
         return out.toString();
     }
 
