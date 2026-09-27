@@ -1,13 +1,13 @@
-Pixiko v1.0.1 —— 第一次运行，三步走
+Pixiko v1.0.2 —— 第一次运行，三步走
 ====================================
 
 【你下载的是哪个包？】
 
-  pixiko-v1.0.1-runnable.zip   ← 开箱即用。里面已经带好了编译好的 jar 和全部依赖，
+  pixiko-v1.0.2-runnable.zip   ← 开箱即用。里面已经带好了编译好的 jar 和全部依赖，
                                  只要有 JDK 17+，双击 start.bat 就能启动。
                                  （就选这个，除非你要改代码。）
 
-  pixiko-v1.0.1.zip            ← 源码包。给要编译、要改代码的人用，
+  pixiko-v1.0.2.zip            ← 源码包。给要编译、要改代码的人用，
                                  需要自己补 lib\spring\ 里的 Spring Boot 依赖，
                                  再用 run.bat 构建并启动。
 
@@ -42,6 +42,17 @@ Pixiko v1.0.1 —— 第一次运行，三步走
   没有浏览器的环境可以用命令行向导：run.bat --setup。
 
 
+【中文词库：已经自带，不用你准备】
+
+  data\prompt-tags.txt（14 万条标准词条）、data\prompt-usage.json（中文分类词库）、
+  data\prompt-zh-tags.json（3.4 万条中文↔标准词条）等词库文件都随包提供，
+  下载后 .usage 词库 / .usage 搜索 / .prompt classify 直接可用。
+  两个上游词表都是 MIT，许可全文在 LICENSES\MIT-*.txt，明细见 THIRD-PARTY-LICENSES.md。
+  （只有《Rewrite》原作对白语料 data\kotori-corpus.txt 不随包分发，需要自备。）
+
+  想加自己的中文说法：编辑 data\prompt-zh-extra.txt（格式：中文=tag1,tag2），
+  再跑 node tools\build-zh-tags.mjs 重新生成 data\prompt-zh-tags.json。
+
 【出图相关的额外要求】
 
   生图必须有一个带 --api 启动的 Stable Diffusion WebUI（A1111 系）。
@@ -56,7 +67,7 @@ Pixiko v1.0.1 —— 第一次运行，三步走
      这样报错信息会留在屏幕上。最常见的原因是没装 JDK，或 java.exe 不在 PATH 里。
 
   Q: 提示 build\pixiko.jar not found？
-  A: 你下的是源码包（pixiko-v1.0.1.zip）。源码包请用 run.bat（它会先编译再启动），
+  A: 你下的是源码包（pixiko-v1.0.2.zip）。源码包请用 run.bat（它会先编译再启动），
      或者改用开箱即用包。
 
   Q: 提示 lib\spring not found？

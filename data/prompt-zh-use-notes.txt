@@ -1,0 +1,27 @@
+# 词条用法人工说明：词条=使用需求（优先于模板）。一行可以用逗号给多个词条写同一条说明。
+# ===== 容易被误加的通用/质量/画风词条 =====
+masterpiece,best_quality,highres,absurdres,high_resolution,ultra_detailed,official_art=用户明确要求画质/质量时（用户没提画质就不要加）
+realistic,photorealistic,3d,3d_background=用户明确要求写实/3D 风格或立体背景时（默认不要加）
+backdrop=用户明确要求摄影棚幕布/背景板时
+simple_background,white_background,black_background,grey_background=用户明确要求纯色/简单背景时
+multiple_views,comic,4koma,2koma,split_screen,storyboard,inset=用户要求分镜、多格或拼图展示时
+pov,pov_hands,female_pov=用户要求第一人称/主视角时（不要与其它视角词条同时用）
+from_above,from_below,from_behind,from_side=用户要求俯视/仰视/背后/侧面机位时（视角词条互相冲突，只留一个）
+close-up,cowboy_shot,full_body,upper_body,lower_body=用户要求特写/半身/全身等取景时（互相冲突，只留一个）
+blurry,bokeh,depth_of_field=用户要求虚化/景深时
+# ===== 成人向：只在明确要求时使用 =====
+sex,vaginal,hetero=用户明确要求性交/交合时
+chikan=用户明确要求电车痴汉/骚扰场景时
+molestation,sexual_harassment,groping=用户明确要求性骚扰/猥亵/抚摸时
+cum,ejaculation,precum=用户明确要求射精/精液时
+pussy,spread_pussy,presenting=用户明确要求露出私处/展示下体时
+penis=用户明确要求出现男性器官时
+nude,topless,bottomless=用户明确要求裸露时
+bondage,shibari,restrained=用户明确要求束缚/捆绑时
+ass,ass_focus,hip_focus,crotch_focus=用户明确要求臀部/腰部/交合部位特写时
+# ===== 常见误命中：中文写法宽，容易在无关句子里被匹配 =====
+zoom_layer=只在用户明确要求放大图层/局部放大时
+presenting=只在用户明确要求展示下体时
+no_ahoge=只在用户明确要求"没有呆毛"时
+still_life=只在用户要求静物/摆拍时
+artist_name,watermark,signature,username,logo,text=这些是应当写进反向提示词的词条，不要加进正向

@@ -1,0 +1,7 @@
+{
+  "source": "https://github.com/DominikDoom/a1111-sd-webui-tagcomplete/blob/main/tags/danbooru.csv",
+  "git_blob_sha": "7a3cba59a8cd75bad45b0097338f8f882714a040",
+  "sha256": "f936684fa0b041e9a55d35f2052588e28d95eef8672be6829241f8b1a7214732",
+  "tags": 140782,
+  "format": "One canonical tag per line; SD syntax escaped; CSV alias column not imported."
+}

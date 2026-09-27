@@ -1,13 +1,36 @@
-# Pixiko v1.0.1 发行说明
+# Pixiko v1.0.2 发行说明
 
-- **版本**：v1.0.1
+- **版本**：v1.0.2
 - **日期**：2026-09-27
 - **作者**：loriko（deloriko@outlook.com）
 - **当前实现**：Java 版（`src/`）。另有一次**未完成的** Next.js 重构，见 `nextjs-wip/`，**不可运行**。
 
 ---
 
-## 〇、本版新增（v1.0.1）
+## 〇、本版新增（v1.0.2）
+
+**中文词库随包分发**：`data/` 下的提示词词库进了仓库与两个发行包，下载后开箱就有词库可用——
+`.usage 词库` / `.usage 搜索` 能查、`.prompt classify` 能分类、`.infix filter on` 的标准词库约束
+能生效，不需要自己准备词表：
+
+| 文件 | 体积 | 内容 |
+|---|---|---|
+| `data/prompt-tags.txt` | 2.3 MB | 140,779 条标准词条（Danbooru 词表） |
+| `data/prompt-usage.json` | 464 KB | 中文分类词库，11 类 |
+| `data/prompt-zh-tags.json` | 1.6 MB | 34,211 条中文↔标准词条、38,941 个中文写法 |
+| `data/prompt-zh-extra.txt` | 188 KB | 手工同义词表（生成词库的输入） |
+| `data/prompt-zh-usage.md` | 4.0 MB | 词条用法表（人读版） |
+| `data/prompt-zh-use-notes.txt` | 2.2 KB | 词条使用需求的人工说明 |
+| `data/prompt-tags.source.json` | 362 B | 标准词表来源与校验值 |
+
+- 上游两个词表均为 **MIT**（DominikDoom/a1111-sd-webui-tagcomplete © 2022 Dominik Reh；
+  Physton/sd-webui-prompt-all-in-one © 2023 Physton），许可全文随包放在 `LICENSES/MIT-*.txt`，
+  明细见 `THIRD-PARTY-LICENSES.md`。
+- **`data/` 里的其它内容照旧不进包**：DeepSeek 密钥、生成图、队列状态、Civitai Cookie、
+  原作对白语料（`data/kotori-corpus.txt`）都不在仓库与发行包里。
+
+<details>
+<summary>上一版（v1.0.1）新增</summary>
 
 1. **首次配置改到网页端**：第一次启动不再停在命令行等输入，而是自动打开
    `http://127.0.0.1:8787/setup`（缺 DeepSeek 密钥时本机免令牌），一页填完机器人名字、owner QQ、
@@ -20,6 +43,8 @@
 4. **识别群禁言，不再硬发**：全员禁言或机器人自己被禁言时不再尝试发送，日志里只记一次
    「禁言中，跳过发送」，不再刷一屏 `retcode=1200`；解除通知 / 到期 / 每分钟回查三条路自动恢复，
    禁言期间聊天不发起模型调用（省额度）。见 `README.md`「被禁言时不会硬发」。
+
+</details>
 
 ---
 
@@ -55,7 +80,7 @@
 
 ## 三、安装与启动（三步）
 
-### 开箱即用包 `pixiko-v1.0.1-runnable.zip`
+### 开箱即用包 `pixiko-v1.0.2-runnable.zip`
 
 1. 装好 **JDK 17+**。
 2. **双击 `start.bat`**。第一次运行会自动生成 `config.json`（照 `config.example.json` 起一份），
@@ -65,7 +90,7 @@
 
 > `start.bat` 跑的是包内已编译好的 `build/pixiko.jar`；只有需要改代码时才用 `build.ps1` + `run.bat`。
 
-### 源码包 `pixiko-v1.0.1.zip`
+### 源码包 `pixiko-v1.0.2.zip`
 
 1. 装好 **JDK 17+**。
 2. 在项目根目录准备好依赖 jar：`lib/gson-2.13.1.jar` 由 `build.ps1` **自动下载并校验**，
@@ -110,8 +135,9 @@ copy config.example.json config.json
    否则 `build.ps1` 会以 `Missing lib\spring ...` 退出；`lib/gson-2.13.1.jar` 由脚本自动下载并做 SHA-256 校验。
    **开箱即用包已包含这两者**，不需要你操心。
 4. **本包不含任何真实凭据。** 没有 QQ 号、Civitai Cookie、网页访问令牌或 DeepSeek 密钥；
-   `config.json` 与整个 `data/` 都不在包里（只有空的 `data/`、`logs/`、`maps/` 占位目录）。
-   **第一次运行必须自己配置**，否则 owner 指令无法使用。
+   `config.json` 与 `data/` 里的敏感内容（密钥、生成图、队列状态、原作语料）都不在包里。
+   `data/` 里**只**随包分发中文词库与词表（`data/prompt-*`，见「本版新增」），另有空的
+   `data/`、`logs/`、`maps/` 占位目录。**第一次运行必须自己配置 owner 与密钥**。
 5. **默认没有 owner。** 公开代码里 `Settings.DEFAULT_OWNER` 是空字符串（原版本内置了作者 QQ，
    属于个人信息，已移除）。**务必在配置页或 `config.json` 里设置 `owner_user_id`**，否则所有 owner 专属指令都会被拒绝。
 6. **`test.bat` 的行为依赖工作目录。** `WebUiTest` 通过「进程工作目录下的 `webui/`」找页面资源
@@ -125,8 +151,8 @@ copy config.example.json config.json
 
 ## 六、在 GitHub Releases 里发布这个 zip
 
-1. 打开仓库 → 右侧 **Releases** → **Draft a new release**，Tag 填 `v1.0.1`（新建 tag），标题填 `Pixiko v1.0.1`。
-2. 把 `pixiko-v1.0.1.zip` 与 `pixiko-v1.0.1-runnable.zip`（以及各自的 `.sha256`）拖进附件区，
+1. 打开仓库 → 右侧 **Releases** → **Draft a new release**，Tag 填 `v1.0.2`（新建 tag），标题填 `Pixiko v1.0.2`。
+2. 把 `pixiko-v1.0.2.zip` 与 `pixiko-v1.0.2-runnable.zip`（以及各自的 `.sha256`）拖进附件区，
    正文粘贴本文件内容后点 **Publish release**。
 
 > 建仓库时 License 请选 **None**（本项目保留所有权利，不使用开源许可证）。

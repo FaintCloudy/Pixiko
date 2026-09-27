@@ -6,10 +6,19 @@
 # 本机配置：含 QQ 号、Civitai Cookie、WebUI 访问令牌、DeepSeek 密钥文件路径
 config.json
 
-# 运行期数据：密钥文件、中文词库、原作语料、生成图、队列与状态
+# 运行期数据：密钥文件、原作语料、生成图、队列与状态
 # 这些目录都只在仓库根目录，所以用 / 开头锚定：
 # 不加锚点会连源码一起吃掉（例如 nextjs-wip/app/logs/page.tsx 会被 "logs/" 命中）。
-/data/
+# 注意是 /data/*（不是 /data/）：中文词库与词表要随包分发，下面用 ! 逐个放行；
+# 目录本身不能整体忽略，否则「父目录被排除时无法再放行其中的文件」。
+/data/*
+!/data/prompt-tags.txt
+!/data/prompt-tags.source.json
+!/data/prompt-usage.json
+!/data/prompt-zh-tags.json
+!/data/prompt-zh-extra.txt
+!/data/prompt-zh-usage.md
+!/data/prompt-zh-use-notes.txt
 /logs/
 /work/
 /backup/

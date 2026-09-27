@@ -5,7 +5,7 @@ Pixiko 是一个自用的 QQ 机器人：接 **NapCat** 收消息，接 **Stable
 领图；机器人自己把生成好的图片发回对话。
 
 - **作者**：loriko（deloriko@outlook.com）
-- **版本**：v1.0.1（发行说明见 [`RELEASE.md`](RELEASE.md)）
+- **版本**：v1.0.2（发行说明见 [`RELEASE.md`](RELEASE.md)）
 - **当前实现**：**Java 版**（`src/`）——这是线上一直在跑的那一份
 - **网页控制台**：`webui/`（纯静态 HTML/CSS/JS，随机器人一起由内嵌 Spring Boot 提供）
 - **SD WebUI 桥接扩展**：`webui-extension/pixiko-bridge/`（把文生图页正在编辑的提示词同步给机器人）
@@ -146,9 +146,9 @@ run.bat --set-map yh "路径"       # 命令行设置地图（需先停止机器
 
 ## 四、配置项要点（`config.json`）
 
-> **`config.json` 与 `data/` 不进版本库。** 前者含真实 QQ 号、Civitai Cookie、网页访问令牌，
-> 后者含 DeepSeek 密钥、生成图、原作语料。两者都已在 `.gitignore` 里；
-> 仓库里只有脱敏的 `config.example.json`。
+> **`config.json` 不进版本库；`data/` 只放行中文词库与词表。** 前者含真实 QQ 号、Civitai Cookie、
+> 网页访问令牌；`data/` 里的 DeepSeek 密钥、生成图、队列状态、原作语料同样都不进仓库。
+> 随包分发的只有 `data/prompt-*.json|txt|md` 这几个词库文件（见下），`.gitignore` 里逐个白名单放行。
 
 | 配置段 | 关键项 | 说明 |
 |---|---|---|
@@ -247,6 +247,30 @@ run.bat --set-map yh "路径"       # 命令行设置地图（需先停止机器
 | `.usage 搜索 <中文或英文> [起始条数]` | 搜索词条 |
 | `.usage 词条 <词条或中文>` | 看某词条的词意与使用注意 |
 
+#### 中文词库随包分发（v1.0.2 起）
+
+`data/` 下这几个文件**已经随仓库与发行包提供**，下载后 `.usage 词库`、`.usage 搜索`、
+词条分类（`.prompt classify`）与 `.infix filter on`（标准词库约束）都能直接用，不需要自己造词库：
+
+| 文件 | 体积 | 内容 |
+|---|---|---|
+| `data/prompt-tags.txt` | 2.3 MB | 140,779 条标准词条（Danbooru 词表，一行一个） |
+| `data/prompt-usage.json` | 464 KB | 中文分类词库，11 类，供 `.usage` 逐级浏览 |
+| `data/prompt-zh-tags.json` | 1.6 MB | 34,211 条中文↔标准词条、38,941 个中文写法，13 类 |
+| `data/prompt-zh-extra.txt` | 188 KB | 手工维护的中文同义词表（生成词库的输入） |
+| `data/prompt-zh-usage.md` | 4.0 MB | 3 万多条词条的人读用法表（生成物） |
+| `data/prompt-zh-use-notes.txt` | 2.2 KB | 词条「什么需求下才该用」的人工说明 |
+| `data/prompt-tags.source.json` | 362 B | 标准词表的来源与校验值 |
+
+- 两个上游词表都是 **MIT**（[a1111-sd-webui-tagcomplete](https://github.com/DominikDoom/a1111-sd-webui-tagcomplete)、
+  [sd-webui-prompt-all-in-one](https://github.com/Physton/sd-webui-prompt-all-in-one)），
+  全文随包放在 `LICENSES/MIT-tagcomplete.txt` 与 `LICENSES/MIT-prompt-all-in-one.txt`，
+  明细见 [`THIRD-PARTY-LICENSES.md`](THIRD-PARTY-LICENSES.md)。
+- 中文含义里**含机器翻译**，可能不准确；词库只是把中文说法对到标准词条，最终由模型判断。
+- 想改词库：直接编辑 `data/prompt-zh-extra.txt`（手工同义词，优先级最高）后跑
+  `node tools/build-zh-tags.mjs` 重新生成 `data/prompt-zh-tags.json`；差异用
+  `node tools/diff-zh-tags.mjs` 看。
+
 ### 样式、参数与提示词集
 
 | 指令 | 作用 |
@@ -313,7 +337,7 @@ run.bat --set-map yh "路径"       # 命令行设置地图（需先停止机器
 ```
 pixiko\
 ├─ README.md                       本文件
-├─ RELEASE.md                      v1.0.1 发行说明（含版权声明与已知限制）
+├─ RELEASE.md                      v1.0.2 发行说明（含版权声明与已知限制）
 ├─ THIRD-PARTY-LICENSES.md         随二进制包分发的第三方组件与许可
 ├─ config.example.json             脱敏配置模板（复制成 config.json 再改）
 ├─ .gitignore                      config.json / data / logs / lib jar 等一律不入库
@@ -355,6 +379,7 @@ pixiko\
 │  ├─ tests\                       自带测试（python unittest + node --test）
 │  └─ README.md                    安装与本地 API 说明
 │
+├─ data\                           随包分发的只有中文词库/词表（prompt-*），其它 data 内容不进包
 ├─ tools\                          可选 Node 工具（词库与自检）
 │  ├─ webui-selfcheck.mjs          网页控制台端到端自检
 │  ├─ build-zh-tags.mjs            生成中文词库
@@ -405,6 +430,8 @@ pixiko\
   文件不存在时该功能静默失效，其余功能不受影响。
 - 仓库中不包含任何真实凭据：Civitai Cookie、网页访问令牌、DeepSeek 密钥、真实 QQ 号
   与个人目录路径都已被移除或替换为占位符。
+- **中文词库随包分发**（`data/prompt-*.json|txt|md`，来源与许可见 「提示词与中文词库」一节与
+  `THIRD-PARTY-LICENSES.md`）；`data/` 里的其它内容（密钥、生成图、队列状态、原作语料）仍然不进包。
 
 > 随二进制发行包一起分发的第三方组件（Spring Boot 系列、gson）均为 Apache-2.0，
 > 清单见 [`THIRD-PARTY-LICENSES.md`](THIRD-PARTY-LICENSES.md)。

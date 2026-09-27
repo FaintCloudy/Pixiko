@@ -4,13 +4,38 @@ Pixiko 本身的代码版权归 **loriko** 所有，**保留所有权利**（见
 本文件只说明 **Pixiko 依赖的第三方组件**。
 
 适用范围：
-- **源码包 `pixiko-v1.0.0.zip`**：不含任何第三方 jar，因此下面「随包分发」一节的组件**不在源码包里**。
-- **开箱即用包 `pixiko-v1.0.0-runnable.zip`**：随包分发 `lib/gson-2.13.1.jar` 与 `lib/spring/` 下 23 个 jar，
+- **源码包 `pixiko-v1.0.2.zip`**：不含任何第三方 jar，因此下面「随包分发」一节里的**二进制组件不在源码包里**；
+  但**中文词库与词表（第二节）在两个包里都有**。
+- **开箱即用包 `pixiko-v1.0.2-runnable.zip`**：随包分发 `lib/gson-2.13.1.jar` 与 `lib/spring/` 下 23 个 jar，
   即下表全部内容。这些 jar **未做任何修改**，原样来自 Maven Central。
 
 ---
 
-## 一、随包分发的组件（仅开箱即用包）
+## 〇、随包分发的中文词库与词表（两个包都有）
+
+`data/` 下的提示词词库随包分发（其余 `data/` 内容——密钥、原作语料、生成图、队列状态——仍然不进包）：
+
+| 文件 | 体积 | 内容 | 来源与许可 |
+|---|---|---|---|
+| `data/prompt-tags.txt` | 2.3 MB | 140,779 条标准词条（Danbooru 词表，一行一个，未导入别名列） | 由 [DominikDoom/a1111-sd-webui-tagcomplete](https://github.com/DominikDoom/a1111-sd-webui-tagcomplete) 的 `tags/danbooru.csv` 导出，上游 **MIT**（© 2022 Dominik Reh），全文见 `LICENSES/MIT-tagcomplete.txt` |
+| `data/prompt-usage.json` | 464 KB | 中文分类词库（11 类：人物/服饰/表情动作/画面/环境/场景/物品/镜头/汉服/魔法系/反向提示词） | 由 [Physton/sd-webui-prompt-all-in-one](https://github.com/Physton/sd-webui-prompt-all-in-one) 的 `group_tags/zh_CN.yaml` 整理而来，上游 **MIT**（© 2023 Physton），全文见 `LICENSES/MIT-prompt-all-in-one.txt` |
+| `data/prompt-zh-tags.json` | 1.6 MB | 34,211 条中文↔标准词条对照 + 38,941 个中文写法（13 类） | 本项目生成物：`prompt-usage.json` + 上表的 `danbooru.zh_CN_SFW.csv` 中文翻译 + 本仓库 `data/prompt-zh-extra.txt` 手工同义词 |
+| `data/prompt-zh-extra.txt` | 188 KB | 手工维护的中文同义词表（生成 `prompt-zh-tags.json` 的输入） | 本项目原创 |
+| `data/prompt-zh-usage.md` | 4.0 MB | 上面 34,211 条词条的用法表（`node tools/annotate-zh-tags.mjs` 生成的人读版） | 本项目生成物 |
+| `data/prompt-zh-use-notes.txt` | 2.2 KB | 词条「什么需求下才该用」的人工说明 | 本项目原创 |
+| `data/prompt-tags.source.json` | 362 B | 上面 `prompt-tags.txt` 的来源与校验值（仓库地址、blob sha、sha256、条数） | 本项目生成物 |
+
+说明：
+- 词条名本身是 Danbooru 的标签标识符（事实性数据）；中文翻译与分类里**含机器翻译**，可能不准确，
+  只用于把中文说法对应到标准词条。
+- 上游两个项目都是 **MIT**：再分发时请一并保留 `LICENSES/MIT-tagcomplete.txt`、
+  `LICENSES/MIT-prompt-all-in-one.txt` 与本说明。Pixiko 自身的代码仍是**保留所有权利**（见 `RELEASE.md`）。
+- 生成脚本：`tools/build-zh-tags.mjs`（生成中文词库）、`tools/annotate-zh-tags.mjs`（生成用法表）、
+  `tools/diff-zh-tags.mjs`（对比前后差异）。
+
+---
+
+## 一、随包分发的二进制组件（仅开箱即用包）
 
 | 组件 | 版本 | 坐标 | 许可 |
 |---|---|---|---|
@@ -59,6 +84,7 @@ Pixiko 本身的代码版权归 **loriko** 所有，**保留所有权利**（见
 
 ## 三、如果你要再分发
 
-本包已按 Apache-2.0 的要求保留了各 jar 内的许可与 NOTICE 文件，并附带上述许可文本。
+本包已按 Apache-2.0 与 MIT 的要求保留了各 jar 内的许可与 NOTICE 文件，并附带上述许可文本；
+中文词库/词表的两个上游（均为 MIT）文本见 `LICENSES/MIT-tagcomplete.txt` 与 `LICENSES/MIT-prompt-all-in-one.txt`。
 你若再次分发本包，请**一并保留** `THIRD-PARTY-LICENSES.md` 与 `LICENSES/` 目录；
 同时注意 Pixiko 自身代码是**保留所有权利**的，再分发前需先取得作者许可。
