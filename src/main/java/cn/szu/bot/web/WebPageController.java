@@ -111,7 +111,7 @@ public class WebPageController {
               <p><a class="bookmarklet" href="%s">回填到 Pixiko</a></p>
               <p class="muted">书签小工具读取 <code>document.cookie</code> 发给本机机器人；在控制台这一页点会提示"先打开 civitai 页面"，那是正常的。</p>
               <p>② 或者手动：在 Civitai 页按 F12 → Network → 任选一个请求 → 复制请求头里的 <code>cookie</code> 整段，粘到下面。</p>
-              <textarea id="cookie" placeholder="绮樿创娴忚鍣?Cookie 閲?civitai 鐩稿叧鐨勯偅鍑犳潯 name=value"></textarea>
+              <textarea id="cookie" placeholder="粘贴浏览器的 Cookie 里 civitai 相关的那几条 name=value"></textarea>
               <p><button id="save">保存 Cookie</button> <span id="result"></span></p>
             </div>
             <p class="muted">保存成功后可以直接关掉本页；机器人下次搜索/下载就会用这个账号。</p>

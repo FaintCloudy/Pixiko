@@ -1,9 +1,11 @@
 package cn.szu.bot;
 
 import com.google.gson.*;
+import java.io.IOException;
 import java.net.*;
 import java.net.http.*;
 import java.nio.channels.*;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.*;
 import java.time.Duration;
 import java.util.concurrent.CountDownLatch;
@@ -17,6 +19,7 @@ public final class Main {
     }
     private static void run(String[] args) throws Exception {
         Path root = Path.of(System.getProperty("bot.home", ".")).toAbsolutePath().normalize();
+        seedFirstRunConfig(root);
         Settings settings = new Settings(root);
         if (args.length > 0 && args[0].equals("--set-map")) {
             if (args.length != 3) throw new IllegalArgumentException("用法：run.bat --set-map yh|liv \"图片或文件夹路径\"");
@@ -100,6 +103,28 @@ public final class Main {
                 stop.await();
             }
         }
+    }
+    /**
+     * 第一次运行：还没有 config.json 时，拿随包分发的 config.example.json 起一份，
+     * 好让配置向导（以及 run.bat --help 之类）能跑起来；示例也缺就写一个空对象，其余全靠各项默认值。
+     * 已经有 config.json 时一个字都不动。
+     */
+    private static void seedFirstRunConfig(Path root) throws IOException {
+        Path config = root.resolve("config.json");
+        if (Files.exists(config)) return;
+        Path example = root.resolve("config.example.json");
+        if (Files.isRegularFile(example)) {
+            try {
+                Json.parse(Files.readString(example, StandardCharsets.UTF_8));   // 示例文件坏了就别照抄
+                Files.copy(example, config);
+                Log.info("第一次运行：还没有 config.json，已按 config.example.json 生成一份（内容随时可改）。");
+                return;
+            } catch (RuntimeException | IOException broken) {
+                Log.warn("config.example.json 不可用，改用空配置启动：" + Bot.error(broken));
+            }
+        }
+        Files.writeString(config, "{}" + System.lineSeparator(), StandardCharsets.UTF_8);
+        Log.info("第一次运行：已生成空的 config.json，全部使用内置默认值（之后可用 run.bat --setup 补配置）。");
     }
     /**
      * Announces the bot in the main group after a successful start, so a restart is visible in chat.
