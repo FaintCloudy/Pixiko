@@ -1,13 +1,13 @@
-Pixiko v1.0.2 —— 第一次运行，三步走
+Pixiko v1.0.3 —— 第一次运行，三步走
 ====================================
 
 【你下载的是哪个包？】
 
-  pixiko-v1.0.2-runnable.zip   ← 开箱即用。里面已经带好了编译好的 jar 和全部依赖，
+  pixiko-v1.0.3-runnable.zip   ← 开箱即用。里面已经带好了编译好的 jar 和全部依赖，
                                  只要有 JDK 17+，双击 start.bat 就能启动。
                                  （就选这个，除非你要改代码。）
 
-  pixiko-v1.0.2.zip            ← 源码包。给要编译、要改代码的人用，
+  pixiko-v1.0.3.zip            ← 源码包。给要编译、要改代码的人用，
                                  需要自己补 lib\spring\ 里的 Spring Boot 依赖，
                                  再用 run.bat 构建并启动。
 
@@ -51,7 +51,8 @@ Pixiko v1.0.2 —— 第一次运行，三步走
   （只有《Rewrite》原作对白语料 data\kotori-corpus.txt 不随包分发，需要自备。）
 
   想加自己的中文说法：编辑 data\prompt-zh-extra.txt（格式：中文=tag1,tag2），
-  再跑 node tools\build-zh-tags.mjs 重新生成 data\prompt-zh-tags.json。
+  再跑 node tools\build-zh-tags.mjs 重新生成 data\prompt-zh-tags.json（源码包里带了重建词库
+  需要的上游 danbooru 原始词表 data\danbooru\，开箱即用包里没有，见 data\danbooru\README.md）。
 
 【出图相关的额外要求】
 
@@ -67,7 +68,7 @@ Pixiko v1.0.2 —— 第一次运行，三步走
      这样报错信息会留在屏幕上。最常见的原因是没装 JDK，或 java.exe 不在 PATH 里。
 
   Q: 提示 build\pixiko.jar not found？
-  A: 你下的是源码包（pixiko-v1.0.2.zip）。源码包请用 run.bat（它会先编译再启动），
+  A: 你下的是源码包（pixiko-v1.0.3.zip）。源码包请用 run.bat（它会先编译再启动），
      或者改用开箱即用包。
 
   Q: 提示 lib\spring not found？

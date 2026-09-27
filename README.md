@@ -5,7 +5,7 @@ Pixiko 是一个自用的 QQ 机器人：接 **NapCat** 收消息，接 **Stable
 领图；机器人自己把生成好的图片发回对话。
 
 - **作者**：loriko（deloriko@outlook.com）
-- **版本**：v1.0.2（发行说明见 [`RELEASE.md`](RELEASE.md)）
+- **版本**：v1.0.3（发行说明见 [`RELEASE.md`](RELEASE.md)）
 - **当前实现**：**Java 版**（`src/`）——这是线上一直在跑的那一份
 - **网页控制台**：`webui/`（纯静态 HTML/CSS/JS，随机器人一起由内嵌 Spring Boot 提供）
 - **SD WebUI 桥接扩展**：`webui-extension/pixiko-bridge/`（把文生图页正在编辑的提示词同步给机器人）
@@ -267,7 +267,11 @@ run.bat --set-map yh "路径"       # 命令行设置地图（需先停止机器
   全文随包放在 `LICENSES/MIT-tagcomplete.txt` 与 `LICENSES/MIT-prompt-all-in-one.txt`，
   明细见 [`THIRD-PARTY-LICENSES.md`](THIRD-PARTY-LICENSES.md)。
 - 中文含义里**含机器翻译**，可能不准确；词库只是把中文说法对到标准词条，最终由模型判断。
-- 想改词库：直接编辑 `data/prompt-zh-extra.txt`（手工同义词，优先级最高）后跑
+- **上游原始词表也在仓库里**（`data/danbooru/`，共 9.8 MB，随源码包分发、开箱即用包不含）：
+  `danbooru.main-140782.csv`（`prompt-tags.txt` 的来源）、`danbooru.csv`（分类与热度）、
+  `danbooru.zh_CN_SFW.csv`（中文翻译）。因此**不装 SD WebUI 扩展也能重建词库**：
+  `node tools\build-zh-tags.mjs`，校验用 `node tools\build-zh-tags.mjs --check`
+  （仓库里跑过，输出「与现有 data/prompt-zh-tags.json 一致」）。详见 `data/danbooru/README.md`。- 想改词库：直接编辑 `data/prompt-zh-extra.txt`（手工同义词，优先级最高）后跑
   `node tools/build-zh-tags.mjs` 重新生成 `data/prompt-zh-tags.json`；差异用
   `node tools/diff-zh-tags.mjs` 看。
 
@@ -337,7 +341,7 @@ run.bat --set-map yh "路径"       # 命令行设置地图（需先停止机器
 ```
 pixiko\
 ├─ README.md                       本文件
-├─ RELEASE.md                      v1.0.2 发行说明（含版权声明与已知限制）
+├─ RELEASE.md                      v1.0.3 发行说明（含版权声明与已知限制）
 ├─ THIRD-PARTY-LICENSES.md         随二进制包分发的第三方组件与许可
 ├─ config.example.json             脱敏配置模板（复制成 config.json 再改）
 ├─ .gitignore                      config.json / data / logs / lib jar 等一律不入库
@@ -379,7 +383,7 @@ pixiko\
 │  ├─ tests\                       自带测试（python unittest + node --test）
 │  └─ README.md                    安装与本地 API 说明
 │
-├─ data\                           随包分发的只有中文词库/词表（prompt-*），其它 data 内容不进包
+├─ data\                           中文词库/词表（prompt-*）；danbooru\ 是上游原始词表（只在源码包）；其它 data 内容不进包
 ├─ tools\                          可选 Node 工具（词库与自检）
 │  ├─ webui-selfcheck.mjs          网页控制台端到端自检
 │  ├─ build-zh-tags.mjs            生成中文词库

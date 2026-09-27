@@ -7,7 +7,9 @@
 // 所有词条都必须出现在 data/prompt-tags.txt 标准词库里，否则丢弃并计数。
 //
 // 用法：node tools/build-zh-tags.mjs [--tags-dir <目录>] [--check]
-//   --tags-dir 指向 a1111-sd-webui-tagcomplete 的 tags 目录（内含 danbooru.csv / danbooru.zh_CN_SFW.csv）
+//   --tags-dir 指向含 danbooru.csv / danbooru.zh_CN_SFW.csv 的目录；
+//              默认用随仓库分发的 data/danbooru（上游原始词表），
+//              也可以指到 a1111-sd-webui-tagcomplete 的 tags 目录。
 //   --check    只校验现有 data/prompt-zh-tags.json 是否与来源一致，不写文件
 import fs from 'node:fs';
 import path from 'node:path';
@@ -20,9 +22,18 @@ const flag = (name, fallback) => {
   return at >= 0 && argv[at + 1] ? argv[at + 1] : fallback;
 };
 const checkOnly = argv.includes('--check');
-const TAGS_DIR = flag('--tags-dir', 'F:/sd/sd-webui/extensions/a1111-sd-webui-tagcomplete/tags');
+// 默认用随仓库分发的上游词表（data/danbooru），装没装 SD WebUI 扩展都能重建。
+const TAGS_DIR = path.resolve(REPO, flag('--tags-dir', 'data/danbooru'));
 
 const sha256 = (file) => crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex');
+/**
+ * 写进 sources 里的来源路径：仓库内的写成仓库相对路径（data/danbooru/xxx.csv），
+ * 免得把本机绝对路径（F:\sd\...）写进公开的词库文件里；仓库外才写绝对路径。
+ */
+const sourcePath = (file) => {
+  const rel = path.relative(REPO, path.resolve(file));
+  return rel && !rel.startsWith('..') ? rel.replace(/\\/g, '/') : path.resolve(file).replace(/\\/g, '/');
+};
 const readLines = (file) => fs.readFileSync(file, 'utf8').split(/\r?\n/);
 
 /** 标准词库：小写写法与下划线/空格两种形态都接受。 */
@@ -315,8 +326,8 @@ const payload = {
   sources: [
     { file: 'data/prompt-zh-extra.txt', lines: stats.extraLines, sha256: fs.existsSync(extraFile) ? sha256(extraFile) : '' },
     { file: 'data/prompt-usage.json', tags: stats.usageTags, sha256: fs.existsSync(usageFile) ? sha256(usageFile) : '' },
-    { file: zhCsv, rows: csvRows, sha256: sha256(zhCsv) },
-    { file: tagsCsv, rows: danbooru.size, sha256: fs.existsSync(tagsCsv) ? sha256(tagsCsv) : '' },
+    { file: sourcePath(zhCsv), rows: csvRows, sha256: sha256(zhCsv) },
+    { file: sourcePath(tagsCsv), rows: danbooru.size, sha256: fs.existsSync(tagsCsv) ? sha256(tagsCsv) : '' },
   ],
   counts: { entries: rows.length, aliases: aliasCount, by_category: byCategory },
   categories: CATEGORIES,

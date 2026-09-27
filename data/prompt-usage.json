@@ -1,7 +1,7 @@
 {
   "version": 1,
   "source": "本机 WebUI Prompt All-in-One 中文分类词库",
-  "source_file": "F:\\sd\\sd-webui-v10\\extensions\\sd-webui-prompt-all-in-one\\group_tags\\zh_CN.yaml",
+  "source_file": "sd-webui-prompt-all-in-one/group_tags/zh_CN.yaml",
   "source_sha256": "dfc18ce1db62451b0fa55562a217897ab908e92fb189356f1fb51a72235a6f4b",
   "translation_note": "源词库包含机器翻译，可能不准确；空翻译不推测含义。",
   "categories": [

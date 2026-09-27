@@ -1,37 +1,41 @@
-# Pixiko v1.0.2 发行说明
+# Pixiko v1.0.3 发行说明
 
-- **版本**：v1.0.2
+- **版本**：v1.0.3
 - **日期**：2026-09-27
 - **作者**：loriko（deloriko@outlook.com）
 - **当前实现**：Java 版（`src/`）。另有一次**未完成的** Next.js 重构，见 `nextjs-wip/`，**不可运行**。
 
 ---
 
-## 〇、本版新增（v1.0.2）
+## 〇、本版新增（v1.0.3）
 
-**中文词库随包分发**：`data/` 下的提示词词库进了仓库与两个发行包，下载后开箱就有词库可用——
-`.usage 词库` / `.usage 搜索` 能查、`.prompt classify` 能分类、`.infix filter on` 的标准词库约束
-能生效，不需要自己准备词表：
+**上游 danbooru 原始词表一并入库**（`data/danbooru/`，9.8 MB）——从此**不装 SD WebUI 扩展也能重建中文词库**：
 
-| 文件 | 体积 | 内容 |
-|---|---|---|
-| `data/prompt-tags.txt` | 2.3 MB | 140,779 条标准词条（Danbooru 词表） |
-| `data/prompt-usage.json` | 464 KB | 中文分类词库，11 类 |
-| `data/prompt-zh-tags.json` | 1.6 MB | 34,211 条中文↔标准词条、38,941 个中文写法 |
-| `data/prompt-zh-extra.txt` | 188 KB | 手工同义词表（生成词库的输入） |
-| `data/prompt-zh-usage.md` | 4.0 MB | 词条用法表（人读版） |
-| `data/prompt-zh-use-notes.txt` | 2.2 KB | 词条使用需求的人工说明 |
-| `data/prompt-tags.source.json` | 362 B | 标准词表来源与校验值 |
+| 文件 | 行数 | 体积 | 作用 |
+|---|---|---|---|
+| `data/danbooru/danbooru.main-140782.csv` | 140,782 | 3.4 MB | 上游 main 的 `tags/danbooru.csv`；`data/prompt-tags.txt`（140,779 条）取它的第 1 列导出 |
+| `data/danbooru/danbooru.csv` | 121,034 | 3.0 MB | 本机扩展 2024-12-19 快照；`tools/build-zh-tags.mjs` 从它取分类与热度 |
+| `data/danbooru/danbooru.zh_CN_SFW.csv` | 99,293 | 3.0 MB | 上游中文翻译表（SFW） |
 
-- 上游两个词表均为 **MIT**（DominikDoom/a1111-sd-webui-tagcomplete © 2022 Dominik Reh；
-  Physton/sd-webui-prompt-all-in-one © 2023 Physton），许可全文随包放在 `LICENSES/MIT-*.txt`，
-  明细见 `THIRD-PARTY-LICENSES.md`。
-- **`data/` 里的其它内容照旧不进包**：DeepSeek 密钥、生成图、队列状态、Civitai Cookie、
-  原作对白语料（`data/kotori-corpus.txt`）都不在仓库与发行包里。
+- 三个文件的 `sha256` 与 `data/prompt-tags.source.json`、`data/prompt-zh-tags.json` 里记录的校验值**完全一致**
+  （可据此确认拿到的是同一份），都是上游 **MIT**（© 2022 Dominik Reh）原样分发、未做修改。
+- `tools/build-zh-tags.mjs` 的 `--tags-dir` 默认值从作者本机的 SD 扩展目录改为**仓库内的 `data/danbooru`**；
+  `node tools\build-zh-tags.mjs --check` 现在能在仓库里直接跑通，输出「与现有 data/prompt-zh-tags.json 一致」——
+  随包的词库与随包的词表互相可复现（34,211 条逐条比对，差异 0）。
+- 顺手清掉了公开文件里的本机绝对路径：`prompt-zh-tags.json` 的 `sources[].file` 与 `prompt-usage.json` 的
+  `source_file` 现在都写成仓库相对路径（此前是 `F:\sd\...`）。**词条内容一个字节没变**（逐条比对差异 0）。
+- **打包口径**：`data/danbooru/`（原始词表）**只进源码包**；开箱即用包里不含它（运行时不需要，避免白涨 9.8 MB）。
 
 <details>
-<summary>上一版（v1.0.1）新增</summary>
+<summary>更早版本（v1.0.2 / v1.0.1）</summary>
 
+**v1.0.2 —— 中文词库随包分发**：`data/` 下的提示词词库进了仓库与两个发行包，下载后开箱就有词库可用：
+`data/prompt-tags.txt`（140,779 条标准词条）、`data/prompt-usage.json`（11 类分类词库）、
+`data/prompt-zh-tags.json`（34,211 条中文↔标准词条 / 38,941 个中文写法）、`data/prompt-zh-extra.txt`（手工同义词）、
+`data/prompt-zh-usage.md`（用法表）、`data/prompt-zh-use-notes.txt`、`data/prompt-tags.source.json`。
+上游两个词表均为 MIT（a1111-sd-webui-tagcomplete © 2022 Dominik Reh；sd-webui-prompt-all-in-one © 2023 Physton）。
+
+**v1.0.1**
 1. **首次配置改到网页端**：第一次启动不再停在命令行等输入，而是自动打开
    `http://127.0.0.1:8787/setup`（缺 DeepSeek 密钥时本机免令牌），一页填完机器人名字、owner QQ、
    两条 DeepSeek 通道、SD 与 NapCat 地址。命令行向导保留为 `run.bat --setup`。
@@ -80,7 +84,7 @@
 
 ## 三、安装与启动（三步）
 
-### 开箱即用包 `pixiko-v1.0.2-runnable.zip`
+### 开箱即用包 `pixiko-v1.0.3-runnable.zip`
 
 1. 装好 **JDK 17+**。
 2. **双击 `start.bat`**。第一次运行会自动生成 `config.json`（照 `config.example.json` 起一份），
@@ -90,7 +94,7 @@
 
 > `start.bat` 跑的是包内已编译好的 `build/pixiko.jar`；只有需要改代码时才用 `build.ps1` + `run.bat`。
 
-### 源码包 `pixiko-v1.0.2.zip`
+### 源码包 `pixiko-v1.0.3.zip`
 
 1. 装好 **JDK 17+**。
 2. 在项目根目录准备好依赖 jar：`lib/gson-2.13.1.jar` 由 `build.ps1` **自动下载并校验**，
@@ -136,8 +140,8 @@ copy config.example.json config.json
    **开箱即用包已包含这两者**，不需要你操心。
 4. **本包不含任何真实凭据。** 没有 QQ 号、Civitai Cookie、网页访问令牌或 DeepSeek 密钥；
    `config.json` 与 `data/` 里的敏感内容（密钥、生成图、队列状态、原作语料）都不在包里。
-   `data/` 里**只**随包分发中文词库与词表（`data/prompt-*`，见「本版新增」），另有空的
-   `data/`、`logs/`、`maps/` 占位目录。**第一次运行必须自己配置 owner 与密钥**。
+   `data/` 里随包分发中文词库与词表（`data/prompt-*`）；源码包里另有 `data/danbooru/` 上游原始词表，
+   开箱即用包不含后者。另有空的 `logs/`、`maps/` 占位目录。**第一次运行必须自己配置 owner 与密钥**。
 5. **默认没有 owner。** 公开代码里 `Settings.DEFAULT_OWNER` 是空字符串（原版本内置了作者 QQ，
    属于个人信息，已移除）。**务必在配置页或 `config.json` 里设置 `owner_user_id`**，否则所有 owner 专属指令都会被拒绝。
 6. **`test.bat` 的行为依赖工作目录。** `WebUiTest` 通过「进程工作目录下的 `webui/`」找页面资源
@@ -151,8 +155,8 @@ copy config.example.json config.json
 
 ## 六、在 GitHub Releases 里发布这个 zip
 
-1. 打开仓库 → 右侧 **Releases** → **Draft a new release**，Tag 填 `v1.0.2`（新建 tag），标题填 `Pixiko v1.0.2`。
-2. 把 `pixiko-v1.0.2.zip` 与 `pixiko-v1.0.2-runnable.zip`（以及各自的 `.sha256`）拖进附件区，
+1. 打开仓库 → 右侧 **Releases** → **Draft a new release**，Tag 填 `v1.0.3`（新建 tag），标题填 `Pixiko v1.0.3`。
+2. 把 `pixiko-v1.0.3.zip` 与 `pixiko-v1.0.3-runnable.zip`（以及各自的 `.sha256`）拖进附件区，
    正文粘贴本文件内容后点 **Publish release**。
 
 > 建仓库时 License 请选 **None**（本项目保留所有权利，不使用开源许可证）。

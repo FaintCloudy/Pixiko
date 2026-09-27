@@ -4,10 +4,11 @@ Pixiko 本身的代码版权归 **loriko** 所有，**保留所有权利**（见
 本文件只说明 **Pixiko 依赖的第三方组件**。
 
 适用范围：
-- **源码包 `pixiko-v1.0.2.zip`**：不含任何第三方 jar，因此下面「随包分发」一节里的**二进制组件不在源码包里**；
-  但**中文词库与词表（第二节）在两个包里都有**。
-- **开箱即用包 `pixiko-v1.0.2-runnable.zip`**：随包分发 `lib/gson-2.13.1.jar` 与 `lib/spring/` 下 23 个 jar，
-  即下表全部内容。这些 jar **未做任何修改**，原样来自 Maven Central。
+- **源码包 `pixiko-v1.0.3.zip`**：不含任何第三方 jar，因此下面「随包分发的二进制组件」一节的**二进制不在源码包里**；
+  但**中文词库与词表（第〇节）在源码包里全部都有**，包括 `data/danbooru/` 下的上游原始词表。
+- **开箱即用包 `pixiko-v1.0.3-runnable.zip`**：随包分发 `lib/gson-2.13.1.jar` 与 `lib/spring/` 下 23 个 jar，
+  即下表全部内容；中文词库（`data/prompt-*`）也有，但**不含** `data/danbooru/` 下的上游原始词表
+  （运行时不需要它，需要重建词库时请用源码包）。这些 jar **未做任何修改**，原样来自 Maven Central。
 
 ---
 
@@ -32,6 +33,20 @@ Pixiko 本身的代码版权归 **loriko** 所有，**保留所有权利**（见
   `LICENSES/MIT-prompt-all-in-one.txt` 与本说明。Pixiko 自身的代码仍是**保留所有权利**（见 `RELEASE.md`）。
 - 生成脚本：`tools/build-zh-tags.mjs`（生成中文词库）、`tools/annotate-zh-tags.mjs`（生成用法表）、
   `tools/diff-zh-tags.mjs`（对比前后差异）。
+
+### 上游原始 danbooru 词表（`data/danbooru/`，**只在源码包与仓库里**）
+
+机器人运行时**不读**这个目录；放在仓库里是为了「不装 SD WebUI 扩展也能重建词库」。
+同样来自上游 **MIT** 项目，一个字节未改，`sha256` 与上面几个 JSON 里记录的校验值完全一致：
+
+| 文件 | 行数 | 体积 | 作用 |
+|---|---|---|---|
+| `data/danbooru/danbooru.main-140782.csv` | 140,782 | 3.4 MB | 上游 main 分支的 `tags/danbooru.csv`；`data/prompt-tags.txt` 就是取它的第 1 列导出的 |
+| `data/danbooru/danbooru.csv` | 121,034 | 3.0 MB | 本机扩展里的 2024-12-19 快照；`tools/build-zh-tags.mjs` 从它取分类与热度 |
+| `data/danbooru/danbooru.zh_CN_SFW.csv` | 99,293 | 3.0 MB | 上游中文翻译表（SFW）；中文词库的中文写法主要来自它 |
+
+重建方式见 `data/danbooru/README.md`（`node tools/build-zh-tags.mjs --check` 可校验
+随包的词库与随包的词表是否一致——本项目在仓库里跑过，输出「与现有 data/prompt-zh-tags.json 一致」）。
 
 ---
 
