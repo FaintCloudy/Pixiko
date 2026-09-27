@@ -5,7 +5,7 @@ Pixiko 是一个自用的 QQ 机器人：接 **NapCat** 收消息，接 **Stable
 领图；机器人自己把生成好的图片发回对话。
 
 - **作者**：loriko（deloriko@outlook.com）
-- **版本**：v1.0.3（发行说明见 [`RELEASE.md`](RELEASE.md)）
+- **版本**：v1.0.4（发行说明见 [`RELEASE.md`](RELEASE.md)）
 - **当前实现**：**Java 版**（`src/`）——这是线上一直在跑的那一份
 - **网页控制台**：`webui/`（纯静态 HTML/CSS/JS，随机器人一起由内嵌 Spring Boot 提供）
 - **SD WebUI 桥接扩展**：`webui-extension/pixiko-bridge/`（把文生图页正在编辑的提示词同步给机器人）
@@ -330,6 +330,11 @@ run.bat --set-map yh "路径"       # 命令行设置地图（需先停止机器
 | `.yh` / `.liv` | 发送粤海／丽湖地图 |
 | `.map path` / `.map set yh\|liv <路径>` | 查看／设置地图路径（查看需 owner/admin，设置仅 owner） |
 
+**地图随包分发**（v1.0.4 起）：`maps/yh/`（粤海）与 `maps/liv/`（丽湖）各带一张校园地图，
+下载后 `.yh` / `.liv` 直接可用；目录按文件名排序发送，最多 10 张、每张最多 20MB，
+支持 PNG/JPG/JPEG/GIF/WEBP/BMP。换成自己的图就覆盖这两个目录里的文件（或用 `.map set yh "路径"` 指到别处）。
+这两张图是作者自备的校园地图素材，版权归原制图方，仅用于机器人发送地图这一功能，可随时替换或删除。
+
 **通用规则**：宽高均为 64–2048 且为 8 的倍数；LoRA 权重默认 1、范围 0–2；
 路径或名称含空格可以加双引号；目录按文件名发送，最多 10 张、每张最多 20MB；
 生成任务按顺序逐个运行，采用**发出指令时**的完整参数。
@@ -341,7 +346,7 @@ run.bat --set-map yh "路径"       # 命令行设置地图（需先停止机器
 ```
 pixiko\
 ├─ README.md                       本文件
-├─ RELEASE.md                      v1.0.3 发行说明（含版权声明与已知限制）
+├─ RELEASE.md                      v1.0.4 发行说明（含版权声明与已知限制）
 ├─ THIRD-PARTY-LICENSES.md         随二进制包分发的第三方组件与许可
 ├─ config.example.json             脱敏配置模板（复制成 config.json 再改）
 ├─ .gitignore                      config.json / data / logs / lib jar 等一律不入库
@@ -384,6 +389,7 @@ pixiko\
 │  └─ README.md                    安装与本地 API 说明
 │
 ├─ data\                           中文词库/词表（prompt-*）；danbooru\ 是上游原始词表（只在源码包）；其它 data 内容不进包
+├─ maps\                           yh/（粤海）、liv/（丽湖）各一张校园地图，`.yh`/`.liv` 开箱可用
 ├─ tools\                          可选 Node 工具（词库与自检）
 │  ├─ webui-selfcheck.mjs          网页控制台端到端自检
 │  ├─ build-zh-tags.mjs            生成中文词库

@@ -1,13 +1,25 @@
-# Pixiko v1.0.3 发行说明
+# Pixiko v1.0.4 发行说明
 
-- **版本**：v1.0.3
+- **版本**：v1.0.4
 - **日期**：2026-09-27
 - **作者**：loriko（deloriko@outlook.com）
 - **当前实现**：Java 版（`src/`）。另有一次**未完成的** Next.js 重构，见 `nextjs-wip/`，**不可运行**。
 
 ---
 
-## 〇、本版新增（v1.0.3）
+## 〇、本版新增（v1.0.4）
+
+**粤海 / 丽湖地图随包分发**：`maps/yh/`（2480×3367）与 `maps/liv/`（1280×1810）各带一张校园地图，
+下载后 `.yh` / `.liv` 直接可用，不用再自己往 `maps/` 里放图。目录按文件名排序发送，
+最多 10 张、每张最多 20MB，支持 PNG/JPG/JPEG/GIF/WEBP/BMP；换成自己的图覆盖文件即可
+（或用 `.map set yh "路径"` 指到别处）。
+
+- 这两张是作者自备的校园地图素材，版权归原制图方，本项目未声明授权，仅用于 `.yh`/`.liv` 发送地图；
+  介意的话删掉这两个文件并重新打包即可（机器人会照常提示「还没有地图图片」）。见 `THIRD-PARTY-LICENSES.md`。
+- `.gitignore` 不再忽略 `maps/**` 下的图片。
+
+<details>
+<summary>更早版本（v1.0.3 / v1.0.2 / v1.0.1）</summary>
 
 **上游 danbooru 原始词表一并入库**（`data/danbooru/`，9.8 MB）——从此**不装 SD WebUI 扩展也能重建中文词库**：
 
@@ -28,6 +40,8 @@
 
 <details>
 <summary>更早版本（v1.0.2 / v1.0.1）</summary>
+
+**v1.0.3 —— 上游 danbooru 原始词表入库**（`data/danbooru/`，9.8 MB，只进源码包）：`danbooru.main-140782.csv`（`prompt-tags.txt` 的来源）、`danbooru.csv`（分类与热度）、`danbooru.zh_CN_SFW.csv`（中文翻译）；`tools/build-zh-tags.mjs` 的 `--tags-dir` 默认值改为仓库内 `data/danbooru`，`--check` 在仓库/源码包里输出「一致」；清掉了公开文件里的本机绝对路径。
 
 **v1.0.2 —— 中文词库随包分发**：`data/` 下的提示词词库进了仓库与两个发行包，下载后开箱就有词库可用：
 `data/prompt-tags.txt`（140,779 条标准词条）、`data/prompt-usage.json`（11 类分类词库）、
@@ -84,7 +98,7 @@
 
 ## 三、安装与启动（三步）
 
-### 开箱即用包 `pixiko-v1.0.3-runnable.zip`
+### 开箱即用包 `pixiko-v1.0.4-runnable.zip`
 
 1. 装好 **JDK 17+**。
 2. **双击 `start.bat`**。第一次运行会自动生成 `config.json`（照 `config.example.json` 起一份），
@@ -94,7 +108,7 @@
 
 > `start.bat` 跑的是包内已编译好的 `build/pixiko.jar`；只有需要改代码时才用 `build.ps1` + `run.bat`。
 
-### 源码包 `pixiko-v1.0.3.zip`
+### 源码包 `pixiko-v1.0.4.zip`
 
 1. 装好 **JDK 17+**。
 2. 在项目根目录准备好依赖 jar：`lib/gson-2.13.1.jar` 由 `build.ps1` **自动下载并校验**，
@@ -155,8 +169,8 @@ copy config.example.json config.json
 
 ## 六、在 GitHub Releases 里发布这个 zip
 
-1. 打开仓库 → 右侧 **Releases** → **Draft a new release**，Tag 填 `v1.0.3`（新建 tag），标题填 `Pixiko v1.0.3`。
-2. 把 `pixiko-v1.0.3.zip` 与 `pixiko-v1.0.3-runnable.zip`（以及各自的 `.sha256`）拖进附件区，
+1. 打开仓库 → 右侧 **Releases** → **Draft a new release**，Tag 填 `v1.0.4`（新建 tag），标题填 `Pixiko v1.0.4`。
+2. 把 `pixiko-v1.0.4.zip` 与 `pixiko-v1.0.4-runnable.zip`（以及各自的 `.sha256`）拖进附件区，
    正文粘贴本文件内容后点 **Publish release**。
 
 > 建仓库时 License 请选 **None**（本项目保留所有权利，不使用开源许可证）。

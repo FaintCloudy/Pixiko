@@ -25,11 +25,7 @@ config.json
 /work/
 /backup/
 /build/
-/maps/**/*.png
-/maps/**/*.jpg
-/maps/**/*.jpeg
-/maps/**/*.webp
-/maps/**/*.gif
+# 地图图片随包分发（.yh / .liv 开箱可用）：换成自己的图就覆盖 maps/yh、maps/liv 里的文件。
 
 # 依赖与构建产物
 node_modules/
