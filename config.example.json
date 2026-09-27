@@ -1,0 +1,87 @@
+{
+  "bot_name": "神户小鸟",
+  "owner_user_id": "",
+  "startup_group_id": "",
+  "startup_notice": "我上线啦，随时可以叫我。发送 .help 查看指令。",
+  "shutdown_notice": "我先下线啦，稍后再见。",
+  "qq": {
+    "ws_url": "ws://127.0.0.1:3001",
+    "access_token": "",
+    "timeout_seconds": 30,
+    "reconnect_seconds": 5
+  },
+  "allowed_group_ids": [],
+  "allowed_user_ids": [],
+  "admin_user_ids": [],
+  "maps": {},
+  "sd": {
+    "base_url": "http://127.0.0.1:7860",
+    "root": "F:/sd/sd-webui",
+    "auto_start": true,
+    "start_on_boot": false,
+    "start_args": "--api --xformers --skip-python-version-check",
+    "start_timeout_seconds": 300,
+    "api_username": "",
+    "api_password": "",
+    "timeout_seconds": 600,
+    "steps": 20,
+    "width": 512,
+    "height": 512,
+    "cfg_scale": 7,
+    "sampler_name": "Euler a",
+    "styles": [],
+    "seed": -1
+  },
+  "civitai": {
+    "session_cookie": "",
+    "lora_dir": "F:/sd/sd-webui/models/Lora",
+    "base_url": "https://civitai.red",
+    "api_token": "",
+    "proxy_url": "http://127.0.0.1:7890",
+    "max_download_mb": 2048,
+    "timeout_seconds": 1800,
+    "admin_only": false
+  },
+  "imgcnt": 100,
+  "chat": {
+    "personality": "（示例人格，请自行替换成你自己的设定。）\n你是「小鸟」，说话轻快、偶尔毒舌，但很照顾人。\n回复要短，像在 QQ 上聊天；不用敬语，不写长篇大论。\n不剧透原作剧情，也不照搬原作台词。\n遇到不确定的事就直说不知道。",
+    "frequency": 15,
+    "corpus_replay": true,
+    "corpus_top_k": 3,
+    "enabled": true,
+    "reply_probability_scale": 1,
+    "disabled_conversations": [],
+    "reply_base_probability": 0.02,
+    "wake_probability": {},
+    "chime_cooldown_seconds": 15,
+    "topic_gap_seconds": 15,
+    "base_min_interest": 40,
+    "chime_high_interest": 85
+  },
+  "progen": {
+    "model": "deepseek-flash",
+    "thinking": false,
+    "reasoning_effort": "none",
+    "max_tokens": 0,
+    "timeout_seconds": 120,
+    "api_key_file": "data/deepseek-api-key.txt"
+  },
+  "chat_api": {
+    "model": "deepseek-flash",
+    "thinking": false,
+    "reasoning_effort": "none",
+    "max_tokens": 0,
+    "timeout_seconds": 120,
+    "api_key_file": "data/deepseek-chat-api-key.txt"
+  },
+  "webui": {
+    "enabled": true,
+    "host": "0.0.0.0",
+    "port": 8787,
+    "access_token": "change-me",
+    "scope": "web"
+  },
+  "infix": {
+    "filter_enabled_conversations": []
+  }
+}

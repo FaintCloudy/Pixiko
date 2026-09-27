@@ -1,0 +1,392 @@
+package cn.szu.bot;
+
+import com.google.gson.*;
+import java.io.IOException;
+import java.nio.file.*;
+
+public final class Settings {
+    public final Path root;
+    private JsonObject data;
+    public Settings(Path root) throws IOException {
+        this.root = root.toAbsolutePath().normalize();
+        data = Json.parse(Files.readString(this.root.resolve("config.json")));
+        for (String key : new String[]{"allowed_group_ids", "allowed_user_ids", "admin_user_ids"}) {
+            if (data.has(key) && !data.get(key).isJsonArray()) throw new IllegalArgumentException(key + " 必须是数组");
+        }
+    }
+    public synchronized JsonObject snapshot() { return data.deepCopy(); }
+    /** 重新读一遍 config.json（配置向导写完盘之后调用）。 */
+    public synchronized void reload() throws IOException {
+        data = Json.parse(Files.readString(root.resolve("config.json")));
+    }
+    public Path resolve(String name) { return root.resolve(name).normalize().toAbsolutePath(); }
+    public synchronized Path mapPath(String campus) {
+        return resolve(Json.str(Json.obj(data, "maps"), campus, "maps/" + campus));
+    }
+    public synchronized void setMapPath(String campus, String name) throws IOException {
+        if (!campus.equals("yh") && !campus.equals("liv")) throw new IllegalArgumentException("地图类型应为 yh 或 liv");
+        Path path = resolve(name);
+        if (!Files.isDirectory(path) && !(Files.isRegularFile(path) && Maps.supported(path)))
+            throw new IllegalArgumentException("路径必须是存在的图片文件或文件夹：" + path);
+        JsonObject updated = freshSnapshot();
+        JsonObject maps = Json.obj(updated, "maps");
+        maps.addProperty(campus, path.toString()); updated.add("maps", maps);
+        Json.atomicWrite(root.resolve("config.json"), updated);
+        data = updated;
+    }
+    /** Global master switch for everyday chat. */
+    public synchronized boolean chatEnabled() { return Json.bool(Json.obj(data, "chat"), "enabled", true); }
+    /** Effective switch for one conversation key: the global master switch AND the per-conversation switch. */
+    public synchronized boolean chatEnabled(String conversation) {
+        return chatEnabled() && !disabledChats(Json.obj(data, "chat")).contains(conversation);
+    }
+    /** Flips the switch of a single conversation; returns the new effective state for that conversation. */
+    public synchronized boolean toggleChat(String conversation) throws IOException {
+        JsonObject next = freshSnapshot(), chat = Json.obj(next, "chat");
+        java.util.TreeSet<String> disabled = new java.util.TreeSet<>(disabledChats(chat));
+        boolean enabled = disabled.remove(conversation);
+        if (!enabled) disabled.add(conversation);
+        JsonArray updated = new JsonArray();
+        for (String key : disabled) updated.add(key);
+        chat.add("disabled_conversations", updated); next.add("chat", chat);
+        Json.atomicWrite(root.resolve("config.json"), next); data = next;
+        return chatEnabled(conversation);
+    }
+    /** Sets the global master switch; returns the new global state. */
+    public synchronized boolean setChatEnabled(boolean enabled) throws IOException {
+        JsonObject next = freshSnapshot(), chat = Json.obj(next, "chat");
+        chat.addProperty("enabled", enabled); next.add("chat", chat);
+        Json.atomicWrite(root.resolve("config.json"), next); data = next; return enabled;
+    }
+    private static java.util.List<String> disabledChats(JsonObject chat) {
+        java.util.List<String> keys = new java.util.ArrayList<>();
+        JsonElement value = chat.get("disabled_conversations");
+        if (value != null && value.isJsonArray())
+            for (JsonElement item : value.getAsJsonArray())
+                if (item.isJsonPrimitive() && item.getAsJsonPrimitive().isString()) keys.add(item.getAsString());
+        return keys;
+    }
+    /**
+     * Whether "/infix" enforces the standard dictionary in one conversation. Off by default: the rewrite is
+     * free-form (natural language allowed), which measured better than forcing canonical tags. Switching it on
+     * restricts newly introduced terms to data/prompt-tags.txt (words already in the user's prompt, including
+     * LoRA tags, are always allowed).
+     */
+    public synchronized boolean infixFilterEnabled(String conversation) {
+        return enabledInfixFilter(Json.obj(data, "infix")).contains(conversation);
+    }
+    /** Turns the dictionary constraint on or off for one conversation; returns the new state. */
+    public synchronized boolean setInfixFilterEnabled(String conversation, boolean enabled) throws IOException {
+        JsonObject next = freshSnapshot(), infix = Json.obj(next, "infix");
+        java.util.TreeSet<String> keys = new java.util.TreeSet<>(enabledInfixFilter(infix));
+        if (enabled) keys.add(conversation); else keys.remove(conversation);
+        JsonArray updated = new JsonArray();
+        for (String key : keys) updated.add(key);
+        infix.add("filter_enabled_conversations", updated); next.add("infix", infix);
+        Json.atomicWrite(root.resolve("config.json"), next); data = next;
+        return enabled;
+    }
+    private static java.util.List<String> enabledInfixFilter(JsonObject infix) {
+        java.util.List<String> keys = new java.util.ArrayList<>();
+        JsonElement value = infix.get("filter_enabled_conversations");
+        if (value != null && value.isJsonArray())
+            for (JsonElement item : value.getAsJsonArray())
+                if (item.isJsonPrimitive() && item.getAsJsonPrimitive().isString()) keys.add(item.getAsString());
+        return keys;
+    }
+    /** Probability multiplier applied to the model's topic interest (0–100) when deciding to answer. */    public synchronized double chatReplyProbabilityScale() {
+        JsonElement value = Json.obj(data, "chat").get("reply_probability_scale");
+        double scale = value != null && value.isJsonPrimitive() && value.getAsJsonPrimitive().isNumber() ? value.getAsDouble() : 1.0;
+        if (!Double.isFinite(scale)) return 1.0;
+        return Math.max(0, Math.min(1, scale));
+    }
+    /**
+     * 主动插话的总静音开关：0 = 永不主动插话（被点名、窗口续话与带指令的请求照常回复），
+     * 非 0 只表示"允许插话"，不再当作概率使用——是否插话由聊天模型按上下文判断（见 {@link ChatService}）。
+     * 旧配置里的 reply_base_probability / base_probability / wake_probability / reply_probability_scale
+     * 仍然能被读取：读取时只在日志里说明已废弃，不报错，也不再影响判定。
+     */
+    public synchronized boolean chatChimeMuted() {
+        JsonObject chat = Json.obj(data, "chat");
+        JsonElement value = chat.get("reply_base_probability");
+        if (value != null && value.isJsonPrimitive() && value.getAsJsonPrimitive().isNumber()) return value.getAsDouble() <= 0;
+        JsonElement bases = chat.get("base_probability");
+        if (bases != null && bases.isJsonObject()) {
+            for (java.util.Map.Entry<String, JsonElement> entry : bases.getAsJsonObject().entrySet()) {
+                JsonElement item = entry.getValue();
+                if (item != null && item.isJsonPrimitive() && item.getAsJsonPrimitive().isNumber() && item.getAsDouble() <= 0) return true;
+            }
+        }
+        JsonElement wakes = chat.get("wake_probability");
+        if (wakes != null && wakes.isJsonObject()) {
+            for (java.util.Map.Entry<String, JsonElement> entry : wakes.getAsJsonObject().entrySet()) {
+                JsonElement item = entry.getValue();
+                if (item != null && item.isJsonPrimitive() && item.getAsJsonPrimitive().isNumber() && item.getAsDouble() <= 0) return true;
+            }
+        }
+        return false;
+    }
+    /** 主动插话的总开关：1 = 允许按上下文插话，0 = 永不主动插话。 */
+    public synchronized double chatBaseProbability() { return chatChimeMuted() ? 0 : 1; }
+    public synchronized double setChatBaseProbability(double value) throws IOException {
+        if (!Double.isFinite(value) || value < 0 || value > 1) throw new IllegalArgumentException("插话开关须为 0–1（0 = 永不主动插话）。");
+        JsonObject next = freshSnapshot(), chat = Json.obj(next, "chat");
+        chat.addProperty("reply_base_probability", value <= 0 ? 0 : 1); next.add("chat", chat);
+        Json.atomicWrite(root.resolve("config.json"), next); data = next; return value <= 0 ? 0 : 1;
+    }
+    /** 兼容旧调用：同上，conversation 参数保留只为不改调用点。 */
+    public synchronized double chatBaseProbability(String conversation) { return chatBaseProbability(); }
+    /** 旧配置里的唤醒基数已废弃：读取时记一行日志，绝不再影响判定。 */
+    public synchronized void warnDeprecatedWakeSettings() {
+        JsonObject chat = Json.obj(data, "chat");
+        boolean wakes = chat.has("wake_probability") && chat.get("wake_probability").isJsonObject()
+                && !chat.getAsJsonObject("wake_probability").isEmpty();
+        boolean bases = chat.has("base_probability") && chat.get("base_probability").isJsonObject()
+                && !chat.getAsJsonObject("base_probability").isEmpty();
+        boolean scale = chat.has("reply_probability_scale");
+        if (!wakes && !bases && !scale) return;
+        Log.info("config.json 里的唤醒基数配置已废弃（"
+                + (wakes ? "chat.wake_probability " : "") + (bases ? "chat.base_probability " : "")
+                + (scale ? "chat.reply_probability_scale " : "")
+                + "）：是否插话现在由聊天模型按上下文判断，这些字段已忽略；"
+                + "reply_base_probability=0 仍保留为「永不主动插话」的总静音开关。");
+    }
+    /** A chime-in still requires this much topic relevance, so it never barges into unrelated talk. */
+    public synchronized int chatBaseMinInterest() {
+        return Math.max(0, Math.min(100, (int) Json.num(Json.obj(data, "chat"), "base_min_interest", 40)));
+    }
+    /** Relevance needed to join a conversation that is aimed at another member; much higher than the normal floor. */
+    public synchronized int chatChimeHighInterest() {
+        return Math.max(0, Math.min(100, (int) Json.num(Json.obj(data, "chat"), "chime_high_interest", 85)));
+    }
+    /** Idle gap that ends a topic: after this the bot stops acting as if it were mid-conversation. */
+    public synchronized int chatTopicGapSeconds() {
+        return Math.max(1, Math.min(3600, (int) Json.num(Json.obj(data, "chat"), "topic_gap_seconds", 15)));
+    }
+    /** Minimum seconds between two unsolicited chime-ins in the same conversation. */
+    public synchronized int chatChimeCooldownSeconds() {
+        return Math.max(0, Math.min(86400, (int) Json.num(Json.obj(data, "chat"), "chime_cooldown_seconds", 15)));
+    }
+    /**
+     * How long a numbered list stays usable for "#编号". This is separate from the chat topic window on
+     * purpose: planning a multi-step request takes seconds, and a list the user just asked for must not
+     * expire while the plan is still being built.
+     */
+    public synchronized int selectionGapSeconds() {
+        return Math.max(5, Math.min(86400, (int) Json.num(Json.obj(data, "chat"), "selection_gap_seconds", 300)));
+    }
+    /**
+     * Seconds the invited member has to accept a marriage proposal (".结婚 @某人"). The invitation is only
+     * valid inside this window; it is 180 by default and configurable for tests.
+     */
+    public synchronized int marriageProposalSeconds() {
+        return Math.max(5, Math.min(86400, (int) Json.num(Json.obj(data, "marriage"), "proposal_seconds", 180)));
+    }
+    /** Whether the online/offline announcements are posted to the main group. */
+    /**
+     * WebUI（网页控制台）配置。它只是机器人的另一个入口，读写的是同一份个人提示词、样式与生成队列。
+     */
+    public synchronized boolean webEnabled() { return Json.bool(Json.obj(data, "webui"), "enabled", true); }
+    public synchronized String webHost() {
+        String host = Json.str(Json.obj(data, "webui"), "host", "0.0.0.0").strip();
+        return host.isBlank() ? "0.0.0.0" : host;
+    }
+    public synchronized int webPort() { return Math.max(1, Math.min(65535, Json.num(Json.obj(data, "webui"), "port", 8787))); }
+    /** 网页控制台自己的提示词归属：与 QQ 完全分开，不依赖、也不记录任何 QQ 号。 */
+    public static final String WEB_SCOPE = "web";
+    /**
+     * 网页控制台操作的个人提示词归属：固定用 {@link #WEB_SCOPE}，与 QQ 侧的 owner 提示词互不影响。
+     * 旧配置里写过的 "owner"（或具体 QQ 号）会迁移成 web scope，避免网页继续改到 QQ 那份提示词。
+     */
+    public synchronized String webScope() throws IOException {
+        String scope = Json.str(Json.obj(data, "webui"), "scope", "").strip();
+        if (scope.equals(WEB_SCOPE)) return WEB_SCOPE;
+        JsonObject next = freshSnapshot(), group = Json.obj(next, "webui");
+        group.addProperty("scope", WEB_SCOPE);
+        next.add("webui", group);
+        Json.atomicWrite(root.resolve("config.json"), next);
+        data = next;
+        Log.info("网页控制台已改用独立的提示词归属「" + WEB_SCOPE + "」（原来跟着 QQ：" + (scope.isBlank() ? "未设置" : scope) + "）。");
+        return WEB_SCOPE;
+    }
+    /** 远程访问令牌；没有配置时自动生成并保存，日志里给出一次，之后从 config.json 读取。 */
+    public synchronized String webToken() throws IOException {
+        String token = Json.str(Json.obj(data, "webui"), "access_token", "").strip();
+        if (!token.isBlank()) return token;
+        token = java.util.UUID.randomUUID().toString().replace("-", "");
+        webSetting("access_token", new JsonPrimitive(token));
+        Log.warn("WebUI 未配置访问令牌，已自动生成：" + token + "（保存在 config.json 的 webui.access_token）");
+        return token;
+    }
+    /** 修改 webui 段里的一个键，其余配置保持不变。 */
+    public synchronized void webSetting(String key, JsonElement value) throws IOException {
+        JsonObject next = freshSnapshot(), group = Json.obj(next, "webui");
+        group.add(key, value); next.add("webui", group);
+        Json.atomicWrite(root.resolve("config.json"), next); data = next;
+    }
+    /** 修改生图频道（progen 段）里的一个键，聊天频道不受影响。 */
+    public synchronized void progenSetting(String key, JsonElement value) throws IOException {
+        JsonObject next = freshSnapshot(), group = Json.obj(next, "progen");
+        group.add(key, value); next.add("progen", group);
+        Json.atomicWrite(root.resolve("config.json"), next); data = next;
+    }
+    /** 修改 sd 段里的一个键（自启动开关、启动参数、SD 目录…）。 */
+    public synchronized void sdSetting(String key, JsonElement value) throws IOException {
+        JsonObject next = freshSnapshot(), group = Json.obj(next, "sd");
+        group.add(key, value); next.add("sd", group);
+        Json.atomicWrite(root.resolve("config.json"), next); data = next;
+    }
+    /** 修改 civitai 段里的一个键（登录 Cookie、镜像地址、LoRA 目录…）。 */
+    public synchronized void civitaiSetting(String key, JsonElement value) throws IOException {
+        JsonObject next = freshSnapshot(), group = Json.obj(next, "civitai");
+        group.add(key, value); next.add("civitai", group);
+        Json.atomicWrite(root.resolve("config.json"), next); data = next;
+    }
+    public synchronized boolean startupNoticeEnabled() { return Json.bool(data, "startup_notice_enabled", true); }    public synchronized void setStartupNoticeEnabled(boolean enabled) throws IOException { rootSetting("startup_notice_enabled", new JsonPrimitive(enabled)); }
+    /** Whether WARN/ERROR log lines are mirrored into the main group for remote monitoring. */
+    public synchronized boolean logMirrorEnabled() { return Json.bool(data, "log_mirror_enabled", false); }
+    public synchronized void setLogMirrorEnabled(boolean enabled) throws IOException { rootSetting("log_mirror_enabled", new JsonPrimitive(enabled)); }
+    /** Writes one top-level key and persists it. */
+    /**
+     * Re-reads config.json before merging a change. A long-running instance otherwise writes back the
+     * snapshot it started with, silently deleting keys that were added to the file in the meantime
+     * (this is how bot_name / owner_user_id / progen.thinking were lost before).
+     */
+    private synchronized JsonObject freshSnapshot() throws IOException {
+        try { return Json.parse(Files.readString(root.resolve("config.json"))); }
+        catch (Exception error) { return data.deepCopy(); }
+    }
+    public synchronized void rootSetting(String key, JsonElement value) throws IOException {
+        JsonObject next = freshSnapshot(); next.add(key, value);
+        Json.atomicWrite(root.resolve("config.json"), next); data = next;
+    }
+    /** Writes one key inside the chat channel's own API section (chat_api); the image channel is untouched. */
+    public synchronized void chatApiSetting(String key, JsonElement value) throws IOException {
+        JsonObject next = freshSnapshot(), api = Json.obj(next, "chat_api");
+        api.add(key, value); next.add("chat_api", api);
+        Json.atomicWrite(root.resolve("config.json"), next); data = next;
+    }
+    private static double fraction(JsonElement value, double fallback) {
+        if (value == null || !value.isJsonPrimitive() || !value.getAsJsonPrimitive().isNumber()) return fallback;
+        double number = value.getAsDouble();
+        return Double.isFinite(number) ? Math.max(0, Math.min(1, number)) : fallback;
+    }
+    public synchronized int chatFrequency() { return (int) Json.num(Json.obj(data, "chat"), "frequency", 6); }
+    /** 原作文本复现开关（chat.corpus_replay，默认开）：命中原作问答时参考原句。 */
+    public synchronized boolean corpusReplay() { return Json.bool(Json.obj(data, "chat"), "corpus_replay", true); }
+    /** 命中时最多注入几条原作问答（chat.corpus_top_k，默认 3）。 */
+    public synchronized int corpusTopK() { return Math.max(1, Math.min(5, (int) Json.num(Json.obj(data, "chat"), "corpus_top_k", 3))); }
+    public synchronized int chatContextSeconds() { return Math.max(300, Math.min(86400, Json.num(Json.obj(data, "chat"), "context_seconds", 1800))); }
+    public synchronized String chatPersonality() { return Json.str(Json.obj(data, "chat"), "personality", "你是一个友善、自然、简洁的聊天机器人，用对方使用的语言交流。"); }
+    public synchronized void chatSetting(String key, JsonElement value) throws IOException {
+        JsonObject next = freshSnapshot(), chat = Json.obj(next, "chat"); chat.add(key, value); next.add("chat", chat);
+        Json.atomicWrite(root.resolve("config.json"), next); data = next;
+    }
+    public synchronized int imageCount() { return data.has("imgcnt") ? data.get("imgcnt").getAsInt() : 300; }
+    public synchronized void imageCount(int count) throws IOException {
+        if (count < 1) throw new IllegalArgumentException("图片上限须为正整数。");
+        JsonObject next = freshSnapshot(); next.addProperty("imgcnt", count);
+        Json.atomicWrite(root.resolve("config.json"), next); data = next;
+    }
+    public synchronized boolean autoGet() { return Json.bool(data, "gen_auto_get", true); }
+    public synchronized boolean toggleAutoGet() throws IOException {
+        JsonObject updated = freshSnapshot(); boolean enabled = !autoGet();
+        updated.addProperty("gen_auto_get", enabled);
+        Json.atomicWrite(root.resolve("config.json"), updated); data = updated; return enabled;
+    }
+    public synchronized boolean isAdmin(String user) { return contains("admin_user_ids", user, false); }
+    /** True once any admin_user_ids entry exists; an empty list means the operator has not been configured yet. */
+    public synchronized boolean hasAdmin() {
+        JsonElement value = data.get("admin_user_ids");
+        return value != null && value.isJsonArray() && !value.getAsJsonArray().isEmpty();
+    }
+    /**
+     * The single owner account. Persisted on first use, so the default below is only ever a bootstrap value
+     * written into config.json; afterwards the local file is authoritative.
+     */
+    public synchronized String ownerId() throws IOException {
+        String configured = Json.str(data, "owner_user_id", "").strip();
+        if (isUserId(configured)) return configured;
+        // No shipped default owner: return empty rather than rewriting config.json on every call.
+        if (DEFAULT_OWNER.isBlank()) return "";
+        JsonObject updated = freshSnapshot();
+        updated.addProperty("owner_user_id", DEFAULT_OWNER);
+        Json.atomicWrite(root.resolve("config.json"), updated);
+        data = updated;
+        Log.info("已写入默认 owner_user_id：" + DEFAULT_OWNER + "（可在 config.json 中修改）");
+        return DEFAULT_OWNER;
+    }
+    public synchronized boolean isOwner(String user) {
+        String configured = Json.str(data, "owner_user_id", DEFAULT_OWNER).strip();
+        if (!isUserId(configured)) configured = DEFAULT_OWNER;
+        return configured.equals(user);
+    }
+    /** Owner or admin: the roles that may operate on someone else's conversation. */
+    public synchronized boolean isStaff(String user) { return isOwner(user) || isAdmin(user); }
+    public synchronized java.util.List<String> adminIds() {
+        java.util.List<String> ids = new java.util.ArrayList<>();
+        JsonElement value = data.get("admin_user_ids");
+        if (value != null && value.isJsonArray())
+            for (JsonElement item : value.getAsJsonArray())
+                if (item.isJsonPrimitive() && isUserId(item.getAsString())) ids.add(item.getAsString());
+        return java.util.List.copyOf(ids);
+    }
+    /** Adds one admin; the owner cannot be added and duplicates are ignored. Returns the resulting list. */
+    public synchronized java.util.List<String> addAdmin(String user) throws IOException {
+        if (isUserId(user) == false) throw new IllegalArgumentException("请提供有效的 QQ 号。");
+        if (isOwner(user)) throw new IllegalArgumentException("owner 已经是最高权限，无需加入 admin。");
+        java.util.TreeSet<String> ids = new java.util.TreeSet<>(adminIds());
+        ids.add(user);
+        return writeAdmins(ids);
+    }
+    public synchronized java.util.List<String> removeAdmin(String user) throws IOException {
+        java.util.TreeSet<String> ids = new java.util.TreeSet<>(adminIds());
+        if (!ids.remove(user)) throw new IllegalArgumentException("该 QQ 号不在 admin 名单中：" + user);
+        return writeAdmins(ids);
+    }
+    private java.util.List<String> writeAdmins(java.util.TreeSet<String> ids) throws IOException {
+        JsonObject updated = freshSnapshot();
+        JsonArray values = new JsonArray();
+        for (String id : ids) values.add(id);
+        updated.add("admin_user_ids", values);
+        Json.atomicWrite(root.resolve("config.json"), updated);
+        data = updated;
+        return java.util.List.copyOf(ids);
+    }
+    /** QQ numbers only: they are also used as the per-user prompt scope and as file names. */
+    public static boolean isUserId(String value) { return value != null && value.matches("[1-9][0-9]{0,19}"); }
+    /** Display name for forward-message cards and help text; persisted locally on first use. */
+    public synchronized String botName() throws IOException {
+        if (isBotName(Json.str(data, "bot_name", ""))) return Json.str(data, "bot_name", "").strip();
+        JsonObject updated = freshSnapshot();
+        updated.addProperty("bot_name", DEFAULT_BOT_NAME);
+        Json.atomicWrite(root.resolve("config.json"), updated);
+        data = updated;
+        Log.info("已写入默认 bot_name：" + DEFAULT_BOT_NAME + "（可在 config.json 中修改）");
+        return DEFAULT_BOT_NAME;
+    }
+    public static boolean isBotName(String value) {
+        return value != null && !value.isBlank() && value.length() <= 100
+                && value.strip().equals(value) && value.codePoints().noneMatch(Character::isISOControl);
+    }
+    public static final String DEFAULT_BOT_NAME = "神户小鸟";
+    /**
+     * Owner QQ. Deliberately empty in the public source tree: a real QQ number is personal data and is
+     * not published here. A fresh checkout therefore has no owner until you set {@code owner_user_id}
+     * in config.json (see config.example.json); until then owner-only commands are refused.
+     */
+    public static final String DEFAULT_OWNER = "";
+    public synchronized boolean allowed(JsonObject e) {
+        return switch (Json.str(e, "message_type", "")) {
+            case "group" -> contains("allowed_group_ids", Json.str(e, "group_id", ""), true);
+            case "private" -> contains("allowed_user_ids", Json.str(e, "user_id", ""), true);
+            default -> false;
+        };
+    }
+    private boolean contains(String key, String value, boolean emptyAllows) {
+        JsonArray values = data.has(key) ? data.getAsJsonArray(key) : new JsonArray();
+        if (values.isEmpty()) return emptyAllows;
+        for (JsonElement item : values) if (item.getAsString().equals(value)) return true;
+        return false;
+    }
+}

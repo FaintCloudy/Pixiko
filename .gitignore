@@ -1,0 +1,65 @@
+# ---------------------------------------------------------------------------
+# Pixiko — 绝不进版本库的文件
+# 这个仓库是公开的。下面每一项都必须在任何提交里保持缺席。
+# ---------------------------------------------------------------------------
+
+# 本机配置：含 QQ 号、Civitai Cookie、WebUI 访问令牌、DeepSeek 密钥文件路径
+config.json
+
+# 运行期数据：密钥文件、中文词库、原作语料、生成图、队列与状态
+# 这些目录都只在仓库根目录，所以用 / 开头锚定：
+# 不加锚点会连源码一起吃掉（例如 nextjs-wip/app/logs/page.tsx 会被 "logs/" 命中）。
+/data/
+/logs/
+/work/
+/backup/
+/build/
+/maps/**/*.png
+/maps/**/*.jpg
+/maps/**/*.jpeg
+/maps/**/*.webp
+/maps/**/*.gif
+
+# 依赖与构建产物
+node_modules/
+.next/
+out/
+lib/*.jar
+lib/spring/
+*.jar
+*.class
+*.tsbuildinfo
+next-env.d.ts
+nextjs-wip/.next/
+nextjs-wip/out/
+
+# 日志、压缩包、临时文件
+*.log
+*.zip
+*.7z
+*.tmp
+*.bak
+*.pixiko.bak
+*.orig
+*.rej
+
+# 本机密钥（DeepSeek 两条通道各一份）
+data/deepseek-api-key.txt
+data/deepseek-chat-api-key.txt
+*-api-key.txt
+*.key
+.env
+.env.*
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+*.iml
+*.swp
+*~
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# 只保留示例配置：显式放行（防止将来有人用 config* 通配把示例也挡掉）
+!config.example.json

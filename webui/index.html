@@ -1,0 +1,471 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0b1220">
+<!-- 站点图标：由 F:\personal-blog\misc\kotori.jpg 转出来的（work/make-favicon.py） -->
+<link rel="icon" href="/favicon.ico" sizes="any">
+<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32.png">
+<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<title>Pixiko · 控制台</title>
+<link rel="stylesheet" href="/app.css">
+</head>
+<body>
+<div class="aurora" aria-hidden="true"></div>
+
+<header class="bar">
+  <div class="brand">
+    <span class="dot" id="health"></span>
+    <div class="brand-text"><b id="botname">神户小鸟</b><span class="muted" id="subtitle">控制台</span></div>
+  </div>
+  <div class="bar-actions">
+    <button class="ghost" id="refresh" type="button">刷新</button>
+    <button class="ghost" id="lock" type="button">锁定</button>
+  </div>
+</header>
+
+<main id="app" hidden>
+  <div class="banner error" id="banner" hidden></div>
+
+  <nav class="tabs" role="tablist">
+    <a class="tab" data-tab="chat" role="tab" href="/">对话</a>
+    <a class="tab" data-tab="gen" role="tab" href="/gen">出图</a>
+    <a class="tab" data-tab="prompt" role="tab" href="/prompt">提示词</a>
+    <a class="tab" data-tab="styles" role="tab" href="/styles">样式</a>
+    <a class="tab" data-tab="loras" role="tab" href="/loras">LoRA</a>
+    <a class="tab" data-tab="functions" role="tab" href="/functions">提示词集</a>
+    <a class="tab" data-tab="chatcfg" role="tab" href="/chatcfg">聊天</a>
+    <a class="tab" data-tab="system" role="tab" href="/system">系统</a>
+    <a class="tab" data-tab="logs" role="tab" href="/logs">控制台</a>
+    <a class="tab" data-tab="help" role="tab" href="/help">帮助</a>
+  </nav>
+
+  <!--#panel:chat-->
+  <!-- ============================ 对话 ============================ -->
+  <section class="panel active" id="panel-chat">
+    <div class="messages" id="chat-log"></div>
+    <form class="composer" id="chat-form">
+      <textarea id="chat-input" rows="1" placeholder="和机器人说话，或直接写要求（例如：把地点换成草地，服饰换成军装，然后生成）"></textarea>
+      <button type="submit" id="chat-send">发送</button>
+    </form>
+    <div class="row wrap">
+      <label class="check"><input type="checkbox" id="chat-execute" checked> 允许执行指令</label>
+      <button class="ghost" id="chat-reset" type="button">清空对话</button>
+      <span class="muted" id="chat-interest"></span>
+    </div>
+    <div class="receipts" id="chat-receipts"></div>
+  </section>
+  <!--#/panel:chat-->
+
+  <!--#panel:gen-->
+  <!-- ============================ 出图 ============================ -->
+  <section class="panel" id="panel-gen">
+    <div class="card">
+      <div class="card-head"><b>生成</b><span class="muted">当前任务在下面的「任务队列」里看</span></div>
+      <div class="row wrap">
+        <input id="gen-count" type="number" min="1" value="1" inputmode="numeric">
+        <button type="button" id="gen-btn">开始生成</button>
+        <button class="ghost" type="button" id="gen-status-btn">队列状态</button>
+        <button class="ghost" type="button" id="get-btn">领取图片</button>
+      </div>
+      <div class="progress" id="gen-progress-box" hidden>
+        <div class="progress-track"><div class="progress-bar" id="gen-progress-bar"></div></div>
+        <div class="muted" id="gen-progress-text"></div>
+      </div>
+    </div>
+    <div class="card">
+      <div class="card-head"><b>任务队列</b><span class="muted" id="queue-badge"></span></div>
+      <div class="muted" id="task-summary"></div>
+      <div class="kv" id="task-list"></div>
+      <div class="row wrap">
+        <button class="ghost" type="button" id="tasks-reload">刷新队列</button>
+        <button class="danger" type="button" id="tasks-cancel-all">取消全部任务</button>
+      </div>
+      <div class="muted">默认按提交时间顺序生成；「置顶」把某个任务提到第一优先级，下一位就生成它。挂起/取消只影响还没下发的那几次，已经生成的图片照常领取。</div>
+    </div>
+    <div class="card">
+      <div class="card-head"><b>生成参数</b><span class="muted">没有「应用」按钮：改完立刻生效，只影响之后提交的任务</span></div>
+      <div class="grid-2">
+        <label class="field"><span>宽（8 的倍数）</span><input id="set-width" type="number" min="64" max="2048" step="8" inputmode="numeric"></label>
+        <label class="field"><span>高（8 的倍数）</span><input id="set-height" type="number" min="64" max="2048" step="8" inputmode="numeric"></label>
+        <label class="field"><span>采样方法</span><select id="set-sampler"></select></label>
+        <label class="field"><span>基础模型</span><select id="set-model"></select></label>
+        <label class="field"><span>步数</span><input id="set-steps" type="number" min="1" inputmode="numeric"></label>
+        <label class="field"><span>CFG</span><input id="set-cfg" type="number" min="0.1" step="0.1" inputmode="decimal"></label>
+        <label class="field"><span>种子（-1 随机）</span><input id="set-seed" type="number" inputmode="numeric"></label>
+        <label class="field"><span>图片上限/条</span><input id="set-imgcnt" type="number" min="1" inputmode="numeric"></label>
+      </div>
+      <div class="muted" id="gen-applied">当前生效参数会显示在这里。</div>
+    </div>
+    <div class="card">
+      <div class="card-head"><b>智能改写 .infix</b><span class="muted">默认自由改写，允许自然语言</span></div>
+      <input id="infix-input" placeholder="修改要求，例如：把地点换成草地，服饰换成军装">
+      <div class="row wrap">
+        <button type="button" id="infix-btn">改写并应用</button>
+        <label class="check"><input type="checkbox" id="infix-filter"> 标准词库约束</label>
+      </div>
+      <div class="muted">改写的是你个人的正反向提示词（只列出增删变化），不改动 WebUI 页面那一栏；改完直接用于之后的出图。</div>
+    </div>
+    <div class="card">
+      <div class="card-head"><b>参数预设 preset</b></div>
+      <div class="row wrap">
+        <label class="check"><input type="checkbox" id="gen-autoget"> 任务完成后自动领取</label>
+        <button class="ghost" type="button" id="gen-toggle-btn">切换自动领取</button>
+      </div>
+      <div class="row wrap">
+        <input id="preset-name" placeholder="预设名称">
+        <button type="button" id="preset-save">保存当前</button>
+        <button class="ghost" type="button" id="preset-overwrite">覆盖</button>
+      </div>
+      <ul class="list" id="preset-list"></ul>
+    </div>
+    <div class="card">
+      <div class="card-head"><b>回溯 recent</b></div>
+      <div class="row wrap">
+        <input id="rg-count" type="number" min="1" value="4" inputmode="numeric">
+        <button class="ghost" type="button" id="rg-btn">回溯最近 N 张</button>
+      </div>
+    </div>
+    <div class="grid" id="image-grid"></div>
+    <div class="receipts" id="gen-receipts"></div>
+  </section>
+  <!--#/panel:gen-->
+
+  <!--#panel:prompt-->
+  <!-- ============================ 提示词 ============================ -->
+  <section class="panel" id="panel-prompt">
+    <div class="card">
+      <div class="card-head"><b>正向提示词</b><span class="muted" id="prompt-scope"></span></div>
+      <textarea id="prompt-positive" rows="5"></textarea>
+      <div class="terms" id="prompt-positive-terms"></div>
+      <div class="row wrap">
+        <input id="prompt-add" placeholder="添加词条，逗号分隔">
+        <button type="button" id="prompt-add-btn">添加</button>
+        <button class="ghost" type="button" id="prompt-remove-btn">按词条移除</button>
+        <button class="danger" type="button" id="prompt-clear-btn">清空正向</button>
+      </div>
+    </div>
+    <div class="card">
+      <div class="card-head"><b>反向提示词</b></div>
+      <textarea id="prompt-negative" rows="4"></textarea>
+      <div class="terms" id="prompt-negative-terms"></div>
+      <div class="row wrap">
+        <input id="prompt-r-add" placeholder="添加反向词条">
+        <button type="button" id="prompt-r-add-btn">添加</button>
+        <button class="ghost" type="button" id="prompt-r-remove-btn">按词条移除</button>
+        <button class="danger" type="button" id="prompt-r-clear-btn">清空反向</button>
+      </div>
+    </div>
+    <div class="card">
+      <div class="card-head"><b>整段保存 / 回退</b><span class="muted" id="prompt-meta"></span></div>
+      <div class="row wrap">
+        <button type="button" id="prompt-save-btn">保存两段</button>
+        <button class="ghost" type="button" id="undo-btn">回退一步</button>
+        <span class="muted" id="undo-depth"></span>
+      </div>
+    </div>
+    <div class="card">
+      <div class="card-head"><b>提示词生成 .progen</b></div>
+      <textarea id="progen-input" rows="2" placeholder="文字描述，例如：雨夜的城市街道，一辆红色自行车"></textarea>
+      <div class="row wrap"><button type="button" id="progen-btn">生成提示词（只展示不应用）</button></div>
+    </div>
+    <div class="card">
+      <div class="card-head"><b>提示词分类 usage</b><span class="muted">内置中文词库 37,000+ 条</span></div>
+      <div class="row wrap">
+        <input id="usage-query" placeholder="服饰/上衣、词库 场景、搜索 地铁（留空看顶层）">
+        <button type="button" id="usage-btn">浏览</button>
+      </div>
+      <pre class="usage" id="usage-body"></pre>
+      <div class="terms" id="usage-choices"></div>
+    </div>
+    <div class="receipts" id="prompt-receipts"></div>
+  </section>
+  <!--#/panel:prompt-->
+
+  <!--#panel:styles-->
+  <!-- ============================ 样式 ============================ -->
+  <section class="panel" id="panel-styles">
+    <div class="card">
+      <div class="card-head"><b>样式 = 固定模板</b><span class="muted" id="style-loaded"></span></div>
+      <div class="muted" id="style-pageselected"></div>
+      <div class="row wrap">
+        <input id="style-prompt-name" placeholder="样式名称或 #编号">
+        <button class="ghost" type="button" id="style-prompt-btn">查看样式原文</button>
+      </div>
+      <div class="muted">不记录「上一次载入哪个样式」：载入即把样式文本写进你的个人提示词，之后 prompt 就是你自己的内容，不会被样式自动覆盖。</div>
+    </div>
+    <div class="card">
+      <div class="card-head"><b>保存当前提示词为样式</b><span class="muted">只属于机器人，保存在 data/local-styles.json</span></div>
+      <div class="row wrap">
+        <input id="style-save-name" placeholder="新样式名称">
+        
+        <button type="button" id="style-save">保存样式</button>
+        <button class="ghost" type="button" id="style-overwrite">覆盖同名样式</button>
+        <button class="ghost" type="button" id="style-import">导入 WebUI 预设样式</button>
+        <label class="check"><input type="checkbox" id="style-load-nolora"> 载入时不加载 LoRA</label>
+      </div>
+      <div class="muted">样式完全独立在机器人这边：载入时替换你的个人提示词，不需要 WebUI 在线，也不会改动 WebUI。「导入 WebUI 预设样式」是一次性搬家，之后机器人不再读 WebUI 的样式列表。</div>
+    </div>
+    <div class="card">
+      <div class="card-head"><b>批量操作</b><span class="muted">支持 #12-#16 这类区间；样式只属于机器人</span></div>
+      <div class="row wrap">
+        <input id="style-range" placeholder="#12-#16 或 #12,#15">
+        <input id="style-range-name" placeholder="改名时的新名称/前缀">
+        <button type="button" id="style-batch-rename">批量改名</button>
+        <button class="danger" type="button" id="style-batch-delete">批量删除</button>
+      </div>
+    </div>
+    <div class="row wrap">
+      <input id="style-filter" placeholder="筛选样式">
+      <button class="ghost" type="button" id="style-reload">刷新列表</button>
+    </div>
+    <ul class="list" id="style-list"></ul>
+    <div class="receipts" id="style-receipts"></div>
+  </section>
+  <!--#/panel:styles-->
+
+  <!--#panel:loras-->
+  <!-- ============================ LoRA ============================ -->
+  <section class="panel" id="panel-loras">
+    <div class="card">
+      <div class="card-head"><b>Civitai 搜索</b><span class="muted" id="lora-status"></span></div>
+      <div class="row wrap">
+        <input id="lora-query" placeholder="模型搜索词，例如 角色名 / 画风">
+        <button type="button" id="lora-query-btn">搜索</button>
+        <button class="ghost" type="button" id="lora-status-btn">下载状态</button>
+      </div>
+      <div class="row wrap">
+        <label class="check"><input type="checkbox" id="lora-auto-get"> 下载后自动领取展示图</label>
+      </div>
+      <!-- 搜索结果直接显示在这张卡片里：封面图 + 信息，不再当成一条消息发出去 -->
+      <div class="civitai-grid" id="civitai-list"></div>
+    </div>
+    <div class="card">
+      <div class="card-head"><b>本机 LoRA</b><span class="muted" id="lora-count"></span></div>
+      <div class="row wrap">
+        <input id="lora-filter" placeholder="筛选本地 LoRA">
+        <button class="ghost" type="button" id="lora-reload">刷新</button>
+      </div>
+      <ul class="list" id="lora-list"></ul>
+    </div>
+    <div class="receipts" id="lora-receipts"></div>
+  </section>
+  <!--#/panel:loras-->
+
+  <!--#panel:functions-->
+  <!-- ============================ 提示词集 ============================ -->
+  <section class="panel" id="panel-functions">
+    <div class="card">
+      <div class="card-head"><b>已加载</b><span class="muted" id="function-active"></span></div>
+      <div class="row wrap">
+        <button class="ghost" type="button" id="function-clear">全部移出</button>
+        <button class="ghost" type="button" id="function-reset">只清除关联</button>
+        <button class="ghost" type="button" id="function-reload">刷新</button>
+      </div>
+    </div>
+    <div class="card">
+      <div class="card-head"><b>保存当前提示词为提示词集</b></div>
+      <div class="row wrap">
+        <input id="function-save-name" placeholder="提示词集名称">
+        <button type="button" id="function-save">保存</button>
+        <button class="ghost" type="button" id="function-overwrite">覆盖</button>
+      </div>
+    </div>
+    <ul class="list" id="function-list"></ul>
+    <div class="receipts" id="function-receipts"></div>
+  </section>
+  <!--#/panel:functions-->
+
+  <!--#panel:chatcfg-->
+  <!-- ============================ 聊天设置 ============================ -->
+  <section class="panel" id="panel-chatcfg">
+    <div class="card">
+      <div class="card-head"><b>开关</b></div>
+      <label class="check"><input type="checkbox" id="set-chat-global"> 全局聊天开关</label>
+      <div class="row wrap">
+        <span class="muted">每分钟回复上限</span>
+        <input id="set-frequency" type="number" min="0" inputmode="numeric" placeholder="每分钟上限">
+        <button type="button" id="apply-frequency">应用频率</button>
+      </div>
+      <div class="muted" id="chatcfg-summary"></div>
+    </div>
+    <div class="card">
+      <div class="card-head"><b>你与她的状态</b><span class="muted">只读</span></div>
+      <div id="persona-state">好感度：—　情绪：—</div>
+      <div class="muted">好感度与情绪只影响她说话的语气与亲密度，<b>不影响她照不照做</b>——生图类指令永远照做。</div>
+    </div>
+    <div class="card">
+      <div class="card-head"><b>频道</b><span class="muted">聊天与生图各自独立</span></div>
+      <div class="grid-2">
+        <label class="field"><span>聊天模型</span><input id="set-chat-model"></label>
+        <label class="field"><span>生图模型</span><input id="set-image-model"></label>
+      </div>
+      <div class="row wrap">
+        <label class="check"><input type="checkbox" id="set-chat-thinking"> 聊天思考模式</label>
+        <label class="check"><input type="checkbox" id="set-image-thinking"> 生图思考模式</label>
+      </div>
+      <div class="row wrap">
+        <button type="button" id="apply-chat-model">应用聊天模型</button>
+        <button type="button" id="apply-image-model">应用生图模型</button>
+        <button class="ghost" type="button" id="chat-model-info">查看当前模型</button>
+      </div>
+      <div class="muted" id="channel-info"></div>
+    </div>
+    <div class="card">
+      <div class="card-head"><b>性格设定</b><span class="muted" id="personality-chars"></span></div>
+      <textarea id="set-personality" rows="7"></textarea>
+      <div class="row wrap">
+        <button type="button" id="apply-personality">保存性格</button>
+        <input id="personality-add" placeholder="追加内容">
+        <button class="ghost" type="button" id="apply-personality-add">追加</button>
+      </div>
+      <div class="row wrap">
+        <input id="personality-infix" placeholder="让 DeepSeek 改性格，例如：更活泼一些">
+        <button type="button" id="apply-personality-infix">智能修改性格</button>
+      </div>
+    </div>
+    <div class="card">
+      <div class="card-head"><b>通知</b></div>
+      <div class="row wrap">
+        <label class="check"><input type="checkbox" id="set-notice"> 上/下线播报</label>
+        <label class="check"><input type="checkbox" id="set-logmirror"> 日志同步到主群</label>
+      </div>
+    </div>
+    <div class="receipts" id="chatcfg-receipts"></div>
+  </section>
+  <!--#/panel:chatcfg-->
+
+  <!--#panel:system-->
+  <!-- ============================ 系统 ============================ -->
+  <section class="panel" id="panel-system">
+    <div class="card">
+      <div class="card-head"><b>运行状态</b></div>
+      <div class="kv" id="settings-bot"></div>
+    </div>
+    <div class="card">
+      <div class="card-head"><b>高级：直接执行指令</b><span class="muted">每行一条，最多 20 条</span></div>
+      <form class="composer" id="console-form">
+        <textarea id="console-input" rows="3" placeholder=".style list&#10;.infix 换成草地&#10;.gen 1"></textarea>
+        <button type="submit" id="console-send">执行</button>
+      </form>
+      <div class="shortcuts" id="shortcuts"></div>
+    </div>
+    <div class="card">
+      <div class="card-head"><b>接口地址</b><span class="muted">本机连接的服务（不含密钥）</span></div>
+      <div class="kv" id="endpoint-list"></div>
+    </div>
+    <div class="card">
+      <div class="card-head"><b>Stable Diffusion</b><span class="muted" id="sd-state"></span></div>
+      <div class="muted" id="sd-detail"></div>
+      <div class="row wrap">
+        <button type="button" id="sd-start-btn">启动 SD</button>
+        <label class="check"><input type="checkbox" id="sd-auto-start"> 生成前自动启动</label>
+        <label class="check"><input type="checkbox" id="sd-start-on-boot"> 机器人启动时启动</label>
+      </div>
+    </div>
+    <div class="card">
+      <div class="card-head"><b>Civitai 账号</b><span class="muted">可稍后配置</span></div>
+      <div class="muted" id="civitai-state"></div>
+      <div class="row wrap">
+        <button type="button" id="civitai-login-btn">生成一次性登录链接</button>
+        <button class="ghost" type="button" id="civitai-clear-btn">清除已保存的 Cookie</button>
+      </div>
+      <div class="muted" id="civitai-login-link"></div>
+    </div>
+    <div class="receipts" id="system-receipts"></div>
+  </section>
+  <!--#/panel:system-->
+
+  <!--#panel:logs-->
+  <!-- ============================ 控制台（真 CLI：默认全屏、提示符与日志同一股流） ============================ -->
+  <section class="panel terminal-panel" id="panel-logs">
+    <div class="terminal">
+      <div class="terminal-head">
+        <span class="terminal-dot"></span>
+        <b>pixiko://console</b>
+        <label class="field compact"><span>日志</span>
+          <select id="logs-source">
+            <option value="all">全部</option>
+            <option value="qq">QQ 侧</option>
+            <option value="web">网页侧</option>
+          </select>
+        </label>
+        <input id="logs-filter" placeholder="过滤日志关键字">
+        <label class="check"><input type="checkbox" id="logs-follow" checked> 跟随</label>
+        <button class="ghost small" type="button" id="logs-reload">刷新</button>
+        <button class="ghost small" type="button" id="terminal-clear">清屏</button>
+        <button class="ghost small" type="button" id="terminal-fullscreen">退出全屏</button>
+      </div>
+      <!-- 提示符跟着日志流走（就在最新一行后面），它后面再留一片空白：
+           日志把提示符压到底部时，这片空白会把它顶上去，不会贴死屏幕底边。 -->
+      <div class="terminal-body" id="terminal-body">
+        <form class="prompt-line" id="terminal-form">
+          <span class="terminal-caret">pixiko@web:~$</span>
+          <input id="terminal-input" autocomplete="off" autocapitalize="off" spellcheck="false"
+                 placeholder="help / gen 2 / style list …（指令不用加点和斜杠，↑↓ 翻历史，Esc 退出全屏）">
+        </form>
+        <div class="terminal-tail" id="terminal-tail" aria-hidden="true"></div>
+      </div>
+    </div>
+  </section>
+  <!--#/panel:logs-->
+
+  <!--#panel:help-->
+  <!-- ============================ 帮助 ============================ -->
+  <section class="panel" id="panel-help">
+    <div class="card">
+      <div class="card-head"><b>指令帮助</b><span class="muted">与控制台、QQ 侧完全同源</span></div>
+      <pre class="logs" id="help-body"></pre>
+    </div>
+  </section>
+  <!--#/panel:help-->
+</main>
+
+<footer class="footer">
+  <span>Copyright © 2026 <b>loriko</b> · Pixiko（神户小鸟）· 保留所有权利</span>
+  <span class="muted">作者 <b>loriko</b> · Powered by <b>DeepSeek</b> · <b>Stable Diffusion WebUI</b> · <b>NapCat</b> · Java 17</span>
+</footer>
+
+<section id="login" class="login">
+  <h1>Pixiko · 控制台</h1>
+  <p class="muted">输入访问令牌（config.json 的 <code>webui.access_token</code>）。令牌只保存在本机浏览器。</p>
+  <form id="login-form">
+    <input id="token" type="password" autocomplete="current-password" placeholder="访问令牌">
+    <button type="submit">进入</button>
+  </form>
+  <p class="error" id="login-error"></p>
+</section>
+
+<!-- 同风格的确认框：不用浏览器自带的 confirm/prompt，弹出时背景压暗 -->
+<div class="overlay" id="overlay" hidden>
+  <div class="dialog" role="dialog" aria-modal="true" aria-labelledby="dialog-title">
+    <div class="dialog-head"><b id="dialog-title">确认</b></div>
+    <div class="dialog-text" id="dialog-text"></div>
+    <pre class="dialog-pre" id="dialog-pre" hidden></pre>
+    <label class="field" id="dialog-field" hidden><span id="dialog-label">名称</span><input id="dialog-input"></label>
+    <div class="row wrap dialog-acts">
+      <button class="ghost" type="button" id="dialog-cancel">取消</button>
+      <button type="button" id="dialog-ok">确定</button>
+    </div>
+  </div>
+</div>
+
+<!-- 图片查看器：点图放大，背景压暗（不再跳到新标签页） -->
+<div class="viewer" id="viewer" hidden>
+  <div class="viewer-stage" id="viewer-stage">
+    <img id="viewer-image" alt="图片">
+  </div>
+  <div class="viewer-bar">
+    <span class="viewer-caption" id="viewer-caption"></span>
+    <span class="viewer-hint">点图切换 适应屏幕 / 原图 · Esc 关闭</span>
+    <button class="ghost small" type="button" id="viewer-toggle">1:1 原图</button>
+    <button class="ghost small" type="button" id="viewer-close">关闭</button>
+  </div>
+</div>
+
+<div id="toast" class="toast" hidden></div>
+<script src="/app.js"></script>
+</body>
+</html>

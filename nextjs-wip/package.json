@@ -1,0 +1,31 @@
+{
+  "name": "pixiko",
+  "version": "2.0.0",
+  "private": true,
+  "description": "Pixiko - QQ + Stable Diffusion bot (Next.js + TypeScript rewrite)",
+  "author": "loriko",
+  "type": "module",
+  "scripts": {
+    "dev": "next dev --webpack -p 8787",
+    "build": "next build --webpack",
+    "start": "node server.mjs",
+    "test": "node --test \"tests/**/*.test.ts\"",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "next": "16.3.6",
+    "react": "^19.2.0",
+    "react-dom": "^19.2.0",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "@types/react": "^19.2.0",
+    "@types/react-dom": "^19.2.0",
+    "@types/ws": "^8.5.12",
+    "typescript": "^5.9.0"
+  },
+  "engines": {
+    "node": ">=24"
+  }
+}
