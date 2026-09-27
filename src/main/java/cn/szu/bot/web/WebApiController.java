@@ -68,6 +68,11 @@ public class WebApiController {
             case "/api/presets": return WebJson.ok(bot.webPresets());
             case "/api/options": return WebJson.ok(bot.webOptions());
             case "/api/usage": return WebJson.ok(bot.webUsage(Json.str(body, "query", "")));
+            case "/api/tags": {
+                // 提示词输入框的 tab 补全：给定正在敲的词，回标准词条 + 中文 + 分类 + 热度。
+                requirePost(method);
+                return WebJson.ok(bot.webTagSuggest(Json.str(body, "query", ""), Json.num(body, "limit", 20)));
+            }
             case "/api/help": {
                 JsonObject result = new JsonObject();
                 result.addProperty("help", Bot.HELP);
@@ -160,12 +165,10 @@ public class WebApiController {
                 requirePost(method);
                 return WebJson.ok(bot.webGeneration(body));
             }
-            case "/api/civitai/login-link": {
-                JsonObject result = new JsonObject();
-                String token = bot.civitaiIssueLoginToken();
-                result.addProperty("url", "http://" + localHost(request) + ":" + settings.webPort() + "/civitai-login?token=" + token);
-                result.addProperty("expiresMinutes", Bot.CIVITAI_LINK_MINUTES);
-                return WebJson.ok(result);
+            case "/api/civitai/link": {
+                // 粘贴邮件里的一次性登录链接：机器人替浏览器走完整条跳转链并保存会话 Cookie。
+                requirePost(method);
+                return WebJson.ok(bot.civitaiSaveFromLink(Json.str(body, "link", "")));
             }
             case "/api/civitai/cookie": {
                 requirePost(method);

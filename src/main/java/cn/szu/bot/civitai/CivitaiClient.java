@@ -829,7 +829,8 @@ public final class CivitaiClient {
     private static void emit(Consumer<String> progress, String message) {
         if (progress != null) try { progress.accept(message); } catch (RuntimeException ignored) { }
     }
-    private static InetSocketAddress proxyAddress(JsonObject config) throws IOException {
+    /** 代理规则对搜索、下载、登录链接跟随（{@link CivitaiLinkLogin}）是同一套：只认本机 HTTP 代理。 */
+    static InetSocketAddress proxyAddress(JsonObject config) throws IOException {
         String configured = Json.str(config, "proxy_url", "").strip();
         if (configured.isEmpty()) return null;
         try {

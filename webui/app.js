@@ -4,7 +4,8 @@
   /** 当前页面属于哪个栏目：由服务端在页面里注入（见 WebPages.render）。 */
   const PAGE = window.PIXIKO_PAGE || 'chat';
   const state = { token: localStorage.getItem(TOKEN_KEY) || '', status: null, options: null, pollTimer: null, followTimer: null, busy: 0,
-    seenImages: new Map(), followUntil: 0, receiptKey: '', receiptTexts: 0, receiptImages: 0, receiptBox: null, receiptToasted: '',
+    seenImages: new Map(), seenGroups: new Map(), followUntil: 0, receiptKey: '', receiptTexts: 0, receiptImages: 0,
+    receiptCount: 0, receiptBox: null, receiptToasted: '',
     loras: null, terminalHistory: [], terminalCursor: 0 };
 
   const $ = (id) => document.getElementById(id);
@@ -75,11 +76,29 @@
     img.loading = 'lazy';
     img.src = src;
     img.alt = caption || '图片';
+    // 封面代理只认 Civitai 图床：代理取不到就退回原始远程地址再试一次；两次都不行就把 HTTP 状态
+    // 直接显示在图上（回执里的图都是机器人自己发出来的；<img> 不能带 Authorization 头，只能这样兜底）。
+    const coverMarker = String(src).indexOf('&url=');
+    const coverSrc = String(src).startsWith('/api/civitai/thumb') && coverMarker >= 0;
+    let coverRetried = false;
+    img.addEventListener('error', () => {
+      if (coverSrc && !coverRetried) {
+        coverRetried = true;
+        const raw = decodeURIComponent(String(src).slice(coverMarker + 5));
+        if (img.getAttribute('src') !== raw) { img.setAttribute('src', raw); return; }
+      }
+      if (!coverSrc) return;
+      // 原因摆在页面上：401 令牌不对、429 请求太密、502 机器人抓不到图（网络/代理/Cookie）。
+      fetch(src).then((response) => {
+        if (response.ok) return;
+        link.replaceChild(el('div', 'civitai-nocover', '封面 ' + response.status + '（点刷新重试）'), img);
+      }).catch(() => link.replaceChild(el('div', 'civitai-nocover', '封面取不到（点刷新重试）'), img));
+    });
     link.appendChild(img);
     link.addEventListener('click', (event) => {
       if (event.metaKey || event.ctrlKey || event.shiftKey) return;   // 保留浏览器的新标签行为
       event.preventDefault();
-      openViewer(src, caption);
+      openViewer(img.getAttribute('src'), caption);                   // 兜底换过的地址也照样放大
     });
     return link;
   }
@@ -215,33 +234,61 @@
 
   function activeReceiptBoxes() { return RECEIPT_BOXES.filter((id) => $(id) && $(id).closest('.panel').classList.contains('active')); }
 
+  /** 一条出站消息 → 一张回执卡：卡内文字与图片按原顺序排列（LoRA 搜索就是一条一项）。 */
+  function receiptGroup(capture, segments) {
+    const pieces = segments || [];
+    const text = pieces.filter((piece) => piece.type !== 'image' && piece.text).map((piece) => piece.text).join('\n');
+    const card = el('div', 'receipt' + (/操作失败|失败|未完成|错误|不正确/.test(text) ? ' err' : ' ok'));
+    card.appendChild(el('div', 'head', capture.command ? '指令 · ' + capture.command : '执行回执'));
+    pieces.forEach((piece) => {
+      if (piece.type === 'image') {
+        const name = String(piece.file).replace(/^.*[\\/]/, '');
+        card.appendChild(imageNode(imageUrl(piece.file), name, 'receipt-image'));
+      } else if (piece.text) {
+        card.appendChild(el('div', null, piece.text));
+      }
+    });
+    return card;
+  }
+
   /**
-   * 回执渲染：只追加新到的文本/图片，不再每次轮询清空重建——否则整块回执一直在闪。
+   * 回执渲染：只追加新到的消息，不再每次轮询清空重建——否则整块回执一直在闪。
    * state.receipt 记住当前回执 id 与已渲染条数；换了一条指令（id 变化）才重画。
+   *
+   * 后端给了 {@code messages}（按出站消息分组）就按它渲染：一条消息一张卡，卡里文字与图片保持原顺序，
+   * 于是 LoRA 搜索是「一条一项、图文同条」，而不是所有文字一堆、所有图片一堆。
    */
   function renderCapture(capture) {
     const key = String(capture.id || capture.command || '');
     const texts = capture.texts || [], images = capture.images || [];
-    if (state.receiptKey !== key) { state.receiptKey = key; state.receiptTexts = 0; state.receiptImages = 0; state.receiptBox = null; }
+    const groups = Array.isArray(capture.messages) && capture.messages.length ? capture.messages : null;
+    if (state.receiptKey !== key) {
+      state.receiptKey = key; state.receiptTexts = 0; state.receiptImages = 0; state.receiptCount = 0; state.receiptBox = null;
+    }
     for (const id of RECEIPT_BOXES) {
       const box = $(id);
       if (!box) continue;
       const visible = box.closest('.panel').classList.contains('active');
       if (!visible) continue;
-      if (state.receiptBox !== box) { box.innerHTML = ''; state.receiptBox = box; state.receiptTexts = 0; state.receiptImages = 0; }
-      for (let index = state.receiptTexts; index < texts.length; index++) {
-        const text = texts[index];
-        const card = el('div', 'receipt' + (/操作失败|失败|未完成|错误|不正确/.test(text) ? ' err' : ' ok'));
-        card.appendChild(el('div', 'head', capture.command ? '指令 · ' + capture.command : '执行回执'));
-        card.appendChild(el('div', null, text));
-        box.appendChild(card);
-      }
-      for (let index = state.receiptImages; index < images.length; index++) {
-        // 回溯/领取/生成的图片直接显示在回执里，点一下弹查看器放大。
-        const card = el('div', 'receipt ok image-receipt');
-        const name = String(images[index].file).replace(/^.*[\\/]/, '');
-        card.appendChild(imageNode(imageUrl(images[index].file), name, 'receipt-image'));
-        box.appendChild(card);
+      if (state.receiptBox !== box) { box.innerHTML = ''; state.receiptTexts = 0; state.receiptImages = 0; state.receiptCount = 0; }
+      if (groups) {
+        for (let index = state.receiptCount; index < groups.length; index++) box.appendChild(receiptGroup(capture, groups[index]));
+        state.receiptCount = Math.max(state.receiptCount, groups.length);
+      } else {
+        for (let index = state.receiptTexts; index < texts.length; index++) {
+          const text = texts[index];
+          const card = el('div', 'receipt' + (/操作失败|失败|未完成|错误|不正确/.test(text) ? ' err' : ' ok'));
+          card.appendChild(el('div', 'head', capture.command ? '指令 · ' + capture.command : '执行回执'));
+          card.appendChild(el('div', null, text));
+          box.appendChild(card);
+        }
+        for (let index = state.receiptImages; index < images.length; index++) {
+          // 回溯/领取/生成的图片直接显示在回执里，点一下弹查看器放大。
+          const card = el('div', 'receipt ok image-receipt');
+          const name = String(images[index].file).replace(/^.*[\\/]/, '');
+          card.appendChild(imageNode(imageUrl(images[index].file), name, 'receipt-image'));
+          box.appendChild(card);
+        }
       }
       state.receiptTexts = Math.max(state.receiptTexts, texts.length);
       state.receiptImages = Math.max(state.receiptImages, images.length);
@@ -260,9 +307,27 @@
     }
   }
 
+  /**
+   * 图片地址：本地路径走 /api/image。但机器人发给 QQ 的封面是**图床 URL**
+   * （回执里存的是 `https://image.civitai.com/…`），套到 /api/image 上必然取不到图——这里改走封面代理。
+   * 代理只认 Civitai 图床，兜底见 {@link imageNode} 里的加载失败重试。
+   */
   function imageUrl(file) {
-    const path = String(file).replace(/\\/g, '/').replace(/^.*?(data\/generated\/)/, '$1');
+    const value = String(file || '');
+    if (/^https?:\/\//i.test(value)) return coverUrl(value);
+    const path = value.replace(/\\/g, '/').replace(/^.*?(data\/generated\/)/, '$1');
     return '/api/image?token=' + encodeURIComponent(state.token) + '&path=' + encodeURIComponent(path);
+  }
+
+  /** 回执里新到的一条消息 → 对话里的一条机器人消息（文字在上、图片在下，同属一条）。 */
+  function appendCaptureGroup(segments) {
+    const texts = [], images = [];
+    (segments || []).forEach((segment) => {
+      if (segment.type === 'image' && segment.file) images.push({ file: segment.file });
+      else if (segment.text) texts.push(segment.text);
+    });
+    if (!texts.length && !images.length) return;
+    appendMessage('bot', texts.join('\n') || '（一张图片）', images);
   }
 
   async function pollCapture(id, attempt = 0, follow = false) {
@@ -270,13 +335,24 @@
     try {
       const capture = await api('/api/capture', { body: { id } });
       renderCapture(capture);
-      // 生成好的图片必须直接回到对话里：捕获里的图片按增量补成一条聊天消息，不用去图片页自己找。
-      const images = capture.images || [];
-      const seen = state.seenImages.get(id) || 0;
-      if (images.length > seen) {
-        state.seenImages.set(id, images.length);
-        appendMessage('bot', '图片好了，直接发在这里：', images.slice(seen));
-        loadImages().catch(() => {});
+      // 机器人发的每条消息都直接回到对话里：一条消息 = 一条聊天记录（文字配着自己的图）。
+      // 后端给了 messages 就按它分条；旧格式（只有扁平 texts/images）仍走「图片好了」那条老路。
+      const groups = Array.isArray(capture.messages) && capture.messages.length ? capture.messages : null;
+      if (groups) {
+        const seenGroups = state.seenGroups.get(id) || 0;
+        if (groups.length > seenGroups) {
+          for (let index = seenGroups; index < groups.length; index++) appendCaptureGroup(groups[index]);
+          state.seenGroups.set(id, groups.length);
+          loadImages().catch(() => {});
+        }
+      } else {
+        const images = capture.images || [];
+        const seen = state.seenImages.get(id) || 0;
+        if (images.length > seen) {
+          state.seenImages.set(id, images.length);
+          appendMessage('bot', '图片好了，直接发在这里：', images.slice(seen));
+          loadImages().catch(() => {});
+        }
       }
       const busy = capture.busy || (!capture.closed && capture.ageMillis < 1200 && attempt < 3);
       if (attempt % 4 === 0) await loadStatus().catch(() => {});
@@ -562,8 +638,10 @@
     applyGenerationSummary(state.status);
   }
 
+  /** 填下拉框：元素不在本栏目时直接跳过——提示词集这类页面也会调 loadOptions()，别去操作出图面板才有的控件。 */
   function fillSelect(id, values, current) {
     const select = $(id);
+    if (!select) return;
     select.innerHTML = '';
     const list = values && values.length ? values : [current].filter(Boolean);
     list.forEach((value) => {
@@ -1193,15 +1271,26 @@
     if (!grid) return null;                     // 图片网格只在出图页面
     const data = await api('/api/images', { body: { limit: 60 } });
     grid.innerHTML = '';
-    const images = (data.images || []).slice().reverse();
-    if (!images.length) grid.appendChild(el('div', 'muted', '暂无待领取图片。'));
+    // 后端已按「新 → 旧」给：最近生成的图片 + 还没领取的；不再反过来排。
+    const images = data.images || [];
+    const note = $('image-note');
+    if (!images.length) {
+      if (note) note.textContent = '还没有生成过图片。';
+      grid.appendChild(el('div', 'muted', '生成完成后图片会留在这里，刷新、重启都不会丢。'));
+      return images;
+    }
+    const pending = images.filter((image) => image.pending).length;
+    if (note) note.textContent = '最近生成 ' + images.length + ' 张'
+      + (pending ? '，其中 ' + pending + ' 张待领取' : '（都已领取）');
     images.forEach((image) => {
       // 缩略图点开进查看器放大（列表本身不再跳新标签页）。
       const link = imageNode(imageUrl(image.path), image.name + '（' + Math.round(image.size / 1024) + ' KB）');
-      const meta = el('div', 'meta', image.name + '\n' + Math.round(image.size / 1024) + ' KB');
+      const meta = el('div', 'meta', image.name + '\n' + Math.round(image.size / 1024) + ' KB'
+        + (image.pending ? '\n待领取' : ''));
       link.appendChild(meta);
       grid.appendChild(link);
     });
+    return images;
   }
 
   // ---------------------------------------------------------------- 任务队列
@@ -1554,9 +1643,267 @@
     await loadStatus().catch(() => {});
   }
 
+  // ---------------------------------------------------------------- Setup 栏目
+
+  /**
+   * 配置栏目：首次配置与账号凭据都收在这一页（数据来自 /api/config/*）。
+   * 首次配置期间（还没配好 DeepSeek 密钥）这些接口对本机免令牌，所以没有令牌也能填、能存；
+   * 配置完成后它们和别的接口一样要令牌，此时走控制台自己的登录页。
+   */
+  let setupLoadedToken = '';
+
+  function setupChannelState(channel) {
+    return (channel.keyMasked ? '已配置 ' + channel.keyMasked : '未配置密钥') + ' · 生效地址 ' + channel.effective;
+  }
+
+  function fillSetup(values) {
+    $('setup-bot-name').value = values.bot_name || '';
+    $('setup-owner').value = values.owner_user_id || '';
+    $('setup-sd-base').value = values.sd_base_url || '';
+    $('setup-sd-root').value = values.sd_root || '';
+    $('setup-qq-ws').value = values.qq_ws_url || '';
+    $('setup-web-url').value = location.origin;
+    setupLoadedToken = values.webui_access_token || '';
+    $('setup-web-token').value = setupLoadedToken;
+    const image = values.channels.image, chat = values.channels.chat;
+    $('setup-image-base').value = image.base || '';
+    $('setup-chat-base').value = chat.base || '';
+    $('setup-image-base').placeholder = image.official;
+    $('setup-chat-base').placeholder = chat.official;
+    setText('setup-image-state', setupChannelState(image));
+    setText('setup-chat-state', setupChannelState(chat));
+    setText('setup-token-state', values.webui_token_set ? '令牌已配置' : '还没有令牌（保存时会自动生成）');
+  }
+
+  /** 只发要改的字段：密钥留空＝不改（与命令行向导同一套语义）。 */
+  function setupPayload() {
+    const channels = {};
+    for (const name of ['image', 'chat']) {
+      const patch = { base: $('setup-' + name + '-base').value.trim() };
+      const key = $('setup-' + name + '-key').value.trim();
+      if (key) patch.key = key;
+      channels[name] = patch;
+    }
+    const body = { channels };
+    body.bot_name = $('setup-bot-name').value.trim();
+    body.owner_user_id = $('setup-owner').value.trim();
+    body.sd_base_url = $('setup-sd-base').value.trim();
+    body.sd_root = $('setup-sd-root').value.trim();
+    body.qq_ws_url = $('setup-qq-ws').value.trim();
+    const qqToken = $('setup-qq-token').value.trim();
+    if (qqToken) body.qq_access_token = qqToken;
+    const webToken = $('setup-web-token').value.trim();
+    if (webToken && webToken !== setupLoadedToken) body.webui_access_token = webToken;
+    return body;
+  }
+
+  async function loadSetup() {
+    let config;
+    try {
+      config = await api('/api/config/state');
+    } catch (error) {
+      if (String(error.message) === 'unauthorized') return;   // api() 已经切到登录页，这里不再叠加报错
+      throw error;
+    }
+    fillSetup(config.values);
+    $('setup-note').textContent = config.needed ? '首次配置' : '配置已完成';
+    setText('setup-state', config.needed
+      ? '还差：' + (config.missingText || '') + '本机访问免令牌，填好保存即可。'
+      : '改完保存即可：DeepSeek 地址与密钥立刻生效，SD 与 NapCat 的地址重启后生效。');
+    // 首次配置期间服务端会把当前访问令牌交给本页（本机免令牌）：直接记住，省得配完还要去 config.json 里翻。
+    if (config.needed && config.values.webui_access_token && !state.token) unlock(config.values.webui_access_token);
+    if (state.token) {
+      try { await loadStatus(); } catch (error) { if (String(error.message) !== 'unauthorized') throw error; }
+    }
+  }
+
+  function bindSetupTests() {
+    document.querySelectorAll('#panel-setup button[data-setup-test]').forEach((button) => {
+      button.addEventListener('click', async () => {
+        const channel = button.dataset.setupTest;
+        const note = $('setup-' + channel + '-test');
+        note.textContent = '正在测试…'; note.className = 'muted';
+        try {
+          const result = await api('/api/config/test', { body: { channel } });
+          note.textContent = result.message;
+          note.className = 'muted ' + (result.ok ? 'setup-ok' : 'setup-bad');
+        } catch (error) {
+          note.textContent = error.message; note.className = 'muted setup-bad';
+        }
+      });
+    });
+  }
+
+  // ---------------------------------------------------------------- 提示词 tab 补全
+
+  /**
+   * 提示词输入框的 tab 补全：敲英文前缀或中文说法，下拉里给标准词条（数据来自 /api/tags）。
+   * 只用原生 DOM：Tab / Enter 采纳、↑↓ 选择、Esc 关闭，鼠标点也行；输入框带 data-tag-complete 就自动挂上。
+   * 空词条不打扰（只有按 Ctrl+Space 才列出最热词条），结果按词缓存，避免每敲一下都打后端。
+   */
+  const TAG_LIMIT = 20;
+  const tagSuggest = { node: null, mirror: null, field: null, items: [], active: -1, start: 0, end: 0, seq: 0, timer: 0, cache: new Map() };
+
+  function tagSuggestBox() {
+    if (!tagSuggest.node) {
+      tagSuggest.node = el('div', 'tag-suggest');
+      tagSuggest.node.hidden = true;
+      document.body.appendChild(tagSuggest.node);
+    }
+    return tagSuggest.node;
+  }
+
+  /** 光标前正在输入的那个词，以及它在本输入框里的替换区间。 */
+  function tagToken(field) {
+    const caret = field.selectionStart === null ? field.value.length : field.selectionStart;
+    const head = field.value.slice(0, caret);
+    let start = Math.max(head.lastIndexOf(','), head.lastIndexOf('，'), head.lastIndexOf('\n')) + 1;
+    // 权重 / lora 写法 `(tag:1.2)`、`<lora:name:0.8>`：只补最后那截词条本身
+    const piece = head.slice(start);
+    const inner = Math.max(piece.lastIndexOf('('), piece.lastIndexOf('<'), piece.lastIndexOf(':'));
+    if (inner >= 0) start += inner + 1;
+    return { text: field.value.slice(start, caret).trim(), start, end: caret };
+  }
+
+  /** 候选框该出现在哪：textarea 用隐藏镜像层量出光标坐标，input 直接贴在框下面。 */
+  function tagCaretPoint(field) {
+    const rect = field.getBoundingClientRect();
+    if (field.tagName === 'INPUT') return { left: rect.left, top: rect.bottom + 4, width: rect.width };
+    if (!tagSuggest.mirror) {
+      tagSuggest.mirror = el('div', 'tag-mirror');
+      document.body.appendChild(tagSuggest.mirror);
+    }
+    const mirror = tagSuggest.mirror, style = getComputedStyle(field);
+    ['fontFamily', 'fontSize', 'fontWeight', 'lineHeight', 'letterSpacing', 'paddingTop', 'paddingRight',
+      'paddingBottom', 'paddingLeft', 'borderTopWidth', 'borderRightWidth', 'borderBottomWidth',
+      'borderLeftWidth', 'boxSizing'].forEach((name) => { mirror.style[name] = style[name]; });
+    mirror.style.width = field.clientWidth + 'px';
+    const caret = field.selectionStart === null ? field.value.length : field.selectionStart;
+    mirror.textContent = field.value.slice(0, caret);
+    const marker = el('span', null, '\u200b');
+    mirror.appendChild(marker);
+    const base = mirror.getBoundingClientRect(), point = marker.getBoundingClientRect();
+    const line = parseFloat(style.lineHeight) || 18;
+    return { left: rect.left + point.left - base.left - field.scrollLeft,
+             top: rect.top + point.top - base.top - field.scrollTop + line,
+             width: rect.width };
+  }
+
+  function paintTagSuggest() {
+    if (!tagSuggest.node) return;
+    Array.from(tagSuggest.node.children).forEach((row, index) => row.classList.toggle('active', index === tagSuggest.active));
+  }
+
+  function renderTagSuggest(field, items) {
+    const box = tagSuggestBox();
+    tagSuggest.field = field;
+    tagSuggest.items = items;
+    box.innerHTML = '';
+    if (!items.length) { closeTagSuggest(); return; }
+    items.forEach((item, index) => {
+      const row = el('button', 'tag-suggest-item' + (index === tagSuggest.active ? ' active' : ''));
+      row.type = 'button';
+      row.appendChild(el('span', 'tag-suggest-tag', item.tag));
+      if (item.zh) row.appendChild(el('span', 'tag-suggest-zh', item.zh));
+      const meta = [];
+      if (item.category) meta.push(item.category);
+      if (item.rank) meta.push(compactCount(item.rank));
+      if (meta.length) row.appendChild(el('span', 'tag-suggest-meta', meta.join(' · ')));
+      row.addEventListener('mousedown', (event) => { event.preventDefault(); acceptTag(field, item); });
+      row.addEventListener('mouseenter', () => { tagSuggest.active = index; paintTagSuggest(); });
+      box.appendChild(row);
+    });
+    const point = tagCaretPoint(field);
+    box.hidden = false;
+    box.style.left = Math.max(8, Math.min(point.left, window.innerWidth - 320)) + 'px';
+    box.style.top = (point.top + 300 > window.innerHeight ? Math.max(8, point.top - 308) : point.top) + 'px';
+    box.style.width = Math.max(240, Math.min(420, point.width)) + 'px';
+  }
+
+  /** 采纳候选：替换光标前那个词，补一个逗号继续输入。 */
+  function acceptTag(field, item) {
+    if (!item) return;
+    const before = field.value.slice(0, tagSuggest.start);
+    const after = field.value.slice(tagSuggest.end).replace(/^[\s,，]*/, '');
+    field.value = before + item.tag + (after ? ', ' + after : ', ');
+    closeTagSuggest();
+    field.focus();
+    const caret = (before + item.tag).length;
+    field.setSelectionRange(caret, caret);
+  }
+
+  async function queryTagSuggest(field, force) {
+    const token = tagToken(field);
+    tagSuggest.start = token.start;
+    tagSuggest.end = token.end;
+    tagSuggest.field = field;
+    if (!token.text && !force) { closeTagSuggest(); return; }
+    const cached = tagSuggest.cache.get(token.text);
+    if (cached) { tagSuggest.active = 0; renderTagSuggest(field, cached); return; }
+    const seq = ++tagSuggest.seq;
+    try {
+      const data = await api('/api/tags', { body: { query: token.text, limit: TAG_LIMIT } });
+      // 结果回来时用户可能已经敲了别的字：词变了就丢掉这次结果。
+      if (seq !== tagSuggest.seq || tagToken(field).text !== token.text) return;
+      const items = data.tags || [];
+      if (tagSuggest.cache.size > 300) tagSuggest.cache.clear();
+      tagSuggest.cache.set(token.text, items);
+      tagSuggest.active = 0;
+      renderTagSuggest(field, items);
+    } catch (error) {
+      if (String(error.message) !== 'unauthorized') closeTagSuggest();
+    }
+  }
+
+  function tagSuggestKey(event, field) {
+    const open = tagSuggest.node && !tagSuggest.node.hidden && tagSuggest.field === field;
+    if (!open) {
+      // 空词条上主动要候选（Tab 在没开下拉时不抢焦点，留给浏览器默认行为）。
+      if (event.key === ' ' && event.ctrlKey) { event.preventDefault(); queryTagSuggest(field, true); }
+      return;
+    }
+    if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+      event.preventDefault();
+      const size = tagSuggest.items.length;
+      tagSuggest.active = (tagSuggest.active + (event.key === 'ArrowDown' ? 1 : -1) + size) % size;
+      paintTagSuggest();
+    } else if (event.key === 'Tab' || (event.key === 'Enter' && !event.shiftKey)) {
+      event.preventDefault();
+      acceptTag(field, tagSuggest.items[Math.max(0, tagSuggest.active)]);
+    } else if (event.key === 'Escape') { event.preventDefault(); closeTagSuggest(); }
+  }
+
+  function attachTagComplete(field) {
+    field.addEventListener('input', () => {
+      clearTimeout(tagSuggest.timer);
+      tagSuggest.timer = setTimeout(() => queryTagSuggest(field, false), 120);
+    });
+    field.addEventListener('keydown', (event) => tagSuggestKey(event, field));
+    field.addEventListener('blur', () => setTimeout(() => { if (tagSuggest.field === field) closeTagSuggest(); }, 150));
+    field.addEventListener('scroll', () => closeTagSuggest());
+  }
+
+  function closeTagSuggest() {
+    tagSuggest.seq++;                       // 在途请求作废
+    tagSuggest.active = -1;
+    if (tagSuggest.node) tagSuggest.node.hidden = true;
+  }
+
+  /** 热度显示：426664 → 43万，12345 → 12k。 */
+  function compactCount(value) {
+    if (value >= 1000000) return (value / 1000000).toFixed(1).replace(/\.0$/, '') + 'M';
+    if (value >= 10000) return Math.round(value / 10000) + '万';
+    if (value >= 1000) return (value / 1000).toFixed(1).replace(/\.0$/, '') + 'k';
+    return String(value);
+  }
+
   // ---------------------------------------------------------------- 绑定
 
   function bind() {
+    // 提示词输入框的 tab 补全：标了 data-tag-complete 的输入框全部挂上（见上面的模块）。
+    document.querySelectorAll('[data-tag-complete]').forEach(attachTagComplete);
+    window.addEventListener('resize', () => closeTagSuggest());
+    window.addEventListener('scroll', () => closeTagSuggest(), true);
     on('login-form', 'submit', async (event) => {
       event.preventDefault();
       const token = $('token').value.trim();
@@ -1713,18 +2060,24 @@
     });
     on('sd-auto-start', 'change', (event) => setOption('sdAutoStart', event.target.checked ? 'on' : 'off'));
     on('sd-start-on-boot', 'change', (event) => setOption('sdStartOnBoot', event.target.checked ? 'on' : 'off'));
-    on('civitai-login-btn', 'click', async () => {
+    // Civitai 账号：粘一条一次性登录链接，机器人自己走完跳转链并保存会话 Cookie（见 docs/MIGRATION.md）。
+    on('civitai-link-save', 'click', async () => {
+      const input = $('civitai-link'), note = $('civitai-link-note');
+      const link = input.value.trim();
+      if (!link) { note.textContent = '请先粘贴邮件里那条一次性登录链接。'; note.className = 'muted setup-bad'; return; }
+      note.textContent = '正在跟随登录链接（最多 10 跳）…'; note.className = 'muted';
       try {
-        const result = await api('/api/civitai/login-link', { body: { scope: scope() } });
-        $('civitai-login-link').innerHTML = '';
-        const link = el('a', null, result.url);
-        link.href = result.url;
-        link.target = '_blank';
-        $('civitai-login-link').appendChild(el('div', null, '一次性登录链接（' + result.expiresMinutes + ' 分钟内有效）：'));
-        $('civitai-login-link').appendChild(link);
-        $('civitai-login-link').appendChild(el('div', 'muted', '在同一台机器上打开它完成 Civitai 登录，页面会把 Cookie 写回机器人。'));
-        toast('已生成一次性登录链接');
-      } catch (error) { if (String(error.message) !== 'unauthorized') toast(error.message); }
+        const result = await api('/api/civitai/link', { body: { link } });
+        input.value = '';
+        note.textContent = result.verified
+          ? '已保存并验证通过（' + (result.cookieHint || '') + '），搜索与下载改用它。'
+          : '已保存（' + (result.cookieHint || '') + '），但带它查询 LoRA 列表没成功：检查 civitai.proxy_url，或重新申请一封登录邮件。';
+        note.className = 'muted ' + (result.verified ? 'setup-ok' : 'setup-bad');
+        toast('Civitai 登录链接已处理');
+        if (state.token) await loadStatus();
+      } catch (error) {
+        if (String(error.message) !== 'unauthorized') { note.textContent = '保存失败：' + error.message; note.className = 'muted setup-bad'; }
+      }
     });
     on('civitai-clear-btn', 'click', async () => {
       if (!await askConfirm('清除已保存的 Civitai Cookie？\n之后只能用 civitai.com，成人内容与部分模型不可见。',
@@ -1735,6 +2088,35 @@
       } catch (error) { if (String(error.message) !== 'unauthorized') toast(error.message); }
       await loadStatus();
     });
+    // Setup 栏目：首次配置表单（保存 / 测试连接 / 重新读取）
+    on('setup-save', 'click', async () => {
+      const result = $('setup-result');
+      const typedToken = $('setup-web-token').value.trim();
+      result.textContent = '正在保存…'; result.className = 'muted';
+      try {
+        const saved = await api('/api/config/apply', { body: setupPayload() });
+        fillSetup(saved.values);
+        $('setup-image-key').value = ''; $('setup-chat-key').value = '';
+        $('setup-qq-token').value = ''; $('setup-web-token').value = '';
+        const changed = (saved.changed || []).join('；');
+        result.textContent = changed ? '已保存：' + changed : '没有改动。';
+        result.className = 'muted setup-ok';
+        $('setup-note').textContent = saved.needed ? '首次配置' : '配置已完成';
+        setText('setup-state', saved.needed
+          ? '还差：' + (saved.missingText || '') + '本机访问免令牌，填好保存即可。'
+          : '配置完成，可以去别的栏目了。');
+        // 用户自己换了令牌就直接记住：配置完成后接口恢复要令牌，刷新也不会被挡在外面。
+        if (typedToken.length >= 8) unlock(typedToken);
+        if (state.token) await loadStatus();
+      } catch (error) {
+        if (String(error.message) !== 'unauthorized') {
+          result.textContent = '保存失败：' + error.message;
+          result.className = 'muted setup-bad';
+        }
+      }
+    });
+    on('setup-reload', 'click', () => loadSetup().catch((error) => banner('读取配置失败：' + error.message)));
+    bindSetupTests();
     on('console-form', 'submit', (event) => { event.preventDefault(); const text = $('console-input').value.trim(); if (text) runCommands([text]); });
     // DeepSeek 通道：地址与密钥直接写本机配置，不拼指令、不用轮询回执。
     on('channel-save', 'click', saveChannels);
@@ -1792,6 +2174,8 @@
    */
   async function loadPage() {
     try {
+      // Setup 栏目要能在「还没有令牌」的首次配置阶段打开（那些接口对本机免令牌），所以不走 loadStatus。
+      if (PAGE === 'setup') { await loadSetup(); banner(''); return; }
       await loadStatus();                      // 顶栏、健康点、共享状态（约 15ms）
       if (PAGE === 'chat') await loadChatHistory();
       else if (PAGE === 'gen') await Promise.all([loadOptions(), loadPresets(), loadImages(), loadTasks()]);
@@ -1836,6 +2220,11 @@
       if (String(error.message) === 'unauthorized') lock('令牌已失效，请重新输入。');
       else banner('已进入控制台，但数据读取失败：' + error.message + '（可直接切到其它面板，或点刷新重试）');
     });
+  } else if (PAGE === 'setup') {
+    // 首次配置期间本机免令牌：没有令牌也要能打开 Setup 填密钥，登录页不该挡在前面。
+    $('login').hidden = true;
+    $('app').hidden = false;
+    boot().catch((error) => banner('配置栏目加载失败：' + error.message + '（可直接点刷新重试）'));
   } else {
     lock('');
   }

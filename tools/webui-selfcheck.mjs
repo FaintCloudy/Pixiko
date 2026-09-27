@@ -114,7 +114,7 @@ async function authAndStatic() {
     return 'index.html';
   });
   await check('静态资源', '每个栏目一个页面：只用本栏目的面板 + 10 个页签链接', async () => {
-    const tabs = ['chat', 'gen', 'prompt', 'styles', 'loras', 'functions', 'chatcfg', 'system', 'logs', 'help'];
+    const tabs = ['chat', 'gen', 'prompt', 'styles', 'loras', 'functions', 'chatcfg', 'system', 'setup', 'logs', 'help'];
     const panels = tabs.map((tab) => `panel-${tab}`);
     const seen = new Map();
     for (const tab of tabs) {
@@ -269,6 +269,19 @@ async function readEndpoints(status) {
     ['/api/usage', { query: '不存在的词条zzz' }, (body) => {
       assert(typeof body.text === 'string', '未知查询应当也返回文本');
       return snippet({ text: body.text });
+    }],
+    ['/api/tags', { query: '1gi', limit: 5 }, (body) => {
+      assert(Array.isArray(body.tags) && body.tags.length, '补全候选为空（词库装了吗？）');
+      assert(body.tags[0].tag && 'rank' in body.tags[0], '候选缺少 tag/rank');
+      return body.tags.map((item) => item.tag).join('、');
+    }],
+    ['/api/tags', { query: '长发', limit: 5 }, (body) => {
+      assert(body.tags.some((item) => item.zh), '中文查询应当带回中文写法');
+      return snippet({ text: body.tags.map((item) => item.tag + (item.zh ? '/' + item.zh : '')).join('、') });
+    }],
+    ['/api/tags', { query: '', limit: 3 }, (body) => {
+      assert(body.tags.length === 3, `空查询应当返回最热的 3 条，实际 ${body.tags.length}`);
+      return body.tags.map((item) => item.tag).join('、');
     }],
     ['/api/chat/history', { scope }, (body) => {
       assert(Array.isArray(body), '聊天历史应为数组');

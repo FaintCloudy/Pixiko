@@ -38,6 +38,7 @@
     <a class="tab" data-tab="functions" role="tab" href="/functions">提示词集</a>
     <a class="tab" data-tab="chatcfg" role="tab" href="/chatcfg">聊天</a>
     <a class="tab" data-tab="system" role="tab" href="/system">系统</a>
+    <a class="tab" data-tab="setup" role="tab" href="/setup">配置</a>
     <a class="tab" data-tab="logs" role="tab" href="/logs">控制台</a>
     <a class="tab" data-tab="help" role="tab" href="/help">帮助</a>
   </nav>
@@ -128,6 +129,7 @@
         <button class="ghost" type="button" id="rg-btn">回溯最近 N 张</button>
       </div>
     </div>
+    <div class="muted" id="image-note"></div>
     <div class="grid" id="image-grid"></div>
     <div class="receipts" id="gen-receipts"></div>
   </section>
@@ -138,10 +140,10 @@
   <section class="panel" id="panel-prompt">
     <div class="card">
       <div class="card-head"><b>正向提示词</b><span class="muted" id="prompt-scope"></span></div>
-      <textarea id="prompt-positive" rows="5"></textarea>
+      <textarea id="prompt-positive" rows="5" data-tag-complete spellcheck="false" placeholder="逐条输入（逗号分隔）；敲几个字母或中文后按 Tab 补全标准词条"></textarea>
       <div class="terms" id="prompt-positive-terms"></div>
       <div class="row wrap">
-        <input id="prompt-add" placeholder="添加词条，逗号分隔">
+        <input id="prompt-add" data-tag-complete placeholder="添加词条，逗号分隔（Tab 补全）">
         <button type="button" id="prompt-add-btn">添加</button>
         <button class="ghost" type="button" id="prompt-remove-btn">按词条移除</button>
         <button class="danger" type="button" id="prompt-clear-btn">清空正向</button>
@@ -149,10 +151,10 @@
     </div>
     <div class="card">
       <div class="card-head"><b>反向提示词</b></div>
-      <textarea id="prompt-negative" rows="4"></textarea>
+      <textarea id="prompt-negative" rows="4" data-tag-complete spellcheck="false" placeholder="逐条输入（逗号分隔）；同样支持 Tab 补全"></textarea>
       <div class="terms" id="prompt-negative-terms"></div>
       <div class="row wrap">
-        <input id="prompt-r-add" placeholder="添加反向词条">
+        <input id="prompt-r-add" data-tag-complete placeholder="添加反向词条（Tab 补全）">
         <button type="button" id="prompt-r-add-btn">添加</button>
         <button class="ghost" type="button" id="prompt-r-remove-btn">按词条移除</button>
         <button class="danger" type="button" id="prompt-r-clear-btn">清空反向</button>
@@ -382,18 +384,81 @@
         <label class="check"><input type="checkbox" id="sd-start-on-boot"> 机器人启动时启动</label>
       </div>
     </div>
-    <div class="card">
-      <div class="card-head"><b>Civitai 账号</b><span class="muted">可稍后配置</span></div>
-      <div class="muted" id="civitai-state"></div>
-      <div class="row wrap">
-        <button type="button" id="civitai-login-btn">生成一次性登录链接</button>
-        <button class="ghost" type="button" id="civitai-clear-btn">清除已保存的 Cookie</button>
-      </div>
-      <div class="muted" id="civitai-login-link"></div>
-    </div>
     <div class="receipts" id="system-receipts"></div>
   </section>
   <!--#/panel:system-->
+
+  <!--#panel:setup-->
+  <!-- ============================ 配置：首次配置与账号凭据 ============================ -->
+  <section class="panel" id="panel-setup">
+    <div class="card">
+      <div class="card-head"><b>机器人</b><span class="muted" id="setup-note">首次配置的入口</span></div>
+      <div class="muted" id="setup-state"></div>
+      <div class="grid-2">
+        <label class="field"><span>机器人名字</span><input id="setup-bot-name" placeholder="神户小鸟"></label>
+        <label class="field"><span>owner QQ（纯数字）</span><input id="setup-owner" inputmode="numeric" placeholder="例如 10001"></label>
+      </div>
+    </div>
+    <div class="card">
+      <div class="card-head"><b>DeepSeek · 生图频道</b><span class="muted" id="setup-image-state"></span></div>
+      <div class="muted">负责提示词改写、拆解与生成；两条频道各算各的额度，改一条不影响另一条。</div>
+      <div class="grid-2">
+        <label class="field"><span>API 地址（留空用官方 api.deepseek.com）</span><input id="setup-image-base" placeholder="https://api.deepseek.com/chat/completions"></label>
+        <label class="field"><span>API 密钥（sk-…；留空表示不改）</span><input id="setup-image-key" type="password" autocomplete="off" placeholder="sk-…"></label>
+      </div>
+      <div class="row wrap">
+        <button class="ghost" type="button" data-setup-test="image">测试连接</button>
+        <span class="muted" id="setup-image-test"></span>
+      </div>
+    </div>
+    <div class="card">
+      <div class="card-head"><b>DeepSeek · 聊天频道</b><span class="muted" id="setup-chat-state"></span></div>
+      <div class="muted">负责日常聊天、性格改写与意图规划；密钥与生图频道分开，两边额度各算各的。</div>
+      <div class="grid-2">
+        <label class="field"><span>API 地址（留空用官方 api.deepseek.com）</span><input id="setup-chat-base" placeholder="https://api.deepseek.com/chat/completions"></label>
+        <label class="field"><span>API 密钥（sk-…；留空表示不改）</span><input id="setup-chat-key" type="password" autocomplete="off" placeholder="sk-…"></label>
+      </div>
+      <div class="row wrap">
+        <button class="ghost" type="button" data-setup-test="chat">测试连接</button>
+        <span class="muted" id="setup-chat-test"></span>
+      </div>
+    </div>
+    <div class="card">
+      <div class="card-head"><b>Stable Diffusion 与 NapCat</b><span class="muted">改完要重启机器人才生效</span></div>
+      <div class="muted">SD WebUI 必须带 <code>--api</code> 启动；不接 QQ 也能先用网页控制台和出图。</div>
+      <div class="grid-2">
+        <label class="field"><span>Stable Diffusion 地址</span><input id="setup-sd-base" placeholder="http://127.0.0.1:7860"></label>
+        <label class="field"><span>Stable Diffusion 安装目录</span><input id="setup-sd-root" placeholder="留空表示不用机器人拉起 SD"></label>
+        <label class="field"><span>NapCat 正向 WebSocket 地址</span><input id="setup-qq-ws" placeholder="ws://127.0.0.1:3001"></label>
+        <label class="field"><span>NapCat 访问令牌（留空表示不改）</span><input id="setup-qq-token" type="password" autocomplete="off"></label>
+      </div>
+    </div>
+    <div class="card">
+      <div class="card-head"><b>网页控制台</b><span class="muted" id="setup-token-state"></span></div>
+      <div class="muted">令牌至少 8 位，改完用新令牌登录；留空表示保持现在的令牌。</div>
+      <div class="grid-2">
+        <label class="field"><span>访问令牌</span><input id="setup-web-token" autocomplete="off" placeholder="至少 8 位"></label>
+        <label class="field"><span>当前访问地址</span><input id="setup-web-url" disabled></label>
+      </div>
+    </div>
+    <div class="card">
+      <div class="card-head"><b>Civitai 账号</b><span class="muted" id="civitai-state">可稍后配置</span></div>
+      <div class="muted">在 Civitai 请求一封登录邮件，把邮件里那条<b>一次性登录链接</b>整条粘到下面：机器人替浏览器走完
+        跳转链（最多 10 跳）并收下会话 Cookie。链接只能用一次，用过或过期就重新申请一封。</div>
+      <div class="row wrap">
+        <input id="civitai-link" placeholder="https://auth.civitai.com/login/email/verify?token=…">
+        <button type="button" id="civitai-link-save">保存登录链接</button>
+        <button class="ghost" type="button" id="civitai-clear-btn">清除已保存的 Cookie</button>
+      </div>
+      <div class="muted" id="civitai-link-note"></div>
+    </div>
+    <div class="row wrap">
+      <button type="button" id="setup-save">保存</button>
+      <button class="ghost" type="button" id="setup-reload">重新读取</button>
+      <span class="muted" id="setup-result"></span>
+    </div>
+  </section>
+  <!--#/panel:setup-->
 
   <!--#panel:logs-->
   <!-- ============================ 控制台（真 CLI：默认全屏、提示符与日志同一股流） ============================ -->

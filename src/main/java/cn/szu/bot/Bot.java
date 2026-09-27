@@ -5,6 +5,7 @@ import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
+import java.nio.file.LinkOption;
 import java.nio.file.Path;
 import java.math.BigInteger;
 import java.util.*;
@@ -17,10 +18,12 @@ import cn.szu.bot.chat.ChatService;
 import cn.szu.bot.chat.DeepSeekPrompts;
 import cn.szu.bot.chat.SceneDecomposer;
 import cn.szu.bot.civitai.CivitaiClient;
+import cn.szu.bot.civitai.CivitaiLinkLogin;
 import cn.szu.bot.civitai.CivitaiStyleSync;
 import cn.szu.bot.prompt.PromptEditor;
 import cn.szu.bot.prompt.PromptFunctions;
 import cn.szu.bot.prompt.PromptUsage;
+import cn.szu.bot.prompt.TagSuggest;
 import cn.szu.bot.prompt.TermCategories;
 import cn.szu.bot.sd.GenerationPreset;
 import cn.szu.bot.sd.LocalStyles;
@@ -2660,19 +2663,28 @@ public final class Bot implements AutoCloseable {
                 List<CivitaiClient.SearchResult> results = new CivitaiClient(settings.root, Json.obj(settings.snapshot(), "civitai")).query(words);
                 registerLoraSearch(event, results);
                 if (results.isEmpty()) return new LoraResult("未找到匹配的 LoRA。",false);
-                JsonArray message = new JsonArray(); int number = 0;
-                for (var result : results) {
-                    message.addAll(Maps.text("#" + (++number) + " " + result.name() + "\n基础模型：" + result.baseModel() + "\n" + result.url()));
+                // 一条 LoRA 一条消息：封面配着它自己的编号/名称/链接发出去，不把十条挤成一条
+                // （回执按出站消息分组渲染，所以控制台里也是一条一项、图文同条）。
+                for (int at = 0; at < results.size(); at++) {
+                    var result = results.get(at);
+                    JsonArray message = new JsonArray();
+                    message.addAll(Maps.text("#" + (at + 1) + " " + result.name() + "\n基础模型：" + result.baseModel() + "\n" + result.url()));
                     if (!result.cover().isEmpty()) {
                         JsonObject image = new JsonObject(), data = new JsonObject(); image.addProperty("type", "image");
                         data.addProperty("file", result.cover()); image.add("data", data); message.add(image);
                     } else message.addAll(Maps.text("（该结果暂无可用封面）"));
-                }
-                try { sender.send(event.deepCopy(), message).get(); }
-                catch (Exception e) {
-                    StringBuilder fallback = new StringBuilder("封面发送失败，搜索结果保留：\n"); int n = 0;
-                    for (var result : results) fallback.append("#").append(++n).append(" ").append(result.name()).append("\n").append(result.url()).append("\n");
-                    reply(event, fallback.toString());
+                    try { sender.send(event.deepCopy(), message).get(); }
+                    catch (Exception error) {
+                        // 从这一条起发不出去（常见：图床被墙或超时）：余下条目改成纯文本一次给出，编号保持不变。
+                        Log.warn("LoRA 搜索结果第 " + (at + 1) + " 条发送失败，余下改用文字：" + error(error));
+                        StringBuilder fallback = new StringBuilder("封面发送失败，余下条目以文字给出：\n");
+                        for (int rest = at; rest < results.size(); rest++) {
+                            var item = results.get(rest);
+                            fallback.append("#").append(rest + 1).append(' ').append(item.name()).append('\n').append(item.url()).append('\n');
+                        }
+                        reply(event, fallback.toString());
+                        break;
+                    }
                 }
                 return new LoraResult("搜索完成，共 " + results.size() + " 项。使用 /lora download #编号 [权重] 下载；"
                         + "编号属于你在本会话的最近一次搜索（只保存在内存里，重启后必须重新搜索）。",true);
@@ -3986,11 +3998,13 @@ public final class Bot implements AutoCloseable {
     // ---------------------------------------------------------------------------------------------
     // WebUI 桥：网页控制台是机器人的另一个入口，走的仍是同一套指令、权限、守卫与回执。
     // ---------------------------------------------------------------------------------------------
-    /** 一条网页指令（或一次网页对话的执行链）产生的回执：文本按顺序排列，图片单独给出路径。 */
+    /** 一条网页指令（或一次网页对话的执行链）产生的回执：按<b>出站消息</b>分组，组内文字与图片保持原顺序。 */
     public static final class WebCapture {
         private final String id, command;
         private final List<String> texts = new CopyOnWriteArrayList<>();
         private final List<JsonObject> images = new CopyOnWriteArrayList<>();
+        /** 每条出站消息一组（组内是有序的 text / image 片段）：LoRA 搜索就是一条一项，回执也照这个渲染。 */
+        private final List<JsonArray> messages = new CopyOnWriteArrayList<>();
         private final long startedNanos = System.nanoTime();
         private volatile long lastActivityNanos = System.nanoTime();
         private volatile boolean closed;
@@ -4004,9 +4018,10 @@ public final class Bot implements AutoCloseable {
         WebCapture(String id, String command, Path imageRoot) { this.id = id; this.command = command; this.imageRoot = imageRoot; }
         public String id() { return id; }
         public String command() { return command; }
-        /** 收下一条出站消息：文本进 texts，图片段进 images（路径由网页通过 /api/image 读取）。 */
+        /** 收下一条出站消息：文本进 texts、图片段进 images（扁平视图），同时按原顺序记进 {@link #messages}。 */
         void capture(JsonArray segments) {
             if (segments == null) return;
+            JsonArray group = new JsonArray();
             for (JsonElement item : segments) {
                 if (item == null || !item.isJsonObject()) continue;
                 JsonObject segment = item.getAsJsonObject();
@@ -4014,15 +4029,29 @@ public final class Bot implements AutoCloseable {
                 JsonObject data = Json.obj(segment, "data");
                 if ("text".equals(type)) {
                     String text = Json.str(data, "text", "");
-                    if (!text.isBlank()) texts.add(text);
+                    if (!text.isBlank()) {
+                        texts.add(text);
+                        JsonObject node = new JsonObject();
+                        node.addProperty("type", "text");
+                        node.addProperty("text", text);
+                        group.add(node);
+                    }
                 } else if ("image".equals(type)) {
                     String file = materialize(Json.str(data, "file", ""));
-                    if (!file.isBlank()) { JsonObject image = new JsonObject(); image.addProperty("file", file); images.add(image); }
+                    if (!file.isBlank()) {
+                        JsonObject image = new JsonObject(); image.addProperty("file", file); images.add(image);
+                        JsonObject node = new JsonObject();
+                        node.addProperty("type", "image");
+                        node.addProperty("file", file);
+                        group.add(node);
+                    }
                 } else if ("record".equals(type) || "forward".equals(type)) {
+                    // 合并转发里面每条消息都算一条：递归进去各自成组，与会话里看到的条数一致。
                     if (data.has("messages") && data.get("messages").isJsonArray())
                         for (JsonElement node : data.getAsJsonArray("messages")) if (node.isJsonObject()) capture(node.getAsJsonObject().getAsJsonArray("content"));
                 }
             }
+            if (!group.isEmpty()) messages.add(group);
             lastActivityNanos = System.nanoTime();
         }
         public boolean closed() { return closed; }
@@ -4086,6 +4115,8 @@ public final class Bot implements AutoCloseable {
             result.addProperty("command", command);
             result.add("texts", Json.GSON.toJsonTree(new ArrayList<>(texts)));
             result.add("images", Json.GSON.toJsonTree(new ArrayList<>(images)));
+            // 分组视图：前端按它把一条消息渲染成一张卡（一条 LoRA = 一段文字 + 一张封面，同一条）。
+            result.add("messages", Json.GSON.toJsonTree(new ArrayList<>(messages)));
             result.addProperty("busy", busy);
             // 指令执行体是否已经跑完：前端要靠它判断"内容都打完了可以收工"，
             // 只看 busy 会在指令刚受理、回执还空着的那一刻就停止跟随（图片就打不出来了）。
@@ -4555,6 +4586,31 @@ public final class Bot implements AutoCloseable {
         Log.info("Civitai 登录 Cookie 已保存（" + cookieHint(value) + "），搜索与下载改用它。");
         JsonObject result = civitaiStatus();
         result.addProperty("ok", true);
+        return result;
+    }
+
+    /**
+     * 用邮件里的一次性登录链接换取会话 Cookie（设计见 {@code docs/MIGRATION.md}「Civitai 账号」一节）。
+     *
+     * <p>机器人替浏览器走完整条跳转链（见 {@link CivitaiLinkLogin}），把会话 Cookie 写进
+     * {@code config.json} 的 {@code civitai.session_cookie}，再带它打一次 LoRA 列表接口验证。
+     * <b>链接与 Cookie 都不进日志</b>，只记脱敏提示。
+     */
+    public JsonObject civitaiSaveFromLink(String link) throws Exception {
+        JsonObject civitai = Json.obj(settings.snapshot(), "civitai");
+        CivitaiLinkLogin.Result followed = CivitaiLinkLogin.follow(civitai, link);
+        String value = followed.cookie();
+        if (value.isBlank())
+            throw new IllegalArgumentException("这条链接没有带回会话 Cookie：可能已经用过、过期，或不是完整的登录链接。请重新在 Civitai 申请一封登录邮件。");
+        if (value.length() > 8000) throw new IllegalArgumentException("Cookie 太长，这条链接可能不是登录链接。");
+        settings.civitaiSetting("session_cookie", new JsonPrimitive(value));
+        Log.info("Civitai 登录链接已处理（" + cookieHint(value) + "，跟随 " + followed.hops() + " 跳），搜索与下载改用它。");
+        boolean verified = CivitaiLinkLogin.verify(civitai, value,
+                Json.str(civitai, "base_url", CivitaiClient.DEFAULT_BASE_URL));
+        if (!verified) Log.warn("Civitai 会话 Cookie 已保存，但带它查询 LoRA 列表没成功：可能需要检查 civitai.proxy_url 或重新申请登录邮件。");
+        JsonObject result = civitaiStatus();
+        result.addProperty("ok", true);
+        result.addProperty("verified", verified);
         return result;
     }
 
@@ -5121,18 +5177,39 @@ public final class Bot implements AutoCloseable {
         return result;
     }
     /** 待领取图片的相对路径（网页用 /api/image 取图）。 */
+    /**
+     * 出图面板的图片列表：<b>最近生成的</b>（扫 {@code data/generated}，重启后仍在）+ <b>待领取的</b>（发送队列）。
+     *
+     * <p>只列待领取是不够的：任务完成后机器人默认会自动领取，队列随即清空，于是面板一刷新就什么都不剩
+     * （用户报的"生成完的图片刷新后消失"）。这里以最近生成为主体，另外用 {@code pending} 标出哪些还没领取；
+     * 顺序是新→旧，前端直接照序渲染。
+     */
     public JsonArray webImages(int limit) throws Exception {
-        JsonArray result = new JsonArray();
+        int cap = limit > 0 ? limit : 60;
         Path root = settings.root.toAbsolutePath().normalize();
-        List<Path> images = new ArrayList<>(sd.pendingImages());
-        if (limit > 0 && images.size() > limit) images = images.subList(images.size() - limit, images.size());
-        for (Path image : images) {
-            String relative = root.relativize(image.toAbsolutePath().normalize()).toString().replace('\\', '/');
+        List<Path> pending = new ArrayList<>(sd.pendingImages());
+        LinkedHashSet<Path> pendingSet = new LinkedHashSet<>();
+        for (Path image : pending) pendingSet.add(image.toAbsolutePath().normalize());
+        List<Path> ordered = new ArrayList<>();
+        // data/generated/webui 是回执内嵌图片（地图、封面等临时图），不属于"生成的作品"，别混进面板。
+        Path embedded = root.resolve("data/generated/webui");
+        try {
+            for (Path image : sd.recentImages(cap * 2)) if (!image.toAbsolutePath().normalize().startsWith(embedded)) ordered.add(image);
+        } catch (Exception error) { Log.warn("历史图片目录不可用，出图面板只列待领取：" + error.getMessage()); }
+        for (int index = pending.size() - 1; index >= 0; index--) {          // 待领取的同样新的在前
+            Path image = pending.get(index).toAbsolutePath().normalize();
+            if (!ordered.contains(image)) ordered.add(image);
+        }
+        JsonArray result = new JsonArray();
+        for (Path image : ordered) {
+            if (result.size() >= cap) break;
+            if (!Files.isRegularFile(image, LinkOption.NOFOLLOW_LINKS)) continue;
             JsonObject item = new JsonObject();
-            item.addProperty("path", relative);
+            item.addProperty("path", root.relativize(image).toString().replace('\\', '/'));
             item.addProperty("name", image.getFileName().toString());
             item.addProperty("size", Files.size(image));
             item.addProperty("modified", Files.getLastModifiedTime(image).toInstant().toString());
+            item.addProperty("pending", pendingSet.contains(image));
             result.add(item);
         }
         return result;
@@ -5196,6 +5273,28 @@ public final class Bot implements AutoCloseable {
         if (!failure.isBlank()) result.addProperty("error", failure);
         return result;
     }
+    /** tab 补全的词库句柄：懒建一次，内部再按词库文件 mtime 缓存（见 {@link TagSuggest}）。 */
+    private volatile TagSuggest tagSuggest;
+
+    /** tab 补全：把输入框里正在敲的那个词补成标准词条（英文前缀 + 中文写法，见 {@link TagSuggest}）。 */
+    public JsonObject webTagSuggest(String query, int limit) {
+        TagSuggest suggest = tagSuggest;
+        if (suggest == null) { suggest = new TagSuggest(settings.root); tagSuggest = suggest; }
+        JsonArray tags = new JsonArray();
+        for (TagSuggest.Hint hint : suggest.suggest(query, limit)) {
+            JsonObject item = new JsonObject();
+            item.addProperty("tag", hint.tag());
+            if (!hint.zh().isBlank()) item.addProperty("zh", hint.zh());
+            if (!hint.category().isBlank()) item.addProperty("category", hint.category());
+            item.addProperty("rank", hint.rank());
+            tags.add(item);
+        }
+        JsonObject result = new JsonObject();
+        result.addProperty("query", query == null ? "" : query.strip());
+        result.add("tags", tags);
+        return result;
+    }
+
     /** 提示词中文分类浏览：给定路径返回目录文本与可选编号项。 */
     public JsonObject webUsage(String query) throws Exception {
         String selection = select(webEvent(settings.webScope(), "usage"), "usage", (query == null || query.isBlank() ? "" : query.strip()));

@@ -5,7 +5,7 @@ Pixiko 是一个自用的 QQ 机器人：接 **NapCat** 收消息，接 **Stable
 领图；机器人自己把生成好的图片发回对话。
 
 - **作者**：loriko（deloriko@outlook.com）
-- **版本**：v1.0.4（发行说明见 [`RELEASE.md`](RELEASE.md)）
+- **版本**：v1.0.5（发行说明见 [`RELEASE.md`](RELEASE.md)）
 - **当前实现**：**Java 版**（`src/`）——这是线上一直在跑的那一份
 - **网页控制台**：`webui/`（纯静态 HTML/CSS/JS，随机器人一起由内嵌 Spring Boot 提供）
 - **SD WebUI 桥接扩展**：`webui-extension/pixiko-bridge/`（把文生图页正在编辑的提示词同步给机器人）
@@ -91,10 +91,11 @@ copy config.example.json config.json
 .\run.bat
 ```
 
-第一次启动如果检测到还没配好（缺 DeepSeek 密钥或网页令牌），会**自动在浏览器打开配置页**
+第一次启动如果检测到还没配好（缺 DeepSeek 密钥或网页令牌），会**自动在浏览器打开控制台的「配置」栏目**
 `http://127.0.0.1:8787/setup`：填好机器人名字、owner QQ、两条 DeepSeek 通道（地址 + 密钥）、
-SD 与 NapCat 地址即可，密钥只写进本机文件、页面只回显掩码。首次配置期间这个配置页对本机免令牌，
-配好之后就和其它接口一样要令牌（也可以随时从控制台「系统 → DeepSeek 通道」改地址与密钥）。
+SD 与 NapCat 地址即可，密钥只写进本机文件、页面只回显掩码。首次配置期间这个栏目对本机免令牌，
+配好之后就和其它接口一样要令牌。Civitai 账号也在这一栏配：把邮件里那条**一次性登录链接**整条粘进去，
+机器人替浏览器走完跳转链（最多 10 跳）并保存会话 Cookie，不用手动抄 Cookie。
 
 命令行向导仍然保留，适合没有浏览器的环境：
 
@@ -106,8 +107,8 @@ SD 与 NapCat 地址即可，密钥只写进本机文件、页面只回显掩码
 
 1. `owner_user_id` —— **你自己的 QQ 号**。本仓库**不含**任何默认 owner，
    留空时所有 owner 专属指令都会被拒绝（这是刻意为之：公开仓库不发布个人 QQ 号）。
-2. `sd.root` —— 你的 SD WebUI 根目录（示例写的是 `F:/sd/sd-webui`）。
-3. `civitai.lora_dir` —— LoRA 目录（示例 `F:/sd/sd-webui/models/Lora`）。
+2. `sd.root` —— 你的 SD WebUI 根目录（默认留空：不填就不用机器人自动拉起 SD，自己先启动好即可）。
+3. `civitai.lora_dir` —— LoRA 目录（默认留空：不填就用不了 Civitai 下载与 LoRA 列表）。
 4. 两条 DeepSeek 通道的地址与密钥 —— 配置页里填（`api_base` 留空即官方 `api.deepseek.com`）；
    也可以手动放 `data/deepseek-api-key.txt`（生图）与 `data/deepseek-chat-api-key.txt`（聊天）。
 5. `qq.ws_url` —— NapCat 正向 WebSocket 地址。
@@ -346,7 +347,7 @@ run.bat --set-map yh "路径"       # 命令行设置地图（需先停止机器
 ```
 pixiko\
 ├─ README.md                       本文件
-├─ RELEASE.md                      v1.0.4 发行说明（含版权声明与已知限制）
+├─ RELEASE.md                      v1.0.5 发行说明（含版权声明与已知限制）
 ├─ THIRD-PARTY-LICENSES.md         随二进制包分发的第三方组件与许可
 ├─ config.example.json             脱敏配置模板（复制成 config.json 再改）
 ├─ .gitignore                      config.json / data / logs / lib jar 等一律不入库

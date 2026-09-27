@@ -1,15 +1,50 @@
-# Pixiko v1.0.4 发行说明
+# Pixiko v1.0.5 发行说明
 
-- **版本**：v1.0.4
+- **版本**：v1.0.5
 - **日期**：2026-09-27
 - **作者**：loriko（deloriko@outlook.com）
 - **当前实现**：Java 版（`src/`）。另有一次**未完成的** Next.js 重构，见 `nextjs-wip/`，**不可运行**。
 
 ---
 
-## 〇、本版新增（v1.0.4）
+## 〇、本版新增（v1.0.5）
 
-**粤海 / 丽湖地图随包分发**：`maps/yh/`（2480×3367）与 `maps/liv/`（1280×1810）各带一张校园地图，
+**控制台多一个「配置」栏目，Civitai 账号改成黏一条一次性登录链接**：原来独立的首次运行配置页
+（`webui/setup.html`）并进控制台，导航栏新增「配置」（`/setup`，**URL 不变**）：机器人名字、owner QQ、
+两条 DeepSeek 通道（带「测试连接」）、SD 与 NapCat 地址、控制台访问令牌都在这一页改。Civitai 账号也挪到这里，
+并且不再需要手动抄 Cookie：把登录邮件里那条 `https://auth.civitai.com/login/email/verify?token=…`
+**整条粘进去**，机器人替浏览器走完跳转链（最多 10 跳，逐跳收 `Set-Cookie`，只保留 civitai 域、丢弃
+`oauth_bridge`），写入 `civitai.session_cookie` 后再带它验证一次。**链接里的一次性令牌与 Cookie 都不进日志**
+（只出现脱敏提示）。随之删除 `/civitai-login` 页面与 `/api/civitai/login-link` 接口（`/civitai-cookie` 按设计保留）。
+
+**提示词输入框的 tab 补全**：正向/反向提示词与「添加词条」输入框里敲几个字母或中文，按 **Tab / Enter** 补成标准
+Danbooru 词条（↑↓ 选择、Esc 关闭；空词条上按 **Ctrl+Space** 列最热词条）。候选来自随包的
+`data/prompt-tags.txt`（14 万条，二分前缀匹配）与 `data/prompt-zh-tags.json`（3.7 万条中文写法 + 分类 + 热度），
+按热度排序、按文件 mtime 缓存，词库缺失时自动退化成另一侧可用；接口为 `POST /api/tags`。
+
+**三处图片显示问题**：
+
+- 回执与对话里的 Civitai 封面本身是图床 URL，却被当成 `data/generated` 下的本地图片去取，所以一直显示不出来；
+  现在改走封面代理，代理失败会在图上直接显示 HTTP 状态（401/429/502），非 Civitai 域名退回原地址再试一次。
+- 出图面板以前只列「待领取」，而任务完成后默认会自动领取，于是**刷新（或重启）后图片就消失**；
+  现在列出「最近生成（扫 `data/generated`，重启后仍在）∪ 待领取」，并标出哪些还没领取。
+- 回执与对话改成**按消息分条渲染**：一条 LoRA 搜索结果就是一条消息（自己的编号/名称/基础模型/链接 + 自己的封面），
+  不再是「所有文字一堆、所有图片一堆」；发送失败时余下条目自动退化成纯文本列表。
+
+**修掉提示词集面板打不开**：`fillSelect()` 会去填只存在于出图面板的采样方法/模型下拉框，提示词集页因此报
+「加载失败：Cannot set properties of null (setting 'innerHTML')」；已补空值保护。
+
+**新增 macOS 启动脚本**：`run-macos.sh`（等价 `run.bat`：找 JDK 17+、校验或下载 gson、编译、打包、启动）与
+`start-macos.sh`（等价 `start.bat`：只启动已编译好的 jar）。用 macOS 自带 bash 3.2 语法写成，
+`-Dbot.home` 与「Spring jar 只挂运行期 classpath、不合并进 jar」这两条约定与 Windows 版完全一致。
+
+**`config.example.json` 去掉 Windows 示例路径**：`sd.root` 与 `civitai.lora_dir` 默认改为空字符串
+（留空表示不用机器人拉起 SD、用不了 Civitai 下载），`README.md` 对应说明同步更新。
+
+<details>
+<summary>更早版本（v1.0.4）</summary>
+
+**v1.0.4 —— 粤海 / 丽湖地图随包分发**：`maps/yh/`（2480×3367）与 `maps/liv/`（1280×1810）各带一张校园地图，
 下载后 `.yh` / `.liv` 直接可用，不用再自己往 `maps/` 里放图。目录按文件名排序发送，
 最多 10 张、每张最多 20MB，支持 PNG/JPG/JPEG/GIF/WEBP/BMP；换成自己的图覆盖文件即可
 （或用 `.map set yh "路径"` 指到别处）。
@@ -17,6 +52,8 @@
 - 这两张是作者自备的校园地图素材，版权归原制图方，本项目未声明授权，仅用于 `.yh`/`.liv` 发送地图；
   介意的话删掉这两个文件并重新打包即可（机器人会照常提示「还没有地图图片」）。见 `THIRD-PARTY-LICENSES.md`。
 - `.gitignore` 不再忽略 `maps/**` 下的图片。
+
+</details>
 
 <details>
 <summary>更早版本（v1.0.3 / v1.0.2 / v1.0.1）</summary>
@@ -64,6 +101,8 @@
 
 </details>
 
+</details>
+
 ---
 
 ## 一、版权声明
@@ -86,7 +125,7 @@
 
 | 项目 | 要求 |
 |---|---|
-| 操作系统 | Windows 10 / 11 |
+| 操作系统 | Windows 10 / 11；macOS 可用附带的 `run-macos.sh` / `start-macos.sh`（构建脚本 `build.ps1` 仍需要 PowerShell） |
 | Java | **JDK 17 或更高**，`java`（开箱即用包）或 `java` + `javac` + `jar`（源码包）在 `PATH` 里 |
 | Stable Diffusion WebUI | A1111 系，启动参数**必须含 `--api`**，默认地址 `http://127.0.0.1:7860` |
 | NapCat | **可选**。开启正向 WebSocket 服务器；不开也能用网页控制台与出图 |
@@ -98,7 +137,7 @@
 
 ## 三、安装与启动（三步）
 
-### 开箱即用包 `pixiko-v1.0.4-runnable.zip`
+### 开箱即用包 `pixiko-v1.0.5-runnable.zip`
 
 1. 装好 **JDK 17+**。
 2. **双击 `start.bat`**。第一次运行会自动生成 `config.json`（照 `config.example.json` 起一份），
@@ -108,7 +147,7 @@
 
 > `start.bat` 跑的是包内已编译好的 `build/pixiko.jar`；只有需要改代码时才用 `build.ps1` + `run.bat`。
 
-### 源码包 `pixiko-v1.0.4.zip`
+### 源码包 `pixiko-v1.0.5.zip`
 
 1. 装好 **JDK 17+**。
 2. 在项目根目录准备好依赖 jar：`lib/gson-2.13.1.jar` 由 `build.ps1` **自动下载并校验**，
@@ -129,6 +168,8 @@ copy config.example.json config.json
 |---|---|
 | `start.bat` | **开箱即用包专用**：跳过编译，直接用预编译 jar 启动 |
 | `run.bat` | 源码包：先 `build.ps1` 构建再启动；`run.bat --setup` 进命令行配置向导（网页配置页 `/setup` 是默认入口） |
+| `run-macos.sh` | **macOS**：等价 `run.bat`——找 JDK 17+ → 校验或下载 gson → 编译 → 打包 → 启动；参数原样转给机器人 |
+| `start-macos.sh` | **macOS**：等价 `start.bat`——只启动已编译好的 `build/pixiko.jar` |
 | `build.ps1` | 编译 `src/main/java` 并打包 `build/pixiko.jar`；`-Test` 连测试一起跑 |
 | `test.bat` | 等价于 `build.ps1 -Test`：编译并逐个运行全部 `*Test` |
 | `stop-bot.ps1` | 停止正在运行的机器人 |
@@ -160,7 +201,7 @@ copy config.example.json config.json
    属于个人信息，已移除）。**务必在配置页或 `config.json` 里设置 `owner_user_id`**，否则所有 owner 专属指令都会被拒绝。
 6. **`test.bat` 的行为依赖工作目录。** `WebUiTest` 通过「进程工作目录下的 `webui/`」找页面资源
    （见 `WebPageController` 的回退逻辑），所以请在**项目根目录**运行 `test.bat`，
-   不要从别的目录调用。在项目根目录运行，46 个测试全部通过。
+   不要从别的目录调用。在项目根目录运行，48 个测试全部通过（含 CivitaiLinkTest、TagSuggestTest）。
 7. **Logback 两个 jar 内不含许可文本**（上游如此），其 EPL-1.0 / LGPL-2.1 全文需查
    `THIRD-PARTY-LICENSES.md` 里给出的官方链接；`gson` 与 `snakeyaml` 的 jar 内同样没有许可文件，
    但二者均为 Apache-2.0，文本已随包提供。
@@ -169,8 +210,8 @@ copy config.example.json config.json
 
 ## 六、在 GitHub Releases 里发布这个 zip
 
-1. 打开仓库 → 右侧 **Releases** → **Draft a new release**，Tag 填 `v1.0.4`（新建 tag），标题填 `Pixiko v1.0.4`。
-2. 把 `pixiko-v1.0.4.zip` 与 `pixiko-v1.0.4-runnable.zip`（以及各自的 `.sha256`）拖进附件区，
+1. 打开仓库 → 右侧 **Releases** → **Draft a new release**，Tag 填 `v1.0.5`（新建 tag），标题填 `Pixiko v1.0.5`。
+2. 把 `pixiko-v1.0.5.zip` 与 `pixiko-v1.0.5-runnable.zip`（以及各自的 `.sha256`）拖进附件区，
    正文粘贴本文件内容后点 **Publish release**。
 
 > 建仓库时 License 请选 **None**（本项目保留所有权利，不使用开源许可证）。

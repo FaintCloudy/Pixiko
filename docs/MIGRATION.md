@@ -300,11 +300,12 @@ webpack，因此不会触发那个求值器），把实例放进 `lib/core/bot-h
 post-login → 首页，最多 10 跳）逐跳收 `Set-Cookie`，取 `civitai.red` 域上最后那份会话 Cookie
 （civitai 自己的会话/设备两条，丢弃 `oauth_bridge`）→ 写 `config.json` 的
 `civitai.session_cookie` → 带 Cookie 打 `/api/v1/models?limit=1&types=LORA` 验证。**凭据与一次性令牌都不进日志**
-（只出现 `cookieHint`）。书签小工具与手抄 Cookie 的入口已从面板移除（`/civitai-login` 页面与 `/civitai-cookie`
-接口保留不删）。
+（只出现 `cookieHint`）。书签小工具、手抄 Cookie 与那个独立的 `/civitai-login` 页面都已删除：入口只有一个
+输入框，放在控制台新增的 **「配置」栏目**（`/setup`，与首次配置同一页）；`/civitai-cookie` 接口保留不删。
 
-- Java 版：`Bot.civitaiSaveFromLink` + `Bot.civitaiFollowLink`，接口 `POST /api/civitai/link`，
-  前端 `webui/index.html` 的 `#civitai-link`/`#civitai-link-save`；`src/test/java/…/CivitaiLinkTest.java`（假 HTTP 服务整链）。
+- Java 版：`Bot.civitaiSaveFromLink` + `cn.szu.bot.civitai.CivitaiLinkLogin`（`follow` 跟随跳转链、
+  `verify` 带 Cookie 验一次），接口 `POST /api/civitai/link`，
+  前端 `webui/index.html` 的 `#civitai-link`/`#civitai-link-save`（Setup 栏目内）；`src/test/java/…/CivitaiLinkTest.java`（假 HTTP 服务整链）。
   实测（本机需走 `civitai.proxy_url` 代理）：跟随真实链接拿到凭据、写入配置、`/api/civitai/status` → `hasCookie=true`。
 - Next 版：`lib/civitai/civitai-link.ts`（自包含，不牵 `civitai-client.ts`）+ `POST /api/civitai/link`（**动态 import**）
   + `components/panels/SystemPanel.tsx` 的 `#civitai-link`；`tests/civitai-link.test.ts`（10 条）。

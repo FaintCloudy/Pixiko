@@ -203,10 +203,10 @@ public final class WebUiTest {
         // 每个栏目是一个独立页面：首页只有对话面板，其它栏目的 DOM 不在这一页上；
         // 同时每个栏目都能用自己的 URL 打开（见 columnPages）。
         check(index.body().contains("id=\"panel-chat\"") && !index.body().contains("id=\"panel-styles\""),
-                "首页只有对话栏目自己的面板（不是把十个栏目塞进一页）");
-        check(countOf(index.body(), "role=\"tab\"") == 10 && index.body().contains("href=\"/styles\"")
-                        && index.body().contains("href=\"/\""),
-                "页签是十个真链接（每个栏目一个 URL）");
+                "首页只有对话栏目自己的面板（不是把所有栏目塞进一页）");
+        check(countOf(index.body(), "role=\"tab\"") == 11 && index.body().contains("href=\"/styles\"")
+                        && index.body().contains("href=\"/setup\"") && index.body().contains("href=\"/\""),
+                "页签是十一个真链接（每个栏目一个 URL，含 Setup）");
         check(index.body().contains("id=\"viewer\"") && index.body().contains("id=\"viewer-image\"")
                         && index.body().contains("id=\"viewer-stage\""),
                 "页面带图片查看器（点图放大，不再跳新标签页）");
@@ -259,6 +259,8 @@ public final class WebUiTest {
                 "图片查看器支持放大、适应屏幕/1:1 切换与关闭");
         check(script.body().contains("function imageNode") && countOf(script.body(), "imageNode(") >= 5,
                 "所有出图位置（对话、回执、网格、控制台）都走同一个图片节点");
+        check(script.body().contains("function receiptGroup") && script.body().contains("function appendCaptureGroup"),
+                "回执与对话都按出站消息分条渲染（一条消息 = 一张卡 / 一条聊天记录）");
         check(script.body().contains("openViewer(src, caption)") && script.body().contains("点击放大（Esc 关闭）"),
                 "点图直接调查看器，链接上只留提示不再跳转");
         check(script.body().contains("applyGeneration(true)"), "点「开始生成」前先把面板里没提交的改动发出去");
@@ -367,13 +369,16 @@ public final class WebUiTest {
         Map<String, String[]> expected = new LinkedHashMap<>();
         expected.put("/", new String[]{"panel-chat", "chat-log", "chat-send", "chat-reset"});
         expected.put("/gen", new String[]{"panel-gen", "set-width", "set-sampler", "gen-applied", "gen-progress-bar",
-                "preset-save", "infix-filter", "task-list", "task-summary", "image-grid"});
-        expected.put("/prompt", new String[]{"panel-prompt", "prompt-positive", "prompt-add-btn", "usage-body", "undo-btn"});
+                "preset-save", "infix-filter", "task-list", "task-summary", "image-grid", "image-note"});
+        expected.put("/prompt", new String[]{"panel-prompt", "prompt-positive", "prompt-add-btn", "usage-body", "undo-btn",
+                "data-tag-complete"});
         expected.put("/styles", new String[]{"panel-styles", "style-batch-delete", "style-list", "style-save"});
         expected.put("/loras", new String[]{"panel-loras", "lora-count", "lora-filter", "lora-query", "civitai-grid"});
         expected.put("/functions", new String[]{"panel-functions", "function-list", "function-save"});
         expected.put("/chatcfg", new String[]{"panel-chatcfg", "apply-frequency", "set-personality", "set-chat-global"});
-        expected.put("/system", new String[]{"panel-system", "civitai-login-btn", "sd-start-btn", "sd-auto-start", "sd-detail", "endpoint-list"});
+        expected.put("/system", new String[]{"panel-system", "sd-start-btn", "sd-auto-start", "sd-detail", "endpoint-list"});
+        expected.put("/setup", new String[]{"panel-setup", "setup-owner", "setup-save", "setup-reload",
+                "civitai-link", "civitai-link-save", "civitai-clear-btn"});
         expected.put("/logs", new String[]{"panel-logs", "terminal-body", "terminal-input", "terminal-fullscreen",
                 "terminal-clear", "terminal-tail", "logs-source"});
         expected.put("/help", new String[]{"panel-help", "help-body"});
@@ -643,6 +648,12 @@ public final class WebUiTest {
         }
         check(payload != null && payload.get("done").getAsBoolean(), "回执带 done 标记（前端据此收工）：" + payload);
         check(payload.has("images") && payload.has("ageMillis"), "回执带图片列表与存活时长：" + payload.keySet());
+        // 分组视图：一条出站消息一组，组内 text/image 保序——前端据此做「一条一项、图文同条」。
+        check(payload.has("messages") && payload.getAsJsonArray("messages").size() >= 1,
+                "回执按出站消息分组（messages）：" + payload.get("messages"));
+        JsonArray firstGroup = payload.getAsJsonArray("messages").get(0).getAsJsonArray();
+        check(firstGroup.size() >= 1 && firstGroup.get(0).getAsJsonObject().has("type"),
+                "分组里每个片段都带 type（text/image）：" + firstGroup);
         post(base, "/api/capture/close", token, captureBody(freshId));
     }
 
@@ -755,12 +766,20 @@ public final class WebUiTest {
                 "被拒绝之后尺寸仍是上一次生效的值");
     }
 
-    /** 图片接口只允许 data/generated 下的真实图片。 */
+    /** 图片接口只允许 data/generated 下的真实图片；列表要列得出已领取的历史图片（刷新/重启后仍在）。 */
     private static void imageGuard(String base, Path root) throws Exception {
         String token = "test-token-123456";
         Files.writeString(root.resolve("data/generated/evil.txt"), "not an image");
         JsonObject images = post(base, "/api/images", token, body(null));
-        check(images.getAsJsonArray("images").size() >= 0, "图片列表可读");
+        JsonArray listed = images.getAsJsonArray("images");
+        // sample.png 是直接落盘的（没进待领取队列）：以前"只列待领取"会让它在刷新后整片消失。
+        JsonObject sample = null;
+        for (JsonElement item : listed)
+            if (item.getAsJsonObject().get("path").getAsString().equals("data/generated/sample.png")) sample = item.getAsJsonObject();
+        check(sample != null, "已领取的历史图片仍然出现在列表里：" + listed);
+        check(!sample.get("pending").getAsBoolean(), "不在待领取队列里的图片标 pending=false：" + sample);
+        check(sample.get("name").getAsString().equals("sample.png") && sample.get("size").getAsLong() > 0,
+                "列表项带文件名与体积：" + sample);
         HttpResponse<String> ok = HTTP.send(HttpRequest.newBuilder(URI.create(base + "/api/image?token=" + token + "&path=data/generated/sample.png")).GET().build(),
                 HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
         check(ok.statusCode() == 200, "data/generated 下的图片可以读取（" + ok.statusCode() + "）");
@@ -787,7 +806,8 @@ public final class WebUiTest {
 
         HttpResponse<String> page = HTTP.send(HttpRequest.newBuilder(URI.create(base + "/setup")).GET().build(),
                 HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
-        check(page.statusCode() == 200 && page.body().contains("/api/config/state"), "配置页免令牌可打开");
+        check(page.statusCode() == 200 && page.body().contains("panel-setup"),
+                "Setup 栏目（首次配置入口）免令牌可打开");
 
         // 首次配置：不带令牌就能填密钥与地址（本机回环）
         JsonObject filled = post(base, "/api/config/apply", null, Json.parse(

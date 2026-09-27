@@ -537,4 +537,25 @@ a.image-link img:hover { border-color: rgba(120, 160, 220, .55); }
 /* 终端里的滚动条更细一点，不抢视线 */
 .terminal-body::-webkit-scrollbar { width: 9px; }
 .terminal-body::-webkit-scrollbar-thumb { background: rgba(120, 160, 220, .35); background-clip: padding-box; }
+/* Setup 栏目：测试连接与保存结果的状态文字 */
+.setup-ok { color: var(--accent-2); }
+.setup-bad { color: var(--danger); }
+
+/* 提示词 tab 补全：候选下拉与用于量光标位置的隐藏镜像层 */
+.tag-suggest {
+  position: fixed; z-index: 60; max-height: 264px; overflow-y: auto; padding: 4px;
+  background: rgba(15, 23, 40, .98); border: 1px solid var(--line); border-radius: 12px; box-shadow: var(--shadow);
+}
+.tag-suggest-item {
+  display: flex; align-items: baseline; gap: 8px; width: 100%; padding: 6px 9px;
+  background: transparent; border: 0; border-radius: 8px; color: inherit; font: inherit; text-align: left; cursor: pointer;
+}
+.tag-suggest-item.active, .tag-suggest-item:hover { background: rgba(90, 162, 255, .18); }
+.tag-suggest-tag { font-family: ui-monospace, Consolas, monospace; font-size: 13.5px; }
+.tag-suggest-zh { color: var(--muted); font-size: 12.5px; }
+.tag-suggest-meta { margin-left: auto; color: var(--muted); font-size: 11.5px; opacity: .75; }
+.tag-mirror {
+  position: absolute; top: -9999px; left: -9999px; visibility: hidden; white-space: pre-wrap;
+  word-wrap: break-word; overflow-wrap: break-word; pointer-events: none;
+}
 .terminal-body::-webkit-scrollbar-thumb:hover { background: rgba(140, 180, 240, .6); background-clip: padding-box; }

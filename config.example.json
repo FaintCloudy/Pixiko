@@ -16,7 +16,7 @@
   "maps": {},
   "sd": {
     "base_url": "http://127.0.0.1:7860",
-    "root": "F:/sd/sd-webui",
+    "root": "",
     "auto_start": true,
     "start_on_boot": false,
     "start_args": "--api --xformers --skip-python-version-check",
@@ -34,7 +34,7 @@
   },
   "civitai": {
     "session_cookie": "",
-    "lora_dir": "F:/sd/sd-webui/models/Lora",
+    "lora_dir": "",
     "base_url": "https://civitai.red",
     "api_token": "",
     "proxy_url": "http://127.0.0.1:7890",
