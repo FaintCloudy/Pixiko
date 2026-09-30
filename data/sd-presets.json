@@ -1,0 +1,14 @@
+{
+  "version": 1,
+  "presets": {
+    "default": {
+      "steps": 20,
+      "cfg_scale": 5.2,
+      "seed": -1,
+      "checkpoint": "waiIllustriousSDXL_v170.safetensors [f116b0c78f]",
+      "sampler_name": "DPM++ 2M",
+      "width": 832,
+      "height": 1216
+    }
+  }
+}
