@@ -1,49 +1,71 @@
 # ---------------------------------------------------------------------------
-# Pixiko — 绝不进版本库的文件
-# 这个仓库是公开的。下面每一项都必须在任何提交里保持缺席。
+# Pixiko — .gitignore
+#
+# 这个仓库的实际用途：**在笔记本和台式机之间同步进度**。
+# 所以取舍标准是「换台机器能不能接着干」，不是「能不能给别人从 0 部署」：
+#   · 要同步的：源码、脚本、文档、词库、语料、地图、以及**运行期状态**
+#     （提示词、样式、参数预设、功能集、好感度/情绪、队列、人设……）
+#   · 不同步的：能从别处重新生成的（build/、依赖 jar、node_modules）、
+#     体积巨大的（生成图、测试临时目录）、随时会变的噪声（日志、备份）。
 # ---------------------------------------------------------------------------
 
-# 本机配置：含 QQ 号、Civitai Cookie、WebUI 访问令牌、DeepSeek 密钥文件路径
+# ---------------------------------------------------------------- 本机配置
+# config.json：含 owner QQ、Civitai Cookie、NapCat 令牌、网页访问令牌。
+# ⚠ 仓库是公开的：一旦提交就等于把 DeepSeek 额度、Civitai 会话、控制台登录权公开。
+#   想连它一起同步，先把仓库设为 private，再把下面这行注释掉。
 config.json
 
-# 运行期数据：密钥文件、原作语料、生成图、队列与状态
-# 这些目录都只在仓库根目录，所以用 / 开头锚定：
-# 不加锚点会连源码一起吃掉（例如 nextjs-wip/app/logs/page.tsx 会被 "logs/" 命中）。
-# 注意是 /data/*（不是 /data/）：中文词库与词表要随包分发，下面用 ! 逐个放行；
-# 目录本身不能整体忽略，否则「父目录被排除时无法再放行其中的文件」。
+# ---------------------------------------------------------------- 运行期状态（要同步）
+# data/ 下的小文件全是「进度」：提示词、样式、预设、功能集、好感度、情绪、队列、人设。
+# 先排除整个目录，再逐个放行，否则父目录被排除时无法再放行里面的文件。
 /data/*
-!/data/prompt-tags.txt
-!/data/prompt-tags.source.json
-!/data/prompt-usage.json
-!/data/prompt-zh-tags.json
-!/data/prompt-zh-extra.txt
-!/data/prompt-zh-usage.md
-!/data/prompt-zh-use-notes.txt
-# 《Rewrite》原作对白语料（第三方版权内容，作者要求随仓库分发，权利人要求即删）
-!/data/kotori-corpus.txt
-# 上游 danbooru 原始词表（data/danbooru/ 整个目录放行，用于离线重建词库）
+!/data/*.json
+!/data/*.txt
+!/data/prompts/
 !/data/danbooru/
+# 密钥文件永远不进库（哪怕仓库转私有，也建议单独同步，别进 git 历史）
+/data/deepseek-api-key.txt
+/data/deepseek-chat-api-key.txt
+/data/*-api-key.txt
+# 运行期锁与体积大的生成图
+/data/bot.lock
+/data/generated/
+
+# ---------------------------------------------------------------- 地图（要同步）
+# 地图图片随仓库分发（.yh / .liv 开箱可用）：换成自己的图就覆盖 maps/yh、maps/liv 里的文件。
+
+# ---------------------------------------------------------------- 开发脚本（要同步）
+# work/ 下只留能看懂、能复用的脚本与说明；测试临时目录、日志、截图、大数据一律不同步。
+/work/*
+!/work/*.ps1
+!/work/*.sh
+!/work/*.cjs
+!/work/*.mjs
+!/work/*.md
+
+# ---------------------------------------------------------------- 不同步：日志 / 备份 / 构建产物
 /logs/
-/work/
 /backup/
 /build/
-# 地图图片随包分发（.yh / .liv 开箱可用）：换成自己的图就覆盖 maps/yh、maps/liv 里的文件。
+/logs/**
+/backup/**
 
-# 依赖与构建产物
-node_modules/
-.next/
-out/
+# ---------------------------------------------------------------- 不同步：可再生成的依赖
 lib/*.jar
 lib/spring/
 *.jar
 *.class
+node_modules/
+.next/
+out/
 *.tsbuildinfo
 next-env.d.ts
 nextjs-wip/.next/
 nextjs-wip/out/
 
-# 日志、压缩包、临时文件
+# ---------------------------------------------------------------- 不同步：噪声与临时文件
 *.log
+*.jsonl
 *.zip
 *.7z
 *.tmp
@@ -52,15 +74,30 @@ nextjs-wip/out/
 *.orig
 *.rej
 
-# 本机密钥（DeepSeek 两条通道各一份）
-data/deepseek-api-key.txt
-data/deepseek-chat-api-key.txt
+# ---------------------------------------------------------------- 不同步：F:\Bot 根目录的 Next.js 残留
+# 那次重构的代码已经在 nextjs-wip/ 里留档，根目录这几份是过期的开发树，别跟着同步。
+/app/
+/components/
+/public/
+/tests/
+/server.mjs
+/package.json
+/package-lock.json
+/next.config.ts
+/tsconfig.json
+/instrumentation.ts
+/build-next.bat
+/run-next.bat
+/test-next.bat
+/stop-next.ps1
+
+# ---------------------------------------------------------------- 密钥 / 环境变量
 *-api-key.txt
 *.key
 .env
 .env.*
 
-# 编辑器 / 系统
+# ---------------------------------------------------------------- 编辑器 / 系统
 .vscode/
 .idea/
 *.iml
