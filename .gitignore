@@ -34,13 +34,21 @@ config.json
 !/data/kotori-corpus.txt
 
 # ③ 非敏感的运行期状态（要同步：换台机器接着干）
-!/data/chat-personality-kotori.txt      # 人设文本
-!/data/civitai-style-links.json         # 样式名与来源链接
-!/data/prompt-meanings.json             # 词条中文释义缓存
-!/data/napcat-last-start.txt            # 上一次拉起 NapCat 的时间戳
-!/data/sd-parameters.json               # 步数 / CFG / 种子 / 底模
-!/data/sd-presets.json                  # 参数预设
-!/data/sd-settings.json                 # 采样方法 / 尺寸
+#    注意：gitignore 的规则行末尾**不能写注释**，注释必须单独一行，否则整行变成匹配模式。
+#    人设文本
+!/data/chat-personality-kotori.txt
+#    样式名与来源链接
+!/data/civitai-style-links.json
+#    词条中文释义缓存
+!/data/prompt-meanings.json
+#    上一次拉起 NapCat 的时间戳
+!/data/napcat-last-start.txt
+#    步数 / CFG / 种子 / 底模
+!/data/sd-parameters.json
+#    参数预设
+!/data/sd-presets.json
+#    采样方法 / 尺寸
+!/data/sd-settings.json
 
 # ④ 明确**不同步**（2026-09-27 由作者决定）：
 #    · /data/prompts/          个人 prompt（含露骨内容）、文件名是群成员 QQ 号
