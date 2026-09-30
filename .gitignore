@@ -15,19 +15,55 @@
 #   想连它一起同步，先把仓库设为 private，再把下面这行注释掉。
 config.json
 
-# ---------------------------------------------------------------- 运行期状态（要同步）
-# data/ 下的小文件全是「进度」：提示词、样式、预设、功能集、好感度、情绪、队列、人设。
-# 先排除整个目录，再逐个放行，否则父目录被排除时无法再放行里面的文件。
+# ---------------------------------------------------------------- 运行期状态
+# 采用「白名单」写法：/data/* 先全部排除，再把要同步的逐个放行。
+# 这样新增的运行期文件默认不进库，想同步时必须显式加一行——避免误传个人内容。
 /data/*
-!/data/*.json
-!/data/*.txt
-!/data/prompts/
+
+# ① 词库与词表（随仓库分发，见 THIRD-PARTY-LICENSES.md）
+!/data/prompt-tags.txt
+!/data/prompt-tags.source.json
+!/data/prompt-usage.json
+!/data/prompt-zh-tags.json
+!/data/prompt-zh-extra.txt
+!/data/prompt-zh-usage.md
+!/data/prompt-zh-use-notes.txt
 !/data/danbooru/
-# 密钥文件永远不进库（哪怕仓库转私有，也建议单独同步，别进 git 历史）
+
+# ② 《Rewrite》原作对白语料（第三方版权，作者要求随仓库分发，权利人要求即删）
+!/data/kotori-corpus.txt
+
+# ③ 非敏感的运行期状态（要同步：换台机器接着干）
+!/data/chat-personality-kotori.txt      # 人设文本
+!/data/civitai-style-links.json         # 样式名与来源链接
+!/data/prompt-meanings.json             # 词条中文释义缓存
+!/data/napcat-last-start.txt            # 上一次拉起 NapCat 的时间戳
+!/data/sd-parameters.json               # 步数 / CFG / 种子 / 底模
+!/data/sd-presets.json                  # 参数预设
+!/data/sd-settings.json                 # 采样方法 / 尺寸
+
+# ④ 明确**不同步**（2026-09-27 由作者决定）：
+#    · /data/prompts/          个人 prompt（含露骨内容）、文件名是群成员 QQ 号
+#    · /data/local-styles.json 样式库正文（含露骨 prompt）
+#    · /data/sd-state.json / sd-prompt-previous.json / sd-latest.json  当前与上一次的 prompt
+#    · /data/sd-outbox.json    待领取队列（引用没同步的生成图，过去也是悬空路径）
+#    · /data/sd-functions.json 功能集定义（含露骨 prompt）
+#    · /data/affinity.json / mood.json  键是群号，属他人标识
+#    · /data/deepseek-*.txt    DeepSeek 密钥
+#    · /data/bot.lock          运行期锁
+#    · /data/generated/        生成图（本机 10 GB，不进 git）
+/data/prompts/
+/data/local-styles.json
+/data/sd-state.json
+/data/sd-prompt-previous.json
+/data/sd-latest.json
+/data/sd-outbox.json
+/data/sd-functions.json
+/data/affinity.json
+/data/mood.json
 /data/deepseek-api-key.txt
 /data/deepseek-chat-api-key.txt
 /data/*-api-key.txt
-# 运行期锁与体积大的生成图
 /data/bot.lock
 /data/generated/
 
