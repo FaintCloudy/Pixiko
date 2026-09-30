@@ -1,13 +1,29 @@
-# Pixiko v1.0.5 发行说明
+# Pixiko v1.0.6 发行说明
 
-- **版本**：v1.0.5
+- **版本**：v1.0.6
 - **日期**：2026-09-27
 - **作者**：loriko（deloriko@outlook.com）
 - **当前实现**：Java 版（`src/`）。另有一次**未完成的** Next.js 重构，见 `nextjs-wip/`，**不可运行**。
 
 ---
 
-## 〇、本版新增（v1.0.5）
+## 〇、本版新增（v1.0.6）
+
+**《Rewrite》原作对白语料随仓库与发行包分发**：`data/kotori-corpus.txt`（324 KB，45 个场景、
+2,707 句小鸟台词 + 瑚太朗等角色 2,820 句，共 122,675 字符）进了仓库、源码包与开箱即用包，
+下载后「原作语料复现」（`chat.corpus_replay`，默认开）直接生效，不用再自己准备语料：
+命中相近的原作问答时会参考原句说话，同时注入 2,689 组问答、45 个场景的锚点素材
+（启动日志会打印「原作语料已载入：2689 组问答（45 个场景）…」）。
+
+> **版权声明（请务必读）**：这个文件**不是开源内容，也不是本项目创作**，版权属于
+> **Key / VisualArts**；本项目与官方没有任何关系、未获授权或认可，该文件不附带任何许可证。
+> 它由仓库所有者决定随包提供，使用者请自行判断合规风险；
+> **权利人若提出异议，会立即删除该文件**（连同 `.gitignore` 里的白名单行），
+> 机器人随后静默降级为只走口癖锚点，其余功能不受影响。
+> 明细见 `THIRD-PARTY-LICENSES.md` 与 `README.md` 版权一节。
+
+<details>
+<summary>上一版（v1.0.5）</summary>
 
 **控制台多一个「配置」栏目，Civitai 账号改成黏一条一次性登录链接**：原来独立的首次运行配置页
 （`webui/setup.html`）并进控制台，导航栏新增「配置」（`/setup`，**URL 不变**）：机器人名字、owner QQ、
@@ -40,6 +56,9 @@ Danbooru 词条（↑↓ 选择、Esc 关闭；空词条上按 **Ctrl+Space** �
 
 **`config.example.json` 去掉 Windows 示例路径**：`sd.root` 与 `civitai.lora_dir` 默认改为空字符串
 （留空表示不用机器人拉起 SD、用不了 Civitai 下载），`README.md` 对应说明同步更新。
+
+</details>
+
 
 <details>
 <summary>更早版本（v1.0.4）</summary>
@@ -75,9 +94,6 @@ Danbooru 词条（↑↓ 选择、Esc 关闭；空词条上按 **Ctrl+Space** �
   `source_file` 现在都写成仓库相对路径（此前是 `F:\sd\...`）。**词条内容一个字节没变**（逐条比对差异 0）。
 - **打包口径**：`data/danbooru/`（原始词表）**只进源码包**；开箱即用包里不含它（运行时不需要，避免白涨 9.8 MB）。
 
-<details>
-<summary>更早版本（v1.0.2 / v1.0.1）</summary>
-
 **v1.0.3 —— 上游 danbooru 原始词表入库**（`data/danbooru/`，9.8 MB，只进源码包）：`danbooru.main-140782.csv`（`prompt-tags.txt` 的来源）、`danbooru.csv`（分类与热度）、`danbooru.zh_CN_SFW.csv`（中文翻译）；`tools/build-zh-tags.mjs` 的 `--tags-dir` 默认值改为仓库内 `data/danbooru`，`--check` 在仓库/源码包里输出「一致」；清掉了公开文件里的本机绝对路径。
 
 **v1.0.2 —— 中文词库随包分发**：`data/` 下的提示词词库进了仓库与两个发行包，下载后开箱就有词库可用：
@@ -98,8 +114,6 @@ Danbooru 词条（↑↓ 选择、Esc 关闭；空词条上按 **Ctrl+Space** �
 4. **识别群禁言，不再硬发**：全员禁言或机器人自己被禁言时不再尝试发送，日志里只记一次
    「禁言中，跳过发送」，不再刷一屏 `retcode=1200`；解除通知 / 到期 / 每分钟回查三条路自动恢复，
    禁言期间聊天不发起模型调用（省额度）。见 `README.md`「被禁言时不会硬发」。
-
-</details>
 
 </details>
 
@@ -137,7 +151,7 @@ Danbooru 词条（↑↓ 选择、Esc 关闭；空词条上按 **Ctrl+Space** �
 
 ## 三、安装与启动（三步）
 
-### 开箱即用包 `pixiko-v1.0.5-runnable.zip`
+### 开箱即用包 `pixiko-v1.0.6-runnable.zip`
 
 1. 装好 **JDK 17+**。
 2. **双击 `start.bat`**。第一次运行会自动生成 `config.json`（照 `config.example.json` 起一份），
@@ -147,7 +161,7 @@ Danbooru 词条（↑↓ 选择、Esc 关闭；空词条上按 **Ctrl+Space** �
 
 > `start.bat` 跑的是包内已编译好的 `build/pixiko.jar`；只有需要改代码时才用 `build.ps1` + `run.bat`。
 
-### 源码包 `pixiko-v1.0.5.zip`
+### 源码包 `pixiko-v1.0.6.zip`
 
 1. 装好 **JDK 17+**。
 2. 在项目根目录准备好依赖 jar：`lib/gson-2.13.1.jar` 由 `build.ps1` **自动下载并校验**，
@@ -188,13 +202,15 @@ copy config.example.json config.json
 1. **`nextjs-wip/` 未完成、不可运行。** 那次 Next.js + TypeScript 重构的后端 `lib/**`（约 60 个文件）已丢失，
    `app/**` 与 `components/**` 都 `import '@/lib/...'`，因此无法构建；依赖同一后端的 `tests/**` 也没有收进仓库。
    详见 `nextjs-wip/README.md`。**Java 版才是当前实现。**
-2. **原作对白语料不随包分发。** `data/kotori-corpus.txt` 是《Rewrite》的原创文本，有版权，需**自备**。
-   该文件不存在时，语料复现功能（`chat.corpus_replay`）**自动降级**——静默失效，其余功能不受影响。
+2. **原作对白语料从 v1.0.6 起随包分发**（`data/kotori-corpus.txt`，见「本版新增」）。它是《Rewrite》的原创文本，
+   **版权归 Key / VisualArts**，未获授权、不附带许可证，由仓库所有者决定随包提供，使用者自行判断合规风险；
+   **权利人若提出异议会立即删除**——删掉该文件即可，语料复现功能（`chat.corpus_replay`）随后自动降级为只走口癖锚点，
+   其余功能不受影响。
 3. **第三方 jar 不随源码包分发。** `lib/spring/`（Spring Boot 运行时，23 个 jar / 约 17 MB）需自行获取，
    否则 `build.ps1` 会以 `Missing lib\spring ...` 退出；`lib/gson-2.13.1.jar` 由脚本自动下载并做 SHA-256 校验。
    **开箱即用包已包含这两者**，不需要你操心。
 4. **本包不含任何真实凭据。** 没有 QQ 号、Civitai Cookie、网页访问令牌或 DeepSeek 密钥；
-   `config.json` 与 `data/` 里的敏感内容（密钥、生成图、队列状态、原作语料）都不在包里。
+   `config.json` 与 `data/` 里的敏感内容（密钥、生成图、队列状态）都不在包里。
    `data/` 里随包分发中文词库与词表（`data/prompt-*`）；源码包里另有 `data/danbooru/` 上游原始词表，
    开箱即用包不含后者。另有空的 `logs/`、`maps/` 占位目录。**第一次运行必须自己配置 owner 与密钥**。
 5. **默认没有 owner。** 公开代码里 `Settings.DEFAULT_OWNER` 是空字符串（原版本内置了作者 QQ，
@@ -210,8 +226,8 @@ copy config.example.json config.json
 
 ## 六、在 GitHub Releases 里发布这个 zip
 
-1. 打开仓库 → 右侧 **Releases** → **Draft a new release**，Tag 填 `v1.0.5`（新建 tag），标题填 `Pixiko v1.0.5`。
-2. 把 `pixiko-v1.0.5.zip` 与 `pixiko-v1.0.5-runnable.zip`（以及各自的 `.sha256`）拖进附件区，
+1. 打开仓库 → 右侧 **Releases** → **Draft a new release**，Tag 填 `v1.0.6`（新建 tag），标题填 `Pixiko v1.0.6`。
+2. 把 `pixiko-v1.0.6.zip` 与 `pixiko-v1.0.6-runnable.zip`（以及各自的 `.sha256`）拖进附件区，
    正文粘贴本文件内容后点 **Publish release**。
 
 > 建仓库时 License 请选 **None**（本项目保留所有权利，不使用开源许可证）。

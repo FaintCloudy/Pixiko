@@ -5,7 +5,7 @@ Pixiko 是一个自用的 QQ 机器人：接 **NapCat** 收消息，接 **Stable
 领图；机器人自己把生成好的图片发回对话。
 
 - **作者**：loriko（deloriko@outlook.com）
-- **版本**：v1.0.5（发行说明见 [`RELEASE.md`](RELEASE.md)）
+- **版本**：v1.0.6（发行说明见 [`RELEASE.md`](RELEASE.md)）
 - **当前实现**：**Java 版**（`src/`）——这是线上一直在跑的那一份
 - **网页控制台**：`webui/`（纯静态 HTML/CSS/JS，随机器人一起由内嵌 Spring Boot 提供）
 - **SD WebUI 桥接扩展**：`webui-extension/pixiko-bridge/`（把文生图页正在编辑的提示词同步给机器人）
@@ -148,7 +148,7 @@ run.bat --set-map yh "路径"       # 命令行设置地图（需先停止机器
 ## 四、配置项要点（`config.json`）
 
 > **`config.json` 不进版本库；`data/` 只放行中文词库与词表。** 前者含真实 QQ 号、Civitai Cookie、
-> 网页访问令牌；`data/` 里的 DeepSeek 密钥、生成图、队列状态、原作语料同样都不进仓库。
+> 网页访问令牌；`data/` 里的 DeepSeek 密钥、生成图、队列状态同样都不进仓库。
 > 随包分发的只有 `data/prompt-*.json|txt|md` 这几个词库文件（见下），`.gitignore` 里逐个白名单放行。
 
 | 配置段 | 关键项 | 说明 |
@@ -347,7 +347,7 @@ run.bat --set-map yh "路径"       # 命令行设置地图（需先停止机器
 ```
 pixiko\
 ├─ README.md                       本文件
-├─ RELEASE.md                      v1.0.5 发行说明（含版权声明与已知限制）
+├─ RELEASE.md                      v1.0.6 发行说明（含版权声明与已知限制）
 ├─ THIRD-PARTY-LICENSES.md         随二进制包分发的第三方组件与许可
 ├─ config.example.json             脱敏配置模板（复制成 config.json 再改）
 ├─ .gitignore                      config.json / data / logs / lib jar 等一律不入库
@@ -435,14 +435,15 @@ pixiko\
 - **角色与作品版权归原作者。** 机器人的默认人设指向《**Rewrite**》的**神户小鸟**，
   该角色与作品版权属于 **Key / VisualArts**。本项目与官方**没有任何关系**，
   不是官方作品，也未获官方授权或认可。
-- **原作对白语料不随本仓库分发。** `data/kotori-corpus.txt` 是《Rewrite》的原创对白文本，
-  有版权，因此**被明确排除在仓库之外**（同时已在 `.gitignore` 里）。
-  `chat.corpus_replay` 相关功能需要你自己准备该文件并自行承担版权责任；
-  文件不存在时该功能静默失效，其余功能不受影响。
+- **原作对白语料（`data/kotori-corpus.txt`）从 v1.0.6 起随仓库与发行包分发。**
+  它是《Rewrite》的原创对白文本（45 个场景、2,707 句小鸟台词、122,675 字符），
+  **版权属于 Key / VisualArts**，本项目**未获授权**、也不以开源许可分发；由仓库所有者决定随包提供，
+  仅用于「原作语料复现」这一功能。**权利人若提出异议，这个文件会被立即删除**（删掉它即可，
+  其余功能不受影响：文件不存在时 `chat.corpus_replay` 静默降级为只走口癖锚点）。
 - 仓库中不包含任何真实凭据：Civitai Cookie、网页访问令牌、DeepSeek 密钥、真实 QQ 号
   与个人目录路径都已被移除或替换为占位符。
 - **中文词库随包分发**（`data/prompt-*.json|txt|md`，来源与许可见 「提示词与中文词库」一节与
-  `THIRD-PARTY-LICENSES.md`）；`data/` 里的其它内容（密钥、生成图、队列状态、原作语料）仍然不进包。
+  `THIRD-PARTY-LICENSES.md`）；`data/` 里仍然不进包的是：DeepSeek 密钥、生成图、队列状态等运行期数据。
 
 > 随二进制发行包一起分发的第三方组件（Spring Boot 系列、gson）均为 Apache-2.0，
 > 清单见 [`THIRD-PARTY-LICENSES.md`](THIRD-PARTY-LICENSES.md)。

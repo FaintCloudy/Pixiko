@@ -19,6 +19,8 @@ config.json
 !/data/prompt-zh-extra.txt
 !/data/prompt-zh-usage.md
 !/data/prompt-zh-use-notes.txt
+# 《Rewrite》原作对白语料（第三方版权内容，作者要求随仓库分发，权利人要求即删）
+!/data/kotori-corpus.txt
 # 上游 danbooru 原始词表（data/danbooru/ 整个目录放行，用于离线重建词库）
 !/data/danbooru/
 /logs/

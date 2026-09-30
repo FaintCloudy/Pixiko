@@ -1,13 +1,13 @@
-Pixiko v1.0.5 —— 第一次运行，三步走
+Pixiko v1.0.6 —— 第一次运行，三步走
 ====================================
 
 【你下载的是哪个包？】
 
-  pixiko-v1.0.5-runnable.zip   ← 开箱即用。里面已经带好了编译好的 jar 和全部依赖，
+  pixiko-v1.0.6-runnable.zip   ← 开箱即用。里面已经带好了编译好的 jar 和全部依赖，
                                  只要有 JDK 17+，双击 start.bat 就能启动。
                                  （就选这个，除非你要改代码。）
 
-  pixiko-v1.0.5.zip            ← 源码包。给要编译、要改代码的人用，
+  pixiko-v1.0.6.zip            ← 源码包。给要编译、要改代码的人用，
                                  需要自己补 lib\spring\ 里的 Spring Boot 依赖，
                                  再用 run.bat 构建并启动。
 
@@ -73,7 +73,7 @@ Pixiko v1.0.5 —— 第一次运行，三步走
      这样报错信息会留在屏幕上。最常见的原因是没装 JDK，或 java.exe 不在 PATH 里。
 
   Q: 提示 build\pixiko.jar not found？
-  A: 你下的是源码包（pixiko-v1.0.5.zip）。源码包请用 run.bat（它会先编译再启动），
+  A: 你下的是源码包（pixiko-v1.0.6.zip）。源码包请用 run.bat（它会先编译再启动），
      或者改用开箱即用包。
 
   Q: 提示 lib\spring not found？
@@ -102,8 +102,9 @@ Pixiko v1.0.5 —— 第一次运行，三步走
   · 机器人默认人格指向《Rewrite》的「神户小鸟」，该角色与作品版权属于
     Key / VisualArts。本项目与官方没有任何关系，非官方作品，未获官方授权或认可。
 
-  · 原作对白语料（data/kotori-corpus.txt）不随包分发，需要自备。
-    该文件不存在时，语料复现功能会自动降级，其余功能不受影响。
+  · 原作对白语料（data/kotori-corpus.txt）随包提供：这是《Rewrite》的原作文本，
+    版权归 Key / VisualArts，本项目未获授权、不附带许可证，仅用于「原作语料复现」功能；
+    权利人若提出异议会立即删除（删掉该文件即可，其余功能不受影响）。
 
   · 随二进制包分发的第三方组件（Spring Boot / Spring Framework / Tomcat / Gson 等）
     的许可证与全文，见 THIRD-PARTY-LICENSES.md 与 LICENSES\ 目录。
