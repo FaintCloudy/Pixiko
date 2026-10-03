@@ -20,8 +20,10 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
+import java.util.Set;
 
 /**
  * 网页控制台的全部 {@code /api/**} 接口（等价于迁移前 WebUiServer 里的 {@code route()}）。
@@ -153,6 +155,19 @@ public class WebApiController {
             }
             // 任务回执（/quest/#22）：按任务号取那一条，实时返回指令结果与图片。
             case "/api/quest": return WebJson.ok(bot.webQuest(Json.num(body, "id", 0)));
+            // 任务回执列表（摘要 + 未读标记）：正文仍然只有 /api/quest 才回，列表里一条正文都不带。
+            case "/api/quests": return WebJson.ok(bot.webQuests(questLimit(request, body)));
+            case "/api/quests/read": {
+                requirePost(method);
+                // numbers 是任务号数组（不存在的忽略），all=true 表示全部标为已读。
+                JsonArray items = body.has("numbers") && body.get("numbers").isJsonArray()
+                        ? body.getAsJsonArray("numbers") : new JsonArray();
+                Set<Integer> numbers = new LinkedHashSet<>();
+                for (JsonElement item : items) {
+                    try { numbers.add(item.getAsInt()); } catch (RuntimeException ignored) { /* 非数字的号忽略 */ }
+                }
+                return WebJson.ok(bot.webMarkQuestsRead(numbers, Json.bool(body, "all", false)));
+            }
             case "/api/capture": {
                 Bot.WebCapture capture = bot.webCapture(Json.str(body, "id", ""));
                 if (capture == null) throw new IllegalArgumentException("回执已结束或不存在。");
@@ -294,6 +309,16 @@ public class WebApiController {
         if (!name.isBlank()) return name;
         String value = request.getParameter("name");
         return value == null ? "" : value;
+    }
+
+    /** 回执列表的 limit：body 与查询串都认（GET /api/quests?limit=50），认不出的值用默认 50。 */
+    static int questLimit(HttpServletRequest request, JsonObject body) {
+        if (body.has("limit") && !body.get("limit").isJsonNull()) {
+            try { return body.get("limit").getAsInt(); } catch (RuntimeException ignored) { return 50; }
+        }
+        String value = request.getParameter("limit");
+        if (value == null || value.isBlank()) return 50;
+        try { return Integer.parseInt(value.strip()); } catch (NumberFormatException ignored) { return 50; }
     }
 
     /** 本机 LoRA 的展示图（civitai.lora_dir 里的 <模型名>.preview.png），路径校验在 Bot 里做。 */

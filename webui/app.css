@@ -647,3 +647,66 @@ a.image-link img:hover { border-color: rgba(120, 160, 220, .55); }
 .quest-images { display: flex; flex-wrap: wrap; gap: 8px; }
 .quest-images img { max-width: min(100%, 260px); max-height: 260px; border-radius: 10px; border: 1px solid var(--line); }
 .quest-empty { color: var(--muted); }
+
+/* ---------------------------------------------------------------- 回执列表（左列表 / 右详情）
+   未查看（unread）的行：左边一条色条 + 圆点 + 加粗 + 高亮底色 + 「未读」徽标，四种标记一起上。 */
+.quest-split { display: grid; grid-template-columns: minmax(250px, 340px) minmax(0, 1fr); gap: 12px; align-items: start; }
+.quest-list-card { min-width: 0; }
+.quest-list {
+  display: flex; flex-direction: column; gap: 6px;
+  max-height: min(56vh, 560px); overflow-y: auto; padding-right: 2px;
+  border-radius: 10px;
+}
+.quest-list::-webkit-scrollbar { width: 8px; }
+.quest-list::-webkit-scrollbar-thumb { background: rgba(120, 160, 220, .3); border-radius: 8px; }
+.quest-row {
+  display: flex; align-items: flex-start; gap: 6px; width: 100%; text-align: left;
+  background: rgba(120, 160, 220, .06); color: var(--text);
+  border: 1px solid var(--line); border-left: 3px solid transparent; border-radius: 12px;
+  padding: 8px 10px; font-weight: 450; cursor: pointer;
+  transition: background .2s var(--ease), border-color .2s var(--ease), transform .15s var(--ease);
+}
+.quest-row:hover { background: rgba(120, 160, 220, .14); transform: translateY(-1px); }
+.quest-row.unread {
+  border-left-color: var(--accent);
+  background: rgba(90, 162, 255, .14);
+}
+.quest-row.unread .quest-row-cmd { font-weight: 700; color: #eaf3ff; }
+.quest-row.current { border-color: rgba(90, 162, 255, .55); }
+.quest-row.expired { opacity: .78; }
+.quest-row.expired .quest-row-cmd { color: var(--muted); }
+.quest-dot {
+  flex: 0 0 auto; width: 8px; height: 8px; margin-top: 6px; border-radius: 50%;
+  background: transparent;
+}
+.quest-row.unread .quest-dot { background: var(--accent); box-shadow: 0 0 8px rgba(90, 162, 255, .8); }
+.quest-row-main { display: flex; flex-direction: column; gap: 2px; min-width: 0; flex: 1 1 auto; }
+.quest-row-line { display: flex; align-items: baseline; gap: 6px; min-width: 0; }
+.quest-row-num { flex: 0 0 auto; color: var(--muted); font-variant-numeric: tabular-nums; font-size: 12.5px; }
+.quest-row-cmd { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13.5px; }
+.quest-row-state { flex: 0 0 auto; color: var(--muted); font-size: 11.5px; white-space: nowrap; }
+.quest-row-badge {
+  flex: 0 0 auto; font-size: 11px; padding: 1px 7px; border-radius: 999px;
+  color: #04101f; background: var(--accent); font-weight: 600;
+}
+.quest-row-spin { flex: 0 0 auto; align-self: center; }
+.quest-row-summary {
+  color: var(--muted); font-size: 12px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+
+/* 「回执」页签上的未读数徽标：文字在 active 态是深色、平时是 muted，所以徽标用自带底色 + 亮字。 */
+.tab-badge {
+  display: inline-flex; align-items: center; justify-content: center; min-width: 18px;
+  margin-left: 6px; padding: 0 5px; height: 18px; border-radius: 999px;
+  background: var(--accent); color: #04101f; font-size: 11.5px; font-weight: 700;
+  font-variant-numeric: tabular-nums; line-height: 1;
+}
+.tab.active .tab-badge { background: #04101f; color: #dce9ff; }
+
+@media (max-width: 860px) {
+  /* 窄屏：列表与详情改成上下堆叠 */
+  .quest-split { grid-template-columns: minmax(0, 1fr); }
+  .quest-list { max-height: 40vh; }
+}
+

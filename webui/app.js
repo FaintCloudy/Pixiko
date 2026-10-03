@@ -6,6 +6,9 @@
   const state = { token: localStorage.getItem(TOKEN_KEY) || '', status: null, options: null, pollTimer: null, followTimer: null, busy: 0,
     seenImages: new Map(), seenGroups: new Map(), followUntil: 0, receiptKey: '', receiptTexts: 0, receiptImages: 0,
     receiptCount: 0, receiptBox: null, receiptToasted: '',
+    // 「回执」栏：全部回执列表 + 未查看（unread）标记。字段与 /api/quests 契约一致。
+    quests: { unread: 0, latest: 0, retainedMinutes: 0 }, questPollTimer: null,
+    questList: null, questListError: '', questListLoading: false, questListWarned: false,
     loras: null, loraGroups: null, terminalHistory: [], terminalCursor: 0,
     // Civitai 搜索的翻页状态：搜索词与当前页留在前端，翻页时不用重敲。
     civitaiQuery: '', civitaiPage: 1 };
@@ -283,7 +286,11 @@
         return;
       }
       renderQuest(data);
-      if (data.done && !data.busy) clearInterval(questWatch.timer);
+      if (data.done && !data.busy) {
+        clearInterval(questWatch.timer);
+        renderQuestList();                 // 跑完了：列表里那条从「进行中…」变成已完成
+        refreshQuestListQuietly();
+      }
     };
     await tick();
     questWatch.timer = setInterval(tick, 900);
@@ -300,7 +307,22 @@
     $('quest-command').textContent = data.command ? '指令：' + data.command : '';
     $('quest-progress').textContent = data.latest ? '最新一条是 #' + data.latest : '';
     body.innerHTML = '';
-    if (data.error) { body.appendChild(el('div', 'quest-empty', data.error)); return; }
+    if (data.error) {
+      // 旧回执：正文过期（重启后/超过保留时间）时只留摘要 —— 不能白屏，也不能像报错一样吓人。
+      const listed = Array.isArray(state.questList) ? state.questList.find((item) => item && item.number === number) : null;
+      const expired = data.expired === true || (listed && listed.expired)
+        || /过期|expired|不存在|没有这条/i.test(String(data.error));
+      if (expired) {
+        const notice = el('div', 'quest-step');
+        notice.appendChild(el('div', 'head', '正文已过期（只保留摘要）'));
+        notice.appendChild(el('div', 'quest-text', data.summary || (listed && listed.summary)
+          || '这条回执的正文已经过期，摘要也没有留下。指令与时间仍能在左边列表里看到。'));
+        body.appendChild(notice);
+        return;
+      }
+      body.appendChild(el('div', 'quest-empty', data.error));
+      return;
+    }
 
     const groups = Array.isArray(data.messages) && data.messages.length ? data.messages : null;
     const steps = groups || (data.texts || []).map((text) => [{ type: 'text', text }]);
@@ -330,6 +352,234 @@
       body.appendChild(box);
     }
     if (running) body.appendChild(el('div', 'quest-empty', '（还在跑，实时刷新中…）'));
+  }
+
+  // ---------------------------------------------------------------- 回执列表（/quest 左栏）与未读标记
+
+  /**
+   * 页签徽标上的未读数：只认 `state.quests.unread`（服务端的未读总数）。
+   * 三处会刷新它：/api/status 的轻量轮询、/api/quests 列表头部的总数、/api/quests/read 标记后的新值。
+   * 不按列表里的行数去数——列表可能落后于服务端（少报），也可能还挂着刚点掉的那一行（多报）。
+   */
+  function questUnreadCount() {
+    return Math.max(0, Number(state.quests.unread) || 0);
+  }
+
+  /** 相对时间：刚刚 / 3 分钟前 / 2 小时前（超过一天就退回本地绝对时间）。 */
+  function relativeTime(millis) {
+    const value = Number(millis);
+    if (!Number.isFinite(value) || value < 0) return '未知';
+    if (value < 60_000) return '刚刚';
+    const minutes = Math.floor(value / 60_000);
+    if (minutes < 60) return minutes + ' 分钟前';
+    const hours = Math.floor(minutes / 60);
+    if (hours < 24) return hours + ' 小时前';
+    const days = Math.floor(hours / 24);
+    if (days < 7) return days + ' 天前';
+    const when = new Date(Date.now() - value);
+    return when.toLocaleDateString('zh-CN');
+  }
+
+  function questListState(text) {
+    const node = $('quest-list-state');
+    if (!node) return;
+    node.textContent = text || '';
+    node.hidden = !text;
+  }
+
+  /** 把整张列表刷成"已读"（本地），未读点立刻消失。 */
+  function clearLocalUnread() {
+    if (!Array.isArray(state.questList)) return;
+    state.questList.forEach((item) => { if (item) item.unread = false; });
+    state.quests.unread = 0;
+    renderQuestList();
+  }
+
+  /** 单条标为已读：本地先落，再让后端确认；失败就把点补回来（列表与徽标同步）。 */
+  async function readQuests(payload) {
+    if (payload && payload.all) {
+      clearLocalUnread();
+      renderQuestTabBadge();
+    } else if (payload && Array.isArray(payload.numbers) && Array.isArray(state.questList)) {
+      payload.numbers.forEach((number) => {
+        const item = state.questList.find((row) => row && row.number === number);
+        if (item) item.unread = false;
+      });
+      // 先把本地总数减一（徽标立刻掉一格），/api/quests/read 的返回值随后会覆盖成权威值。
+      state.quests.unread = Math.max(0, (Number(state.quests.unread) || 0) - payload.numbers.length);
+      renderQuestList();
+    }
+    try {
+      const data = await api('/api/quests/read', { body: payload || { all: true } });
+      if (data && Number.isFinite(Number(data.unread))) state.quests.unread = Number(data.unread);
+      renderQuestTabBadge();
+      return data;
+    } catch (error) {
+      if (String(error.message) !== 'unauthorized') {
+        // 后端不认这个接口（旧版本）：本地按已读处理就行，不要把点又弹回来，也不再重拉列表。
+        toast('标记已读没有成功：' + error.message);
+      }
+      return null;
+    }
+  }
+
+  /**
+   * 拉全部回执列表（**只读，不隐式改已读** —— 一行在还没被点开之前必须是"未读"）。
+   * 旧后端没有 /api/quests 时给出提示并优雅降级，其余功能照常。
+   */
+  async function loadQuestList() {
+    if (!Array.isArray(state.questList)) questListState('正在读取回执列表…');
+    const data = await api('/api/quests?limit=50');
+    if (!data || !Array.isArray(data.quests)) throw new Error('bad payload');   // 旧后端返回 {} 时也走这里
+    state.questList = data.quests;
+    // unread 总数以服务端为准（列表里可能还有没带 unread 的条目），列表只用来画每行的点。
+    if (Number.isFinite(Number(data.unread))) state.quests.unread = Number(data.unread);
+    else state.quests.unread = state.questList.filter((item) => item && item.unread).length;
+    if (Number.isFinite(Number(data.latest))) state.quests.latest = Number(data.latest);
+    if (Number.isFinite(Number(data.retainedMinutes))) state.quests.retainedMinutes = Number(data.retainedMinutes);
+    state.questListError = '';
+    renderQuestList();
+    renderQuestTabBadge();
+    return data;
+  }
+
+  function questListFailed(error) {
+    const message = String((error && error.message) || error || '');
+    if (message === 'unauthorized') return;               // 401 由 api() 弹回登录页
+    state.questList = null;
+    state.questListError = '列表接口不可用（' + message + '）';
+    const box = $('quest-list');
+    if (box) box.innerHTML = '';                          // 先把上一次的行清掉，再画降级提示
+    renderQuestList();
+    renderQuestTabBadge();
+    if (!state.questListWarned) {                          // 旧后端：只提示一次，别每 30 秒吵一遍
+      state.questListWarned = true;
+      toast('回执列表接口不可用，单条回执照常可看。');
+    }
+  }
+
+  /** 末位刷新：列表里有"进行中"的条目就顺带更新一下状态（不重复标已读）。 */
+  async function refreshQuestListQuietly() {
+    if (!Array.isArray(state.questList)) return;
+    if (!(PAGE === 'quest' && document.visibilityState !== 'hidden')) return;
+    if (!state.questList.some((item) => item && (item.busy || (item.done === false && !item.expired)))) return;
+    try { await loadQuestList(); } catch { /* 旧后端/断网：下一次动作再刷新 */ }
+  }
+
+  /**
+   * 回执未读数的轻量轮询：每 30 秒问一次 /api/status（**不拉列表**），
+   * 有新回执时页签徽标就涨。标签页切回来立刻问一次；页面隐藏时完全不动。
+   */
+  async function pollQuestStatusQuietly() {
+    if (!state.token || document.visibilityState === 'hidden') return;
+    try {
+      const status = await api('/api/status');
+      const quests = status.quests || {};
+      // 这里**只认服务端的数**：列表是上一次拉的，可能已经过期；下一行才是真相。
+      if (Number.isFinite(Number(quests.unread))) state.quests.unread = Number(quests.unread);
+      if (Number.isFinite(Number(quests.latest))) state.quests.latest = Number(quests.latest);
+      renderQuestTabBadge();
+      if (PAGE === 'quest') await refreshQuestListQuietly();
+    } catch { /* 旧后端/断网/未登录：静默，等下一次 */ }
+  }
+
+  /** 「回执」页签上的未读数徽标（所有栏目都会跟着 /api/status 更新）。 */
+  function renderQuestTabBadge() {
+    const badge = $('quest-tab-badge');
+    const tab = $('tab-quest');
+    if (!badge) return;
+    const count = questUnreadCount();
+    badge.hidden = count <= 0;
+    badge.textContent = count > 99 ? '99+' : String(count);
+    badge.title = count > 0 ? count + ' 条未查看的回执' : '';
+    if (tab) tab.setAttribute('aria-label', '回执' + (count > 0 ? '（' + count + ' 条未查看）' : ''));
+  }
+
+  function renderQuestList() {
+    const box = $('quest-list');
+    if (!box) return;
+    box.innerHTML = '';
+    const unread = questUnreadCount();
+    if (state.questListError) {
+      questListState(state.questListError);
+      const hint = el('div', 'quest-empty', '列表接口不可用：单条回执照样看（上面填任务号，或用「最新一条」）。');
+      hint.setAttribute('data-quest', 'list-unavailable');
+      box.appendChild(hint);
+      renderQuestTabBadge();
+      return;
+    }
+    if (!Array.isArray(state.questList)) { questListState('正在读取回执列表…'); return; }
+    const retained = state.quests.retainedMinutes;
+    questListState(state.questList.length
+      ? '共 ' + state.questList.length + ' 条' + (unread ? ' · 未读 ' + unread : '') + (retained ? ' · 正文保留 ' + retained + ' 分钟' : '')
+      : '还没有任何回执。');
+    if (!state.questList.length) {
+      box.appendChild(el('div', 'quest-empty', '下达一条指令后，回执会出现在这里。'));
+      renderQuestTabBadge();
+      return;
+    }
+    const current = questWatch.number || questNumberFromLocation();
+    state.questList.forEach((item) => {
+      if (!item) return;
+      const number = Number(item.number);
+      const running = !item.done || item.busy;
+      const row = el('button', 'quest-row' + (item.unread ? ' unread' : '') + (running ? ' running' : '')
+        + (item.expired ? ' expired' : '') + (number === current ? ' current' : ''));
+      row.type = 'button';
+      row.setAttribute('role', 'listitem');
+      row.setAttribute('data-number', String(number));
+      row.setAttribute('aria-label', '回执 #' + number + '：' + (item.command || '（无指令）')
+        + '，' + (running ? '进行中' : relativeTime(item.ageMillis))
+        + (item.expired ? '，正文已过期，只保留摘要' : '') + (item.unread ? '，未读' : ''));
+      if (number === current) row.setAttribute('aria-current', 'true');
+      row.appendChild(el('span', 'quest-dot', item.unread ? '' : null));   // 未读圆点（已读时保持占位，行高不跳）
+      const main = el('div', 'quest-row-main');
+      const line = el('div', 'quest-row-line');
+      line.appendChild(el('span', 'quest-row-num', '#' + number));
+      line.appendChild(el('span', 'quest-row-cmd', item.command || '（无指令）'));
+      if (item.unread) line.appendChild(el('span', 'quest-row-badge', '未读'));
+      line.appendChild(el('span', 'quest-row-state',
+        item.expired ? '已过期' : (running ? '进行中…' : relativeTime(item.ageMillis))));
+      if (running && !item.expired) line.appendChild(el('span', 'spin quest-row-spin'));
+      main.appendChild(line);
+      const summary = item.expired
+        ? '已过期（只保留摘要）' + (item.summary ? '：' + item.summary : '')
+        : (item.summary || (running ? '（还在跑，暂无摘要）' : '（没有摘要）'));
+      main.appendChild(el('div', 'quest-row-summary', summary));
+      row.appendChild(main);
+      row.addEventListener('click', () => openQuest(number));
+      box.appendChild(row);
+    });
+    renderQuestTabBadge();
+  }
+
+  /** 点列表里的一行：换地址（可分享/可刷新）→ 打开那条 → 标为已读（点立刻消失）。 */
+  function openQuest(number) {
+    const value = Number(number);
+    if (!Number.isFinite(value) || value <= 0) return;
+    if (questNumberFromLocation() !== Math.floor(value)) history.replaceState(null, '', '/quest#' + Math.floor(value));
+    questWatch.number = Math.floor(value);              // 先认下来：下面的列表重画得知道哪一行是"当前"
+    loadQuest(Math.floor(value));                       // 内含 POST /api/quest {id}，后端会把它标为已读
+    readQuests({ numbers: [Math.floor(value)] });       // 前端不等后端：列表上的未读点立刻消失
+  }
+
+  /** 列表卡头部的两个按钮。 */
+  function bindQuestListActions() {
+    on('quest-list-refresh', 'click', () => {
+      loadQuestList()
+        .then((data) => toast('回执列表已刷新，共 ' + data.quests.length + ' 条。'))
+        .catch((error) => { questListFailed(error); toast('刷新失败：' + error.message); });
+    });
+    on('quest-list-all', 'click', () => {
+      if (!Array.isArray(state.questList)) { toast('列表还没读出来，先点「刷新」。'); return; }
+      if (!questUnreadCount()) { toast('没有未读的回执。'); return; }
+      readQuests({ all: true })
+        .then((data) => {
+          if (data && Number.isFinite(Number(data.marked))) toast('已把 ' + data.marked + ' 条标为已读。');
+          return loadQuestList();
+        })
+        .catch((error) => toast('操作失败：' + error.message));
+    });
   }
 
   /**
@@ -552,6 +802,16 @@
   async function loadStatus() {
     const status = await api('/api/status');
     state.status = status;
+    // 回执未读数：控制台所有栏目都在轮询 /api/status，新回执一到页签徽标就跟着涨。
+    const quests = status.quests || {};
+    if (Number.isFinite(Number(quests.unread)) || Number.isFinite(Number(quests.latest))) {
+      // 只覆盖服务端给的数：列表已经读出来时以列表为准（它刚刚才按本地点击改过）。
+      if (Number.isFinite(Number(quests.unread))) state.quests.unread = Number(quests.unread);
+      if (Number.isFinite(Number(quests.latest))) state.quests.latest = Number(quests.latest);
+      renderQuestTabBadge();
+    } else if (!Array.isArray(state.questList)) {
+      renderQuestTabBadge();   // 旧后端没有 quests 字段：没有徽标，但也不能因此报错
+    }
     setText('botname', status.botName || '神户小鸟');
     setText('subtitle', (status.scope || '') + ' · :' + (status.webPort || ''));
     setNode('health', (node) => { node.className = 'dot ok'; });
@@ -2917,9 +3177,19 @@
       if (data.quest) { location.hash = '#' + data.quest; loadQuest(data.quest); }
       else toast(data.error || '还没有任何任务回执。');
     });
-    on('quest-reload', 'click', () => loadQuest(questNumberFromLocation()));
+    on('quest-reload', 'click', () => {
+      loadQuest(questNumberFromLocation());
+      if (PAGE === 'quest') loadQuestList().catch((error) => questListFailed(error));
+    });
     if ($('quest-number')) on('quest-number', 'keydown', (event) => { if (event.key === 'Enter') { event.preventDefault(); $('quest-open').click(); } });
     window.addEventListener('hashchange', () => { if (PAGE === 'quest') loadQuest(questNumberFromLocation()); });
+    bindQuestListActions();
+    // 列表里的「进行中」条目不靠高频轮询：页面重新可见时刷一次就够了。
+    document.addEventListener('visibilitychange', () => {
+      if (document.hidden) return;
+      refreshQuestListQuietly();
+      pollQuestStatusQuietly();            // 切回来顺手问一次未读数（新回执 → 徽标涨）
+    });
 
     on('terminal-form', 'submit', async (event) => { event.preventDefault(); await submitTerminal(); });
     // 点终端任意位置都聚焦到提示符（真终端就是这样）
@@ -2964,7 +3234,12 @@
         resetTerminalTail();                   // 进控制台时把提示符下面那片"被顶上去"的空白收回默认高度
         await loadLogs();
         if ($('terminal-input')) $('terminal-input').focus();
-      } else if (PAGE === 'quest') await loadQuest();
+      } else if (PAGE === 'quest') {
+        await loadQuest();                     // 先单条回执（旧后端也必须有）
+        // 再拉整张列表：串行、单独 try，列表挂了（旧后端没有 /api/quests）也不影响上面那条。
+        try { await loadQuestList(); state.questListWarned = false; }
+        catch (error) { questListFailed(error); }
+      }
       else if (PAGE === 'help') await loadHelp();
       else if (PAGE === 'system') await loadChannels();
       // chatcfg / system 只要状态，上面已经拉过
@@ -2982,6 +3257,9 @@
     banner('');
     syncConsoleFullscreen(PAGE);               // 控制台栏目默认全屏（跟着页面走）
     clearInterval(state.followTimer);
+    clearInterval(state.questPollTimer);
+    // 回执未读徽标：只问 /api/status（很轻），不用整页刷新；页面隐藏时不发请求。
+    state.questPollTimer = setInterval(() => { pollQuestStatusQuietly(); }, 30000);
     state.followTimer = setInterval(() => {
       if ($('logs-follow') && $('logs-follow').checked && PAGE === 'logs') loadLogs().catch(() => {});
     }, 4000);

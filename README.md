@@ -5,7 +5,7 @@ Pixiko 是一个自用的 QQ 机器人：接 **NapCat** 收消息，接 **Stable
 领图；机器人自己把生成好的图片发回对话。
 
 - **作者**：loriko（deloriko@outlook.com）
-- **版本**：v1.0.15（发行说明见 [`RELEASE.md`](RELEASE.md)）
+- **版本**：v1.0.16（发行说明见 [`RELEASE.md`](RELEASE.md)）
 - **当前实现**：**Java 版**（`src/`）——这是线上一直在跑的那一份
 - **网页控制台**：`webui/`（纯静态 HTML/CSS/JS，随机器人一起由内嵌 Spring Boot 提供）
 - **SD WebUI 桥接扩展**：`webui-extension/pixiko-bridge/`（把文生图页正在编辑的提示词同步给机器人）
@@ -328,6 +328,21 @@ run.bat --set-map yh "路径"       # 命令行设置地图（需先停止机器
 网页控制台改完参数，提示信息云会回一句「已生效：…」并附「参数来源：…」。
 历史在 `logs/bot-YYYYMMDD.log`（或网页「日志」页）。
 
+### 任务回执：全部回执的列表与未读标记（v1.0.16）
+
+控制台「回执」栏（`/quest`）左边是**所有任务回执的列表**，右边是选中那条的执行结果。
+
+- 每行显示 `#编号`、指令、相对时间与**第一段文字的摘要**；**没看过的回执用未读圆点 + 高亮**标出来，
+  「回执」页签上带未读条数。点一行就打开那条（地址变成 `/quest#N`，可以直接把链接发给自己），
+  打开即标记已读；「全部标为已读」一次清空未读；「刷新」重读列表。
+- **正文只留存 30 分钟**（在内存里），列表摘要与已读状态存在 `data/quests.json`（最新 200 条），
+  所以重启后列表还在；点开一条正文已被回收的回执，会如实显示「内容已过期，只保留摘要」，
+  不会假装还在跑；正在跑的回执在列表里标「进行中…」。
+- 接口：`GET /api/quests?limit=50` → `quests[{number,command,startedAt,ageMillis,done,busy,unread,expired,texts,images,summary}]`
+  加 `unread/latest/total/retainedMinutes`；`POST /api/quests/read`（`{"numbers":[21,22]}` 或 `{"all":true}`）；
+  `GET /api/status` 顶层带 `quests:{unread,latest}`（控制台靠它更新页签徽标）。
+- 新回执到来时右下角仍会弹一条**回执云**，点它跳 `/quest#N`。
+
 ### 样式分类：一个 LoRA 一个分类，其余按归属栈
 
 样式库里每条样式都可以有分类（`data/local-styles.json` 的 `category` 字段）。**手动设过的分类优先**；
@@ -500,7 +515,7 @@ Civitai 下载记录里的 `base_model` → Forge 的 LoRA 元数据（`/sdapi/v
 ```
 pixiko\
 ├─ README.md                       本文件
-├─ RELEASE.md                      v1.0.15 发行说明（含版权声明与已知限制）
+├─ RELEASE.md                      v1.0.16 发行说明（含版权声明与已知限制）
 ├─ THIRD-PARTY-LICENSES.md         随二进制包分发的第三方组件与许可
 ├─ config.example.json             脱敏配置模板（复制成 config.json 再改）
 ├─ .gitignore                      config.json / data / logs / lib jar 等一律不入库

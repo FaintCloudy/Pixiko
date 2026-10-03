@@ -1200,6 +1200,14 @@ public final class Bot implements AutoCloseable {
                 Json.obj(settings.snapshot(), "civitai")).download(url, stage, meter));
     }
     public Bot(Settings settings, SdClient sd, Sender sender, LoraDownloader loraDownloader) {        this.settings = settings; this.sd = sd; this.sender = muteAware(webAware(sender)); this.loraDownloader = Objects.requireNonNull(loraDownloader);
+        // 回执索引：只存摘要与已读标记，列表在重启后也还在（读失败就是空索引，不影响回执）。
+        this.questFile = settings.root.resolve("data/quests.json");
+        this.questIndex = new QuestIndex();
+        this.questIndex.load(questFile);
+        // 刚读进来的索引就是"已保存"的样子：之后真的要写盘才算变化（空索引不会凭空建文件）。
+        this.questSavedRevision = this.questIndex.revision();
+        // 任务号在进程内自增；重启后从索引里的最大号接着发，新回执不会和旧摘要撞号。
+        WEB_QUEST_SEQ.accumulateAndGet(questIndex.latest(), Math::max);
         this.sdLauncher = new cn.szu.bot.sd.SdLauncher(cn.szu.bot.sd.SdLauncher.root(Json.obj(settings.snapshot(), "sd")),
                 () -> Json.obj(settings.snapshot(), "sd"), sd::reachable);
         // SD 的启动输出写进机器人自己的 logs 目录，和别的日志放在一起看。
@@ -4982,6 +4990,10 @@ public final class Bot implements AutoCloseable {
         public String id() { return id; }
         public String command() { return command; }
         public int number() { return number; }
+        /** 索引用的摘要信息：文字条数、图片条数、第一段文字（列表接口只回这些，不回正文数组）。 */
+        public int textCount() { return texts.size(); }
+        public int imageCount() { return images.size(); }
+        public String firstText() { return texts.isEmpty() ? "" : texts.get(0); }
         /** 收下一条出站消息：文本进 texts、图片段进 images（扁平视图），同时按原顺序记进 {@link #messages}。 */
         void capture(JsonArray segments) {
             if (segments == null) return;
@@ -5094,6 +5106,16 @@ public final class Bot implements AutoCloseable {
     private final Map<String, WebCapture> webCaptures = new ConcurrentHashMap<>();
     /** 每个网页会话最新的一条指令：异步后续消息（生成完成、下载进度）落到它上面。 */
     private final Map<String, WebCapture> webCurrent = new ConcurrentHashMap<>();
+    /** 回执索引：只存摘要与已读标记（正文只在 webCaptures 里），重启后列表还能看到。 */
+    private final QuestIndex questIndex;
+    /** 索引落盘文件（data/quests.json）。 */
+    private final Path questFile;
+    /** 回执在内存里保留的分钟数（索引过期标记与网页提示都以它为准）。 */
+    public static final int QUEST_RETAINED_MINUTES = 30;
+    /** 索引写盘节流：距上次写盘不足 2 秒、且内容没变，就不写——900ms 一次的轮询不能把磁盘写爆。 */
+    private static final long QUEST_SAVE_INTERVAL_MILLIS = 2000;
+    private volatile long questSavedMillis;
+    private volatile long questSavedRevision = -1;
     /** 正在执行这条指令的线程自己的回执：并发的多条指令不会互相串消息。 */
     private final ThreadLocal<WebCapture> webThreadCapture = new ThreadLocal<>();
     /** 控制台的指令并发执行（不再单线程排队），4 条同时跑足够用，也不会把机器压垮。 */
@@ -5231,18 +5253,21 @@ public final class Bot implements AutoCloseable {
                 WebCapture capture = webCaptureFor(event);
                 if (capture == null) return transport.send(event, segments);
                 capture.capture(segments);
+                observeQuest(capture);
                 return CompletableFuture.completedFuture(null);
             }
             @Override public CompletableFuture<Void> sendMap(JsonObject event, JsonArray segments) {
                 WebCapture capture = webCaptureFor(event);
                 if (capture == null) return transport.sendMap(event, segments);
                 capture.capture(segments);
+                observeQuest(capture);
                 return CompletableFuture.completedFuture(null);
             }
             @Override public CompletableFuture<Void> sendRecord(JsonObject event, List<JsonArray> messages) {
                 WebCapture capture = webCaptureFor(event);
                 if (capture == null) return transport.sendRecord(event, messages);
                 for (JsonArray message : messages) capture.capture(message);
+                observeQuest(capture);
                 return CompletableFuture.completedFuture(null);
             }
             @Override public CompletableFuture<JsonElement> callApi(String action, JsonObject params) { return transport.callApi(action, params); }
@@ -5301,6 +5326,7 @@ public final class Bot implements AutoCloseable {
         event.addProperty(WEB_CAPTURE_KEY, capture.id());
         webCaptures.put(capture.id(), capture);
         webCurrent.put(webConversationKey(scope), capture);
+        observeQuest(capture);
         Log.info("WebUI 指令（" + scope + "）：" + Log.text(label) + "（并发执行中 " + webRunning() + " 条）");
         webIO.execute(() -> {
             Log.markWeb();   // 网页指令的执行日志进 web-*.log
@@ -5315,6 +5341,7 @@ public final class Bot implements AutoCloseable {
             } finally {
                 // 指令体已结束：回执再静默 1.2 秒就算收完，网页可以随时发下一条。
                 capture.finish();
+                observeQuest(capture);
                 webThreadCapture.remove();
                 Log.clearWeb();
             }
@@ -5337,13 +5364,29 @@ public final class Bot implements AutoCloseable {
             }
         }
         if (capture == null) {
+            // 内容不在了也照样算"打开过"：索引里那一条（如果还在）标为已读，列表里不再算未读。
+            markQuestRead(number);
             JsonObject missing = new JsonObject();
             missing.addProperty("quest", number);
             missing.addProperty("latest", latestQuest());
-            missing.addProperty("error", number <= 0 ? "还没有任何任务回执。" : "回执 #" + number + " 不在了（回执只保留 30 分钟）。");
+            // 索引里还有摘要（重启后或超过保留时间的回执）就把摘要一起给出去：
+            // /quest#N 这种直接打开的链接也能看到"有过这么一条任务"，不用只吃一句报错。
+            JsonObject stale = questIndex.item(number);
+            if (stale != null) {
+                stale.addProperty("quest", number);
+                stale.addProperty("latest", latestQuest());
+                stale.addProperty("error", "回执 #" + number + " 的正文已过期：正文只在内存里保留 "
+                        + QUEST_RETAINED_MINUTES + " 分钟，下面是摘要。");
+                return stale;
+            }
+            missing.addProperty("error", number <= 0 ? "还没有任何任务回执。" : "回执 #" + number + " 不在了（回执只保留 "
+                    + QUEST_RETAINED_MINUTES + " 分钟）。");
             return missing;
         }
         capture.read();
+        // 打开过就标为已读（已读不会再变回未读），并把最新状态刷进索引。
+        markQuestRead(capture.number());
+        observeQuest(capture);
         // "还在跑"必须把出图队列算进去：生成一张图要几十秒，只报 busy（DeepSeek/LoRA）
         // 会让回执页在生成期间就停表——用户就永远等不到那张图。
         JsonObject result = capture.json(webBusy() || generationQueued());
@@ -5362,12 +5405,76 @@ public final class Bot implements AutoCloseable {
         return latest;
     }
     /**
+     * 网页「任务回执列表」：索引里的摘要（最新在前，最多 limit 条，钳到 1..200）。
+     *
+     * <p>只回元信息与摘要，**不回任何正文数组**；正文还在内存里的条目 expired=false，
+     * 重启后或超过保留时间的旧条目只给摘要，网页据此提示"内容已过期"。
+     */
+    public JsonObject webQuests(int limit) {
+        observeQuests();
+        return questIndex.json(limit, QUEST_RETAINED_MINUTES);
+    }
+    /**
+     * 批量标记已读：numbers 里的任务号（索引里没有的忽略），或者 all=true 全部。
+     * 返回 {@code {"unread":N,"marked":M}}，marked 是本次真正从"未读"变"已读"的条数。
+     */
+    public JsonObject webMarkQuestsRead(Set<Integer> numbers, boolean all) {
+        observeQuests();
+        int marked = all ? questIndex.markAllRead() : questIndex.markRead(numbers);
+        persistQuests(true);
+        JsonObject result = new JsonObject();
+        result.addProperty("unread", questIndex.unread());
+        result.addProperty("marked", marked);
+        return result;
+    }
+    /**
+     * 刷新索引里还活着的回执（列表与状态接口都先走这一步），再按节流落盘。
+     * 先 prune：超过保留时间的回执已经从内存里清掉，索引里那一条自然标成 expired。
+     */
+    private void observeQuests() {
+        pruneWebCaptures();
+        QuestIndex index = questIndex;
+        if (index == null) return;
+        index.begin();
+        for (WebCapture capture : webCaptures.values()) index.observe(capture);
+        persistQuests(false);
+    }
+    /** 一条回执变了（来了文字/图片、指令跑完）：立刻刷新索引，落盘按节流。 */
+    private void observeQuest(WebCapture capture) {
+        QuestIndex index = questIndex;
+        if (index == null || capture == null) return;
+        index.observe(capture);
+        persistQuests(false);
+    }
+    /**
+     * 索引落盘（节流）：内容没变就完全不写，变了也最多每 2 秒写一次——
+     * 网页 900ms 一次的轮询不会把磁盘写爆，下一轮轮询会把还没落盘的变化补上。
+     */
+    private void persistQuests(boolean force) {
+        QuestIndex index = questIndex;
+        if (index == null) return;
+        long revision = index.revision();
+        if (revision == questSavedRevision) return;
+        long now = System.currentTimeMillis();
+        if (!force && now - questSavedMillis < QUEST_SAVE_INTERVAL_MILLIS) return;
+        questSavedRevision = revision;
+        questSavedMillis = now;
+        index.save(questFile);
+    }
+    /** 打开一条回执：把索引里对应任务号标为已读（没有的号忽略），真的变了就立刻落盘。 */
+    private void markQuestRead(int number) {
+        QuestIndex index = questIndex;
+        if (index == null || number <= 0) return;
+        if (index.markRead(List.of(number)) > 0) persistQuests(true);
+    }
+    /**
      * 建一条回执（内部接口触发的任务也得有回执，不然"每次任务一个回执"就漏了）。
      * 和 {@link #webCommand} 一样登记进 webCaptures，网页照常轮询、/quest/#N 也能看。
      */
     private WebCapture newCapture(String label) {
         WebCapture capture = new WebCapture(UUID.randomUUID().toString(), label, settings.root.resolve("data/generated"));
         webCaptures.put(capture.id(), capture);
+        observeQuest(capture);
         return capture;
     }
     /** 正在执行的网页指令条数（日志与网页面板用）。 */
@@ -5379,12 +5486,17 @@ public final class Bot implements AutoCloseable {
     public WebCapture webCapture(String id) {
         pruneWebCaptures();
         WebCapture capture = webCaptures.get(id);
-        if (capture != null) capture.read();
+        if (capture != null) {
+            capture.read();
+            // 按 id 取回执也是"打开过"：同样标为已读。
+            markQuestRead(capture.number());
+            observeQuest(capture);
+        }
         return capture;
     }
     /** 收完的回执保留半小时：网页可能已经关掉，不能让收集器无限堆积。 */
     private void pruneWebCaptures() {
-        long deadline = System.nanoTime() - TimeUnit.MINUTES.toNanos(30);
+        long deadline = System.nanoTime() - TimeUnit.MINUTES.toNanos(QUEST_RETAINED_MINUTES);
         webCaptures.values().removeIf(capture -> capture.startedNanos < deadline);
         webCurrent.values().removeIf(capture -> !webCaptures.containsKey(capture.id()));
     }
@@ -5540,6 +5652,9 @@ public final class Bot implements AutoCloseable {
         result.addProperty("promptTerms", promptTerms(effectivePrompts(settings.webScope()).positive()).size());
         result.addProperty("pendingImages", sd.pendingImages().size());
         result.addProperty("loraStatus", loraStatus);
+        // 任务回执：列表页的角标只看这两个数（未读几条、最新是几号），不用把整份列表拉下来。
+        observeQuests();
+        result.add("quests", questIndex.counts());
         return result;
     }
 
@@ -6889,6 +7004,9 @@ public final class Bot implements AutoCloseable {
     int activeChatWorkflows() { return activeChatWorkflows.get(); }
     @Override public void close() {
         closed.set(true); loraClosed.set(true);
+        // 关停前把回执索引里还没落盘的变化补上（已读标记、最后几段摘要）。
+        observeQuests();
+        persistQuests(true);
         // Bounded grace period: a chain that is mid-way (for example .style load → .infix → .gen) must not
         // be cut in half, but shutdown still has to be prompt.
         long deadline = System.nanoTime() + java.util.concurrent.TimeUnit.SECONDS.toNanos(10);
