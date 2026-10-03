@@ -3332,6 +3332,35 @@ public final class Bot implements AutoCloseable {
         return applied;
     }
 
+    /**
+     * Forge／Forge Neo 的防呆：**只换底模不换预设栈**会出全灰废图（实测 SDXL 底模配 anima 栈 → 2 KB 灰图；
+     * 同一台机器上用 anima 栈自己的底模 + ER SDE + beta + Shift 3 → 671 KB 正常图）。
+     * 返回一句警告（不属于当前栈时），或空串（正常 / 不是 Forge / 跟随当前模型）。
+     */
+    private String forgeStackWarning(String checkpoint) {
+        try {
+            if (!sd.forge()) return "";
+            String requested = checkpoint == null ? "" : checkpoint.strip();
+            if (requested.isEmpty() || requested.equalsIgnoreCase("auto")) return "";
+            String active = sd.forgePreset();
+            for (String preset : sd.forgePresets()) {
+                String stackCheckpoint = Json.str(sd.forgePresetDefaults(preset), "checkpoint", "");
+                if (stackCheckpoint.isBlank()) continue;
+                String base = stackCheckpoint.replaceAll("(?i)\\.safetensors$", "").toLowerCase(Locale.ROOT);
+                String wanted = requested.toLowerCase(Locale.ROOT);
+                boolean same = wanted.equalsIgnoreCase(stackCheckpoint) || wanted.startsWith(base);
+                if (!same) continue;
+                if (preset.equalsIgnoreCase(active)) return "";
+                return "\n⚠ 这个底模属于 Forge 预设「" + preset + "」，当前栈是「" + active
+                        + "」：只换底模不换栈，出的是全灰废图。请改用 .model preset " + preset
+                        + "，或先在 Forge 页面把 UI Preset 切到 " + preset + "。";
+            }
+            return "\n⚠ 这个底模不在任何 Forge 预设栈里（当前栈「" + active
+                    + "」）：栈里的 VAE / 文本编码器对不上时出的是全灰废图。建议用 .model preset <名字> 切换，"
+                    + "或在 Forge 页面选好预设再出图。";
+        } catch (Exception error) { return ""; }
+    }
+
     /** 当前模型参数快照；读不到（SD 没跑）返回 null——存样式时不该因为 SD 离线就失败。 */
     private JsonObject modelParamsOrNull() {
         try { return sd.modelParams(); }
@@ -3396,7 +3425,9 @@ public final class Bot implements AutoCloseable {
             Matcher assignment = SET_VALUE.matcher(arguments);
             if (!assignment.matches() || assignment.group(1) == null || assignment.group(1).isBlank())
                 throw new IllegalArgumentException("用法：/" + option + " set <值>");
-            reply(event, "生成参数已保存，用于后续提交的任务：\n" + sd.setParameter(option, assignment.group(1).strip()).describe());
+            String assigned = assignment.group(1).strip();
+            reply(event, "生成参数已保存，用于后续提交的任务：\n" + sd.setParameter(option, assigned).describe()
+                    + (option.equals("model") ? forgeStackWarning(assigned) : ""));
             return;
         }
         String usage = switch (option) {
@@ -4153,6 +4184,8 @@ public final class Bot implements AutoCloseable {
         String model = Json.str(body, "model", "").strip();
         if (!model.isEmpty() && !model.equalsIgnoreCase(parameters.checkpoint())) {
             parameters = sd.setParameter("model", model);
+            String stackWarning = forgeStackWarning(model);
+            if (!stackWarning.isBlank()) changed.add(stackWarning.strip());
             changed.add("基础模型 " + parameters.checkpoint());
         }
         if (numberProvided(body, "steps")) {
