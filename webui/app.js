@@ -721,7 +721,7 @@
     const options = await api('/api/options');
     state.options = options;
     fillSelect('set-sampler', options.samplers, (state.status?.generation?.sampler) || '');
-    fillSelect('set-model', options.models, (state.status?.generation?.model) || '');
+    fillModelSelect('set-model', options, (state.status?.generation?.model) || '');
     appliedGeneration = JSON.stringify(generationPayload());
     applyGenerationSummary(state.status);
   }
@@ -739,6 +739,35 @@
       select.appendChild(option);
     });
     if (current && !list.includes(current)) {
+      const option = el('option', null, current + '（当前）');
+      option.value = current;
+      option.selected = true;
+      select.appendChild(option);
+    }
+  }
+
+  /**
+   * 基础模型下拉：每项后面带**归属栈**（后端从 safetensors 头部/记录/Forge 预设配置判出来），
+   * 例如 {@code waiIllustriousSDXL_v170.safetensors [SDXL 栈]}；悬停给出判定依据。
+   * 后端没给 modelOptions（SD 没在跑的老情况）时退回只有名字的下拉。
+   */
+  function fillModelSelect(id, options, current) {
+    const rows = (options && options.modelOptions) || [];
+    if (!rows.length) { fillSelect(id, (options && options.models) || [], current); return; }
+    const select = $(id);
+    if (!select) return;
+    select.innerHTML = '';
+    rows.forEach((item) => {
+      const option = el('option', null, item.stackLabel ? item.name + ' [' + item.stackLabel + ']' : (item.name || item.title));
+      option.value = item.title;
+      const why = item.evidence ? '判定依据：' + item.evidence : '';
+      option.title = item.stackLabel
+        ? item.stackLabel + (item.preset ? '（预设 ' + item.preset + '）' : '') + (why ? '；' + why : '')
+        : (why || '栈未识别');
+      if (item.title === current) option.selected = true;
+      select.appendChild(option);
+    });
+    if (current && !rows.some((item) => item.title === current)) {
       const option = el('option', null, current + '（当前）');
       option.value = current;
       option.selected = true;
@@ -881,7 +910,9 @@
     if (groups.length) $('style-pageselected').textContent += '；底模：' + groups.join('、');
     const filter = $('style-filter').value.trim().toLowerCase();
     const items = (data.styles || []).filter((item) => !filter || item.name.toLowerCase().includes(filter)
-      || String(item.baseModel || '').toLowerCase().includes(filter));
+      || String(item.baseModel || '').toLowerCase().includes(filter)
+      || String(item.stack || '').toLowerCase().includes(filter)
+      || String(item.stackLabel || '').toLowerCase().includes(filter));
     styleItems.clear();
     (data.styles || []).forEach((item) => styleItems.set(item.name, item));
     syncRows($('style-list'), styleRows, items, styleRow, '没有匹配的样式。');
@@ -925,10 +956,10 @@
     label.onclick = startRename;
     name.appendChild(label);
     name.appendChild(el('div', 'sub', '载入时替换你的个人提示词，之后 prompt 就是你自己的文本'));
-    // 样式保存时记下的模型参数（底模 + 采样方法/调度器/步数/CFG/Shift/尺寸）：载入时一并套用。
+    // 样式保存时记下的模型参数（底模 + 归属栈 + 采样方法/调度器/步数/CFG/Shift/尺寸）：载入时一并套用。
     if (item.modelSummary) {
       const model = el('div', 'sub');
-      model.appendChild(el('span', 'tag', item.baseModel || '底模未记录'));
+      model.appendChild(el('span', 'tag', item.stackLabel || item.baseModel || '底模未记录'));
       model.appendChild(document.createTextNode(' ' + item.modelSummary));
       model.title = item.modelSummary;
       name.appendChild(model);
@@ -1130,15 +1161,19 @@
     tick();
   }
 
-  /** 底模来源的中文说法（和机器人回执同一个词表）。 */
+  /** 底模/归属栈来源的中文说法（和机器人回执同一个词表）。 */
   function baseModelSourceLabel(source) {
+    if (source === 'safetensors-header') return 'safetensors 头部元数据';
+    if (source === 'safetensors-keys') return 'safetensors 张量结构';
     if (source === 'civitai') return 'Civitai 记录';
     if (source === 'forge-metadata') return 'Forge 元数据';
+    if (source === 'forge-preset') return 'Forge 预设配置';
     if (source === 'preset-inferred') return '按当前预设推断';
+    if (source === 'inferred') return '按文件名/当前预设推断';
     return '';
   }
 
-  /** 按底模分组：组头是底模名，来源写在旁边；未识别的排最后（组序由后端 groups 定）。 */
+  /** 按**归属栈**分组：组头是栈名（Anima 栈），旁边标出底模；判不出栈的排最后（组序由后端 groups 定）。 */
   function loraBuckets(items, groups) {
     const meta = new Map((groups || []).map((group) => [String(group.key == null ? '' : group.key), group]));
     const order = new Map((groups || []).map((group, index) => [String(group.key == null ? '' : group.key), index]));
@@ -1150,15 +1185,16 @@
         buckets.set(key, {
           key,
           keyed: !!key,
-          title: group.baseModel || item.baseModel || '未识别底模',
-          source: baseModelSourceLabel(group.baseModelSource || item.baseModelSource),
+          title: group.label || item.stackLabel || group.baseModel || item.baseModel || '未识别栈',
+          base: (group.baseModels || []).filter(Boolean).join('、') || item.baseModel || '',
+          source: baseModelSourceLabel(group.stackSource || item.stackSource),
           items: [],
         });
       }
       buckets.get(key).items.push(item);
     });
     return [...buckets.values()].sort((left, right) => {
-      if (left.keyed !== right.keyed) return left.keyed ? -1 : 1;         // 未识别底模的排最后
+      if (left.keyed !== right.keyed) return left.keyed ? -1 : 1;         // 未识别栈的排最后
       const leftRank = order.has(left.key) ? order.get(left.key) : order.size;
       const rightRank = order.has(right.key) ? order.get(right.key) : order.size;
       return leftRank - rightRank || left.title.localeCompare(right.title, 'zh');
@@ -1166,15 +1202,17 @@
   }
 
   /**
-   * 渲染本机 LoRA 列表：按底模分组（组头例如 Anima（4）· Civitai 记录），每项也带自己的底模标签。
-   * 行 DOM 仍按名字复用：加载/删除后不整表重画，列表不会晃。
+   * 渲染本机 LoRA 列表：按**归属栈**分组（组头例如 Anima 栈（4）· 底模 Anima · Forge 元数据），
+   * 每项也带自己的栈与底模标签。行 DOM 仍按名字复用：加载/删除后不整表重画，列表不会晃。
    */
   function renderLoras(items, groups) {
     const list = $('lora-list');
     const filter = ($('lora-filter') && $('lora-filter').value || '').trim().toLowerCase();
     const matched = (items || []).filter((item) => !filter || item.name.toLowerCase().includes(filter)
       || String(item.alias || '').toLowerCase().includes(filter)
-      || String(item.baseModel || '').toLowerCase().includes(filter));
+      || String(item.baseModel || '').toLowerCase().includes(filter)
+      || String(item.stack || '').toLowerCase().includes(filter)
+      || String(item.stackLabel || '').toLowerCase().includes(filter));
     const emptyText = (items || []).length
       ? '没有匹配「' + filter + '」的 LoRA（本机共 ' + items.length + ' 个）。'
       : '本机 LoRA 目录里还没有 .safetensors 文件；用上面「Civitai 搜索」下载，或把模型放进 '
@@ -1188,6 +1226,8 @@
       const holder = el('li', 'lora-group');
       const head = el('div', 'group-head');
       head.appendChild(el('span', 'group-name', bucket.title + '（' + bucket.items.length + '）'));
+      // 组头保留底模名：同一个栈下可以有多个底模（Illustrious / NoobAI / Pony 都是 SDXL 栈）。
+      if (bucket.base && bucket.base !== bucket.title) head.appendChild(el('span', 'tag', '底模 ' + bucket.base));
       if (bucket.source) head.appendChild(el('span', 'tag', bucket.source));
       holder.appendChild(head);
       const rows = el('ul', 'list group-rows');
@@ -1198,14 +1238,23 @@
         row.dataset.number = String(item.number);
         const number = row.querySelector('.num');
         if (number) number.textContent = '#' + item.number;
-        // 底模标签可能因为 Forge 元数据/预设栈的变化而变（补展示图之后就会），每次渲染对齐一次。
+        // 底模与归属栈标签可能因为 Forge 元数据/预设栈的变化而变（补展示图之后就会），每次渲染对齐一次。
         const base = row.querySelector('.lora-base');
-        if (base) base.textContent = item.baseModelLabel || (item.baseModel ? '底模 ' + item.baseModel : '底模未识别');
+        if (base) base.textContent = loraBaseText(item);
         rows.appendChild(row);
       });
       holder.appendChild(rows);
       list.appendChild(holder);
     });
+  }
+
+  /** 一行 LoRA 的归属文字：{@code Anima 栈 · 底模 Anima}（栈判不出来就只说底模，都不识别就说未识别）。 */
+  function loraBaseText(item) {
+    const stack = item && item.stackLabel ? item.stackLabel : '';
+    const base = item && (item.baseModelLabel || (item.baseModel ? '底模 ' + item.baseModel : ''));
+    if (stack && base) return stack + ' · ' + base;
+    if (stack) return stack;
+    return base || '底模未识别';
   }
 
   const loraRows = new Map();
@@ -1246,8 +1295,10 @@
     label.onclick = startRename;
     name.appendChild(label);
     if (item.alias) name.appendChild(el('div', 'sub', '别名：' + item.alias));
-    // 底模标签：Civitai 记录 → Forge 元数据 → 当前预设栈（推断的会写明），识别不出来就如实写未识别。
-    name.appendChild(el('div', 'sub lora-base', item.baseModelLabel || (item.baseModel ? '底模 ' + item.baseModel : '底模未识别')));
+    // 归属栈 + 底模：栈与当前 Forge 预设不一致时不能直接用（换底模不换栈会出全灰废图）。
+    const baseLine = el('div', 'sub lora-base', loraBaseText(item));
+    if (item.evidence) baseLine.title = '判定依据：' + item.evidence;
+    name.appendChild(baseLine);
     li.appendChild(name);
     const acts = el('div', 'acts');
     acts.appendChild(actionButton('加载', () => {
@@ -2607,7 +2658,7 @@
       // chatcfg / system 只要状态，上面已经拉过
       if (state.options) {
         fillSelect('set-sampler', state.options.samplers, state.status?.generation?.sampler || '');
-        fillSelect('set-model', state.options.models, state.status?.generation?.model || '');
+        fillModelSelect('set-model', state.options, state.status?.generation?.model || '');
       }
       banner('');
     } catch (error) {

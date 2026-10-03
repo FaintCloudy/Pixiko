@@ -164,6 +164,17 @@ public final class SdClientTest {
             equal(List.of("qwen_image_vae.safetensors"), client.modules(), "额外模块列表");
             expectFailure(() -> client.setForgePreset("nope"), "未知预设", "未知预设要报错并列出可用的");
 
+            // 归属栈：Forge 预设配置里哪个预设置的就是这个文件，它就属于那一栈（换底模防呆走的就是这条）。
+            equal(Map.of("anima", "animaCatTower_v11-full.safetensors", "sd", "Counterfeit-V3.0_fp16.safetensors",
+                            "xl", "waiIllustriousSDXL_v170.safetensors"),
+                    Map.copyOf(client.forgePresetCheckpoints()), "预设 → 检查点的映射");
+            equal("xl", client.checkpointInfo("waiIllustriousSDXL_v170.safetensors").stack(), "SDXL 底模属于 xl 栈");
+            equal("xl", client.checkpointInfo("waiIllustriousSDXL_v170.safetensors [f116b0c78f]").preset(), "带哈希的标题也能查到预设");
+            equal("sd", client.checkpointInfo("Counterfeit-V3.0_fp16.safetensors").stack(), "SD1.5 底模属于 sd 栈");
+            equal("anima", client.checkpointInfo("animaCatTower_v11-full.safetensors").stack(), "anima 栈自己的底模");
+            equal(null, client.checkpointInfo("完全没有这个模型"), "一条实据都没有时返回 null（调用方保留通用警告）");
+            equal("anima", client.checkpointInfo("animaCatTower_v11").stack(), "不带扩展名也查得到");
+
             // 采纳预设参数后，生成请求必须带上调度器与蒸馏 CFG（Anima 没有这两个就跑不出正常图）。
             client.setForgeExtras("Beta", 3);
             client.generate(new SdClient.Prompts("p", "n", "test"));

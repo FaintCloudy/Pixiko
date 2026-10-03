@@ -5,7 +5,7 @@ Pixiko 是一个自用的 QQ 机器人：接 **NapCat** 收消息，接 **Stable
 领图；机器人自己把生成好的图片发回对话。
 
 - **作者**：loriko（deloriko@outlook.com）
-- **版本**：v1.0.10（发行说明见 [`RELEASE.md`](RELEASE.md)）
+- **版本**：v1.0.11（发行说明见 [`RELEASE.md`](RELEASE.md)）
 - **当前实现**：**Java 版**（`src/`）——这是线上一直在跑的那一份
 - **网页控制台**：`webui/`（纯静态 HTML/CSS/JS，随机器人一起由内嵌 Spring Boot 提供）
 - **SD WebUI 桥接扩展**：`webui-extension/pixiko-bridge/`（把文生图页正在编辑的提示词同步给机器人）
@@ -291,7 +291,7 @@ run.bat --set-map yh "路径"       # 命令行设置地图（需先停止机器
 | `.sampler` / `.sampler list` / `.sampler set <完整名称>` | 采样方法 |
 | `.size` / `.size set <宽> <高>` | 图片宽高（64–2048 且为 8 的倍数，也支持 `768x512`） |
 | `.steps [set <步数>]` / `.cfg [set <数值>]` / `.seed [set <种子>]` | 步数／CFG／种子（种子 `-1` 为随机） |
-| `.model` / `.model list` / `.model set <完整名称>` / `.model set auto` | 基础模型（`auto`＝每次提交时用 WebUI 当前模型） |
+| `.model` / `.model list` / `.model set <完整名称>` / `.model set auto` | 基础模型（`list` 每项标出**归属栈**；`auto`＝每次提交时用 WebUI 当前模型；换到别的栈会给出防呆提示） |
 | `.model preset` / `.model preset <名字>` | Forge／Forge Neo 的预设：底模 + VAE + 文本编码器按栈切换，并采纳该栈的采样方法／调度器／尺寸／步数／CFG（Anima 就是其中一栈） |
 | `.imgcnt <数量>` | 每条聊天记录图片上限（默认 300，按任务分开发送） |
 | `.preset list\|save\|overwrite\|show\|load\|remove` | 参数预设 |
@@ -304,7 +304,39 @@ run.bat --set-map yh "路径"       # 命令行设置地图（需先停止机器
 预设里没给（例如 Anima 不设尺寸）就回退到机器人当前设置。实在识别不出底模时按当前预设栈**推断**，
 并在样式里标成「按当前预设推断」，绝不编一个底模名出来。`.style load` 会把这份参数套回机器人设置
 （只要提示词就加 `noparams`）；网页「样式」页上方按底模汇总（例如「底模：Anima 12、NoobAI 5」），
-每条样式也标着自己的底模。
+每条样式也标着自己的底模与**归属栈**。
+
+### 底模归属栈：它属于哪一栈、要切到哪个预设
+
+Forge／Forge Neo 把「底模 + VAE + 文本编码器」按预设分成一栈一栈（`anima` / `xl` / `sd` / `flux` /
+`qwen` …），**只换底模不换栈会出全灰废图**。所以光知道"底模叫什么"不够，还要知道"它属于哪一栈"。
+机器人判据按可靠性排序，全部来自真实数据：
+
+1. **safetensors 头部元数据（最可靠）**：读文件开头的头部 JSON（8 字节长度 + N 字节 JSON，只读前若干 KB，
+   **不加载权重**），取 `__metadata__` 里的 `ss_base_model_version`（如 `anima`）、
+   `modelspec.architecture`（如 `stable-diffusion-xl-v1-base`、`anima-preview/lora`）、`ss_sd_model_name`
+   （sd-scripts 的 `model.safetensors` 是占位，不算）；
+2. **头部张量名结构**（同一份头部）：SDXL 有第二个文本编码器 `conditioner.embedders.1.*`；SD1.5 只有
+   `conditioner.embedders.0.transformer.*`；SD2 是 `conditioner.embedders.0.model.*`（OpenCLIP）；
+   Anima 是 `net.llm_adapter.*` / `net.blocks.*`；Flux 是 `double_blocks.* + single_blocks.*`；
+   LoRA 侧看 `lora_te_*`（单文本编码器＝SD1.5，`ss_v2=True` 则是 SD2）与 `lora_te1_*`/`lora_te2_*`（＝SDXL）；
+3. **Civitai 下载记录**的 `base_model`；
+4. **Forge 的 LoRA 元数据**，以及 **Forge 预设配置** `forge_checkpoint_<preset>`（哪个预设置的就是这个文件，
+   它就属于那一栈——这是"归属"最直接的一条）；
+5. 兜底才按**文件名关键词**猜（anima、illustrious、noob、pony、sdxl、xl、sd1.5、sd_v1、sd 2、flux、qwen），
+   结果一律标成推断。
+
+判不出来就返回空串，**绝不编造**。用法：
+
+- `.model list` 每个底模后面标出栈：`waiIllustriousSDXL_v170.safetensors [SDXL 栈]`；
+- 网页「基础模型」下拉同样带栈（`GET /api/options` 的 `modelOptions` 给出「底模 → 栈」映射），
+  LoRA 面板按**栈**分组（组头 `Anima 栈（1）`、`SDXL 栈（1）`，组里保留底模名）；
+- `.model set <底模>` 与网页改底模时的**防呆**：所选底模的栈 ≠ 当前栈就直说
+  「`waiIllustriousSDXL_v170` 属于 SDXL 栈（预设 `xl`），当前是 anima 栈 —— 直接换会出全灰废图，
+  请用 `.model preset xl` 或在 Forge 页面切到 `xl`」；判不出栈时保留原来的通用警告；
+- 样式里也记 `stack` 字段，`.style load` 时样式栈 ≠ 当前栈会如实提示（**不偷偷切栈**）；
+- `GET /api/loras` 每项带 `stack` / `stackLabel` / `preset` / `stackSource` / `evidence`，
+  `groups` 按栈分组（`groupKey` 就是栈键，底模另给 `baseModelGroupKey`）。
 
 ### 出图、LoRA 与图片
 
@@ -323,8 +355,8 @@ run.bat --set-map yh "路径"       # 命令行设置地图（需先停止机器
 | `.lora query <模型搜索词>` | 搜索 Civitai，显示编号及封面 |
 | `.lora download #编号 [权重]` / `.lora download <Civitai链接> [权重]` | 下载并启用，同时把展示图提示词存成样式 |
 | `.lora status` | 查看最近下载状态 |
-| `.lora list` | 列出 WebUI 本地 LoRA（每项标出底模，并在上方按底模分组） |
-| `.lora detail <名称\|#编号>` | 查看一个本地 LoRA 的底模（含来源）、Civitai 记录与它的展示图样式 |
+| `.lora list` | 列出 WebUI 本地 LoRA（每项标出底模与**归属栈**，并在上方按栈分组） |
+| `.lora detail <名称\|#编号>` | 查看一个本地 LoRA 的底模（含来源与判据）、归属栈、Civitai 记录与它的展示图样式 |
 | `.lora load <完整本地名称> [权重]` | 重新加载或启用已有 LoRA |
 | `.lora rename <旧本地名称> <新本地名称>` | 重命名本地 LoRA 并同步个人 prompt 标签 |
 | `.lora delete <名称\|#编号>` | 删除本地 LoRA（只允许 LoRA 目录下的文件；**未列在 `--help` 输出里，但代码中可用**） |
@@ -351,13 +383,14 @@ run.bat --set-map yh "路径"       # 命令行设置地图（需先停止机器
 路径或名称含空格可以加双引号；目录按文件名发送，最多 10 张、每张最多 20MB；
 生成任务按顺序逐个运行，采用**发出指令时**的完整参数。
 
-**每个 LoRA 都带底模，网页按底模分组**：`/lora list`、`/lora detail` 与网页「LoRA」面板都会给出
-底模（基础模型），面板按底模分组显示（组头例如 `Anima（4）`），每项也有自己的底模标签。
-底模按**优先级**识别：Civitai 下载记录里的 `base_model` → Forge 的 LoRA 元数据
-（`/sdapi/v1/loras` 里每项的 `metadata.ss_base_model_version`，占位值 `model.safetensors` 不算）→
+**每个 LoRA 都带底模与归属栈，网页按栈分组**：`/lora list`、`/lora detail` 与网页「LoRA」面板都会给出
+底模（基础模型）与它属于哪一栈，面板按**栈**分组显示（组头例如 `Anima 栈（4）`，旁边保留底模名），
+每项也有自己的栈与底模标签。底模按**优先级**识别：safetensors 头部 `__metadata__` 声明的底模 →
+Civitai 下载记录里的 `base_model` → Forge 的 LoRA 元数据（`/sdapi/v1/loras` 里每项的
+`metadata.ss_base_model_version`，占位值 `model.safetensors` 不算）→ 头部张量名结构 →
 都没有时按**当前 Forge 预设栈**推断并标注「按当前预设推断」；实在没有就如实显示「未识别」。
-`GET /api/loras` 的每一项带 `baseModel` / `baseModelSource`（`civitai` / `forge-metadata` /
-`preset-inferred`）/ `groupKey`，并在 `groups` 里给出按底模分组的结果给网页直接用。
+`GET /api/loras` 的每一项带 `baseModel` / `baseModelSource` / `stack` / `stackLabel` / `preset` /
+`stackSource` / `evidence` / `groupKey`（栈键）/ `baseModelGroupKey`，并在 `groups` 里给出按**栈**分组的结果。
 
 ---
 
@@ -366,7 +399,7 @@ run.bat --set-map yh "路径"       # 命令行设置地图（需先停止机器
 ```
 pixiko\
 ├─ README.md                       本文件
-├─ RELEASE.md                      v1.0.10 发行说明（含版权声明与已知限制）
+├─ RELEASE.md                      v1.0.11 发行说明（含版权声明与已知限制）
 ├─ THIRD-PARTY-LICENSES.md         随二进制包分发的第三方组件与许可
 ├─ config.example.json             脱敏配置模板（复制成 config.json 再改）
 ├─ .gitignore                      config.json / data / logs / lib jar 等一律不入库

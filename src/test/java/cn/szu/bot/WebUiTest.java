@@ -397,12 +397,31 @@ public final class WebUiTest {
         check(loras.getAsJsonArray("loras").get(0).getAsJsonObject().has("baseModelSource")
                         && loras.getAsJsonArray("loras").get(0).getAsJsonObject().has("groupKey"),
                 "每项都带 baseModelSource 与 groupKey：" + loras.getAsJsonArray("loras").get(0));
+        // 归属栈：这个桩既没有 Forge 预设、文件也不存在，栈必须如实给空串（前端归到「未识别栈」）。
+        JsonObject onlyLora = loras.getAsJsonArray("loras").get(0).getAsJsonObject();
+        check(onlyLora.has("stack") && onlyLora.get("stack").getAsString().isEmpty()
+                        && onlyLora.has("stackLabel") && onlyLora.get("stackLabel").getAsString().isEmpty()
+                        && onlyLora.has("stackSource") && onlyLora.has("preset") && onlyLora.has("baseModelGroupKey"),
+                "每项都带 stack/stackLabel/stackSource/preset（判不出来必须是空串）：" + onlyLora);
+        check(!onlyLora.has("evidence") || onlyLora.get("evidence").getAsString().isEmpty(),
+                "判不出栈时不给编造的判据：" + onlyLora);
         check(loras.has("groups") && loras.getAsJsonArray("groups").size() == 1,
                 "按底模分组的结果给在 groups 里（未识别的也算一组）：" + loras);
         JsonObject onlyGroup = loras.getAsJsonArray("groups").get(0).getAsJsonObject();
         check(onlyGroup.get("key").getAsString().isEmpty() && onlyGroup.get("count").getAsInt() == 1
                         && onlyGroup.getAsJsonArray("names").get(0).getAsString().equals("kotori.safetensors"),
                 "未识别底模的组键是空串、成员是这个 LoRA：" + onlyGroup);
+        check(onlyGroup.has("stack") && onlyGroup.has("label") && onlyGroup.has("baseModels"),
+                "分组按栈给：key/stack/label/baseModels 都在（这里栈是空的）：" + onlyGroup);
+        // 「基础模型」下拉的数据来源：每项带栈（这个桩没有 Forge，栈只能是空串，前端退回只显示名字）。
+        JsonObject optionData = get(base, "/api/options", token);
+        check(optionData.has("modelOptions") && optionData.getAsJsonArray("modelOptions").size() == 1,
+                "/api/options 里带基础模型的归属信息：" + optionData);
+        JsonObject onlyModel = optionData.getAsJsonArray("modelOptions").get(0).getAsJsonObject();
+        check(onlyModel.has("title") && onlyModel.has("stack") && onlyModel.has("stackLabel")
+                        && onlyModel.has("preset") && onlyModel.has("stackSource") && onlyModel.has("label")
+                        && onlyModel.get("stack").getAsString().isEmpty(),
+                "每个基础模型都带 stack/stackLabel/preset/stackSource（判不出来是空串）：" + onlyModel);
         JsonObject loraProgress = get(base, "/api/lora/progress", token);
         check(loraProgress.has("busy") && loraProgress.has("downloading") && loraProgress.has("metered")
                         && loraProgress.has("stage"),

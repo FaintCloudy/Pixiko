@@ -1,13 +1,55 @@
-# Pixiko v1.0.10 发行说明
+# Pixiko v1.0.11 发行说明
 
-- **版本**：v1.0.10
+- **版本**：v1.0.11
 - **日期**：2026-10-04
 - **作者**：loriko（deloriko@outlook.com）
 - **当前实现**：Java 版（`src/`）。另有一次**未完成的** Next.js 重构，见 `nextjs-wip/`，**不可运行**。
 
 ---
 
-## 〇、本版新增（v1.0.10）
+## 〇、本版新增（v1.0.11）
+
+**自动识别底模的「归属栈」，而不是只认底模名字**。Forge／Forge Neo 把「底模 + VAE + 文本编码器」按预设
+分成一栈一栈（`anima` / `xl` / `sd` / `flux` / `qwen` …），同一个底模文件在错的栈里跑出来就是全灰废图。
+上一版只知道"这个 LoRA 的底模叫什么"，这一版回答"**它属于哪一栈、要切到哪个预设**"。
+
+- **新类 `cn.szu.bot.sd.StackClassifier`**：`baseModelOf(Path)`（读 safetensors 头部，只读开头若干 KB，
+  不加载权重）/ `stackOf(底模名, 文件名)` / `presetFor(栈, 预设列表)` / `stackLabel(栈)` / `sourceLabel(来源)`。
+  栈关键词表覆盖 anima、illustrious、noobai、noob、pony、sdxl、xl、sd 1.5、sd1.5、sd_v1、sd 2、flux、qwen。
+- **判据按可靠性排序，全部来自真实数据**（判不出来返回空串，**绝不编造**）：
+  1. `safetensors` 头部 `__metadata__`：`ss_base_model_version`（如 `anima`）、`modelspec.architecture`
+     （如 `stable-diffusion-xl-v1-base`、`anima-preview/lora`）、`ss_sd_model_name`（sd-scripts 的
+     `model.safetensors` 是占位，不算）；
+  2. 同一份头部的**张量名结构**：SDXL 有第二个文本编码器 `conditioner.embedders.1.*`，SD1.5 只有
+     `conditioner.embedders.0.transformer.*`，SD2 是 `conditioner.embedders.0.model.*`（OpenCLIP），
+     Anima 是 `net.llm_adapter.*` / `net.blocks.*`，Flux 是 `double_blocks.* + single_blocks.*`；
+     LoRA 侧看 `lora_te_*`（单文本编码器＝SD1.5，`ss_v2=True` 则是 SD2）与 `lora_te1_*`/`lora_te2_*`（＝SDXL）；
+  3. Civitai 下载记录的 `base_model`；
+  4. Forge 的 LoRA 元数据；**Forge 预设配置**（`forge_checkpoint_<preset>`：哪个预设置的就是这个文件，
+     它就属于那一栈，这是"归属"最直接的一条）；
+  5. 兜底才按文件名关键词猜，结果一律标成推断。
+  来源标记：`safetensors-header` / `safetensors-keys` / `civitai` / `forge-metadata` / `forge-preset` / `inferred`。
+- **`/api/loras` 每项加 `stack` / `stackLabel` / `preset` / `stackSource` / `stackSourceLabel` / `evidence`，
+  `groups` 改成按栈分组**（组头 `Anima 栈（1）`、`SDXL 栈（1）`，组里保留底模名 `baseModels`），
+  `groupKey` 现在是栈键（前端按它分桶），底模单独给 `baseModelGroupKey`。
+- **底模列表带栈**：`.model list` 每项标出 `waiIllustriousSDXL_v170 [SDXL 栈]`；
+  `GET /api/options` 新增 `modelOptions`（title/name/stack/stackLabel/preset/stackSource/label/evidence），
+  网页「基础模型」下拉直接显示栈，悬停给出判定依据。**没有另造接口**，扩的就是原有的下拉数据源。
+- **防呆升级**：`forgeStackWarning` 改用栈判定——所选底模的栈 ≠ 当前栈就明说
+  「`waiIllustriousSDXL_v170` 属于 SDXL 栈（预设 `xl`），当前是 anima 栈 —— 直接换会出全灰废图，
+  请用 `.model preset xl` 或在 Forge 页面切到 `xl`」；判不出栈时保留原来的通用警告（按各预设的检查点名字比对）。
+- **样式记 `stack` 字段**：写 `data/local-styles.json` 时一并记下归属栈；`.style load` 时样式栈 ≠ 当前栈
+  会**如实提示**（"底模没有随之切换，请先 `.model preset xl`"），**不偷偷切栈**。
+  `GET /api/styles` 每条带 `stack` / `stackLabel`，网页样式行显示栈。
+- **前端**：`webui/index.html` 资源版本 `?v=1.0.15`；LoRA 面板按栈分组（组头栈名 + 底模 + 来源），
+  每行显示「Anima 栈 · 底模 Anima」；基础模型下拉显示 `名字 [SDXL 栈]`；样式行显示栈。
+- **测试**：新增 `StackClassifierTest`（用临时目录造最小合法 safetensors 头，覆盖 anima / sdxl / sd1.5 /
+  sd2 / flux / qwen / 未知 / 占位元数据 / 截断头部 / 普通文件，以及关键词表、栈→预设映射、
+  `modelInfos`、桩 Forge 下的 `/api/loras` 栈字段与分组）；`SdClientTest` 补了预设配置归属与
+  `checkpointInfo` 的断言；`WebUiTest` 补了 `stack`/`modelOptions` 字段的断言。
+
+<details>
+<summary>上一版（v1.0.10）</summary>
 
 **每个 LoRA 都有底模了，样式也按底模归类**。以前 LoRA 列表只有文件名与别名，样式里只有提示词——
 这台机器上 Anima / NoobAI / SD1.5 的 LoRA 混在一堆，换上错的底模出的是全灰废图。
@@ -30,6 +72,8 @@
 - **测试**：`LoraBaseModelTest` 覆盖来源优先级（civitai → forge 元数据 → 预设推断）、占位元数据不当底模、
   展示图样式写盘带 `model`、样式载入套用参数、以及"都识别不出来时不编造底模"；`WebUiTest` 补了
   `/api/loras` 新字段与分组的断言。
+
+</details>
 
 <details>
 <summary>上一版（v1.0.9）</summary>

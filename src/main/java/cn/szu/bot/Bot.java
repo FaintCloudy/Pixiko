@@ -3233,6 +3233,53 @@ public final class Bot implements AutoCloseable {
         try { return sd.presetBaseModel(); } catch (Exception error) { return SdClient.BaseModel.NONE; }
     }
     /**
+     * 载入样式之后：这份样式的**归属栈**与当前 Forge 栈不一致就如实提示一句（**不偷偷切栈**）。
+     * 判不出栈、不是 Forge、读不到预设都返回空串，绝不硬猜一句警告出来。
+     */
+    private String styleStackNotice(LocalStyles.Style style) {
+        if (style == null || !style.hasModel()) return "";
+        try { return sd.styleStackNotice(style.model()); } catch (Exception error) { return ""; }
+    }
+    /**
+     * 基础模型的展示标签（{@code waiIllustriousSDXL_v170 [SDXL 栈 · 预设 xl]}）。
+     * 判不出栈的原样返回文件名——**不编栈**。顺序与 {@code names} 一一对应。
+     */
+    List<String> modelLabels(List<String> names) {
+        Map<String, SdClient.ModelInfo> byTitle = new LinkedHashMap<>();
+        try {
+            for (SdClient.ModelInfo info : sd.modelInfos()) byTitle.put(info.title(), info);
+        } catch (Exception error) { /* 读不到就只给文件名 */ }
+        List<String> labels = new ArrayList<>();
+        for (String name : names) {
+            SdClient.ModelInfo info = byTitle.get(name);
+            if (info == null || !info.stackKnown()) { labels.add(name); continue; }
+            String preset = info.preset() == null || info.preset().isBlank() ? info.stack() : info.preset();
+            labels.add(info.name() + " [" + info.stackLabel() + (preset.equalsIgnoreCase(info.stack()) ? "" : " · 预设 " + preset) + "]");
+        }
+        return labels;
+    }
+    /** 网页「基础模型」下拉的数据：每个模型带归属栈（前端显示 {@code 名字 [SDXL 栈]}）。 */
+    private JsonArray modelOptions() {
+        JsonArray result = new JsonArray();
+        try {
+            for (SdClient.ModelInfo info : sd.modelInfos()) {
+                JsonObject item = new JsonObject();
+                item.addProperty("title", info.title());
+                item.addProperty("name", info.name());
+                item.addProperty("stack", info.stack());
+                item.addProperty("stackLabel", info.stackLabel());
+                item.addProperty("preset", info.preset() == null ? "" : info.preset());
+                item.addProperty("stackSource", info.stackSource());
+                item.addProperty("stackSourceLabel", cn.szu.bot.sd.StackClassifier.sourceLabel(info.stackSource()));
+                item.addProperty("baseModel", info.baseModel());
+                item.addProperty("label", info.label());
+                item.addProperty("evidence", info.evidence());
+                result.add(item);
+            }
+        } catch (Exception error) { /* SD 没在跑：下拉为空，面板另有说明 */ }
+        return result;
+    }
+    /**
      * 在 LoRA 目录里按名字找一个文件（只扫目录，不问 WebUI）：列一页 LoRA 不该为每个都多打一次接口。
      */
     private Path localLoraFile(String name) {
@@ -3269,27 +3316,40 @@ public final class Bot implements AutoCloseable {
             return null;
         }
     }
-    /** 按底模分组（网页 LoRA 面板的组头用，例如 Anima（4））；有底模的按名字排前，未识别的排最后。 */
+    /**
+     * 按**归属栈**分组（网页 LoRA 面板的组头用，例如 {@code Anima 栈（4）}）；判出栈的排前面，判不出的排最后。
+     * 组里同时保留底模名——同一个栈可以有多个底模（Illustrious / NoobAI / Pony 都是 SDXL 栈）。
+     */
     private static JsonArray loraGroups(JsonArray items) {
         Map<String, JsonObject> groups = new LinkedHashMap<>();
         for (JsonElement element : items) {
             JsonObject item = element.getAsJsonObject();
-            String key = Json.str(item, "groupKey", "");
+            String key = Json.str(item, "groupKey", "");      // 前端按 groupKey 分桶，这里就是栈键
             JsonObject group = groups.get(key);
             if (group == null) {
                 group = new JsonObject();
                 group.addProperty("key", key);
+                group.addProperty("stack", key);
+                group.addProperty("label", Json.str(item, "stackLabel", ""));
+                group.addProperty("stackSource", Json.str(item, "stackSource", ""));
+                group.addProperty("preset", Json.str(item, "preset", ""));
                 group.addProperty("baseModel", Json.str(item, "baseModel", ""));
                 group.addProperty("baseModelSource", Json.str(item, "baseModelSource", ""));
+                group.add("baseModels", new JsonArray());
                 group.add("names", new JsonArray());
                 groups.put(key, group);
             }
             group.getAsJsonArray("names").add(Json.str(item, "name", ""));
             group.addProperty("count", group.getAsJsonArray("names").size());
+            String base = Json.str(item, "baseModel", "");
+            JsonArray bases = group.getAsJsonArray("baseModels");
+            boolean seen = false;
+            for (JsonElement existing : bases) if (existing.getAsString().equalsIgnoreCase(base)) { seen = true; break; }
+            if (!base.isEmpty() && !seen) bases.add(base);
         }
         List<JsonObject> ordered = new ArrayList<>(groups.values());
         ordered.sort(Comparator.comparingInt((JsonObject group) -> Json.str(group, "key", "").isEmpty() ? 1 : 0)
-                .thenComparing(group -> Json.str(group, "baseModel", "").toLowerCase(Locale.ROOT)));
+                .thenComparing(group -> Json.str(group, "stack", "").toLowerCase(Locale.ROOT)));
         JsonArray result = new JsonArray();
         for (JsonObject group : ordered) result.add(group);
         return result;
@@ -3350,6 +3410,17 @@ public final class Bot implements AutoCloseable {
         text.append("\n文件：").append(found.path());
         text.append("\n底模：").append(base.known() ? base.name() + base.note() : "未识别");
         if (base.known()) text.append("（来源：").append(base.sourceLabel()).append("）");
+        // 归属栈：这是"能不能直接用"的关键——栈与当前预设不一致就得先 .model preset 切过去。
+        if (base.stackKnown()) {
+            String preset = "";
+            try { preset = cn.szu.bot.sd.StackClassifier.presetFor(base.stack(), sd.forge() ? sd.forgePresets() : List.of()); } catch (Exception ignored) { /* 读不到预设就不提 */ }
+            text.append("\n归属栈：").append(base.stackLabel())
+                    .append(preset.isBlank() ? "（没有同名预设，在 Forge 页面切到 " + base.stack() + "）" : "（预设 " + preset + "）")
+                    .append("；来源：").append(base.stackSourceLabel().isBlank() ? base.stackSource() : base.stackSourceLabel());
+            if (!base.evidence().isBlank()) text.append("\n判据：").append(base.evidence());
+        } else {
+            text.append("\n归属栈：未识别（判不出就不猜：换底模时按 Forge 预设页面对照）");
+        }
         JsonObject record = file == null ? null : readManifest(settings.root.resolve("data/civitai").resolve(file.getFileName() + ".json"));
         if (record == null) {
             text.append("\nCivitai 记录：无（不是用 /lora download 下的，或记录已删）");
@@ -3511,14 +3582,29 @@ public final class Bot implements AutoCloseable {
     /**
      * Forge／Forge Neo 的防呆：**只换底模不换预设栈**会出全灰废图（实测 SDXL 底模配 anima 栈 → 2 KB 灰图；
      * 同一台机器上用 anima 栈自己的底模 + ER SDE + beta + Shift 3 → 671 KB 正常图）。
-     * 返回一句警告（不属于当前栈时），或空串（正常 / 不是 Forge / 跟随当前模型）。
+     *
+     * <p>判据是**这个底模自己的归属栈**（safetensors 头部元数据 / 张量结构 / Civitai 记录 / Forge 元数据 /
+     * Forge 预设配置，见 {@link cn.szu.bot.sd.StackClassifier}）：与当前预设不是同一栈时，给出明确的切换命令。
+     * 判不出栈时退回原来的通用警告（按各预设的检查点名字比对）——**绝不硬说一个栈出来**。
+     *
+     * @return 一句警告（不属于当前栈时），或空串（正常 / 不是 Forge / 跟随当前模型）
      */
     private String forgeStackWarning(String checkpoint) {
         try {
             if (!sd.forge()) return "";
             String requested = checkpoint == null ? "" : checkpoint.strip();
-            if (requested.isEmpty() || requested.equalsIgnoreCase("auto")) return "";
+            if (requested.isEmpty() || SdClient.isAutoModel(requested)) return "";
             String active = sd.forgePreset();
+            // 先把"这个底模属于哪一栈"判出来（栈是从文件本身/记录里读的，不是按名字对齐到预设）。
+            SdClient.ModelInfo info = sd.checkpointInfo(requested);
+            if (info != null && info.stackKnown()) {
+                if (cn.szu.bot.sd.StackClassifier.matchesPreset(info.stack(), active)) return "";
+                String preset = info.preset() == null || info.preset().isBlank() ? info.stack() : info.preset();
+                return "\n⚠ 「" + requested + "」属于" + info.stackLabel() + "（预设 " + preset + "），当前是 "
+                        + (active.isBlank() ? "未知" : active) + " 栈 —— 直接换会出全灰废图，请用 .model preset "
+                        + preset + " 或在 Forge 页面切到 " + preset + "。";
+            }
+            // 栈判不出来：保留原来的通用警告（拿各预设自带的检查点名字比对）。
             for (String preset : sd.forgePresets()) {
                 String stackCheckpoint = Json.str(sd.forgePresetDefaults(preset), "checkpoint", "");
                 if (stackCheckpoint.isBlank()) continue;
@@ -3589,7 +3675,10 @@ public final class Bot implements AutoCloseable {
         if (Set.of("steps", "cfg", "seed", "model").contains(option)) {
             if (arguments.isEmpty()) { reply(event, sd.parameters().describe() + "\n步数、CFG、种子使用机器人持久化参数。"); return; }
             if (option.equals("model") && arguments.equalsIgnoreCase("list")) {
-                reply(event, "WebUI 基础模型：" + numbered(event, "model", sd.models())); return;
+                List<String> names = sd.models();
+                // 方括号里是**归属栈**（从 safetensors 头部/记录/Forge 预设配置判出来的），换栈用 .model preset。
+                reply(event, "WebUI 基础模型（方括号是它属于哪一栈，换栈用 .model preset <预设>）："
+                        + numbered(event, "model", names, modelLabels(names))); return;
             }
             // Forge / Forge Neo：底模、VAE、文本编码器是按「预设」分栈的（anima / flux / xl …），
             // 切模型得连着预设一起看，否则会出现 preset=anima 却加载着 SDXL 这种错配。
@@ -3691,6 +3780,7 @@ public final class Bot implements AutoCloseable {
                                     ? (noParams ? "\n（样式带有模型参数：" + local.modelSummary() + "；本次按 noparams 没有套用）"
                                                 : "\n已套用样式的模型参数：" + (params.isEmpty() ? "（没有可用项）" : String.join("、", params)))
                                     : "")
+                            + styleStackNotice(local)
                             + "\n（替换后的 prompt 就是你自己的文本，之后改 prompt 不会再被样式覆盖；用 .prompt 查看完整提示词）");
                 } else {
                     if (name.isEmpty()) throw new IllegalArgumentException("用法：/style prompt <名称|#编号>，查看样式原文。");
@@ -5752,7 +5842,8 @@ public final class Bot implements AutoCloseable {
                         + diffCount(previous.positive(), updated.positive()) + " 处、反向 "
                         + diffCount(previous.negative(), updated.negative()) + " 处变化）"
                         + (skippedLora.isEmpty() ? "" : "；已按 nolora 跳过 " + String.join("、", skippedLora))
-                        + (local.hasModel() ? "；模型参数：" + (params.isEmpty() ? "未套用" : String.join("、", params)) : "");
+                        + (local.hasModel() ? "；模型参数：" + (params.isEmpty() ? "未套用" : String.join("、", params)) : "")
+                        + styleStackNotice(local);
             }
             default -> throw new IllegalArgumentException("不支持的样式操作：" + op);
         }
@@ -5885,6 +5976,13 @@ public final class Bot implements AutoCloseable {
                     item.add("model", style.model().deepCopy());
                     item.addProperty("modelSummary", style.modelSummary());
                     item.addProperty("baseModel", Json.str(style.model(), "baseModel", ""));
+                    // 样式属于哪一栈（样式里的 stack 字段；老样式没有就用底模名判一次）。
+                    String stack = Json.str(style.model(), "stack", "");
+                    if (stack.isBlank()) stack = cn.szu.bot.sd.StackClassifier.stackOf(
+                            Json.str(style.model(), "baseModel", ""), Json.str(style.model(), "checkpoint", ""));
+                    item.addProperty("stack", stack);
+                    item.addProperty("stackLabel", cn.szu.bot.sd.StackClassifier.stackLabel(stack));
+                    item.addProperty("forgePreset", Json.str(style.model(), "forge_preset", ""));
                 }
             }
         } catch (Exception error) { /* 单条读不出来不影响列表 */ }
@@ -5957,6 +6055,8 @@ public final class Bot implements AutoCloseable {
         String directory = Json.str(Json.obj(settings.snapshot(), "civitai"), "lora_dir", "");
         // 底模兜底（当前 Forge 预设栈）只读一次：每个 LoRA 都去问一次 Forge 没必要。
         SdClient.BaseModel presetBase = loras.isEmpty() ? SdClient.BaseModel.NONE : presetBaseModelOrNone();
+        List<String> presets = List.of();
+        try { if (!loras.isEmpty() && sd.forge()) presets = sd.forgePresets(); } catch (Exception ignored) { /* 不是 Forge 就没有预设 */ }
         for (int index = 0; index < loras.size(); index++) {
             JsonObject item = new JsonObject();
             item.addProperty("number", index + 1);
@@ -5964,12 +6064,20 @@ public final class Bot implements AutoCloseable {
             item.addProperty("alias", loras.get(index).alias());
             // 有展示图才给 true：前端据此决定显示缩略图还是"无图"占位，不必自己去猜文件名。
             item.addProperty("preview", hasLoraPreview(directory, loras.get(index).name()));
-            // 底模（基础模型）：Civitai 记录 → Forge 元数据 → 当前预设栈（标注为推断）。前端按 groupKey 分组。
+            // 底模（基础模型）：safetensors 头部 → Civitai 记录 → Forge 元数据 → 张量结构 → 当前预设（推断）。
             SdClient.BaseModel base = loraBaseModel(loras.get(index).name(), loras.get(index).path(), presetBase);
             item.addProperty("baseModel", base.name());
             item.addProperty("baseModelSource", base.source());
             item.addProperty("baseModelLabel", base.known() ? "底模 " + base.name() + base.note() : "底模未识别");
-            item.addProperty("groupKey", base.groupKey());
+            item.addProperty("baseModelGroupKey", base.groupKey());
+            item.addProperty("evidence", base.evidence());
+            // 归属栈：前端按 **stack** 分组（组头「Anima 栈（1）」），底模名照旧展示。
+            item.addProperty("stack", base.stack());
+            item.addProperty("stackLabel", base.stackLabel());
+            item.addProperty("stackSource", base.stackSource());
+            item.addProperty("stackSourceLabel", base.stackSourceLabel());
+            item.addProperty("preset", cn.szu.bot.sd.StackClassifier.presetFor(base.stack(), presets));
+            item.addProperty("groupKey", base.stack());
             items.add(item);
         }
         JsonObject result = new JsonObject();
@@ -6085,6 +6193,9 @@ public final class Bot implements AutoCloseable {
         try { models = sd.models(); } catch (Exception error) { failure = failure.isBlank() ? error(error) : failure; }
         result.add("samplers", Json.GSON.toJsonTree(samplers));
         result.add("models", Json.GSON.toJsonTree(models));
+        // 每个基础模型的**归属栈**（底模名从 safetensors 头部/记录/Forge 预设配置判出来）：
+        // 下拉框里显示「waiIllustriousSDXL_v170 [SDXL 栈]」，选错栈时页面也能拿 preset 给出提示。
+        result.add("modelOptions", modelOptions());
         result.add("functions", Json.GSON.toJsonTree(new PromptFunctions(settings.root).names()));
         if (!failure.isBlank()) result.addProperty("error", failure);
         return result;
