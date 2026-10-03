@@ -206,64 +206,228 @@ public final class SdClient {
     /**
      * 当前 WebUI 是不是 Forge / Forge Neo。
      *
-     * <p>判据是它的 options 里有没有 {@code forge_preset}：Forge 把「底模 + VAE + 文本编码器」按
-     * **预设**分成一栈一栈（sd / xl / anima / flux / qwen …），预设与检查点必须一起换，
-     * 否则会出现「preset=anima 却加载着 SDXL 检查点」这种错配。
+     * <p>判据有三条，取或：options 里有 {@code forge_preset}；**WebUI 目录下的 config.json 里有
+     * {@code forge_preset}**；目录名里带 forge。第三条是必需的：这台 Forge Neo 的
+     * {@code /sdapi/v1/options} 返回的是一份白名单，{@code forge_preset} / {@code forge_checkpoint_*} /
+     * {@code <preset>_t2i_*} 这些键**根本不在响应里**（POST 它们还会 500 KeyError），
+     * 但预设确实存在——就存在 Forge 自己的 {@code config.json} 里。所以预设一律以那份文件为准。
      */
     public synchronized boolean forge() {
-        try { return options().has("forge_preset"); }
-        catch (Exception error) { return false; }
+        try { if (options().has("forge_preset")) return true; } catch (Exception ignored) { /* 读不到就看文件 */ }
+        JsonObject saved = forgeConfig();
+        if (saved.has("forge_preset")) return true;
+        String directory = sdRoot();
+        return !directory.isBlank() && directory.toLowerCase(java.util.Locale.ROOT).contains("forge");
     }
 
-    /** Forge 的预设列表：从 {@code forge_checkpoint_<名字>} 这些选项推出来，按名字排序。 */
+    /** Forge 自己的 config.json（在 {@code sd.root} 下）；读不到就返回空对象。 */
+    private JsonObject forgeConfig() {
+        String directory = sdRoot();
+        if (directory.isBlank()) return new JsonObject();
+        try {
+            Path file = Path.of(directory).resolve("config.json");
+            if (!Files.isRegularFile(file)) return new JsonObject();
+            JsonElement parsed = JsonParser.parseString(Files.readString(file, StandardCharsets.UTF_8));
+            return parsed.isJsonObject() ? parsed.getAsJsonObject() : new JsonObject();
+        } catch (Exception error) { return new JsonObject(); }
+    }
+
+    /** 配置里的 SD 安装目录（可以为空：不装 Forge 也能只用 API）。 */
+    private String sdRoot() { return Json.str(config, "root", "").strip(); }
+
+    /** Forge 的预设列表：options 与 config.json 两处合起来，按名字排序。 */
     public synchronized List<String> forgePresets() throws Exception {
-        JsonObject options = options();
-        List<String> presets = new ArrayList<>();
-        for (String key : options.keySet())
+        java.util.TreeSet<String> presets = new java.util.TreeSet<>();
+        try {
+            for (String key : options().keySet())
+                if (key.startsWith("forge_checkpoint_")) presets.add(key.substring("forge_checkpoint_".length()));
+        } catch (Exception ignored) { /* 这台 Forge Neo 的 options 里没有，走 config.json */ }
+        JsonObject saved = forgeConfig();
+        for (String key : saved.keySet()) {
             if (key.startsWith("forge_checkpoint_")) presets.add(key.substring("forge_checkpoint_".length()));
-        presets.sort(String::compareTo);
+            else if (key.endsWith("_t2i_sampler")) presets.add(key.substring(0, key.length() - "_t2i_sampler".length()));
+        }
         return List.copyOf(presets);
     }
 
     /** 当前预设（不是 Forge 就是空串）。 */
-    public synchronized String forgePreset() throws Exception { return Json.str(options(), "forge_preset", ""); }
+    public synchronized String forgePreset() throws Exception {
+        try {
+            String active = Json.str(options(), "forge_preset", "");
+            if (!active.isBlank()) return active;
+        } catch (Exception ignored) { /* 同上 */ }
+        return Json.str(forgeConfig(), "forge_preset", "");
+    }
 
     /**
      * 读某个预设自己的推荐参数。Forge Neo 给每个预设都存了一套 {@code <preset>_t2i_*}：
      * Anima 是「ER SDE + beta + 32 步 + CFG 4 + Shift 3 + 它自己的尺寸」，Flux/Qwen 同理。
-     * 把这些采纳进机器人自己的设置，出图参数才跟得上换模型。
+     * 先看 options（新一点的构建会把它们暴露出来），没有就用 Forge 的 config.json。
      */
     public synchronized JsonObject forgePresetDefaults(String preset) throws Exception {
-        JsonObject options = options();
+        JsonObject options;
+        try { options = options(); } catch (Exception error) { options = new JsonObject(); }
+        JsonObject saved = forgeConfig();
         JsonObject result = new JsonObject();
         result.addProperty("preset", preset);
-        result.addProperty("checkpoint", Json.str(options, "forge_checkpoint_" + preset, ""));
-        result.add("modules", options.has("forge_additional_modules_" + preset)
-                ? options.get("forge_additional_modules_" + preset).deepCopy() : new JsonArray());
-        result.addProperty("sampler", Json.str(options, preset + "_t2i_sampler", ""));
-        result.addProperty("scheduler", Json.str(options, preset + "_t2i_scheduler", ""));
-        result.addProperty("steps", Json.num(options, preset + "_t2i_step", 0));
-        result.addProperty("cfg", Json.decimal(options, preset + "_t2i_cfg", 0));
-        result.addProperty("distilledCfg", Json.decimal(options, preset + "_t2i_dcfg", 0));
-        result.addProperty("width", Json.num(options, preset + "_t2i_width", 0));
-        result.addProperty("height", Json.num(options, preset + "_t2i_height", 0));
+        result.addProperty("checkpoint", firstNonBlank(Json.str(options, "forge_checkpoint_" + preset, ""),
+                Json.str(saved, "forge_checkpoint_" + preset, "")));
+        JsonElement modules = options.has("forge_additional_modules_" + preset) ? options.get("forge_additional_modules_" + preset)
+                : saved.get("forge_additional_modules_" + preset);
+        result.add("modules", modules != null && modules.isJsonArray() ? modules.deepCopy() : new JsonArray());
+        result.addProperty("sampler", firstNonBlank(Json.str(options, preset + "_t2i_sampler", ""), Json.str(saved, preset + "_t2i_sampler", "")));
+        result.addProperty("scheduler", firstNonBlank(Json.str(options, preset + "_t2i_scheduler", ""), Json.str(saved, preset + "_t2i_scheduler", "")));
+        result.addProperty("steps", pickNumber(options, saved, preset + "_t2i_step"));
+        result.addProperty("cfg", pickDecimal(options, saved, preset + "_t2i_cfg"));
+        result.addProperty("distilledCfg", pickDecimal(options, saved, preset + "_t2i_dcfg"));
+        result.addProperty("width", pickNumber(options, saved, preset + "_t2i_width"));
+        result.addProperty("height", pickNumber(options, saved, preset + "_t2i_height"));
+        result.addProperty("active", preset.equalsIgnoreCase(forgePreset()));
         return result;
     }
 
-    /** 切 Forge 预设（预设与检查点是一栈的，切完返回这一栈的推荐参数）。 */
+    private static String firstNonBlank(String preferred, String fallback) { return preferred.isBlank() ? fallback : preferred; }
+
+    private static long pickNumber(JsonObject options, JsonObject saved, String key) {
+        if (options.has(key)) return Json.num(options, key, 0);
+        return Json.num(saved, key, 0);
+    }
+
+    private static double pickDecimal(JsonObject options, JsonObject saved, String key) {
+        if (options.has(key)) return Json.decimal(options, key, 0);
+        return Json.decimal(saved, key, 0);
+    }
+
+    /**
+     * 切 Forge 预设。
+     *
+     * <p>两条路：新构建支持 {@code POST /sdapi/v1/options {"forge_preset": …}}；这台 Forge Neo 不支持
+     * （500 KeyError），于是走它 UI 内部同一条路——把这一栈的**检查点与模块**直接换掉
+     * （{@code sd_model_checkpoint} 经实测可用；{@code forge_additional_modules} 视构建而定，失败就跳过），
+     * 再加上把该栈的推荐参数采纳成机器人设置。效果与点 UI 里的预设一致：栈换过去了、参数也跟着换。
+     *
+     * @return 这一栈的推荐参数（含 {@code applied} 字段说明实际做了什么）
+     */
     public synchronized JsonObject setForgePreset(String requested) throws Exception {
         List<String> presets = forgePresets();
         if (presets.isEmpty()) throw new IOException("当前 WebUI 不是 Forge／Forge Neo（没有 forge_preset 这套预设）。");
         String wanted = requested == null ? "" : requested.strip();
         String preset = presets.stream().filter(name -> name.equalsIgnoreCase(wanted)).findFirst()
                 .orElseThrow(() -> new IOException("未知预设：" + wanted + "；可用：" + String.join("、", presets) + "。"));
-        JsonObject payload = new JsonObject();
-        payload.addProperty("forge_preset", preset);
-        // 注意：/sdapi/v1/options 的 POST 返回空响应体（不是 JSON），所以这里只看状态码。
-        HttpResponse<String> response = request("/sdapi/v1/options", "POST", payload, false, false);
-        if (response.statusCode() < 200 || response.statusCode() >= 300)
-            throw new IOException("切换 Forge 预设失败：HTTP " + response.statusCode() + "。");
-        return forgePresetDefaults(preset);
+        JsonObject defaults = forgePresetDefaults(preset);
+        List<String> applied = new ArrayList<>();
+        boolean switched = false;
+        JsonObject direct = new JsonObject();
+        direct.addProperty("forge_preset", preset);
+        try {
+            HttpResponse<String> response = request("/sdapi/v1/options", "POST", direct, false, false);
+            switched = response.statusCode() >= 200 && response.statusCode() < 300;
+            if (switched) applied.add("forge_preset=" + preset);
+        } catch (Exception ignored) { /* 这一版不接受 forge_preset，走下面的检查点路线 */ }
+        if (!switched) {
+            String checkpoint = Json.str(defaults, "checkpoint", "");
+            if (checkpoint.isBlank())
+                throw new IOException("预设「" + preset + "」里没有配置检查点；在 Forge 页面里给这一栈选一个底模再试。");
+            JsonObject payload = new JsonObject();
+            payload.addProperty("sd_model_checkpoint", checkpoint);
+            HttpResponse<String> response = request("/sdapi/v1/options", "POST", payload, false, false);
+            if (response.statusCode() < 200 || response.statusCode() >= 300)
+                throw new IOException("切换底模失败：HTTP " + response.statusCode() + "。" + response.body());
+            applied.add("底模=" + checkpoint);
+            if (defaults.has("modules") && defaults.getAsJsonArray("modules").size() > 0) {
+                JsonObject modules = new JsonObject();
+                modules.add("forge_additional_modules", defaults.getAsJsonArray("modules").deepCopy());
+                try {
+                    HttpResponse<String> moduleResponse = request("/sdapi/v1/options", "POST", modules, false, false);
+                    if (moduleResponse.statusCode() >= 200 && moduleResponse.statusCode() < 300)
+                        applied.add("模块 " + defaults.getAsJsonArray("modules").size() + " 个");
+                } catch (Exception ignored) { /* 有的构建不通过 API 收模块，忽略 */ }
+            }
+        }
+        JsonObject result = forgePresetDefaults(preset);
+        JsonArray done = new JsonArray();
+        for (String item : applied) done.add(item);
+        result.add("applied", done);
+        result.addProperty("switched", true);
+        return result;
+    }
+
+    /**
+     * 当前生效的「模型参数」快照：底模、采样方法、调度器、步数、CFG、蒸馏 CFG（Shift）、尺寸，
+     * 以及 Forge 当前的预设名（预设名从 Forge 自己的 config.json 读，不联网）。
+     *
+     * <p>**只读本地已知值、不发任何请求**：保存样式必须能在 WebUI 离线时完成（样式库是机器人自己的东西，
+     * 原来就有「保存不碰 WebUI」这条约定）。采样方法/尺寸来自最近的设置缓存，底模/步数/CFG 来自持久化参数。
+     */
+    public synchronized JsonObject modelParams() {
+        GenerationParameters parameters = generationParameters;
+        GenerationSettings settings = cachedSettings;
+        JsonObject result = new JsonObject();
+        if (parameters != null) {
+            if (parameters.checkpoint() != null && !parameters.checkpoint().isBlank())
+                result.addProperty("checkpoint", parameters.checkpoint());
+            result.addProperty("steps", parameters.steps());
+            result.addProperty("cfg", parameters.cfgScale());
+        }
+        if (settings != null) {
+            if (settings.samplerName() != null && !settings.samplerName().isBlank())
+                result.addProperty("sampler", settings.samplerName());
+            if (settings.scheduler() != null && !settings.scheduler().isBlank())
+                result.addProperty("scheduler", settings.scheduler());
+            result.addProperty("width", settings.width());
+            result.addProperty("height", settings.height());
+            result.addProperty("distilledCfg", settings.distilledCfg());
+        }
+        JsonObject saved = forgeConfig();
+        String preset = Json.str(saved, "forge_preset", "");
+        if (!preset.isBlank()) {
+            result.addProperty("forge_preset", preset);
+            if (!result.has("checkpoint")) {
+                String checkpoint = Json.str(saved, "forge_checkpoint_" + preset, "");
+                if (!checkpoint.isBlank()) result.addProperty("checkpoint", checkpoint);
+            }
+        }
+        return result;
+    }
+
+    /**
+     * 把样式里记着的模型参数套回机器人设置（载入样式时用）。
+     * 逐项容错：某一项现在不可用（例如那个底模被删了）就跳过并如实说，不影响提示词已经载入这件事。
+     *
+     * @return 「实际套上了什么」的中文说明；空列表表示这份参数里没有任何可用项
+     */
+    public synchronized List<String> applyModelParams(JsonObject model) {
+        List<String> applied = new ArrayList<>();
+        if (model == null || model.size() == 0) return applied;
+        String checkpoint = Json.str(model, "checkpoint", "");
+        if (!checkpoint.isBlank()) {
+            try { setParameter("model", checkpoint); applied.add("底模 " + checkpoint); }
+            catch (Exception error) { applied.add("底模 " + checkpoint + " 不可用（保留原值）"); }
+        }
+        String sampler = Json.str(model, "sampler", "");
+        if (!sampler.isBlank()) {
+            try { setSampler(sampler); applied.add(sampler); }
+            catch (Exception error) { applied.add("采样方法 " + sampler + " 不可用（保留原值）"); }
+        }
+        String scheduler = Json.str(model, "scheduler", "");
+        double distilled = Json.decimal(model, "distilledCfg", 0);
+        if (!scheduler.isBlank() || distilled > 0) {
+            try { setForgeExtras(scheduler, distilled); applied.add("调度器 " + (scheduler.isBlank() ? "（不变）" : scheduler)); }
+            catch (Exception error) { applied.add("调度器未能写入（保留原值）"); }
+        }
+        int steps = Json.num(model, "steps", 0);
+        if (steps > 0) { try { setParameter("steps", String.valueOf(steps)); applied.add(steps + " 步"); } catch (Exception ignored) { /* 跳过 */ } }
+        double cfg = Json.decimal(model, "cfg", 0);
+        if (cfg > 0) {
+            try { setParameter("cfg", cfg == Math.rint(cfg) ? String.valueOf((long) cfg) : String.valueOf(cfg)); applied.add("CFG " + (cfg == Math.rint(cfg) ? String.valueOf((long) cfg) : cfg)); }
+            catch (Exception ignored) { /* 跳过 */ }
+        }
+        int width = Json.num(model, "width", 0), height = Json.num(model, "height", 0);
+        if (width > 0 && height > 0) {
+            try { setSize(width, height); applied.add(width + "×" + height); }
+            catch (Exception error) { applied.add("尺寸 " + width + "×" + height + " 未被接受（保留原值）"); }
+        }
+        return applied;
     }
 
     /**

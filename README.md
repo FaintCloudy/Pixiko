@@ -157,8 +157,8 @@ run.bat --set-map yh "路径"       # 命令行设置地图（需先停止机器
 | | `allowed_group_ids` / `allowed_user_ids` | 白名单；**留空数组 = 不限制** |
 | | `admin_user_ids` | admin 名单（可代 owner 操作，但不是 owner） |
 | `qq` | `ws_url` / `access_token` / `timeout_seconds` / `reconnect_seconds` | NapCat 正向 WebSocket 地址与 Token |
-| `sd` | `base_url` | SD WebUI 的 API 地址 |
-| | `root` | WebUI 根目录；自启动靠它找 `python/python.exe`+`launch.py` 或 `webui-user.bat` |
+| `sd` | `base_url` | SD WebUI 的 API 地址（A1111 / Forge / Forge Neo 都行） |
+| | `root` / `start_command` | WebUI 根目录；自启动靠它找 `python/python.exe`+`launch.py` 或 `webui-user.bat`（Forge Neo 建议直接填 `start_command` = 它的 `webui-user.bat`）。**Forge 的预设也是从这里的 `config.json` 读的** |
 | | `auto_start` / `start_on_boot` / `start_args` / `start_timeout_seconds` | 生成前自动拉起、随机器人启动、启动参数（**必须含 `--api`**） |
 | | `api_username` / `api_password` | WebUI 若开了 `--gradio-auth` 才需要 |
 | | `steps` / `width` / `height` / `cfg_scale` / `sampler_name` / `seed` / `styles` | 生成默认参数（`.settings` 看，`.steps`/`.size`/`.cfg`/`.seed`/`.model`/`.sampler` 改） |

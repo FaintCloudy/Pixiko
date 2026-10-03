@@ -102,6 +102,18 @@
       <div class="muted" id="gen-applied">当前生效参数会显示在这里。</div>
     </div>
     <div class="card">
+      <div class="card-head"><b>模型预设 model preset</b><span class="muted" id="forge-state"></span></div>
+      <div class="muted">Forge / Forge Neo 把「底模 + VAE + 文本编码器」分成一栈一栈（sd / xl / anima / flux …）。
+        切换预设会连它自己的采样方法、调度器、尺寸、步数、CFG、Shift 一起采纳，避免拿旧栈的参数跑新模型。</div>
+      <div class="row wrap">
+        <select id="forge-preset" style="min-width:220px"></select>
+        <button type="button" id="forge-apply">切换预设</button>
+        <button class="ghost" type="button" id="forge-auto">跟随 WebUI 当前模型</button>
+        <button class="ghost" type="button" id="forge-reload">刷新列表</button>
+      </div>
+      <div class="muted" id="forge-note"></div>
+    </div>
+    <div class="card">
       <div class="card-head"><b>智能改写 .infix</b><span class="muted">默认自由改写，允许自然语言</span></div>
       <input id="infix-input" placeholder="修改要求，例如：把地点换成草地，服饰换成军装">
       <div class="row wrap">

@@ -18,8 +18,37 @@ import cn.szu.bot.Log;
  */
 public final class LocalStyles {
     private static final int VERSION = 1;
-    /** 一个本机样式：保存时的正反向原文与更新时间。 */
-    public record Style(String name, String positive, String negative, String updatedAt) {}
+    /** 一个本机样式：保存时的正反向原文与更新时间，外加**保存时的模型参数**（可为空）。 */
+    public record Style(String name, String positive, String negative, String updatedAt, JsonObject model) {
+        /** 不带模型参数的写法（导入、老数据、纯文本样式）保持原样可用。 */
+        public Style(String name, String positive, String negative, String updatedAt) {
+            this(name, positive, negative, updatedAt, null);
+        }
+        /** 有模型参数吗（底模/采样/步数/CFG/尺寸任意一项即可）。 */
+        public boolean hasModel() { return model != null && model.size() > 0; }
+        /** 一行摘要，给回执与网页显示用；没有模型参数时返回空串。 */
+        public String modelSummary() {
+            if (!hasModel()) return "";
+            List<String> parts = new ArrayList<>();
+            String checkpoint = Json.str(model, "checkpoint", "");
+            if (!checkpoint.isBlank()) parts.add("底模 " + checkpoint);
+            String preset = Json.str(model, "forge_preset", "");
+            if (!preset.isBlank()) parts.add("Forge 预设 " + preset);
+            String sampler = Json.str(model, "sampler", "");
+            if (!sampler.isBlank()) parts.add(sampler);
+            String scheduler = Json.str(model, "scheduler", "");
+            if (!scheduler.isBlank()) parts.add("调度器 " + scheduler);
+            int steps = Json.num(model, "steps", 0);
+            if (steps > 0) parts.add(steps + " 步");
+            double cfg = Json.decimal(model, "cfg", 0);
+            if (cfg > 0) parts.add("CFG " + trim(cfg));
+            double distilled = Json.decimal(model, "distilledCfg", 0);
+            if (distilled > 0) parts.add("Shift " + trim(distilled));
+            int width = Json.num(model, "width", 0), height = Json.num(model, "height", 0);
+            if (width > 0 && height > 0) parts.add(width + "×" + height);
+            return String.join("，", parts);
+        }
+    }
     /** 批量导入的结果：导入/覆盖了多少条、因为同名跳过多少条。 */
     public record ImportResult(int imported, int skipped) {}
 
@@ -50,6 +79,16 @@ public final class LocalStyles {
     public synchronized boolean contains(String name) { return get(name) != null; }
 
     public synchronized Style save(String name, String positive, String negative, boolean overwrite) throws IOException {
+        return save(name, positive, negative, overwrite, null);
+    }
+
+    /**
+     * 保存样式（可带保存时的模型参数）。
+     *
+     * <p>带参数的样式在使用时会把底模/采样/步数/CFG/尺寸一起套上去——Anima 这类「一栈一栈」的模型
+     * 必须连参数一起记住，否则载入样式后拿旧栈的参数出图会出废图。
+     */
+    public synchronized Style save(String name, String positive, String negative, boolean overwrite, JsonObject model) throws IOException {
         String requested = SdClient.styleSaveName(name);
         List<Style> styles = new ArrayList<>(all());
         int at = indexOf(styles, requested);
@@ -57,7 +96,8 @@ public final class LocalStyles {
             throw new IOException("已有同名样式「" + styles.get(at).name() + "」；确认覆盖请用 .style overwrite " + styles.get(at).name()
                     + "（.style list 查看全部样式）");
         Style saved = new Style(at >= 0 ? styles.get(at).name() : requested,
-                Objects.requireNonNullElse(positive, ""), Objects.requireNonNullElse(negative, ""), Instant.now().toString());
+                Objects.requireNonNullElse(positive, ""), Objects.requireNonNullElse(negative, ""), Instant.now().toString(),
+                model == null ? null : model.deepCopy());
         // 覆盖时保持原位置：编号与批量操作（#6-#9）依靠列表顺序稳定，改名/覆盖不该把后面的项整体挪位。
         if (at >= 0) styles.set(at, saved); else styles.add(saved);
         write(styles);
@@ -68,6 +108,11 @@ public final class LocalStyles {
         for (int index = 0; index < styles.size(); index++)
             if (styles.get(index).name().equalsIgnoreCase(name)) return index;
         return -1;
+    }
+
+    /** 3.0 显示成 "3"，3.5 保持 "3.5"（摘要里别出现 4.0 这种零头）。 */
+    private static String trim(double value) {
+        return value == Math.rint(value) ? String.valueOf((long) value) : String.valueOf(value);
     }
 
     /**
@@ -87,7 +132,9 @@ public final class LocalStyles {
             if (existing != null) styles.remove(existing);
             styles.add(new Style(existing != null ? existing.name() : requested,
                     Objects.requireNonNullElse(style.positive(), ""), Objects.requireNonNullElse(style.negative(), ""),
-                    Instant.now().toString()));
+                    Instant.now().toString(),
+                    style.hasModel() ? style.model().deepCopy()
+                            : (existing != null && existing.hasModel() ? existing.model().deepCopy() : null)));
             imported++;
         }
         if (imported > 0) write(styles);
@@ -107,7 +154,8 @@ public final class LocalStyles {
         int at = indexOf(styles, source.name());
         if (at < 0) at = styles.size();
         // 原地改名：列表顺序保持，编号和 #6-#9 这类区间操作才不会错位。
-        styles.set(at, new Style(requested, source.positive(), source.negative(), Instant.now().toString()));
+        styles.set(at, new Style(requested, source.positive(), source.negative(), Instant.now().toString(),
+                source.hasModel() ? source.model().deepCopy() : null));
         write(styles);
         // 网页上那张展示图跟着改名走；覆盖同名样式时旧图先丢掉，别张冠李戴。
         if (target >= 0) StylePreviews.delete(root, requested);
@@ -142,7 +190,8 @@ public final class LocalStyles {
                 String name = Json.str(style, "name", "").strip();
                 if (name.isEmpty()) continue;
                 styles.add(new Style(name, Json.str(style, "positive", ""), Json.str(style, "negative", ""),
-                        Json.str(style, "updated_at", "")));
+                        Json.str(style, "updated_at", ""),
+                        style.has("model") && style.get("model").isJsonObject() ? style.getAsJsonObject("model").deepCopy() : null));
             }
             return List.copyOf(styles);
         } catch (Exception error) {
@@ -159,6 +208,7 @@ public final class LocalStyles {
             item.addProperty("positive", style.positive());
             item.addProperty("negative", style.negative());
             item.addProperty("updated_at", style.updatedAt());
+            if (style.hasModel()) item.add("model", style.model().deepCopy());
             array.add(item);
         }
         JsonObject data = new JsonObject();

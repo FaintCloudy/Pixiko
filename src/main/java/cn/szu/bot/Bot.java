@@ -3275,36 +3275,8 @@ public final class Bot implements AutoCloseable {
         }
         JsonObject defaults = sd.setForgePreset(wanted);
         String preset = Json.str(defaults, "preset", wanted);
-        List<String> applied = new ArrayList<>();
-        String sampler = Json.str(defaults, "sampler", "");
-        if (!sampler.isBlank()) {
-            try { sd.setSampler(sampler); applied.add("采样方法 " + sampler); }
-            catch (Exception error) { applied.add("采样方法 " + sampler + "（该模型不可用，保留原值：" + error(error) + "）"); }
-        }
-        String scheduler = Json.str(defaults, "scheduler", "");
-        double distilled = Json.decimal(defaults, "distilledCfg", 0);
-        if (!scheduler.isBlank() || distilled > 0) {
-            sd.setForgeExtras(scheduler, distilled);
-            applied.add("调度器 " + (scheduler.isBlank() ? "（不变）" : scheduler)
-                    + (distilled > 0 ? "，蒸馏 CFG " + trimNumber(distilled) : ""));
-        }
-        int width = Json.num(defaults, "width", 0), height = Json.num(defaults, "height", 0);
-        if (width > 0 && height > 0) { sd.setSize(width, height); applied.add("尺寸 " + width + "×" + height); }
-        int steps = Json.num(defaults, "steps", 0);
-        if (steps > 0) { sd.setParameter("steps", String.valueOf(steps)); applied.add("步数 " + steps); }
-        double cfg = Json.decimal(defaults, "cfg", 0);
-        if (cfg > 0) { sd.setParameter("cfg", trimNumber(cfg)); applied.add("CFG " + trimNumber(cfg)); }
+        List<String> applied = adoptForgePreset(defaults);
         String checkpoint = Json.str(defaults, "checkpoint", "");
-        // 预设与底模是一栈的：把机器人固定的底模也对齐到这一栈（没有就改成"跟随"），
-        // 否则出图时会用 override_settings 把上一个预设的检查点塞回来，盖掉刚切的预设。
-        try {
-            if (!checkpoint.isBlank()) { sd.setParameter("model", checkpoint); applied.add("底模 " + checkpoint); }
-            else { sd.setParameter("model", "auto"); applied.add("底模改为跟随 WebUI（该预设栈里没有检查点）"); }
-        } catch (Exception error) {
-            // 预设已经切了，固定底模失败不该让整条命令看起来失败：如实说，并改成跟随。
-            sd.setParameter("model", "auto");
-            applied.add("底模与预设名字对不上（" + error(error) + "），已改为跟随 WebUI 当前模型");
-        }
         StringBuilder text = new StringBuilder("已切到 Forge 预设：" + preset);
         if (!checkpoint.isBlank()) text.append("\n底模：").append(checkpoint).append("（预设自带的那一个）");
         JsonArray modules = defaults.has("modules") ? defaults.getAsJsonArray("modules") : new JsonArray();
@@ -3315,6 +3287,89 @@ public final class Bot implements AutoCloseable {
         }
         text.append(applied.isEmpty() ? "" : "\n已采纳：" + String.join("、", applied));
         reply(event, text.toString());
+    }
+
+    /**
+     * 把某个 Forge 预设自带的参数**采纳**成机器人设置：切预设之后必须做，
+     * 否则出图时会拿着上一栈的采样方法/尺寸/步数/CFG 去跑新模型（Anima 会被 SD1.5 的参数带偏）。
+     * 命令（{@code .model preset <名字>}）与网页控制台共用这一条路，返回「实际采纳了什么」。
+     */
+    private List<String> adoptForgePreset(JsonObject defaults) {
+        List<String> applied = new ArrayList<>();
+        String sampler = Json.str(defaults, "sampler", "");
+        if (!sampler.isBlank()) {
+            try { sd.setSampler(sampler); applied.add("采样方法 " + sampler); }
+            catch (Exception error) { applied.add("采样方法 " + sampler + "（该模型不可用，保留原值：" + error(error) + "）"); }
+        }
+        String scheduler = Json.str(defaults, "scheduler", "");
+        double distilled = Json.decimal(defaults, "distilledCfg", 0);
+        if (!scheduler.isBlank() || distilled > 0) {
+            try {
+                sd.setForgeExtras(scheduler, distilled);
+                applied.add("调度器 " + (scheduler.isBlank() ? "（不变）" : scheduler)
+                        + (distilled > 0 ? "，蒸馏 CFG " + trimNumber(distilled) : ""));
+            } catch (Exception error) { applied.add("调度器/蒸馏 CFG 未能写入：" + error(error)); }
+        }
+        int width = Json.num(defaults, "width", 0), height = Json.num(defaults, "height", 0);
+        if (width > 0 && height > 0) {
+            try { sd.setSize(width, height); applied.add("尺寸 " + width + "×" + height); }
+            catch (Exception error) { applied.add("尺寸 " + width + "×" + height + " 未被接受：" + error(error)); }
+        }
+        int steps = Json.num(defaults, "steps", 0);
+        if (steps > 0) { try { sd.setParameter("steps", String.valueOf(steps)); applied.add("步数 " + steps); } catch (Exception error) { applied.add("步数未能写入：" + error(error)); } }
+        double cfg = Json.decimal(defaults, "cfg", 0);
+        if (cfg > 0) { try { sd.setParameter("cfg", trimNumber(cfg)); applied.add("CFG " + trimNumber(cfg)); } catch (Exception error) { applied.add("CFG 未能写入：" + error(error)); } }
+        // 预设与底模是一栈的：把机器人固定的底模也对齐到这一栈（没有就改成"跟随"），
+        // 否则出图时会用 override_settings 把上一个预设的检查点塞回来，盖掉刚切的预设。
+        String checkpoint = Json.str(defaults, "checkpoint", "");
+        try {
+            if (!checkpoint.isBlank()) { sd.setParameter("model", checkpoint); applied.add("底模 " + checkpoint); }
+            else { sd.setParameter("model", "auto"); applied.add("底模改为跟随 WebUI（该预设栈里没有检查点）"); }
+        } catch (Exception error) {
+            try { sd.setParameter("model", "auto"); } catch (Exception ignored) { /* 连跟随都写不进去就只能保留原值 */ }
+            applied.add("底模与预设名字对不上（" + error(error) + "），已改为跟随 WebUI 当前模型");
+        }
+        return applied;
+    }
+
+    /** 当前模型参数快照；读不到（SD 没跑）返回 null——存样式时不该因为 SD 离线就失败。 */
+    private JsonObject modelParamsOrNull() {
+        try { return sd.modelParams(); }
+        catch (Exception error) { Log.warn("读取 SD 模型参数失败（样式只存提示词）：" + error(error)); return null; }
+    }
+
+    /** 网页「Forge 预设」卡片：当前预设 + 每个预设的底模与推荐参数（不是 Forge 就如实说）。 */
+    public JsonObject webForgePresets() throws Exception {
+        JsonObject result = new JsonObject();
+        boolean forge = sd.forge();
+        result.addProperty("forge", forge);
+        result.addProperty("active", forge ? sd.forgePreset() : "");
+        result.addProperty("model", sd.parameters().checkpoint());
+        JsonArray presets = new JsonArray();
+        if (forge) for (String name : sd.forgePresets()) presets.add(sd.forgePresetDefaults(name));
+        result.add("presets", presets);
+        return result;
+    }
+
+    /** 网页切换 Forge 预设：切栈 + 采纳该栈参数（与 {@code .model preset <名字>} 同一条路）。 */
+    public JsonObject webSetForgePreset(String name) throws Exception {
+        String wanted = name == null ? "" : name.strip();
+        if (wanted.isEmpty()) throw new IllegalArgumentException("请先选择一个预设。");
+        if (wanted.equalsIgnoreCase("auto") || wanted.equals("跟随")) {
+            sd.setParameter("model", "auto");
+            JsonObject followed = webForgePresets();
+            followed.addProperty("notice", "底模已改为跟随 WebUI 当前模型（预设仍以 Forge 页面里选的那个为准）。");
+            return followed;
+        }
+        JsonObject defaults = sd.setForgePreset(wanted);
+        List<String> applied = adoptForgePreset(defaults);
+        JsonObject result = webForgePresets();
+        JsonArray done = new JsonArray();
+        for (String item : applied) done.add(item);
+        result.add("applied", done);
+        result.addProperty("notice", "已切到 Forge 预设「" + Json.str(defaults, "preset", wanted) + "」"
+                + (applied.isEmpty() ? "。" : "：" + String.join("；", applied) + "。"));
+        return result;
     }
 
     /** 3.0 显示成 "3"，3.5 保持 "3.5"（回执里别出现 4.0 这种零头）。 */
@@ -3386,10 +3441,14 @@ public final class Bot implements AutoCloseable {
             if (content.matches()) {
                 String name = Objects.requireNonNullElse(content.group(2), "").strip();
                 if (content.group(1).equalsIgnoreCase("load")) {
-                    if (name.isEmpty()) throw new IllegalArgumentException("用法：/style load <名称|#编号> [nolora]，用样式替换你个人的正向、反向 prompt；加 nolora 则不加载样式里的 LoRA。");
+                    if (name.isEmpty()) throw new IllegalArgumentException("用法：/style load <名称|#编号> [nolora] [noparams]，用样式替换你个人的正向、反向 prompt；"
+                            + "nolora 不加载样式里的 LoRA，noparams 不套用样式记着的模型参数（底模/采样/步数/CFG/尺寸）。");
                     // 可选修饰 nolora：只替换画面词条，样式里的 <lora:…> 不写进提示词。
                     boolean noLora = name.matches("(?is).*\\s(?:nolora|no-lora|不带lora|不要lora|不加载lora)$");
                     if (noLora) name = name.replaceFirst("(?is)\\s(?:nolora|no-lora|不带lora|不要lora|不加载lora)$", "").strip();
+                    // 可选修饰 noparams：只要提示词，不把样式里记着的模型参数套回来。
+                    boolean noParams = name.matches("(?is).*\\s(?:noparams|no-params|不带参数|不要参数|不套参数)$");
+                    if (noParams) name = name.replaceFirst("(?is)\\s(?:noparams|no-params|不带参数|不要参数|不套参数)$", "").strip();
                     // 修 bug 1（对齐 TS 版修过的"答应了不做"那条）：/style load 必须和 /style save、/style rename
                     // 一样先 stripQuotes。/.char apply 生成的是 .style load "样式名"（含空格的名称整段传入），
                     // 以前引号被当成名字的一部分 → 报「没有这个样式："样式名"」，"应用基底 → .infix → .gen"
@@ -3415,9 +3474,16 @@ public final class Bot implements AutoCloseable {
                     SdClient.Prompts composed = new SdClient.Prompts(positive, negative, UserPromptStore.PERSONAL_SOURCE);
                     SdClient.Prompts updated = userPrompts.replace(scope, composed);
                     new PromptFunctions(settings.root).reset(scope);
+                    // 样式记着模型参数就一并套回来（Anima 这类一栈一栈的模型，光换提示词会出废图）。
+                    List<String> params = List.of();
+                    if (!noParams && local.hasModel()) params = sd.applyModelParams(local.model());
                     reply(event, "已用样式「" + canonical + "」替换你个人的正向、反向 prompt，本次变化：\n"
                             + formatPromptDiff(previous, updated)
                             + (skipped.isEmpty() ? "" : "\n（已按 nolora 跳过样式里的 " + String.join("、", skipped) + "）")
+                            + (local.hasModel()
+                                    ? (noParams ? "\n（样式带有模型参数：" + local.modelSummary() + "；本次按 noparams 没有套用）"
+                                                : "\n已套用样式的模型参数：" + (params.isEmpty() ? "（没有可用项）" : String.join("、", params)))
+                                    : "")
                             + "\n（替换后的 prompt 就是你自己的文本，之后改 prompt 不会再被样式覆盖；用 .prompt 查看完整提示词）");
                 } else {
                     if (name.isEmpty()) throw new IllegalArgumentException("用法：/style prompt <名称|#编号>，查看样式原文。");
@@ -3503,10 +3569,15 @@ public final class Bot implements AutoCloseable {
                 try { current = effectivePrompts(scope); }
                 catch (Exception unavailable) { current = userPrompts.prompts(scope); inherited = true; }
                 List<String> lora = loraTagsIn(current.positive());
-                LocalStyles.Style saved = localStyles.save(requested, current.positive(), current.negative(), save.group(1).equalsIgnoreCase("overwrite"));
+                // 连同**当前模型参数**一起记下来：载入样式时把底模/采样/步数/CFG/尺寸一并套回去。
+                JsonObject modelParams = modelParamsOrNull();
+                LocalStyles.Style saved = localStyles.save(requested, current.positive(), current.negative(),
+                        save.group(1).equalsIgnoreCase("overwrite"), modelParams);
                 reply(event, "样式已" + (save.group(1).equalsIgnoreCase("overwrite") ? "覆盖保存" : "保存") + "：" + saved.name()
                         + "\n提示词来源：你个人的 prompt（只存在机器人这边，与 WebUI 无关）"
                         + (inherited ? "\n（WebUI 页面提示词读取失败，本次用你已有的个人提示词保存）" : "")
+                        + (saved.hasModel() ? "\n已记下模型参数：" + saved.modelSummary() + "（载入时会一起套用；只要提示词就加 noparams）"
+                                            : "\n（这次没读到 SD 的模型参数，样式只存提示词）")
                         + (lora.isEmpty() ? "" : "\n已连同 " + lora.size() + " 个 LoRA 标签一起保存；载入时不想加载它们就加 nolora：.style load " + saved.name() + " nolora")
                         + "\n使用 .style load " + saved.name() + " 直接替换当前提示词。");
                 return;
@@ -5417,9 +5488,11 @@ public final class Bot implements AutoCloseable {
                 boolean inherited = false;
                 try { current = effectivePrompts(scope); }
                 catch (Exception unavailable) { current = userPrompts.prompts(scope); inherited = true; }
-                LocalStyles.Style saved = localStyles.save(target, current.positive(), current.negative(), overwrite || op.equals("overwrite"));
+                LocalStyles.Style saved = localStyles.save(target, current.positive(), current.negative(),
+                        overwrite || op.equals("overwrite"), modelParamsOrNull());
                 message = "样式已" + (op.equals("overwrite") ? "覆盖保存" : "保存") + "：" + saved.name()
-                        + (inherited ? "（WebUI 提示词读取失败，本次用你已有的个人提示词保存）" : "（含 LoRA 标签）");
+                        + (inherited ? "（WebUI 提示词读取失败，本次用你已有的个人提示词保存）" : "（含 LoRA 标签）")
+                        + (saved.hasModel() ? "；已记下模型参数：" + saved.modelSummary() : "");
             }
             case "rename" -> {
                 List<String> targets = styleTargets(event, name == null ? "" : name);
@@ -5449,6 +5522,9 @@ public final class Bot implements AutoCloseable {
                 // 修 bug 1（与 QQ 侧 `.style load` 同一处）：网页控制台与角色链会带引号传名称，
                 // 这里同样要先 stripQuotes；#编号 也按实时样式列表解析。
                 String requested = stripQuotes(name == null ? "" : name.strip());
+                // 与 QQ 侧一致：名称后面可以跟 noparams，表示只要提示词、不套用样式里的模型参数。
+                boolean noParams = requested.matches("(?is).*\\s(?:noparams|no-params|不带参数|不要参数|不套参数)$");
+                if (noParams) requested = requested.replaceFirst("(?is)\\s(?:noparams|no-params|不带参数|不要参数|不套参数)$", "").strip();
                 if (requested.isEmpty()) throw new IllegalArgumentException("请选择要载入的样式。");
                 if (requested.startsWith("#")) requested = select(event, "style", requested);
                 SdClient.Prompts previous = effectivePrompts(scope);
@@ -5461,10 +5537,13 @@ public final class Bot implements AutoCloseable {
                 SdClient.Prompts updated = userPrompts.replace(scope,
                         new SdClient.Prompts(positive, negative, UserPromptStore.PERSONAL_SOURCE));
                 new PromptFunctions(settings.root).reset(scope);
+                // 网页载入同样把样式记着的模型参数套回来（WebUI 之前只换提示词，模型还得手点）。
+                List<String> params = local.hasModel() && !noParams ? sd.applyModelParams(local.model()) : List.of();
                 message = "已用样式「" + local.name() + "」替换你个人的正向、反向 prompt（正向 "
                         + diffCount(previous.positive(), updated.positive()) + " 处、反向 "
                         + diffCount(previous.negative(), updated.negative()) + " 处变化）"
-                        + (skippedLora.isEmpty() ? "" : "；已按 nolora 跳过 " + String.join("、", skippedLora));
+                        + (skippedLora.isEmpty() ? "" : "；已按 nolora 跳过 " + String.join("、", skippedLora))
+                        + (local.hasModel() ? "；模型参数：" + (params.isEmpty() ? "未套用" : String.join("、", params)) : "");
             }
             default -> throw new IllegalArgumentException("不支持的样式操作：" + op);
         }

@@ -1342,6 +1342,66 @@
     return renderPresets(await api('/api/presets'));
   }
 
+  /**
+   * Forge / Forge Neo 的预设栈（底模 + VAE + 文本编码器）。切换会把该栈的采样方法 / 调度器 /
+   * 尺寸 / 步数 / CFG / Shift 一起采纳成机器人设置——参数是随请求发的，不换就会拿旧栈参数跑新模型。
+   */
+  async function loadForgePresets() {
+    try {
+      renderForgePresets(await api('/api/sd/presets'));
+    } catch (error) {
+      const note = $('forge-note');
+      if (note && String(error.message) !== 'unauthorized') { note.textContent = '读取预设失败：' + error.message; note.className = 'bad'; }
+    }
+  }
+
+  function renderForgePresets(data) {
+    const select = $('forge-preset');
+    if (!select) return;                       // 预设下拉只在出图页面
+    const state = $('forge-state'), note = $('forge-note');
+    const presets = (data && data.presets) || [];
+    const forge = !!(data && data.forge);
+    if (state) state.textContent = forge ? ('当前：' + (data.active || '（未选）')) : '当前 WebUI 不是 Forge / Forge Neo';
+    select.innerHTML = '';
+    if (!forge || !presets.length) {
+      const option = el('option', null, forge ? '（Forge 里还没有配置预设）' : '（不是 Forge，用「基础模型」下拉即可）');
+      option.value = '';
+      select.appendChild(option);
+      select.disabled = true;
+      if ($('forge-apply')) $('forge-apply').disabled = true;
+      if (note) { note.textContent = forge ? '在 Forge 页面里给每个预设选好底模后，这里就会列出来。' : '底模直接在「基础模型」里换。'; note.className = 'muted'; }
+      return;
+    }
+    select.disabled = false;
+    if ($('forge-apply')) $('forge-apply').disabled = false;
+    presets.forEach((preset) => {
+      const option = el('option', null, (preset.active ? '▶ ' : '') + preset.preset + ' ← ' + (preset.checkpoint || '（没有底模）'));
+      option.value = preset.preset;
+      if (preset.active) option.selected = true;
+      select.appendChild(option);
+    });
+    const active = presets.find((preset) => preset.active) || presets[0];
+    const bits = [active.sampler, active.scheduler ? '调度器 ' + active.scheduler : '', active.steps ? active.steps + ' 步' : '',
+      active.cfg ? 'CFG ' + active.cfg : '', active.distilledCfg ? 'Shift ' + active.distilledCfg : '',
+      (active.width && active.height) ? active.width + '×' + active.height : '',
+      (active.modules && active.modules.length) ? '模块 ' + active.modules.length + ' 个' : ''].filter(Boolean);
+    if (note) { note.textContent = active.preset + '：' + bits.join('，') + '；当前底模 ' + ((data && data.model) || '（未知）'); note.className = 'muted'; }
+  }
+
+  async function switchForgePreset(name) {
+    const note = $('forge-note');
+    try {
+      if (note) { note.textContent = '正在切换…'; note.className = 'muted'; }
+      const data = await api('/api/sd/preset', { body: { name } });
+      renderForgePresets(data);
+      if (note && data.notice) { note.textContent = data.notice; note.className = 'ok'; }
+      toast(data.notice || '已切换预设');
+      await Promise.all([loadStatus().catch(() => {}), loadOptions().catch(() => {})]);
+    } catch (error) {
+      if (String(error.message) !== 'unauthorized' && note) { note.textContent = '切换失败：' + error.message; note.className = 'bad'; }
+    }
+  }
+
   function renderPresets(data) {
     const list = $('preset-list');
     if (!list) return null;                     // 预设列表只在出图页面

@@ -221,6 +221,12 @@ public class WebApiController {
                 return WebJson.ok(bot.webProgress());
             }
             case "/api/sd/status": return WebJson.ok(bot.sdStatus());
+            // Forge／Forge Neo 的预设栈（底模 + VAE + 文本编码器）：列出与切换；不是 Forge 时 forge=false。
+            case "/api/sd/presets": return WebJson.ok(bot.webForgePresets());
+            case "/api/sd/preset": {
+                requirePost(method);
+                return WebJson.ok(bot.webSetForgePreset(Json.str(body, "name", "")));
+            }
             case "/api/sd/start": {
                 // 「启动 SD」按钮：拉起 SD 要等模型加载（几十秒到几分钟），后台跑，网页轮询状态即可。
                 requirePost(method);
