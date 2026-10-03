@@ -216,6 +216,16 @@ code { background: rgba(120, 160, 220, .14); padding: 1px 5px; border-radius: 6p
 }
 .list li.lora-group .group-head .group-name, .list li.cat-group .group-head .group-name { color: var(--text); font-weight: 600; }
 .list li.lora-group .group-rows, .list li.cat-group .group-rows { gap: 7px; }
+/* 样式面板的分类可折叠：组头整行可点（箭头 + 分类名 + 条数），折叠后只留组头；箭头旋转给出明确的展开/收起指示 */
+.list li.cat-group .group-head { cursor: pointer; user-select: none; border-radius: 8px; }
+.list li.cat-group .group-head:hover .group-name { color: var(--accent); }
+.list li.cat-group .group-head:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.list li.cat-group .group-head .group-arrow {
+  flex: 0 0 auto; width: 13px; text-align: center; color: var(--muted);
+  transition: transform .18s var(--ease);
+}
+.list li.cat-group.collapsed .group-head .group-arrow { transform: rotate(-90deg); }
+.list li.cat-group.collapsed .group-rows { display: none; }
 /* 样式行的分类徽标：手动设过的实心，按默认规则归类的描边；点一下就地改分类 */
 .list li .tag.cat { cursor: pointer; }
 .list li .tag.cat:hover { border-color: rgba(120, 160, 220, .5); }

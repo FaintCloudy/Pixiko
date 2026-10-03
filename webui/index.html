@@ -10,7 +10,7 @@
 <link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <title>Pixiko · 控制台</title>
-<link rel="stylesheet" href="/app.css?v=1.0.17">
+<link rel="stylesheet" href="/app.css?v=1.0.18">
 </head>
 <body>
 <div class="aurora" aria-hidden="true"></div>
@@ -237,8 +237,11 @@
     <div class="row wrap">
       <input id="style-filter" placeholder="筛选样式（名称 / 分类 / 底模）">
       <select id="style-category-filter" title="按分类筛选"></select>
+      <button class="ghost" type="button" id="style-expand-all" title="展开所有分类">全部展开</button>
+      <button class="ghost" type="button" id="style-collapse-all" title="折叠所有分类，只留下分类名与条数">全部折叠</button>
       <button class="ghost" type="button" id="style-reload">刷新列表</button>
     </div>
+    <div class="muted">每个分类是一行可折叠的条目：点分类名（或那一行的箭头）展开/收起；一个 LoRA 一个分类。折叠状态记在本机浏览器里，刷新后保持。</div>
     <datalist id="style-category-options"></datalist>
     <ul class="list" id="style-list"></ul>
     <div class="receipts" id="style-receipts"></div>
@@ -600,6 +603,6 @@
 <div id="toast" class="toast" hidden></div>
 <!-- 任务信息云：从下方弹出，带跳去 /quest/#N 的链接 -->
 <div id="quest-clouds" class="quest-clouds" aria-live="polite"></div>
-<script src="/app.js?v=1.0.17"></script>
+<script src="/app.js?v=1.0.18"></script>
 </body>
 </html>

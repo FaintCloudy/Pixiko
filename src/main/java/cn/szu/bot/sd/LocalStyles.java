@@ -6,6 +6,7 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.*;
 import java.time.Instant;
 import java.util.*;
+import java.util.regex.Pattern;
 import cn.szu.bot.Json;
 import cn.szu.bot.Log;
 
@@ -18,27 +19,91 @@ import cn.szu.bot.Log;
  *
  * <p><b>分类</b>（{@code category} 字段）：用户手动的分类优先；没手动设过就走默认规则——
  * <ol>
- *   <li><b>LoRA 附带的展示图样式一律归到同一个大类</b> {@value #LORA_CATEGORY}
- *       （判据：样式里记着 {@code model.sizeSource=preview}／{@code model.lora}，
- *       或者它在 {@code data/civitai-style-links.json} 里——那是生成展示图样式时留下的映射）；</li>
- *   <li>其它样式按其**归属栈**给默认分类：{@code Anima} / {@code SDXL} / {@code SD 1.5} /
- *       {@code Flux} / {@code Qwen}；</li>
+ *   <li><b>LoRA 附带的展示图样式：一个 LoRA 一个分类</b>，分类名＝该 LoRA 的显示名。
+ *       判据按可靠性排序：{@code model.lora}（生成展示图样式时写进去的 LoRA 名）→
+ *       {@code data/civitai-style-links.json} 里映射到这条样式名的记录（键里带 LoRA 文件名）→
+ *       样式名前缀（展示图样式名一律是 {@code <模型名> <图号>}，去掉尾号就是模型名）。
+ *       显示名优先用 {@code data/civitai/*.json} 记录里的 {@code model_name}（人看的名字，与样式名前缀一致），
+ *       查不到就用判据本身给出的名字。**判不出具体是哪个 LoRA 时退回 {@value #LORA_CATEGORY}**；</li>
+ *   <li>不是 LoRA 附带样式就按其**归属栈**给分类（{@code Anima 栈} / {@code SDXL 栈} / {@code SD 1.5 栈} /
+ *       {@code Flux 栈} / {@code Qwen 栈}，沿用 {@link StackClassifier}）；</li>
  *   <li>判不出归属栈的就是 {@value #OTHER_CATEGORY}。</li>
  * </ol>
  * 默认规则只在**显示与分组**时现算，不会因为读一次列表就往用户的数据文件里写东西；
  * 老文件没有 {@code category} 字段时一律当成"未手动分类"，既不报错也不重写。
+ *
+ * <p><b>老数据</b>：v1.0.12 把展示图样式一律写成 {@code category="LoRA 附带"}（那是**自动**分类，
+ * 不是用户的选择），这里一律当成"没手动设过"，于是老样式自动落回各自的 LoRA 分类。
+ * 分类用的外部文件（{@code civitai-style-links.json} 与 {@code data/civitai/*.json}）**只读，绝不改写**。
  */
 public final class LocalStyles {
     private static final int VERSION = 1;
-    /** 「LoRA 附带」大类：下载/补展示图生成的展示图样式都归到这里（用户要求：同一个大类）。 */
+    /**
+     * 判不出具体是哪个 LoRA 时的兜底分类名。v1.0.12 之前它是所有展示图样式的统一大类；
+     * 现在只是一个兜底（每个能认出来的 LoRA 各成一个分类）。
+     */
     public static final String LORA_CATEGORY = "LoRA 附带";
     /** 判不出归属栈时的默认分类。 */
     public static final String OTHER_CATEGORY = "未分类";
     /** 分类名的长度上限（回执与网页都按字符数算）。 */
     public static final int MAX_CATEGORY = 40;
-    /** 分类清单的固定顺序：LoRA 附带 → 各栈 → 未分类 → 其它自定义分类。 */
-    private static final List<String> CATEGORY_ORDER = List.of(
-            LORA_CATEGORY, "Anima", "SDXL", "SD 1.5", "Flux", "Qwen", OTHER_CATEGORY);
+
+    /** 分类种类（{@code /api/styles} 的 kind 与 categorySource 都用这一份词表）。 */
+    public static final String KIND_LORA = "lora";
+    public static final String KIND_STACK = "stack";
+    public static final String KIND_MANUAL = "manual";
+    public static final String KIND_NONE = "none";
+    /** 「未分类」那一组的 key（没有细分，就是个固定串）。 */
+    public static final String NONE_KEY = KIND_NONE;
+    /** 归属栈分组的固定顺序（与 Forge 预设同序；不在表里的栈按名字排到后面去了）。 */
+    private static final List<String> STACK_ORDER = List.of(
+            StackClassifier.ANIMA, StackClassifier.XL, StackClassifier.SD, StackClassifier.FLUX, StackClassifier.QWEN);
+    /** 展示图样式的名字：{@code <模型名> <图号>}（尾号是展示图编号）。 */
+    private static final Pattern TRAILING_NUMBER = Pattern.compile("^(.+?)\\s+([0-9]+)$");
+
+    /** 一条样式生效后的分类：{@code key} 前端拿来持久化折叠状态，{@code name} 是人看的名字。 */
+    public record Classification(String key, String name, String kind) {
+        public Classification {
+            key = key == null || key.isBlank() ? NONE_KEY : key;
+            name = name == null ? "" : name;
+            kind = kind == null ? "" : kind;
+        }
+        /** 这是用户手动设的分类吗（手动分类名一模一样的自动分类是另一组，key 不同）。 */
+        public boolean manual() { return KIND_MANUAL.equals(kind); }
+    }
+
+    /** 分类清单里的一组：key / 名字 / 种类 / 条数。 */
+    public record Group(String key, String name, String kind, int count) {
+        /** 前端靠它决定组头样式（LoRA 组可以显示 LoRA 名与「去 LoRA 页」入口）。 */
+        public boolean lora() { return KIND_LORA.equals(kind); }
+    }
+
+    /**
+     * 分类要用的**只读**外部数据：
+     * <ul>
+     *   <li>{@code showcases}：展示图样式名 → LoRA 标识（{@code civitai-style-links.json} 的键里那个文件名）；</li>
+     *   <li>{@code displayNames}：LoRA 标识（小写）→ 显示名（{@code data/civitai/*.json} 的 {@code model_name}）。</li>
+     * </ul>
+     */
+    public record LoraIndex(Map<String, String> showcases, Map<String, String> displayNames) {
+        public static final LoraIndex EMPTY = new LoraIndex(Map.of(), Map.of());
+        public LoraIndex {
+            showcases = showcases == null ? Map.of() : Map.copyOf(showcases);
+            displayNames = displayNames == null ? Map.of() : Map.copyOf(displayNames);
+        }
+        /** 这条样式名在展示图映射里吗（老样式没有 lora 标注时靠它认出是展示图样式）。 */
+        public boolean showcase(String styleName) { return styleName != null && showcases.containsKey(styleName); }
+        /** 展示图样式名 → LoRA 标识（没有就是空串）。 */
+        public String loraOf(String styleName) {
+            return styleName == null ? "" : showcases.getOrDefault(styleName, "");
+        }
+        /** LoRA 标识 → 人看的显示名；没有 Civitai 记录就用标识本身（绝不编造）。 */
+        public String displayName(String id) {
+            String value = id == null ? "" : id.strip();
+            if (value.isEmpty()) return "";
+            return displayNames.getOrDefault(value.toLowerCase(Locale.ROOT), value);
+        }
+    }
 
     /** 一个本机样式：保存时的正反向原文与更新时间，外加**保存时的模型参数**与**分类**（都可为空）。 */
     public record Style(String name, String positive, String negative, String updatedAt, JsonObject model, String category) {
@@ -51,7 +116,10 @@ public final class LocalStyles {
             this(name, positive, negative, updatedAt, null, "");
         }
         public Style {
-            category = category == null ? "" : category.strip();
+            String value = category == null ? "" : category.strip();
+            // 老版本把展示图样式一律写成「LoRA 附带」——那是**自动**分类，不是用户的选择：
+            // 一律当成"没手动设过"，这样老样式会按新规则回到各自 LoRA 的分类里。
+            category = LORA_CATEGORY.equals(value) ? "" : value;
         }
         /** 有模型参数吗（底模/采样/步数/CFG/尺寸任意一项即可）。 */
         public boolean hasModel() { return model != null && model.size() > 0; }
@@ -105,9 +173,9 @@ public final class LocalStyles {
     private final Path file;
     /** 机器人根目录：样式的展示图（data/style-previews）也挂在下面。 */
     private final Path root;
-    /** 「LoRA 附带」样式名的缓存（来自 data/civitai-style-links.json）与它的文件指纹。 */
-    private volatile Set<String> showcaseNames = Set.of();
-    private volatile long showcaseStamp = Long.MIN_VALUE;
+    /** 分类要用的只读数据（展示图映射 + LoRA 显示名）的缓存与它的文件指纹。 */
+    private volatile LoraIndex index = LoraIndex.EMPTY;
+    private volatile long indexStamp = Long.MIN_VALUE;
 
     public LocalStyles(Path root) {
         this.root = root.toAbsolutePath().normalize();
@@ -115,32 +183,113 @@ public final class LocalStyles {
     }
 
     /**
-     * 已知的「LoRA 附带」样式名：{@code data/civitai-style-links.json} 的值（生成展示图样式时留下的
-     * {@code 模型/版本/文件/图号 → 样式名} 映射）。老样式里没有 {@code sizeSource}/{@code lora} 标注，
-     * 靠这份映射也能正确归到「LoRA 附带」——**只读它，不改它**。
+     * 分类要用的只读数据：
+     * <ul>
+     *   <li>{@code data/civitai-style-links.json}：展示图样式名 → {@code 模型号/版本号/LoRA 文件名/图号}；</li>
+     *   <li>{@code data/civitai/*.json}：每个下载过的 LoRA 的记录，用来把 LoRA 文件名换成它的
+     *       {@code model_name}（人看的显示名，与样式名前缀一致）。</li>
+     * </ul>
+     * 两个来源都没变就用缓存（网页面板会反复算分类）。**只读，绝不改写这些文件。**
      */
-    public Set<String> loraShowcaseNames() {
+    public LoraIndex loraIndex() {
         Path links = root.resolve("data/civitai-style-links.json");
+        Path records = root.resolve("data/civitai");
+        long stamp = fileStamp(links) * 131L + directoryStamp(records) * 31L + 7L;
+        if (stamp == indexStamp) return index;
+        LoraIndex built = readIndex(links, records);
+        index = built;
+        indexStamp = stamp;
+        return built;
+    }
+
+    private static LoraIndex readIndex(Path links, Path records) {
+        Map<String, String> showcases = new LinkedHashMap<>();
         try {
-            if (!Files.isRegularFile(links)) return Set.of();
-            long stamp = Files.getLastModifiedTime(links).toMillis() * 31L + Files.size(links);
-            if (stamp == showcaseStamp) return showcaseNames;
-            JsonObject data = Json.parse(Files.readString(links, StandardCharsets.UTF_8));
-            Set<String> names = new LinkedHashSet<>();
-            for (String key : data.keySet()) {
-                JsonElement value = data.get(key);
-                if (value != null && value.isJsonPrimitive()) {
+            if (Files.isRegularFile(links)) {
+                JsonObject data = Json.parse(Files.readString(links, StandardCharsets.UTF_8));
+                for (String key : data.keySet()) {
+                    JsonElement value = data.get(key);
+                    if (value == null || !value.isJsonPrimitive()) continue;
                     String name = value.getAsString().strip();
-                    if (!name.isEmpty()) names.add(name);
+                    String lora = loraOfLinkKey(key);
+                    // 同一个样式名对应多条记录时以先出现的为准（老记录先写）；判不出 LoRA 文件名的键跳过。
+                    if (!name.isEmpty() && !lora.isEmpty() && !showcases.containsKey(name)) showcases.put(name, lora);
                 }
             }
-            showcaseNames = Set.copyOf(names);
-            showcaseStamp = stamp;
-            return showcaseNames;
         } catch (Exception error) {
             Log.warn("展示图样式映射读取失败（分类按默认规则算）：" + cn.szu.bot.Bot.error(error));
-            return showcaseNames;
         }
+        Map<String, String> displayNames = new LinkedHashMap<>();
+        try {
+            if (Files.isDirectory(records)) {
+                List<Path> files;
+                try (var stream = Files.list(records)) {
+                    files = stream.filter(path -> path.getFileName().toString().endsWith(".json")).sorted().toList();
+                }
+                for (Path record : files) {
+                    try {
+                        JsonObject data = Json.parse(Files.readString(record, StandardCharsets.UTF_8));
+                        String name = clean(Json.str(data, "model_name", ""));
+                        String stem = loraStem(Json.str(data, "path", ""));
+                        if (stem.isEmpty()) stem = loraStem(Json.str(data, "original_filename", ""));
+                        if (!name.isEmpty() && !stem.isEmpty())
+                            displayNames.putIfAbsent(stem.toLowerCase(Locale.ROOT), name);
+                    } catch (Exception ignored) { /* 单条记录读不出来不影响分类 */ }
+                }
+            }
+        } catch (Exception error) {
+            Log.warn("Civitai 记录读取失败（LoRA 分类用文件名显示）：" + cn.szu.bot.Bot.error(error));
+        }
+        return new LoraIndex(showcases, displayNames);
+    }
+
+    /**
+     * 已知的「LoRA 附带」样式名（{@code data/civitai-style-links.json} 的值）。老样式里没有
+     * {@code sizeSource}/{@code lora} 标注，靠这份映射也能认出是展示图样式——**只读它，不改它**。
+     */
+    public Set<String> loraShowcaseNames() { return loraIndex().showcases().keySet(); }
+
+    /** 展示图映射的键 {@code 模型号/版本号/LoRA 文件名/图号} → LoRA 名（去扩展名）；键不像这个格式就是空串。 */
+    static String loraOfLinkKey(String key) {
+        String[] parts = String.valueOf(key == null ? "" : key).split("/");
+        return parts.length >= 3 ? loraStem(parts[2]) : "";
+    }
+
+    /** 文件名（可带目录）→ 去目录、去 {@code .safetensors} 的 LoRA 名。 */
+    static String loraStem(String path) {
+        String text = String.valueOf(path == null ? "" : path).strip().replace('\\', '/');
+        int slash = text.lastIndexOf('/');
+        if (slash >= 0) text = text.substring(slash + 1);
+        return text.replaceFirst("(?i)\\.safetensors$", "").strip();
+    }
+
+    /** 展示图样式的名字前缀：{@code DeepSeek 鲸鱼娘 … 1} → {@code DeepSeek 鲸鱼娘 …}；名字不像展示图样式就是空串。 */
+    static String namePrefix(String name) {
+        String text = String.valueOf(name == null ? "" : name).strip();
+        var trailing = TRAILING_NUMBER.matcher(text);
+        if (!trailing.matches()) return "";
+        String prefix = trailing.group(1).strip();
+        // 前缀只有一个字（"图 1"）不当成模型名：普通样式的名字不该被误认成 LoRA。
+        return prefix.codePointCount(0, prefix.length()) < 2 ? "" : prefix;
+    }
+
+    /** 显示名/分类名里的控制字符清掉（Civitai 与文件名都可能带进来）。 */
+    private static String clean(String value) {
+        return String.valueOf(value == null ? "" : value).replaceAll("\\p{Cntrl}", " ").replaceAll("\\s+", " ").strip();
+    }
+
+    private static long fileStamp(Path path) {
+        try { return Files.isRegularFile(path) ? Files.getLastModifiedTime(path).toMillis() * 31L + Files.size(path) : 0L; }
+        catch (Exception error) { return 0L; }
+    }
+
+    private static long directoryStamp(Path directory) {
+        try {
+            if (!Files.isDirectory(directory)) return 0L;
+            long count;
+            try (var stream = Files.list(directory)) { count = stream.count(); }
+            return Files.getLastModifiedTime(directory).toMillis() * 31L + count;
+        } catch (Exception error) { return 0L; }
     }
 
     /** 这条样式是不是「LoRA 附带」的展示图样式（只按样式自己记着的东西判，不看名字）。 */
@@ -151,16 +300,16 @@ public final class LocalStyles {
         return !Json.str(model, "lora", "").isBlank();
     }
 
-    /** 归属栈 → 默认分类名（Anima / SDXL / SD 1.5 / Flux / Qwen；判不出就是「未分类」）。 */
-    public static String stackCategory(String stack) {
-        return switch (stack == null ? "" : stack.strip().toLowerCase(java.util.Locale.ROOT)) {
-            case StackClassifier.ANIMA -> "Anima";
-            case StackClassifier.XL -> "SDXL";
-            case StackClassifier.SD -> "SD 1.5";
-            case StackClassifier.FLUX -> "Flux";
-            case StackClassifier.QWEN -> "Qwen";
-            default -> OTHER_CATEGORY;
-        };
+    /**
+     * 这条样式有没有「它是 LoRA 展示图样式」的**实据**（仍不看名字）：{@code model.sizeSource=preview}、
+     * {@code model.lora}、{@code model.previewImage}（只有展示图样式会记这个），或者样式名在展示图映射里。
+     * 光"名字像"不算实据——普通样式名结尾也可能带数字（{@code 篠森よもぎ 2}），不能因此被分进 LoRA 分类。
+     */
+    public static boolean loraShowcaseEvidence(Style style, LoraIndex index) {
+        if (loraShowcase(style)) return true;
+        JsonObject model = style == null ? null : style.model();
+        if (model != null && !Json.str(model, "previewImage", "").isBlank()) return true;
+        return index != null && index.showcase(style == null ? "" : style.name());
     }
 
     /** 这条样式记着的归属栈（没有就按底模/检查点名现判；判不出来是空串）。 */
@@ -171,39 +320,121 @@ public final class LocalStyles {
         return stack.isBlank() ? StackClassifier.stackOf(Json.str(model, "baseModel", ""), Json.str(model, "checkpoint", "")) : stack;
     }
 
+    /** 归属栈 → 分类（{@code stack:xl} / {@code SDXL 栈}；栈为空就是「未分类」）。 */
+    public static Classification stackCategory(String stack) {
+        String value = stack == null ? "" : stack.strip().toLowerCase(Locale.ROOT);
+        if (value.isEmpty()) return noneCategory();
+        String label = StackClassifier.stackLabel(value);
+        return new Classification(KIND_STACK + ":" + value, label.isBlank() ? OTHER_CATEGORY : label, KIND_STACK);
+    }
+
+    /** 一个 LoRA 的分类（key 前缀 {@code lora:}，名字就是 LoRA 的显示名）。 */
+    public static Classification loraCategory(String name) {
+        String value = clean(name);
+        return value.isEmpty() ? loraCategory(LORA_CATEGORY)
+                : new Classification(KIND_LORA + ":" + value, value, KIND_LORA);
+    }
+
+    /** 用户手动设的分类（key 前缀 {@code manual:}）。 */
+    public static Classification manualCategory(String name) {
+        String value = name == null ? "" : name.strip();
+        return new Classification(KIND_MANUAL + ":" + value, value, KIND_MANUAL);
+    }
+
+    /** 「未分类」（key 固定 {@code none}，永远排在最后）。 */
+    public static Classification noneCategory() { return new Classification(NONE_KEY, OTHER_CATEGORY, KIND_NONE); }
+
     /**
-     * 默认分类（用户没手动设过时用它）：LoRA 附带的展示图样式一律 {@value #LORA_CATEGORY}，
-     * 其它按归属栈，判不出栈就是 {@value #OTHER_CATEGORY}。
+     * 这条展示图样式属于哪个 LoRA（显示名）；判不出具体 LoRA 就是空串。判据按可靠性排序：
+     * <ol>
+     *   <li>{@code model.lora}——生成展示图样式时写进去的 LoRA 名；</li>
+     *   <li>{@code data/civitai-style-links.json} 里映射到这条样式名的记录（键里带 LoRA 文件名）；</li>
+     *   <li>样式名前缀——展示图样式名一律是 {@code <模型名> <图号>}，去掉尾号就是模型名（LoRA 名或 model_name）。
+     *       这一条只在**确认它确实是展示图样式**（见 {@link #loraShowcaseEvidence}）时才用，免得把普通样式
+     *       按名字误分进 LoRA 分类。</li>
+     * </ol>
+     * 判出来的标识还会查一次 Civitai 记录里的 {@code model_name}：有就用那个更好看、也和样式名前缀一致的写法。
      *
-     * @param showcaseNames {@code data/civitai-style-links.json} 里的样式名（可为 null）
+     * @param index 只读外部数据（{@link #loraIndex()}）；可为 null（此时不查映射、不做显示名替换）
      */
-    public static String defaultCategory(Style style, Set<String> showcaseNames) {
-        if (style == null) return OTHER_CATEGORY;
-        if (loraShowcase(style) || (showcaseNames != null && showcaseNames.contains(style.name()))) return LORA_CATEGORY;
-        return stackCategory(stackOf(style));
+    public static String loraName(Style style, LoraIndex index) {
+        if (style == null) return "";
+        JsonObject model = style.model();
+        String id = clean(model == null ? "" : Json.str(model, "lora", ""));
+        if (id.isEmpty() && index != null) id = index.loraOf(style.name());
+        if (!id.isEmpty()) return index == null ? id : index.displayName(id);
+        if (!loraShowcaseEvidence(style, index)) return "";
+        String prefix = clean(namePrefix(style.name()));
+        if (prefix.isEmpty()) return "";
+        return index == null ? prefix : index.displayName(prefix);
     }
 
-    /** 生效的分类：用户手动设的优先，其次默认规则。 */
-    public static String categoryOf(Style style, Set<String> showcaseNames) {
-        if (style != null && style.hasCategory()) return style.category();
-        return defaultCategory(style, showcaseNames);
+    /**
+     * 生效的分类（用户手动设的优先，其次自动规则）。自动规则：
+     * 认得出具体 LoRA → 该 LoRA 一个分类（分类名＝LoRA 显示名）；是展示图样式但认不出是哪个 LoRA →
+     * {@value #LORA_CATEGORY}；否则按归属栈；都判不出就是 {@value #OTHER_CATEGORY}。
+     */
+    public static Classification classify(Style style, LoraIndex index) {
+        if (style == null) return noneCategory();
+        // 手动分类优先（老版本自动写下的「LoRA 附带」在 Style 里已经归一成"没设过"）。
+        if (style.hasCategory()) return manualCategory(style.category());
+        String lora = loraName(style, index);
+        if (!lora.isEmpty()) return loraCategory(lora);
+        if (loraShowcaseEvidence(style, index)) return loraCategory(LORA_CATEGORY);
+        String stack = stackOf(style);
+        return stack.isEmpty() ? noneCategory() : stackCategory(stack);
     }
 
-    /** 生效的分类（用本机 {@code civitai-style-links.json} 补齐老样式的「LoRA 附带」判定）。 */
-    public String categoryOf(Style style) { return categoryOf(style, loraShowcaseNames()); }
+    /** 生效的分类（用本机 {@code data/} 下的只读数据补齐老样式的判断）。 */
+    public Classification classify(Style style) { return classify(style, loraIndex()); }
 
-    /** 现有样式按分类的计数，顺序固定（LoRA 附带 → 各栈 → 未分类 → 自定义分类按名字）。 */
-    public synchronized Map<String, Integer> categoryCounts() {
-        Set<String> showcases = loraShowcaseNames();
-        Map<String, Integer> raw = new LinkedHashMap<>();
-        for (Style style : all()) raw.merge(categoryOf(style, showcases), 1, Integer::sum);
-        Map<String, Integer> ordered = new LinkedHashMap<>();
-        for (String category : CATEGORY_ORDER) {
-            Integer count = raw.remove(category);
-            if (count != null) ordered.put(category, count);
+    /** 生效的分类名（人看的名字：LoRA 名 / {@code SDXL 栈} / 手动分类名 / {@value #OTHER_CATEGORY}）。 */
+    public String categoryOf(Style style) { return classify(style).name(); }
+
+    /**
+     * 分类清单，顺序：<b>lora 组</b>（count 降序，同 count 按名字升序）→ <b>stack 组</b>（固定栈序）→
+     * <b>manual 组</b>（count 降序，同 count 按名字升序）→ {@code none} 永远最后
+     * （哪怕 0 条也给出这一组：前端要有「未分类」这个落脚点）。**只读地现算，不落盘。**
+     */
+    public synchronized List<Group> categoryGroups() {
+        LoraIndex index = loraIndex();
+        Map<String, Group> groups = new LinkedHashMap<>();
+        int unclassified = 0;
+        for (Style style : all()) {
+            Classification classification = classify(style, index);
+            if (NONE_KEY.equals(classification.key())) { unclassified++; continue; }
+            Group group = new Group(classification.key(), classification.name(), classification.kind(), 1);
+            groups.merge(classification.key(), group,
+                    (left, right) -> new Group(left.key(), left.name(), left.kind(), left.count() + right.count()));
         }
-        raw.entrySet().stream().sorted(Map.Entry.comparingByKey()).forEach(entry -> ordered.put(entry.getKey(), entry.getValue()));
-        return ordered;
+        List<Group> lora = new ArrayList<>(), stack = new ArrayList<>(), manual = new ArrayList<>();
+        for (Group group : groups.values()) {
+            if (KIND_LORA.equals(group.kind())) lora.add(group);
+            else if (KIND_STACK.equals(group.kind())) stack.add(group);
+            else manual.add(group);
+        }
+        lora.sort(byCountThenName());
+        manual.sort(byCountThenName());
+        stack.sort(Comparator.comparingInt((Group group) -> stackRank(group.key())).thenComparing(Group::name));
+        List<Group> result = new ArrayList<>(lora);
+        result.addAll(stack);
+        result.addAll(manual);
+        result.add(new Group(NONE_KEY, OTHER_CATEGORY, KIND_NONE, unclassified));
+        return List.copyOf(result);
+    }
+
+    private static Comparator<Group> byCountThenName() {
+        return Comparator.comparingInt((Group group) -> -group.count())
+                .thenComparing(Group::name, String.CASE_INSENSITIVE_ORDER)
+                .thenComparing(Group::key);
+    }
+
+    /** 栈在固定顺序里的位置（不在表里的栈排到最后，内部再按名字）。 */
+    private static int stackRank(String key) {
+        String text = key == null ? "" : key;
+        int colon = text.indexOf(':');
+        int at = STACK_ORDER.indexOf(colon < 0 ? text : text.substring(colon + 1));
+        return at < 0 ? STACK_ORDER.size() : at;
     }
 
     public synchronized List<String> names() {
@@ -238,8 +469,9 @@ public final class LocalStyles {
      * <p>带参数的样式在使用时会把底模/采样/步数/CFG/尺寸一起套上去——Anima 这类「一栈一栈」的模型
      * 必须连参数一起记住，否则载入样式后拿旧栈的参数出图会出废图。
      *
-     * <p><b>分类</b>：{@code category} 只用于**新建**的样式（例如展示图样式一律「LoRA 附带」）；
-     * 覆盖已有样式时**保留它原来的分类**——用户手动改过的分类绝不被保存/同步悄悄改回去。
+     * <p><b>分类</b>：{@code category} 只用于**新建**的样式；覆盖已有样式时**保留它原来的分类**——
+     * 用户手动改过的分类绝不被保存/同步悄悄改回去。展示图样式不要再传分类（留空即按"一个 LoRA 一个分类"
+     * 的规则自动分组）。
      */
     public synchronized Style save(String name, String positive, String negative, boolean overwrite, JsonObject model,
                                   String category) throws IOException {
@@ -279,7 +511,8 @@ public final class LocalStyles {
 
     /**
      * 分类名的规范化与校验：去首尾空格、去掉换行/控制字符，长度 1–{@value #MAX_CATEGORY}。
-     * 空串由调用方解释成"清空手动分类"（这里直接放行）。
+     * 空串由调用方解释成"清空手动分类"（这里直接放行）；老版本的自动分类名 {@value #LORA_CATEGORY}
+     * 不是用户能选的分类，给这个值同样等于"回到自动规则"。
      */
     public static String categoryName(String category) throws IOException {
         String value = category == null ? "" : category.strip();
@@ -287,6 +520,7 @@ public final class LocalStyles {
         if (value.equals("-") || value.equals("清除") || value.equals("清空")) return "";
         value = value.replaceAll("\\p{Cntrl}", " ").replaceAll("\\s+", " ").strip();
         if (value.isEmpty()) return "";
+        if (value.equals(LORA_CATEGORY)) return "";
         if (value.codePointCount(0, value.length()) > MAX_CATEGORY)
             throw new IOException("分类名最长 " + MAX_CATEGORY + " 个字：" + value);
         return value;
@@ -387,7 +621,8 @@ public final class LocalStyles {
                 styles.add(new Style(name, Json.str(style, "positive", ""), Json.str(style, "negative", ""),
                         Json.str(style, "updated_at", ""),
                         style.has("model") && style.get("model").isJsonObject() ? style.getAsJsonObject("model").deepCopy() : null,
-                        // 老文件没有 category 字段：读成空（＝未手动分类），既不报错也不重写文件。
+                        // 老文件没有 category 字段：读成空（＝未手动分类），既不报错也不重写文件；
+                        // 老版本自动写下的「LoRA 附带」在 Style 的构造里也被归一成空。
                         categoryOf(style)));
             }
             return List.copyOf(styles);

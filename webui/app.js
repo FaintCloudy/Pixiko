@@ -882,12 +882,16 @@
   const styleRows = new Map();
   /** 样式数据缓存（行 DOM 只负责显示，"查看原文"要的是数据）。 */
   const styleItems = new Map();
-  /** 分类清单（组头顺序、筛选下拉、改分类的候选都用它；每次 /api/styles 都刷新）。 */
+  /** 分类清单（组头顺序、筛选下拉、改分类的候选都用它；每次 /api/styles 都刷新）。
+   *  后端一个 LoRA 一个分类：每项形如 {key:'lora:鸣濑白羽', name:'鸣濑白羽', kind:'lora', count:9, lora:true}。 */
   let styleCategories = [];
   /** 最近一次 /api/styles 的完整返回（筛选是纯前端的事，不必再打一次接口）。 */
   let lastStyles = null;
   /** 分类清单的指纹：一样就不重建筛选下拉/候选表（在筛选框里打字时别抖）。 */
   let categorySignature = '';
+  /** 折叠状态存 localStorage（分类 key 的数组），默认全部展开；null ＝ 还没从 localStorage 读过。 */
+  const STYLE_COLLAPSED_KEY = 'pixiko-style-collapsed';
+  let styleCollapsed = null;
 
   async function loadStyles() {
     return renderStyles(await api('/api/styles'));
@@ -915,6 +919,99 @@
     return (item && item.category) || '未分类';
   }
 
+  /**
+   * 分类清单：新后端直接给 key（一个 LoRA 一个分类，key 形如 {@code lora:<显示名>}，另有 stack:/manual:/none）；
+   * 旧后端只给 name/count/lora，甚至完全没有 categories —— 那就按 style.category 现场聚合，行为与改造前一致（不白屏）。
+   */
+  function normalizeCategories(data) {
+    const raw = data && Array.isArray(data.categories) ? data.categories : [];
+    if (raw.length) {
+      return raw.map((entry) => {
+        const name = String(entry.name || entry.key || '未分类');
+        const kind = entry.kind || (entry.lora ? 'lora' : (name === '未分类' ? 'none' : 'manual'));
+        return { key: String(entry.key || name), name, kind, count: Number(entry.count) || 0, lora: !!entry.lora || kind === 'lora' };
+      });
+    }
+    // 兜底：没有分类清单时按 style.category 分桶；key 加 name: 前缀，免得和 lora:/stack:/manual: 撞车。
+    const buckets = new Map();
+    ((data && data.styles) || []).forEach((item) => {
+      const name = styleCategory(item);
+      if (!buckets.has(name)) buckets.set(name, { key: 'name:' + name, name, kind: name === '未分类' ? 'none' : 'manual', count: 0, lora: false });
+      buckets.get(name).count++;
+    });
+    return [...buckets.values()];
+  }
+
+  /** 一条样式的分类 key：新后端直接给 categoryKey；缺了就按分类名回查，再不行用 name:<分类名> 兜住。 */
+  function styleCategoryKey(item) {
+    const key = item && item.categoryKey;
+    if (typeof key === 'string' && key) return key;
+    const name = styleCategory(item);
+    const known = styleCategories.find((entry) => entry.name === name);
+    return known ? known.key : 'name:' + name;
+  }
+
+  // ---------------------------------------------------------- 分类折叠
+
+  /** 折叠状态（分类 key 的集合）：读 localStorage；读不出来或内容坏了就当全部展开（不抛错、不白屏）。 */
+  function collapsedGroups() {
+    if (styleCollapsed) return styleCollapsed;
+    styleCollapsed = new Set();
+    try {
+      const saved = JSON.parse(localStorage.getItem(STYLE_COLLAPSED_KEY) || '[]');
+      if (Array.isArray(saved)) saved.forEach((key) => { if (typeof key === 'string' && key) styleCollapsed.add(key); });
+    } catch (error) { /* 存储被禁用/内容坏了：按默认（全部展开）走 */ }
+    return styleCollapsed;
+  }
+
+  function saveCollapsedGroups() {
+    try { localStorage.setItem(STYLE_COLLAPSED_KEY, JSON.stringify([...collapsedGroups()])); } catch (error) { /* 存不下就只在本次会话里生效 */ }
+  }
+
+  /** 把一组的折叠/展开画出来：class 交给 CSS 收起行，aria 给读屏，title 提示下一步动作。 */
+  function applyGroupCollapse(holder) {
+    if (!holder) return;
+    const collapsed = collapsedGroups().has(holder.dataset.key);
+    holder.classList.toggle('collapsed', collapsed);
+    const head = holder.querySelector('.group-head');
+    if (head) {
+      head.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
+      head.title = (collapsed ? '展开' : '折叠') + '「' + (holder.dataset.name || '') + '」这一组';
+    }
+  }
+
+  /** 整块列表按 localStorage 对齐一次：重画（改名/改分类/刷新）之后折叠状态不会丢。 */
+  function applyAllGroupCollapse() {
+    const list = $('style-list');
+    if (!list) return;
+    list.querySelectorAll('li.cat-group').forEach(applyGroupCollapse);
+  }
+
+  /** 点组头：切换这一组的折叠状态并写回 localStorage。 */
+  function toggleGroupCollapse(holder) {
+    if (!holder) return;
+    const key = holder.dataset.key;
+    if (!key) return;
+    const set = collapsedGroups();
+    if (set.has(key)) set.delete(key); else set.add(key);
+    saveCollapsedGroups();
+    applyGroupCollapse(holder);
+  }
+
+  /**
+   * 「全部折叠」/「全部展开」：按**真的画出来的组**来写（空的分类不落垃圾 key），再整块对齐 DOM。
+   * 列表还没画出来（数据还没回来）时退回分类清单，保证这一次点击不是白点。
+   */
+  function setAllGroupCollapse(collapsed) {
+    const list = $('style-list');
+    const holders = list ? [...list.querySelectorAll('li.cat-group')] : [];
+    const keys = holders.length ? holders.map((holder) => holder.dataset.key) : styleCategories.map((entry) => entry.key);
+    const set = collapsedGroups();
+    keys.forEach((key) => { if (collapsed) set.add(key); else set.delete(key); });
+    saveCollapsedGroups();
+    applyAllGroupCollapse();
+  }
+
   function renderStyles(data) {
     if (!data) return;
     lastStyles = data;
@@ -923,15 +1020,19 @@
     // 底模分类：列表按分类分组，这里只在上面汇总一行。
     const groups = (data.baseModelGroups || []).map((group) => group.baseModel + ' ' + group.count);
     if (groups.length) $('style-pageselected').textContent += '；底模：' + groups.join('、');
-    styleCategories = data.categories || [];
+    styleCategories = normalizeCategories(data);
+    // 分类多了（一个 LoRA 一类）会很长：只列前几个，其余折成「等 N 类」。
     const categories = styleCategories.map((entry) => entry.name + ' ' + entry.count);
-    if (categories.length) $('style-pageselected').textContent += '；分类：' + categories.join('、');
+    if (categories.length) {
+      const head = categories.slice(0, 8).join('、');
+      $('style-pageselected').textContent += '；分类：' + head + (categories.length > 8 ? ' …（共 ' + categories.length + ' 类）' : '');
+    }
     fillCategoryFilter();
     const filter = $('style-filter').value.trim().toLowerCase();
     const select = $('style-category-filter');
     const only = select ? select.value : '';
     const items = (data.styles || []).filter((item) => {
-      if (only && styleCategory(item) !== only) return false;
+      if (only && styleCategoryKey(item) !== only) return false;
       if (!filter) return true;
       return item.name.toLowerCase().includes(filter)
         || styleCategory(item).toLowerCase().includes(filter)
@@ -944,9 +1045,12 @@
     syncRows(items, (data.styles || []).length ? '没有匹配的样式。' : '还没有样式：保存一条当前提示词就会出现在这里。');
   }
 
-  /** 分类筛选下拉 + 改分类的候选（datalist）：保留当前选择，选项顺序与组头一致。 */
+  /**
+   * 分类筛选下拉 + 改分类的候选（datalist）：保留当前选择，选项顺序与组头一致。
+   * 下拉的 value 用分类 key（同名不同类不会串），显示文字用分类名；改分类的候选仍发分类名（接口要的是名字，不能改）。
+   */
   function fillCategoryFilter() {
-    const signature = styleCategories.map((entry) => entry.name + ':' + entry.count).join('|');
+    const signature = styleCategories.map((entry) => entry.key + ':' + entry.name + ':' + entry.count).join('|');
     if (signature === categorySignature) return;      // 筛选框里打字时不必反复重建下拉
     categorySignature = signature;
     const select = $('style-category-filter');
@@ -954,7 +1058,7 @@
       const current = select.value;
       select.innerHTML = '';
       select.appendChild(new Option('全部分类', ''));
-      styleCategories.forEach((entry) => select.appendChild(new Option(entry.name + '（' + entry.count + '）', entry.name)));
+      styleCategories.forEach((entry) => select.appendChild(new Option(entry.name + '（' + entry.count + '）', entry.key)));
       select.value = [...select.options].some((option) => option.value === current) ? current : '';
     }
     const datalist = $('style-category-options');
@@ -964,20 +1068,20 @@
     }
   }
 
-  /** 按分类分桶：顺序跟分类清单走（LoRA 附带 → 各栈 → 未分类 → 自定义），清单外的按出现顺序排后面。 */
+  /** 按分类 key 分桶：顺序跟分类清单走（一个 LoRA 一组 → 各栈 → 未分类 → 自定义），清单外的按出现顺序排后面。 */
   function styleBuckets(items) {
     const buckets = new Map();
-    styleCategories.forEach((entry) => buckets.set(entry.name, []));
+    styleCategories.forEach((entry) => buckets.set(entry.key, { key: entry.key, name: entry.name, kind: entry.kind, lora: entry.lora, items: [] }));
     items.forEach((item) => {
-      const name = styleCategory(item);
-      if (!buckets.has(name)) buckets.set(name, []);
-      buckets.get(name).push(item);
+      const key = styleCategoryKey(item);
+      if (!buckets.has(key)) buckets.set(key, { key, name: styleCategory(item), kind: 'manual', lora: false, items: [] });
+      buckets.get(key).items.push(item);
     });
-    return [...buckets].filter(([, list]) => list.length).map(([name, list]) => ({ name, items: list }));
+    return [...buckets.values()].filter((bucket) => bucket.items.length);
   }
 
   /**
-   * 增量同步列表：**按分类分组**（组头「LoRA 附带（12）」），同名的行原地复用（只更新编号，不重建、
+   * 增量同步列表：**按分类分组，组头可折叠**（「鸣濑白羽（9）▾」），同名的行原地复用（只更新编号，不重建、
    * 不重放动画、不丢滚动位置）；分类变了的行重建一次——分类徽标与它所在的分组都得跟着变。
    * 编号仍取自后端列表，所以 `.style load #N` / 批量 `#6-#9` 不因分组而错位。
    */
@@ -989,18 +1093,16 @@
     if (!items.length) { list.appendChild(el('li', 'muted', emptyText)); return; }
     styleBuckets(items).forEach((bucket) => {
       const holder = el('li', 'cat-group');
-      const head = el('div', 'group-head');
-      head.appendChild(el('span', 'group-name', bucket.name + '（' + bucket.items.length + '）'));
-      const known = styleCategories.find((entry) => entry.name === bucket.name);
-      head.appendChild(el('span', 'tag', known && known.lora ? '下载 LoRA 时用展示图生成' : '分类'));
-      holder.appendChild(head);
+      holder.dataset.key = bucket.key;
+      holder.dataset.name = bucket.name;
+      holder.appendChild(groupHead(bucket, holder));
       const rows = el('ul', 'list group-rows');
       bucket.items.forEach((item) => {
         let row = styleRows.get(item.name);
-        if (row && row.dataset.category !== styleCategory(item)) { row.remove(); styleRows.delete(item.name); row = null; }
+        if (row && row.dataset.categoryKey !== styleCategoryKey(item)) { row.remove(); styleRows.delete(item.name); row = null; }
         if (!row) { row = styleRow(item); styleRows.set(item.name, row); }
         row.dataset.name = item.name;
-        row.dataset.category = styleCategory(item);
+        row.dataset.categoryKey = styleCategoryKey(item);
         row.dataset.number = String(item.number);
         const number = row.querySelector('.num');
         if (number) number.textContent = '#' + item.number;
@@ -1009,6 +1111,34 @@
       holder.appendChild(rows);
       list.appendChild(holder);
     });
+    applyAllGroupCollapse();     // 重画之后按 localStorage 重新对齐折叠状态
+  }
+
+  /** 组头：折叠箭头 + 分类名（条数）+ 类型标签；点一下（或回车/空格）折叠或展开这一组。 */
+  function groupHead(bucket, holder) {
+    const head = el('div', 'group-head');
+    head.setAttribute('role', 'button');
+    head.setAttribute('tabindex', '0');
+    head.setAttribute('aria-expanded', 'true');
+    head.appendChild(el('span', 'group-arrow', '▾'));
+    head.appendChild(el('span', 'group-name', bucket.name + '（' + bucket.items.length + '）'));
+    head.appendChild(el('span', 'tag' + (bucket.lora ? ' on' : ''), groupKindText(bucket)));
+    const toggle = () => toggleGroupCollapse(holder);
+    head.onclick = toggle;
+    head.onkeydown = (event) => {
+      if (event.key !== 'Enter' && event.key !== ' ' && event.key !== 'Spacebar') return;
+      event.preventDefault();
+      toggle();
+    };
+    return head;
+  }
+
+  /** 组头右边的类型标签：一眼看出这组是 LoRA 自动组、栈组还是手工分类。 */
+  function groupKindText(bucket) {
+    if (bucket.lora || bucket.kind === 'lora') return 'LoRA 样式';
+    if (bucket.kind === 'stack') return '栈';
+    if (bucket.kind === 'none') return '未分类';
+    return '手动分类';
   }
 
   /** 一行样式：按钮都从 dataset 读当前名称/编号，编号前移时不需要重建这一行。 */
@@ -2626,6 +2756,9 @@
     });
     on('style-filter', 'input', () => { if (lastStyles) renderStyles(lastStyles); });
     on('style-category-filter', 'change', () => { if (lastStyles) renderStyles(lastStyles); });
+    // 分类折叠：默认全部展开，折叠状态记在 localStorage（pixiko-style-collapsed），刷新后保持。
+    on('style-expand-all', 'click', () => setAllGroupCollapse(false));
+    on('style-collapse-all', 'click', () => setAllGroupCollapse(true));
     on('style-reload', 'click', loadStyles);
 
     // LoRA

@@ -1,11 +1,38 @@
-# Pixiko v1.0.13 发行说明
+# Pixiko v1.0.14 发行说明
 
-- **版本**：v1.0.13
+- **版本**：v1.0.14
 - **日期**：2026-10-04
 - **作者**：loriko（deloriko@outlook.com）
 - **当前实现**：Java 版（`src/`）。另有一次**未完成的** Next.js 重构，见 `nextjs-wip/`，**不可运行**。
 
 ---
+
+## 〇、本版新增（v1.0.14）
+
+**样式分类从「一个跟着 LoRA 走的大类」改成一个 LoRA 一个分类，网页端的分类可以折起来**。上一版所有
+展示图样式都堆在 `LoRA 附带` 里，LoRA 一多就分不清哪条样式属于哪个 LoRA；这一版还让样式面板的每个
+分类都能折叠。
+
+- **一个 LoRA 一个分类**（分类名 = 该 LoRA 的显示名）：判据按优先级来——
+  样式里记录的 LoRA 名（展示图样式生成时写入的 `model.lora`）→ `data/civitai-style-links.json` 的映射
+  （老样式没有标注就靠它，**只读不改**）→ 样式名前缀；三者都判不出具体是哪个 LoRA 时，才退回
+  `LoRA 附带` 这个兜底分类。非 LoRA 样式按**归属栈**分类（`Anima` / `SDXL 栈` / `SD 1.5 栈` / …），
+  连栈都判不出来的才是 `未分类`。
+- **手动分类优先于自动分类**，命令与写法不变：`.style category <名称|#编号|#起-#止> <分类名>`
+  （批量与 `.style rename` 同一套区间写法）；只给样式名＝查询；分类名给 `-` 或 `清除`＝清空手动分类，
+  清空后回到自动分类。
+- **`GET /api/styles` 的分类形状**：新增 `categories: [{key,name,kind,count,lora}]`——`kind` 是
+  `lora`/`stack`/`manual`/`none`，`key` 形如 `lora:<LoRA名>`、`stack:xl`、`manual:<分类名>`、`none`；
+  每条样式带 `categoryKey`；排序为 LoRA 组 → stack → manual → 未分类。
+- **网页端分类可折叠**：样式面板的每个分类是一个可折叠条目——组头显示分类名 + 条数 + 箭头，点组头
+  展开／收起（键盘 Enter/空格也行），工具栏另有「全部展开 / 全部折叠」。折叠状态存在浏览器 localStorage 里
+  （键 `pixiko-style-collapsed`），**刷新后保持**，默认全部展开。
+- **前端**：`webui/index.html` 资源版本 `?v=1.0.18`；样式面板按分类 key 分组（同名不同类不会串组），
+  筛选下拉按分类 key 过滤；顶部汇总行在分类很多时只列前 8 个并标出总类数。
+- **读取不改写数据文件**：读样式列表**不会改写** `data/local-styles.json`；写盘只写用户手动设置的分类。
+
+<details>
+<summary>上一版（v1.0.13）</summary>
 
 ## 〇、本版新增（v1.0.13）
 
@@ -49,6 +76,8 @@
 - **测试**：新增 `LoraPaginationTest`（68 条断言：cursor 分页、`hasMore` 探针、可配置每页条数、
   页码解析、越界文案、本页编号语义）与 `ShowcaseSkipTest`（42 条断言：真机形状的 9 张无提示词图按原因
   计数、同名 vs 无匹配分开计数、修正覆盖并备份、上限可配置）。全量 `build.ps1 -Test` 56 个 suite 全绿。
+
+</details>
 
 <details>
 <summary>上一版（v1.0.12）</summary>
@@ -399,7 +428,7 @@ Danbooru 词条（↑↓ 选择、Esc 关闭；空词条上按 **Ctrl+Space** �
 
 ## 三、安装与启动（三步）
 
-### 开箱即用包 `pixiko-v1.0.9-runnable.zip`
+### 开箱即用包 `pixiko-v1.0.14-runnable.zip`
 
 1. 装好 **JDK 17+**。
 2. **双击 `start.bat`**。第一次运行会自动生成 `config.json`（照 `config.example.json` 起一份），
@@ -409,7 +438,7 @@ Danbooru 词条（↑↓ 选择、Esc 关闭；空词条上按 **Ctrl+Space** �
 
 > `start.bat` 跑的是包内已编译好的 `build/pixiko.jar`；只有需要改代码时才用 `build.ps1` + `run.bat`。
 
-### 源码包 `pixiko-v1.0.9.zip`
+### 源码包 `pixiko-v1.0.14.zip`
 
 1. 装好 **JDK 17+**。
 2. 在项目根目录准备好依赖 jar：`lib/gson-2.13.1.jar` 由 `build.ps1` **自动下载并校验**，
@@ -474,8 +503,8 @@ copy config.example.json config.json
 
 ## 六、在 GitHub Releases 里发布这个 zip
 
-1. 打开仓库 → 右侧 **Releases** → **Draft a new release**，Tag 填 `v1.0.9`（新建 tag），标题填 `Pixiko v1.0.9`。
-2. 把 `pixiko-v1.0.9.zip` 与 `pixiko-v1.0.9-runnable.zip`（以及各自的 `.sha256`）拖进附件区，
+1. 打开仓库 → 右侧 **Releases** → **Draft a new release**，Tag 填 `v1.0.14`（新建 tag），标题填 `Pixiko v1.0.14`。
+2. 把 `pixiko-v1.0.14.zip` 与 `pixiko-v1.0.14-runnable.zip`（以及各自的 `.sha256`）拖进附件区，
    正文粘贴本文件内容后点 **Publish release**。
 
 > 建仓库时 License 请选 **None**（本项目保留所有权利，不使用开源许可证）。

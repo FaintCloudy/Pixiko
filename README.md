@@ -5,7 +5,7 @@ Pixiko 是一个自用的 QQ 机器人：接 **NapCat** 收消息，接 **Stable
 领图；机器人自己把生成好的图片发回对话。
 
 - **作者**：loriko（deloriko@outlook.com）
-- **版本**：v1.0.12（发行说明见 [`RELEASE.md`](RELEASE.md)）
+- **版本**：v1.0.14（发行说明见 [`RELEASE.md`](RELEASE.md)）
 - **当前实现**：**Java 版**（`src/`）——这是线上一直在跑的那一份
 - **网页控制台**：`webui/`（纯静态 HTML/CSS/JS，随机器人一起由内嵌 Spring Boot 提供）
 - **SD WebUI 桥接扩展**：`webui-extension/pixiko-bridge/`（把文生图页正在编辑的提示词同步给机器人）
@@ -288,7 +288,7 @@ run.bat --set-map yh "路径"       # 命令行设置地图（需先停止机器
 | `.style load <名称\|#编号> [nolora]` | 用样式替换当前正反向 prompt |
 | `.style rename [overwrite] <旧名称\|#编号\|#6-#9> <新名称或前缀>` | 改名 |
 | `.style delete <名称\|#编号\|#6-#9>` | 删除 |
-| `.style category <名称\|#编号\|#6-#9> [分类名]` | 查看／修改样式分类（批量支持区间；分类名给 `-`/`清除`＝恢复自动分类） |
+| `.style category <名称\|#编号\|#6-#9> [分类名]` | 查看／修改样式分类（批量支持区间；只给样式名＝查询；分类名给 `-`/`清除`＝清空手动分类、回到自动分类；手动分类优先于自动） |
 | `.style import webui [overwrite]` | 把 WebUI 预设样式一次性搬进机器人样式库 |
 | `.settings` | 查看尺寸、采样方法、步数、CFG、种子、基础模型与来源 |
 | `.sampler` / `.sampler list` / `.sampler set <完整名称>` | 采样方法 |
@@ -309,23 +309,31 @@ run.bat --set-map yh "路径"       # 命令行设置地图（需先停止机器
 （只要提示词就加 `noparams`）；网页「样式」页上方按底模汇总（例如「底模：Anima 12、NoobAI 5」），
 每条样式也标着自己的底模与**归属栈**。
 
-### 样式分类：LoRA 附带的一个大类，其余按归属栈
+### 样式分类：一个 LoRA 一个分类，其余按归属栈
 
 样式库里每条样式都可以有分类（`data/local-styles.json` 的 `category` 字段）。**手动设过的分类优先**；
 没手动设过的按下面的默认规则现算（这只影响显示与分组，**不会因为读一次列表就往你的数据文件里写东西**）：
 
-1. **LoRA 附带的展示图样式一律归到同一个大类 `LoRA 附带`**（下载 LoRA / 补展示图时用 Civitai 展示图
-   生成的那些）。判据：样式里记着 `model.sizeSource=preview` 或 `model.lora`，或者它在
-   `data/civitai-style-links.json` 的映射里（老样式没有标注就靠这份映射，只读不改）；
-2. 其它样式按**归属栈**：`Anima` / `SDXL` / `SD 1.5` / `Flux` / `Qwen`；
-3. 判不出归属栈的就是 `未分类`。
+1. **LoRA 附带的展示图样式按 LoRA 分开**：分类名就是**那个 LoRA 的显示名**（下载 LoRA / 补展示图时
+   用 Civitai 展示图生成的那些，不再统统归到 `LoRA 附带` 一个大类）。判据按优先级来——
+   样式里记着的 LoRA 名（展示图样式生成时写入的 `model.lora`）→
+   `data/civitai-style-links.json` 的映射（老样式没有标注就靠它，只读不改）→ 样式名前缀；
+   三者都判不出具体是哪个 LoRA 时，才退回 `LoRA 附带`；
+2. 其它样式按**归属栈**：`Anima` / `SDXL 栈` / `SD 1.5 栈` / `Flux 栈` / `Qwen 栈`；
+3. 连栈都判不出来的就是 `未分类`。
 
-改分类有两条路：命令 `.style category <名称|#编号|#6-#9> <分类名>`（只给名称＝查看；分类名给 `-`/`清除`
-＝清空手动分类、回到默认规则），以及网页「样式」页——列表按分类分组（组头 `LoRA 附带（12）`、`Anima（3）`），
-每行一个分类徽标，点它（或「改分类」按钮）就能改，输入框带已有分类的候选、也可以直接输入新分类名；
-工具栏有分类筛选，批量区有「批量改分类」。`.style list`、`.style prompt`、`.style load` 的回执里也都会显示分类。
+改分类有两条路：命令 `.style category <名称|#编号|#6-#9> <分类名>`（只给样式名＝查询；分类名给 `-`/`清除`
+＝清空手动分类、回到自动规则），以及网页「样式」页——列表按分类分组，**每个分类是一个可折叠条目**，
+点组头（分类名 + 条数 + 箭头）就能展开或收起，工具栏另有「全部展开 / 全部折叠」；折叠状态存在浏览器的
+localStorage 里，**刷新后保持**，默认全部展开。组里每行一个分类徽标，点它（或「改分类」按钮）就能改，
+输入框带已有分类的候选、也可以直接输入新分类名；工具栏有分类筛选，批量区有「批量改分类」。
+`.style list`、`.style prompt`、`.style load` 的回执里也都会显示分类。
 
-**老文件（没有 `category` 字段）读成"未手动分类"**：不报错、也不会被读取过程重写；写盘时只写非空的分类。
+接口上，`GET /api/styles` 新增 `categories: [{key,name,kind,count,lora}]`——`kind` 是
+`lora`/`stack`/`manual`/`none`，`key` 形如 `lora:<LoRA名>`、`stack:xl`、`manual:<分类名>`、`none`；
+每条样式带 `categoryKey`，排序为 LoRA 组 → stack → manual → 未分类。
+
+**老文件（没有 `category` 字段）读成"未手动分类"**：不报错、也不会被读取过程重写；写盘只写用户手动设置的分类。
 
 ### 展示图样式会记住展示图自己的尺寸
 
@@ -335,10 +343,10 @@ run.bat --set-map yh "路径"       # 命令行设置地图（需先停止机器
 - 尺寸优先级：**展示图自己的像素** ＞ 当前 Forge 预设栈的 `width/height` ＞ 机器人当前设置
   （Anima 预设的 `anima_t2i_width/height` 是 0，等于"没给"，会逐项回退）；
 - 同时记下展示图路径 `model.previewImage`（`data/style-previews/<哈希>.png`，**不复制大图**）与所属 LoRA
-  的 `model.lora`（`LoRA 附带` 大类的细分标签）；
+  的 `model.lora`（分类时靠它把样式归到这个 LoRA 的分类）；
 - 「补展示图」这条重跑路径同样带尺寸：已存在但缺 `width/height` 的展示图样式会补写一次，回执报
   「补展示图尺寸 N 条」；重复同步是"复用"，不会反复重写；
-- `.style load`（命令与网页）会把记着的尺寸一起套回机器人设置；分类是 `LoRA 附带` 而它记的栈与当前栈
+- `.style load`（命令与网页）会把记着的尺寸一起套回机器人设置；分类来自展示图样式、而它记的栈与当前栈
   不一致时，仍然照旧提示"底模没有随之切换"，**不偷偷切栈**。
 
 ### 展示图样式的「跳过」按原因分类，不做成的不骗你
@@ -473,7 +481,7 @@ Civitai 下载记录里的 `base_model` → Forge 的 LoRA 元数据（`/sdapi/v
 ```
 pixiko\
 ├─ README.md                       本文件
-├─ RELEASE.md                      v1.0.12 发行说明（含版权声明与已知限制）
+├─ RELEASE.md                      v1.0.14 发行说明（含版权声明与已知限制）
 ├─ THIRD-PARTY-LICENSES.md         随二进制包分发的第三方组件与许可
 ├─ config.example.json             脱敏配置模板（复制成 config.json 再改）
 ├─ .gitignore                      config.json / data / logs / lib jar 等一律不入库

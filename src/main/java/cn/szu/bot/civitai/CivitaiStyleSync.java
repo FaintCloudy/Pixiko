@@ -27,6 +27,8 @@ public final class CivitaiStyleSync {
         /**
          * 连模型参数与**分类**一起保存（v1.0.12 起展示图样式一律归「LoRA 附带」大类）。
          * 老实现可以不覆盖：那就没有分类，样式照旧可用（默认规则里还会按展示图映射兜底）。
+         * <p>v1.0.14 起展示图样式不再写死分类（传空串）：分类由本机样式库按「一个 LoRA 一个分类」
+         * 现算（分类名＝该 LoRA 的显示名），传具体分类会把样式钉成手动分类。
          */
         default void save(String name, String positive, String negative, boolean overwrite, JsonObject model, String category) throws Exception {
             save(name, positive, negative, overwrite, model);
@@ -238,8 +240,9 @@ public final class CivitaiStyleSync {
                             backup.addProperty("replacement_tag", tag);
                             Json.atomicWrite(root.resolve("data/civitai-style-backups/" + UUID.randomUUID() + ".json"), backup);
                         }
-                        // 展示图样式一律归到同一个大类「LoRA 附带」（用户手动改过的分类在 save 里会被保留）。
-                        store.save(name, positive, negative, old != null, recorded, LORA_CATEGORY);
+                        // 分类留空：展示图样式按「一个 LoRA 一个分类」的规则自动分组（分类名＝该 LoRA 的显示名），
+                        // 这里写死一个分类会把样式钉死成手动分类。用户手动改过的分类在 save 里会被保留。
+                        store.save(name, positive, negative, old != null, recorded, "");
                         if (old == null) saved++;
                         else if (!textSame) corrected++;
                         else if (sizeFilled) sized++;
@@ -315,7 +318,10 @@ public final class CivitaiStyleSync {
         };
     }
 
-    /** LoRA 文件名（去扩展名）：作为「LoRA 附带」的细分标签记进样式（大类仍是 {@link #LORA_CATEGORY}）。 */
+    /**
+     * LoRA 文件名（去扩展名）：记进样式的 {@code model.lora}，也是「一个 LoRA 一个分类」的第一判据
+     * （分类名会再用 {@code data/civitai} 记录里的 {@code model_name} 换成显示名）。
+     */
     static String loraStem(Path path) {
         if (path == null || path.getFileName() == null) return "";
         return path.getFileName().toString().replaceFirst("(?i)\\.safetensors$", "").strip();

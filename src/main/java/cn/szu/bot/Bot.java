@@ -1129,7 +1129,7 @@ public final class Bot implements AutoCloseable {
         /style load <名称|#编号> [nolora] — 用样式替换当前正反向 prompt；nolora 表示不加载样式里的 LoRA
         /style rename [overwrite] <旧名称|#编号|#6-#9> <新名称或前缀> — 样式改名
         /style delete <名称|#编号|#6-#9> — 删除样式
-        /style category <名称|#编号|#6-#9> [分类名] — 查看或修改样式分类；分类名给 - 表示恢复自动分类（LoRA 附带的展示图样式自动归到「LoRA 附带」）
+        /style category <名称|#编号|#6-#9> [分类名] — 查看或修改样式分类；分类名给 - 表示恢复自动分类（LoRA 附带样式一个 LoRA 一个分类）
         /size — 查看图片宽高（像素）
         /size set <宽> <高> — 修改宽高，例如 /size set 768 512
         /steps [set <步数>] — 查看或设置机器人迭代步数
@@ -3915,7 +3915,8 @@ public final class Bot implements AutoCloseable {
                 String rest = Objects.requireNonNullElse(category.group(1), "").strip();
                 if (rest.isEmpty())
                     throw new IllegalArgumentException("用法：/style category <名称|#编号|#起-#止> [分类名]；只给名称时查看当前分类，"
-                            + "分类名给 - 恢复自动分类（LoRA 附带的展示图样式自动归到「" + LocalStyles.LORA_CATEGORY + "」）。");
+                            + "分类名给 - 恢复自动分类（LoRA 附带样式自动按所属 LoRA 分组：一个 LoRA 一个分类，"
+                            + "认不出具体 LoRA 的才归到「" + LocalStyles.LORA_CATEGORY + "」）。");
                 // 名称可能含空格：整段恰好是一条已存在的样式名时按"只看不改"处理，否则按"目标 + 分类名"拆开。
                 String spec = rest;
                 String value = null;
@@ -3948,7 +3949,7 @@ public final class Bot implements AutoCloseable {
                     } catch (Exception error) { failed.add(target + "（" + error(error) + "）"); }
                 }
                 reply(event, reportBatch("样式分类", done, failed, List.of())
-                        + (clear ? "\n已清空手动分类：这些样式回到默认规则（" + LocalStyles.LORA_CATEGORY + " → 归属栈 → "
+                        + (clear ? "\n已清空手动分类：这些样式回到自动规则（LoRA 附带样式一个 LoRA 一个分类 → 归属栈 → "
                             + LocalStyles.OTHER_CATEGORY + "）。" : "")
                         + "\n网页「样式」页按分类分组，也可以在那里改。");
                 return;
@@ -4075,14 +4076,15 @@ public final class Bot implements AutoCloseable {
         return text.toString();
     }
 
-    /** 样式分类的一行汇总（`.style` 与 `.style list` 都用它；没有样式就没有这一行）。 */
+    /** 样式分类的一行汇总（`.style` 与 `.style list` 都用它；空库或只有 0 条的组就没有这一行）。 */
     private String categorySummary() {
-        Map<String, Integer> counts = localStyles.categoryCounts();
-        if (counts.isEmpty()) return "";
         List<String> parts = new ArrayList<>();
-        for (Map.Entry<String, Integer> entry : counts.entrySet()) parts.add(entry.getKey() + " " + entry.getValue());
+        for (LocalStyles.Group group : localStyles.categoryGroups())
+            if (group.count() > 0) parts.add(group.name() + " " + group.count());
+        if (parts.isEmpty()) return "";
         return "\n分类：" + String.join("、", parts)
-                + "（" + LocalStyles.LORA_CATEGORY + "＝下载 LoRA 时用展示图生成的样式，自动归到一起）";
+                + "（每个 LoRA 附带样式各成一个分类（分类名＝LoRA 名）；认不出具体 LoRA 的才归到「"
+                + LocalStyles.LORA_CATEGORY + "」，其余按归属栈）";
     }
     private void function(JsonObject event, String arguments) throws Exception {        String scope = promptScope(event);
         PromptFunctions functions = new PromptFunctions(settings.root);
@@ -6032,7 +6034,7 @@ public final class Bot implements AutoCloseable {
                     } catch (Exception error) { failed.add(target + "（" + error(error) + "）"); }
                 }
                 message = reportBatch("样式分类", done, failed, List.of())
-                        + (clear ? "；已清空手动分类，回到默认规则（" + LocalStyles.LORA_CATEGORY + " → 归属栈 → "
+                        + (clear ? "；已清空手动分类，回到自动规则（LoRA 附带样式一个 LoRA 一个分类 → 归属栈 → "
                             + LocalStyles.OTHER_CATEGORY + "）" : "");
             }
             case "load" -> {
@@ -6142,13 +6144,16 @@ public final class Bot implements AutoCloseable {
     /** 样式表：机器人自己的样式库（唯一来源，载入时直接套用到个人提示词）。 */
     public JsonObject webStyles() throws Exception {
         List<String> local = localStyles.names();
+        // 分类只读地现算一次：同时算进「分类清单」与每条样式的 categoryKey/categorySource，
+        // 两边的 key 必须一模一样（前端靠 categoryKey 持久化折叠状态）。
+        LocalStyles.LoraIndex index = localStyles.loraIndex();
         JsonArray items = new JsonArray();
         // 底模分类：列表上方的"Anima 12 个、NoobAI 5 个"用。**不重排列表**——样式编号是
         // .style load #N、批量 #6-#9 的依据，因为分组而变号会让那些指令打错目标。
         Map<String, Integer> byBase = new LinkedHashMap<>();
         int number = 0;
         for (String name : local) {
-            JsonObject item = styleItem(++number, name, "local");
+            JsonObject item = styleItem(++number, name, "local", index);
             items.add(item);
             String base = Json.str(item, "baseModel", "");
             if (!base.isBlank()) byBase.merge(base, 1, Integer::sum);
@@ -6163,14 +6168,20 @@ public final class Bot implements AutoCloseable {
         return result;
     }
 
-    /** 分类清单：名称 + 条数（顺序固定：LoRA 附带 → 各栈 → 未分类 → 自定义分类按名字）。 */
+    /**
+     * 分类清单（组头与「改分类」下拉都读它）：{@code key} / {@code name} / {@code kind} / {@code count} / {@code lora}。
+     * 顺序：lora 组（一个 LoRA 一组，count 降序、同 count 按名字升序）→ stack 组（固定栈序）→ manual 组
+     * → {@code none} 永远最后。**只读地现算，不往 data/local-styles.json 里写东西。**
+     */
     private JsonArray categoryItems() {
         JsonArray result = new JsonArray();
-        for (Map.Entry<String, Integer> entry : localStyles.categoryCounts().entrySet()) {
+        for (LocalStyles.Group group : localStyles.categoryGroups()) {
             JsonObject item = new JsonObject();
-            item.addProperty("name", entry.getKey());
-            item.addProperty("count", entry.getValue());
-            item.addProperty("lora", LocalStyles.LORA_CATEGORY.equals(entry.getKey()));
+            item.addProperty("key", group.key());
+            item.addProperty("name", group.name());
+            item.addProperty("kind", group.kind());
+            item.addProperty("count", group.count());
+            item.addProperty("lora", group.lora());
             result.add(item);
         }
         return result;
@@ -6191,7 +6202,7 @@ public final class Bot implements AutoCloseable {
         return result;
     }
     /** 一行样式：带原文（网页「查看原文」直接弹信息框，不用再走指令通道）。 */
-    private JsonObject styleItem(int number, String name, String source) {
+    private JsonObject styleItem(int number, String name, String source, LocalStyles.LoraIndex index) {
         JsonObject item = new JsonObject();
         item.addProperty("number", number);
         item.addProperty("name", name);
@@ -6204,8 +6215,12 @@ public final class Bot implements AutoCloseable {
             if (style != null) {
                 item.addProperty("positive", style.positive() == null ? "" : style.positive());
                 item.addProperty("negative", style.negative() == null ? "" : style.negative());
-                // 分类：生效值（手动优先、否则默认规则）+ 是不是手动设的（前端据此提示"留空=自动"）。
-                item.addProperty("category", localStyles.categoryOf(style));
+                // 分类：生效值（手动优先、否则自动规则）+ key（与 categories 里那条一模一样）+
+                // 种类（lora/stack/manual/none，前端按它分组）+ 是不是手动设的。
+                LocalStyles.Classification classification = LocalStyles.classify(style, index);
+                item.addProperty("category", classification.name());
+                item.addProperty("categoryKey", classification.key());
+                item.addProperty("categorySource", classification.kind());
                 item.addProperty("categoryStored", style.category());
                 item.addProperty("categoryAuto", !style.hasCategory());
                 // 样式记着的模型参数（底模 + 采样方法/调度器/步数/CFG/Shift/尺寸）：面板直接显示摘要，

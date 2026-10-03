@@ -17,7 +17,7 @@ import cn.szu.bot.sd.SdClient;
 import cn.szu.bot.sd.StylePreviews;
 
 /**
- * 样式分类与展示图尺寸：默认分类规则（按归属栈）、LoRA 附带的展示图样式归到同一个大类、
+ * 样式分类与展示图尺寸：默认分类规则（LoRA 附带样式一个 LoRA 一个分类、其余按归属栈）、
  * 手动/批量改分类与清空、老文件（没有 category 字段）兼容、展示图真实像素尺寸的读取与回退优先级，
  * 以及载入样式时把尺寸一起套回机器人设置。
  *
@@ -33,11 +33,11 @@ public final class StyleCategoryTest {
             loraShowcaseCategory(f);
             previewSizes(f);
         }
-        System.out.println("StyleCategoryTest: " + assertions + " assertions passed: 默认分类规则、LoRA 附带统一大类、"
+        System.out.println("StyleCategoryTest: " + assertions + " assertions passed: 默认分类规则、一个 LoRA 一个分类、"
                 + "手动/批量改分类与清空、老文件兼容、展示图真实尺寸读取与优先级、载入套用尺寸。");
     }
 
-    /** 默认分类规则：LoRA 附带 → 归属栈（Anima/SDXL/SD 1.5/Flux/Qwen）→ 未分类；老文件不报错也不被重写。 */
+    /** 默认分类规则：LoRA 附带样式一个 LoRA 一个分类 → 归属栈（Anima/SDXL/SD 1.5/Flux/Qwen）→ 未分类；老文件不报错也不被重写。 */
     private static void defaultCategories(Fixture f) throws Exception {
         f.seed(List.of(
                 style("Anima 风格", "a", model("baseModel", "Anima", "stack", "anima", "width", 1024, "height", 1024)),
@@ -49,18 +49,28 @@ public final class StyleCategoryTest {
         String before = Files.readString(file, StandardCharsets.UTF_8);
         LocalStyles styles = new LocalStyles(f.root);
         Map<String, String> expected = new LinkedHashMap<>();
-        expected.put("Anima 风格", "Anima");
-        expected.put("SDXL 风格", "SDXL");
-        expected.put("SD15 风格", "SD 1.5");
-        expected.put("Flux 风格", "Flux");
+        expected.put("Anima 风格", "Anima 栈");
+        expected.put("SDXL 风格", "SDXL 栈");
+        expected.put("SD15 风格", "SD 1.5 栈");
+        expected.put("Flux 风格", "Flux 栈");
         expected.put("没底模 风格", LocalStyles.OTHER_CATEGORY);
         for (Map.Entry<String, String> entry : expected.entrySet())
             equal(entry.getValue(), styles.categoryOf(styles.get(entry.getKey())), entry.getKey() + " 的默认分类");
-        // 分类清单顺序固定：LoRA 附带 → 各栈 → 未分类（这里没有 LoRA 附带与 Qwen）。
-        equal(List.of("Anima", "SDXL", "SD 1.5", "Flux", LocalStyles.OTHER_CATEGORY),
-                new ArrayList<>(styles.categoryCounts().keySet()), "分类清单的顺序");
+        // 分类清单顺序固定：各栈按固定栈序 → 未分类永远最后（这里没有 LoRA 附带样式与 Qwen）。
+        List<String> names = new ArrayList<>();
+        for (LocalStyles.Group group : styles.categoryGroups()) names.add(group.name());
+        equal(List.of("Anima 栈", "SDXL 栈", "SD 1.5 栈", "Flux 栈", LocalStyles.OTHER_CATEGORY),
+                names, "分类清单的顺序");
+        equal(List.of("stack:anima", "stack:xl", "stack:sd", "stack:flux", LocalStyles.NONE_KEY),
+                new ArrayList<>(groupKeys(styles)), "分类清单的 key");
         equal(before, Files.readString(file, StandardCharsets.UTF_8), "老文件（没有 category 字段）读多少次都不报错、不重写");
         check(!before.contains("category"), "老文件里本来就没有 category 字段：" + before.substring(0, Math.min(80, before.length())));
+    }
+
+    private static List<String> groupKeys(LocalStyles styles) {
+        List<String> keys = new ArrayList<>();
+        for (LocalStyles.Group group : styles.categoryGroups()) keys.add(group.key());
+        return keys;
     }
 
     /** 手动改分类 / 只查不改 / 清空 / 批量（命令与网页接口两条路都要有）。 */
@@ -93,12 +103,16 @@ public final class StyleCategoryTest {
         String cleared = f.command(".style category 甲 -");
         check(cleared.contains("已清空手动分类"), "清空手动分类：" + cleared);
         equal("", f.categoryInFile("甲"), "清空后文件里不再有这一条的分类");
-        equal("Anima", f.categoryOf("甲"), "清空后按归属栈回到默认分类");
+        equal("Anima 栈", f.categoryOf("甲"), "清空后按归属栈回到默认分类");
         // 网页接口：categories 清单 + 单条改分类 + 清空 + 批量
         JsonObject page = f.bot.webStyles();
         check(page.has("categories") && !page.getAsJsonArray("categories").isEmpty(), "/api/styles 返回 categories");
         JsonObject first = page.getAsJsonArray("styles").get(0).getAsJsonObject();
-        check(first.has("category") && first.has("categoryAuto"), "每条样式带 category/categoryAuto");
+        check(first.has("category") && first.has("categoryAuto") && first.has("categoryKey") && first.has("categorySource"),
+                "每条样式带 category/categoryKey/categorySource/categoryAuto");
+        JsonObject firstGroup = page.getAsJsonArray("categories").get(0).getAsJsonObject();
+        check(firstGroup.has("key") && firstGroup.has("name") && firstGroup.has("kind") && firstGroup.has("count") && firstGroup.has("lora"),
+                "categories 每项带 key/name/kind/count/lora：" + firstGroup);
         JsonObject edited = f.bot.webStylesEdit("web", "category", "丁", null, false, false, "网页分类");
         check(edited.get("message").getAsString().contains("丁 → 网页分类"), "网页改分类的回执：" + edited.get("message").getAsString());
         equal("网页分类", f.categoryInFile("丁"), "网页改分类真的落盘");
@@ -116,11 +130,12 @@ public final class StyleCategoryTest {
         check(f.command(".style category 甲 " + "长".repeat(LocalStyles.MAX_CATEGORY + 1)).contains("失败 1 项"), "过长的分类名要被拒");
         equal("", LocalStyles.categoryName("-"), "分类名 - 表示清空");
         equal("", LocalStyles.categoryName("  清除 "), "分类名「清除」表示清空");
+        equal("", LocalStyles.categoryName(LocalStyles.LORA_CATEGORY), "老版本的自动分类名「LoRA 附带」不是手动分类名");
     }
 
-    /** LoRA 附带的展示图样式一律归到同一个大类；用户手动改过的分类不会被保存/同步改回去。 */
+    /** LoRA 附带样式：一个 LoRA 一个分类（判据 model.lora → 展示图映射 → 样式名前缀）；手动分类优先。 */
     private static void loraShowcaseCategory(Fixture f) throws Exception {
-        // 生成展示图样式时留下的映射（老样式没有 sizeSource/lora 标注，靠它归到「LoRA 附带」）。
+        // 生成展示图样式时留下的映射（老样式没有 sizeSource/lora 标注，靠它认出所属 LoRA）。
         JsonObject links = new JsonObject();
         links.addProperty("1/2/老模型.safetensors/1", "老模型 1");
         Json.atomicWrite(f.root.resolve("data/civitai-style-links.json"), links);
@@ -128,20 +143,31 @@ public final class StyleCategoryTest {
                 style("老模型 1", "legacy", null),
                 style("新模型 1", "fresh", model("sizeSource", "preview", "lora", "新模型", "width", 96, "height", 64)),
                 style("别的模型 1", "other", model("lora", "别的模型")),
+                style("无名展示图", "anonymous", model("sizeSource", "preview")),
+                style("展示图带尾号 3", "numbered", model("sizeSource", "preview")),
                 style("普通 风格", "plain", model("stack", "sd"))));
         LocalStyles styles = new LocalStyles(f.root);
-        equal(LocalStyles.LORA_CATEGORY, styles.categoryOf(styles.get("老模型 1")), "映射里的老展示图样式归到 LoRA 附带");
-        equal(LocalStyles.LORA_CATEGORY, styles.categoryOf(styles.get("新模型 1")), "标了 sizeSource=preview 的归到 LoRA 附带");
-        equal(LocalStyles.LORA_CATEGORY, styles.categoryOf(styles.get("别的模型 1")), "标了 model.lora 的归到 LoRA 附带");
-        equal("SD 1.5", styles.categoryOf(styles.get("普通 风格")), "普通样式照旧按归属栈分类");
-        equal(LocalStyles.LORA_CATEGORY, new ArrayList<>(styles.categoryCounts().keySet()).get(0), "LoRA 附带排在分类清单最前面");
-        // 手动分类优先：同步再写一次（save 带 LoRA 附带）也不能把用户设的分类改回去。
+        equal("老模型", styles.categoryOf(styles.get("老模型 1")), "映射里的老展示图样式认到它自己的 LoRA");
+        equal("lora:老模型", styles.classify(styles.get("老模型 1")).key(), "LoRA 分类的 key 前缀");
+        equal("新模型", styles.categoryOf(styles.get("新模型 1")), "model.lora 给出所属 LoRA");
+        equal("别的模型", styles.categoryOf(styles.get("别的模型 1")), "标了 model.lora 的样式认得出所属 LoRA");
+        equal(LocalStyles.LORA_CATEGORY, styles.categoryOf(styles.get("无名展示图")), "认不出具体 LoRA 才退回「LoRA 附带」");
+        equal("SD 1.5 栈", styles.categoryOf(styles.get("普通 风格")), "普通样式照旧按归属栈分类");
+        // 排序：LoRA 组在最前、栈组在后、未分类最后。
+        List<String> keys = groupKeys(styles);
+        check(keys.indexOf("lora:老模型") >= 0 && keys.indexOf("stack:sd") > keys.indexOf("lora:老模型"),
+                "LoRA 分类排在归属栈分类前面：" + keys);
+        check(keys.indexOf(LocalStyles.NONE_KEY) == keys.size() - 1, "未分类排在最后：" + keys);
+        // 手动分类优先：同步再写一次（save 带分类）也不能把用户设的分类改回去。
         styles.setCategory("新模型 1", "我的手动分类");
         styles.save("新模型 1", "fresh2", "", true, model("width", 96, "height", 64), LocalStyles.LORA_CATEGORY);
         equal("我的手动分类", styles.get("新模型 1").category(), "覆盖保存不会覆盖用户手动设的分类");
-        // 没有映射表时（第二个参数为 null）按默认规则算：这里 "老模型 1" 没有栈信息 → 未分类。
-        equal(LocalStyles.OTHER_CATEGORY, LocalStyles.categoryOf(styles.get("老模型 1"), null),
-                "categoryOf 的映射表参数可以是 null（按默认规则算）");
+        equal("manual:我的手动分类", styles.classify(styles.get("新模型 1")).key(), "手动分类优先于自动分类");
+        // 第二判据用不了（没有映射）时，仍能按样式名前缀判出 LoRA 名（前提是它确实是展示图样式）。
+        equal("展示图带尾号", LocalStyles.loraName(styles.get("展示图带尾号 3"), LocalStyles.LoraIndex.EMPTY),
+                "没有展示图映射时按样式名前缀判 LoRA");
+        equal("", LocalStyles.loraName(styles.get("普通 风格"), LocalStyles.LoraIndex.EMPTY),
+                "普通样式不会只按名字被认成 LoRA");
     }
 
     /** 展示图真实像素尺寸：PNG/JPEG/WebP 文件头、优先级（展示图 > 预设/当前设置）、补写回执、载入套用。 */
@@ -186,7 +212,7 @@ public final class StyleCategoryTest {
         equal(CivitaiStyleSync.PREVIEW_SIZE_SOURCE, Json.str(sized.model(), "sizeSource", ""), "标出尺寸来源是展示图");
         check(Json.str(sized.model(), "previewImage", "").startsWith("data/style-previews/"), "记下展示图路径（不复制大图）：" + sized.model());
         equal("shirohaANY-clothes", Json.str(sized.model(), "lora", ""), "记下所属 LoRA 的细分标签");
-        equal(LocalStyles.LORA_CATEGORY, local.categoryOf(sized), "展示图样式归到「LoRA 附带」大类");
+        equal("shirohaANY-clothes", local.categoryOf(sized), "展示图样式归到所属 LoRA 的分类（一个 LoRA 一个分类）");
         equal("ER SDE", Json.str(sized.model(), "sampler", ""), "预设里的其它参数照旧保留");
         // 没有预览图的那条：回退到原来记着的尺寸（预设/当前设置），不编、不标来源。
         LocalStyles.Style fallback = local.get("测试模型 2");
