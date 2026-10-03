@@ -201,8 +201,9 @@ public class WebApiController {
             case "/api/civitai/status": return WebJson.ok(bot.civitaiStatus());
             case "/api/civitai/search": {
                 // 「Civitai 搜索」卡片：返回结构化结果，网页自己渲染图片+信息，不发消息。
+                // body.page 是页码（从 1 开始），网页的「上一页/下一页」就带它。
                 requirePost(method);
-                return WebJson.ok(bot.webCivitaiSearch(scope, Json.str(body, "query", "")));
+                return WebJson.ok(bot.webCivitaiSearch(scope, Json.str(body, "query", ""), cn.szu.bot.Bot.webSearchPage(body)));
             }
             case "/api/civitai/thumb": {
                 // 封面图代理（<img src> 只能带查询串）：机器人带登录态取图，浏览器不直连图床。

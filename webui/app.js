@@ -6,7 +6,9 @@
   const state = { token: localStorage.getItem(TOKEN_KEY) || '', status: null, options: null, pollTimer: null, followTimer: null, busy: 0,
     seenImages: new Map(), seenGroups: new Map(), followUntil: 0, receiptKey: '', receiptTexts: 0, receiptImages: 0,
     receiptCount: 0, receiptBox: null, receiptToasted: '',
-    loras: null, loraGroups: null, terminalHistory: [], terminalCursor: 0 };
+    loras: null, loraGroups: null, terminalHistory: [], terminalCursor: 0,
+    // Civitai 搜索的翻页状态：搜索词与当前页留在前端，翻页时不用重敲。
+    civitaiQuery: '', civitaiPage: 1 };
 
   const $ = (id) => document.getElementById(id);
   const el = (tag, cls, text) => { const node = document.createElement(tag); if (cls) node.className = cls; if (text !== undefined) node.textContent = text; return node; };
@@ -1526,6 +1528,47 @@
   }
 
   /**
+   * 翻页控件：只有搜索过一次才显示。页数用服务端给的 page 与 hasMore——Civitai 的关键词搜索
+   * **不返回总页数**（cursor 分页），所以知道总数时才写「第 X/Y 页」，否则只写「第 X 页」，
+   * 能不能再翻一页由 hasMore 决定（下一页按钮据此禁用）。
+   */
+  function renderCivitaiPager(data) {
+    const pager = $('civitai-pager');
+    if (!pager) return;
+    pager.hidden = false;
+    const page = Number(data.page) || 1;
+    const total = Number(data.totalPages);
+    $('civitai-page').textContent = (data.totalPagesKnown && total > 0) ? '第 ' + page + '/' + total + ' 页' : '第 ' + page + ' 页';
+    $('civitai-prev').disabled = page <= 1;
+    $('civitai-next').disabled = !data.hasMore;
+    $('civitai-page-hint').textContent = (data.count || 0) + ' 项（卡片上的 #N 是本页编号）';
+  }
+
+  /** 搜一页：query 为空时沿用上一次的搜索词（翻页就不必重敲）。 */
+  function searchCivitai(page) {
+    const input = $('lora-query');
+    const typed = input ? input.value.trim() : '';
+    const query = typed || state.civitaiQuery;
+    if (!query) { toast('请先填搜索词。'); return Promise.resolve(); }
+    state.civitaiQuery = query;
+    renderCivitai([], { loading: '正在搜索 Civitai：' + query + '…' });
+    return api('/api/civitai/search', { body: { query, page: page || 1, scope: scope() } }).then((data) => {
+      state.civitaiQuery = data.query || query;
+      state.civitaiPage = Number(data.page) || 1;
+      renderCivitai(data.results, { empty: data.note || '没有找到匹配的 LoRA。' });
+      renderCivitaiPager(data);
+      if ($('lora-status')) {
+        const at = '「' + state.civitaiQuery + '」第 ' + state.civitaiPage + ' 页：' + (data.count || 0) + ' 项'
+          + (data.hasMore ? '（还有下一页）' : '（已经是最后一页）');
+        $('lora-status').textContent = at;
+      }
+      return data;
+    }).catch((error) => {
+      renderCivitai([], { empty: '搜索失败：' + error.message });
+    });
+  }
+
+  /**
    * 本机 LoRA 展示图 / 样式预览图的地址。同样是 `<img>` 带不了 Authorization 头，
    * 令牌只能挂在查询串上（少了它图会 401，页面上看起来就是"无图"）。
    */
@@ -2586,18 +2629,12 @@
     on('style-reload', 'click', loadStyles);
 
     // LoRA
-    on('lora-query-btn', 'click', async () => {
-      const query = $('lora-query').value.trim();
-      if (!query) return;
-      renderCivitai([], { loading: '正在搜索 Civitai：' + query + '…' });
-      try {
-        const data = await api('/api/civitai/search', { body: { query, scope: scope() } });
-        renderCivitai(data.results, { empty: '没有找到匹配的 LoRA。' });
-        if ($('lora-status')) $('lora-status').textContent = '「' + (data.query || query) + '」找到 ' + (data.count || 0) + ' 项（点卡片上的「下载」即可）';
-      } catch (error) {
-        renderCivitai([], { empty: '搜索失败：' + error.message });
-      }
-    });
+    on('lora-query-btn', 'click', () => searchCivitai(1));
+    // 回车直接搜（不用先点按钮），与「搜索」按钮同一条路径。
+    on('lora-query', 'keydown', (event) => { if (event.key === 'Enter') { event.preventDefault(); searchCivitai(1); } });
+    // 翻页：搜索词保持在 state.civitaiQuery 里，翻页不会丢；页码越界由后端给 note，不静默。
+    on('civitai-prev', 'click', () => { if (state.civitaiPage > 1) searchCivitai(state.civitaiPage - 1); });
+    on('civitai-next', 'click', () => searchCivitai(state.civitaiPage + 1));
     on('lora-status-btn', 'click', () => runCommands(['.lora status']).then(loadLoras));
     on('lora-auto-get', 'change', (event) => setOption('autoGet', event.target.checked ? 'on' : 'off'));
     on('lora-filter', 'input', () => renderLoras(state.loras, state.loraGroups));

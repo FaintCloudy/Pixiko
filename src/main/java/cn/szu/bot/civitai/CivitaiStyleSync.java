@@ -92,14 +92,24 @@ public final class CivitaiStyleSync {
      */
     public static String sync(Path root, CivitaiClient.DownloadedLora download, String tag, SdClient sd, boolean create,
                               CivitaiClient client, JsonObject model) {
+        return sync(root, download, tag, sd, create, client, model, 0);
+    }
+    /** 与上一条同路，额外带上展示图样式张数上限（{@code civitai.showcase_limit}，0 = 不限）。 */
+    public static String sync(Path root, CivitaiClient.DownloadedLora download, String tag, SdClient sd, boolean create,
+                              CivitaiClient client, JsonObject model, int showcaseLimit) {
         JsonObject params = model != null ? model : styleModel(sd, download.baseModel(), SdClient.CIVITAI_SOURCE);
-        return sync(root, download, tag, store(root), create, client, params);
+        return sync(root, download, tag, store(root), create, client, params, showcaseLimit);
     }
     /** 与上一版同一条路径，只是把计数也返回（「补展示图」要报补了几条尺寸）。 */
     public static Outcome run(Path root, CivitaiClient.DownloadedLora download, String tag, SdClient sd, boolean create,
                               CivitaiClient client, JsonObject model) {
+        return run(root, download, tag, sd, create, client, model, 0);
+    }
+    /** 与上一条同路，额外带上展示图样式张数上限（{@code civitai.showcase_limit}，0 = 不限）。 */
+    public static Outcome run(Path root, CivitaiClient.DownloadedLora download, String tag, SdClient sd, boolean create,
+                              CivitaiClient client, JsonObject model, int showcaseLimit) {
         JsonObject params = model != null ? model : styleModel(sd, download.baseModel(), SdClient.CIVITAI_SOURCE);
-        return run(root, download, tag, store(root), create, client, params);
+        return run(root, download, tag, store(root), create, client, params, showcaseLimit);
     }
     /**
      * 展示图样式的模型参数：底模用这个 LoRA 的（Civitai 记录），采样方法/步数/CFG/Shift/尺寸用当前
@@ -123,22 +133,49 @@ public final class CivitaiStyleSync {
     }
     /** 展示图样式记的尺寸来源标记：宽高来自这张展示图**自己的像素**，不是预设/当前设置。 */
     public static final String PREVIEW_SIZE_SOURCE = "preview";
-    /** 一次展示图样式同步的结果：各类计数 + 给用户看的回执（「补展示图」要报补了几条尺寸）。 */
+    /**
+     * 跳过的原因分类。回执不能只给一个「跳过 9」——用户分不清是"已有同名样式"、"图没有提示词"
+     * 还是"撞上了上限"，也就不知道下一步该做什么。每类都对应一条可操作提示（见 {@link #skipHint}）。
+     */
+    public static final String SKIP_NO_PROMPT = "该图没有提示词元数据";
+    public static final String SKIP_NAME_TAKEN = "同名样式内容不同";
+    public static final String SKIP_NO_MATCH = "该图没有对应样式且本次不新建";
+    public static final String SKIP_OVER_LIMIT = "超出展示图样式上限";
+    /** 一次展示图样式同步的结果：各类计数 + 跳过原因分类 + 给用户看的回执（「补展示图」要报补了几条尺寸）。 */
     public record Outcome(int saved, int corrected, int reused, int skipped, int failed, int previews, int params,
-                          int sized, String text) { }
+                          int sized, Map<String, Integer> skips, String text) {
+        public Outcome {
+            skips = skips == null ? Map.of() : Collections.unmodifiableMap(new LinkedHashMap<>(skips));
+        }
+    }
     /**
      * @param model 每条展示图样式要一起写进样式库的模型参数（底模 + 采样方法/调度器/步数/CFG/Shift/尺寸）；
      *              null 表示这次不写参数（老调用方、离线计划）。
      */
     public static String sync(Path root, CivitaiClient.DownloadedLora download, String tag, Store store, boolean create,
                               CivitaiClient client, JsonObject model) {
-        return run(root, download, tag, store, create, client, model).text();
+        return sync(root, download, tag, store, create, client, model, 0);
+    }
+    /** 与上一版同一条路径，只是展示图样式的张数上限（{@code civitai.showcase_limit}，0 = 不限）也能传进来。 */
+    public static String sync(Path root, CivitaiClient.DownloadedLora download, String tag, Store store, boolean create,
+                              CivitaiClient client, JsonObject model, int showcaseLimit) {
+        return run(root, download, tag, store, create, client, model, showcaseLimit).text();
     }
     /** 与 {@link #sync} 同一件事，只是把计数也一并返回（例如「补展示图」要报补了几条尺寸）。 */
     public static Outcome run(Path root, CivitaiClient.DownloadedLora download, String tag, Store store, boolean create,
                               CivitaiClient client, JsonObject model) {
-        if (download.showcases().isEmpty()) return new Outcome(0, 0, 0, 0, 0, 0, 0, 0, "展示图样式：没有可用展示图元数据。");
-        int saved = 0, corrected = 0, reused = 0, skipped = 0, failed = 0, previews = 0, params = 0, sized = 0;
+        return run(root, download, tag, store, create, client, model, 0);
+    }
+    /**
+     * @param showcaseLimit 最多为前 N 张展示图建立样式（0 = 不限，按 {@code civitai.showcase_limit} 配置）。
+     *                      超出的那些按 {@link #SKIP_OVER_LIMIT} 计数并给出"调大上限"的提示，不再静默丢弃。
+     */
+    public static Outcome run(Path root, CivitaiClient.DownloadedLora download, String tag, Store store, boolean create,
+                              CivitaiClient client, JsonObject model, int showcaseLimit) {
+        if (download.showcases().isEmpty())
+            return new Outcome(0, 0, 0, 0, 0, 0, 0, 0, Map.of(), "展示图样式：没有可用展示图元数据。");
+        int saved = 0, corrected = 0, reused = 0, skipped = 0, failed = 0, previews = 0, params = 0, sized = 0, created = 0;
+        Map<String, Integer> skips = new LinkedHashMap<>();
         List<String> lines = new ArrayList<>();
         try {
             Path linksFile = root.resolve("data/civitai-style-links.json");
@@ -150,7 +187,8 @@ public final class CivitaiStyleSync {
             if (prefix.isEmpty()) prefix = "模型" + download.modelId();
             String lora = loraStem(download.path());
             for (var image : download.showcases()) {
-                if (!image.skippedReason().isEmpty()) { skipped++; continue; }
+                if (!image.skippedReason().isEmpty()) { skipped++; count(skips, SKIP_NO_PROMPT); continue; }
+                if (showcaseLimit > 0 && created >= showcaseLimit) { skipped++; count(skips, SKIP_OVER_LIMIT); continue; }
                 String key = download.modelId() + "/" + download.versionId() + "/" + download.path().getFileName() + "/" + image.number();
                 String name = create && links.has(key) ? links.get(key).getAsString() : null;
                 if (name == null || !catalog.containsKey(name)) {
@@ -162,11 +200,18 @@ public final class CivitaiStyleSync {
                     name = matches.stream().anyMatch(value -> value.name().equals(preferred)) ? preferred
                             : matches.size() == 1 ? matches.get(0).name() : null;
                     if (name == null) {
-                        if (!create) { skipped++; continue; }
+                        if (!create) {
+                            // 不新建模式（离线计划/老迁移）碰到两种跳过：名字已被内容不同的样式占了，
+                            // 或者压根没有对应样式。分开计数——前者能用「修正」路径覆盖，后者要新建。
+                            skipped++;
+                            count(skips, catalog.containsKey(preferred) ? SKIP_NAME_TAKEN : SKIP_NO_MATCH);
+                            continue;
+                        }
                         int number = image.number(); name = prefix + " " + number;
                         while (catalog.containsKey(name) || claimed.contains(name)) name = prefix + " " + (++number);
                     }
                 }
+                created++;
                 claimed.add(name);
                 try {
                     var old = catalog.get(name);
@@ -206,15 +251,68 @@ public final class CivitaiStyleSync {
                 } catch (Exception e) { failed++; lines.add("样式 " + name + " 处理失败：" + Bot.error(e)); }
             }
         } catch (Exception e) {
-            return new Outcome(saved, corrected, reused, skipped, failed, previews, params, sized, "展示图样式处理失败：" + Bot.error(e));
+            return new Outcome(saved, corrected, reused, skipped, failed, previews, params, sized, skips,
+                    "展示图样式处理失败：" + Bot.error(e));
         }
-        String text = "展示图样式：新增 " + saved + "，修正 " + corrected + "，复用 " + reused + "，跳过 " + skipped + "，失败 " + failed
+        String summary = "展示图样式：新增 " + saved + "，修正 " + corrected + "，复用 " + reused + "，跳过 " + skipped
+                + (skips.isEmpty() ? "" : "（" + skipBreakdown(skips) + "）") + "，失败 " + failed
                 + (params == 0 ? "" : "，补模型参数 " + params)
                 + (sized == 0 ? "" : "，补展示图尺寸 " + sized)
-                + (previews == 0 ? "" : "，预览图 " + previews)
-                + (model == null || model.size() == 0 ? "" : "。\n模型参数：" + modelText(model))
-                + "。\n本机标签：" + tag + (lines.isEmpty() ? "" : "\n" + String.join("\n", lines));
-        return new Outcome(saved, corrected, reused, skipped, failed, previews, params, sized, text);
+                + (previews == 0 ? "" : "，预览图 " + previews);
+        // 回执的第一行永远是汇总行（Bot 的 showcaseSummary 只取这一行），所以"跳过是怎么来的、下一步怎么办"
+        // 必须挤进这一行：原因分类计数在括号里，后面再接一句最短的可操作说明。
+        String inline = skipInline(skips);
+        String first = summary + "。" + (inline.isEmpty() ? "" : inline)
+                + (model == null || model.size() == 0 ? "" : "\n模型参数：" + modelText(model) + "。");
+        StringBuilder text = new StringBuilder(first);
+        for (String reason : skips.keySet()) text.append("\n提示（").append(reason).append("）：").append(skipHint(reason));
+        text.append("\n本机标签：").append(tag).append(lines.isEmpty() ? "" : "\n" + String.join("\n", lines));
+        return new Outcome(saved, corrected, reused, skipped, failed, previews, params, sized, skips, text.toString());
+    }
+
+    private static void count(Map<String, Integer> skips, String reason) {
+        skips.merge(reason, 1, Integer::sum);
+    }
+
+    /** 首行的"跳过明细"：按原因分类计数，例如「同名样式已存在（内容不同）2、该图没有提示词元数据 1」。 */
+    static String skipBreakdown(Map<String, Integer> skips) {
+        List<String> parts = new ArrayList<>();
+        for (Map.Entry<String, Integer> entry : skips.entrySet())
+            if (entry.getValue() != null && entry.getValue() > 0) parts.add(entry.getKey() + " " + entry.getValue());
+        return String.join("、", parts);
+    }
+
+    /** 首行那句最短的可操作说明（真正的细节在 {@link #skipHint} 的"提示"行里）。 */
+    static String skipInline(Map<String, Integer> skips) {
+        List<String> parts = new ArrayList<>();
+        for (Map.Entry<String, Integer> entry : skips.entrySet()) {
+            if (entry.getValue() == null || entry.getValue() <= 0) continue;
+            String hint = switch (entry.getKey()) {
+                case SKIP_NO_PROMPT -> "这些图在 Civitai 上就没有提示词，做不成样式";
+                case SKIP_NAME_TAKEN -> "同名样式内容不同，用 .lora cover <LoRA名> 可按展示图修正";
+                case SKIP_NO_MATCH -> "本次只补图不建样式，要建出来用 .lora cover <LoRA名>";
+                case SKIP_OVER_LIMIT -> "上限可调：config.json 的 civitai.showcase_limit（0 = 不限）";
+                default -> "";
+            };
+            if (!hint.isEmpty()) parts.add(hint);
+        }
+        return parts.isEmpty() ? "" : "跳过原因：" + String.join("；", parts) + "。";
+    }
+
+    /** 每条跳过原因对应的可操作办法（回执第 2 行起给出，日志里也看得到）。 */
+    static String skipHint(String reason) {
+        return switch (reason == null ? "" : reason) {
+            case SKIP_NO_PROMPT -> "Civitai 上这些展示图没有公开的提示词元数据（作者的图里既没有 A1111 参数也没有 ComfyUI 工作流），"
+                    + "做不成样式——不会伪造提示词。可以挑一个有提示词的版本重新下载，或在网页上自己写一条样式。";
+            case SKIP_NAME_TAKEN -> "同名样式的提示词与这张展示图不一致：用 .lora cover <LoRA名>（网页：「本机 LoRA」卡片的"
+                    + "「补展示图/样式」）按展示图内容修正它；旧内容会先备份到 data/civitai-style-backups。"
+                    + "想换个名字保留两份，可以先用 .style rename <旧名> <新名> 腾出名字再重跑。";
+            case SKIP_NO_MATCH -> "这次是「只补图、不新建样式」的重跑路径：要把它建出来，用 .lora cover <LoRA名>"
+                    + "（网页：「本机 LoRA」卡片的「补展示图/样式」）。";
+            case SKIP_OVER_LIMIT -> "把 config.json 的 civitai.showcase_limit 调大（默认 0 = 不限）后重跑 .lora cover <LoRA名>，"
+                    + "超出的展示图就会补成样式。";
+            default -> "这次没有为这些图建立样式。";
+        };
     }
 
     /** LoRA 文件名（去扩展名）：作为「LoRA 附带」的细分标签记进样式（大类仍是 {@link #LORA_CATEGORY}）。 */

@@ -97,6 +97,8 @@ public final class Bot implements AutoCloseable {
     /** 当前 LoRA 任务的回执（网页接口触发的才有）：进度与结果都要能进 /quest/#N。 */
     private volatile WebCapture loraReceipt;
     private final Map<String, List<CivitaiClient.SearchResult>> loraSearches = new ConcurrentHashMap<>();
+    /** 最近一次搜索的**页码信息**（本页编号从 1 开始；规划层据此知道 #N 是"本页第 N 条"）。 */
+    private final Map<String, CivitaiClient.SearchPage> loraPages = new ConcurrentHashMap<>();
     private static String conversation(JsonObject event) {
         return Json.str(event, "self_id", "") + ":" + Json.str(event, "message_type", "") + ":"
                 + Json.str(event, "group_id", "") + ":" + Json.str(event, "user_id", "");
@@ -592,6 +594,19 @@ public final class Bot implements AutoCloseable {
         });
         List<CivitaiClient.SearchResult> search = loraSearches.get(conversation(event));
         if (search != null) result.add("civitai", Json.GSON.toJsonTree(search.stream().map(CivitaiClient.SearchResult::url).toList()));
+        // 搜索的页码：编号是**本页**编号（`.lora download #N` 指本页第 N 条），别让模型理解成"全部结果的第 N 条"。
+        CivitaiClient.SearchPage page = loraPages.get(conversation(event));
+        if (page != null && !page.results().isEmpty()) {
+            JsonObject info = new JsonObject();
+            info.addProperty("page", page.page());
+            info.addProperty("pageSize", page.pageSize());
+            info.addProperty("count", page.count());
+            info.addProperty("hasMore", page.hasMore());
+            info.addProperty("query", page.query());
+            if (page.totalPagesKnown()) info.addProperty("totalPages", page.totalPages());
+            info.addProperty("hint", "编号是本页编号：.lora download #N 指这一页的第 N 条；翻页用 .lora search <词> <页码>");
+            result.add("civitai_page", info);
+        }
         // 用户刚看过的那份编号列表要单独标出来：它是"第 N 个 / #N"的第一解释，别的列表只是可选种类。
         ShownList shown = shownLists.get(conversation(event));
         if (shown != null) {
@@ -1087,8 +1102,8 @@ public final class Bot implements AutoCloseable {
         /promptR clear — 清空反向 prompt
         /gen toggle — 开关每个任务完成后自动领取，默认开启，重启保留
         /char <角色名或关键词> — 在本机 LoRA 与 WebUI 样式中查找该角色，列出候选并询问是否应用
-        /lora query <模型搜索词> — 搜索 Civitai，显示编号及封面
-        /lora download #编号 [权重] — 下载最近搜索中的模型
+        /lora query <模型搜索词> [页码] — 搜索 Civitai，显示本页编号及封面（/lora search 是同一个命令）
+        /lora download #编号 [权重] — 下载最近搜索中**本页**的模型（#N 指本页第 N 条）
         /rg <数量> — 回溯最近的图片，按任务和图片上限分批，不改变待领取列表
         /progress — 查看 SD WebUI 当前生成进度（第几步／百分比／预计剩余时间）与机器人队列状态
         /imgcnt <数量> — 每条聊天记录图片上限，默认 300，按任务分开发送
@@ -1144,6 +1159,7 @@ public final class Bot implements AutoCloseable {
         /function rename [overwrite] <旧名称> <新名称> — 重命名提示词集定义并同步各用户的加载关联
         /function reset — 仅清除集合关联，不删除当前提示词，用于手工修改后的重新整理
         /lora download <Civitai链接> [权重] — 下载并启用 LoRA，同时将展示图提示词保存为“模型名 编号”样式
+        /lora search <关键词> [页码] — 翻页搜索 Civitai（关键词以数字结尾时用双引号，如 /lora search "milf 2"）
         /lora status — 查看最近下载状态
         /lora list — 列出 WebUI 本地 LoRA
         /lora load <完整本地名称> [权重] — 重新加载或启用已有 LoRA
@@ -2663,19 +2679,82 @@ public final class Bot implements AutoCloseable {
                 results.stream().map(CivitaiClient.SearchResult::url).toList(),
                 results.stream().map(result -> result.name() + "（基础模型：" + result.baseModel() + "）").toList());
     }
+    /**
+     * 带页码的登记：编号列表只放**这一页**的结果，所以 {@code .lora download #N} 指本页第 N 条
+     * （翻页会整体换掉这份列表，与用户看到的回执一一对应）；页码另存一份给规划层上下文用。
+     */
+    void registerLoraSearch(JsonObject event, CivitaiClient.SearchPage page) {
+        registerLoraSearch(event, page.results());
+        loraPages.put(conversation(event), page);
+    }
+    /** `.lora search <关键词> [页码]` 解析出来的参数；页码默认 1。 */
+    record LoraSearchQuery(String words, int page) { }
+    /**
+     * 解析搜索参数：{@code <关键词> [页码]}。
+     *
+     * <p>页码是**结尾的纯数字**（1–3 位）。关键词自己以数字结尾时（例如 "milf 2"）把整段用双引号包起来，
+     * 就不会被当成页码——这条规则写进帮助里，也写进用法报错里。
+     */
+    static LoraSearchQuery parseLoraSearch(String value) {
+        String text = value == null ? "" : value.strip();
+        String usage = "用法：/lora search <模型搜索词> [页码]，例如 /lora search tsumugi 2；"
+                + "搜索词自己以数字结尾时用双引号包起来，例如 /lora search \"milf 2\"。";
+        if (text.isEmpty()) throw new IllegalArgumentException(usage);
+        if (text.length() > 2 && text.startsWith("\"") && text.endsWith("\"")) {
+            String quoted = text.substring(1, text.length() - 1).strip();
+            if (quoted.isEmpty()) throw new IllegalArgumentException(usage);
+            return new LoraSearchQuery(quoted, 1);
+        }
+        Matcher tail = Pattern.compile("^(.*?)\\s+([0-9]{1,3})$", Pattern.DOTALL).matcher(text);
+        if (tail.matches() && !tail.group(1).isBlank()) {
+            int page = Integer.parseInt(tail.group(2));
+            // 结尾写 0（或 "00"）时不当作"关键词以数字结尾"：一律报错，免得悄悄搜错词。
+            if (page < 1) throw new IllegalArgumentException("页码从 1 开始；" + usage);
+            return new LoraSearchQuery(tail.group(1).strip(), page);
+        }
+        return new LoraSearchQuery(text, 1);
+    }
+    /** 回执里"下一页：.lora search <词> <页码>"的写法：搜索词含空格或以数字结尾时加引号，免得页码被当成搜索词。 */
+    static String quoteLoraSearchWords(String words) {
+        String text = words == null ? "" : words.strip();
+        return text.matches(".*\\s.*") || text.matches(".*[0-9]$") ? "\"" + text + "\"" : text;
+    }
+    /**
+     * 搜索回执的页码说明（纯函数，便于断言）：第 X 页（Civitai 不返回总数时就不编页数）、
+     * 本页编号的语义、以及下一页的写法。
+     */
+    static String searchPageLines(CivitaiClient.SearchPage page) {
+        StringBuilder text = new StringBuilder("第 ").append(page.page())
+                .append(page.totalPagesKnown() ? "/" + page.totalPages() : "")
+                .append(" 页，本次返回 ").append(page.count()).append(" 项（每页 ").append(page.pageSize()).append(" 条）");
+        text.append("\n本页编号：.lora download #N 指本页第 N 条（不是全部搜索结果里的第 N 条）");
+        if (page.hasMore()) text.append("\n下一页：.lora search ").append(quoteLoraSearchWords(page.query()))
+                .append(" ").append(page.nextPage());
+        else text.append("\n这已经是最后一页。");
+        return text.toString();
+    }
+    /** 页码越界（翻过头）时的回执：如实说没有更多，并给出回到第 1 页的写法。 */
+    static String searchPageOutOfRange(CivitaiClient.SearchPage page) {
+        return "第 " + page.page() + " 页没有内容：这次搜索没有那么多结果（每页 " + page.pageSize() + " 条）。"
+                + "\n回到第一页：.lora search " + quoteLoraSearchWords(page.query()) + " 1"
+                + "\n（你上一次看到的本页编号没有被改动）";
+    }
     private void lora(JsonObject event, String arguments) throws Exception {
         String loraScope = promptScope(event);
-        if (arguments.equalsIgnoreCase("query") || arguments.toLowerCase(Locale.ROOT).startsWith("query ")) {
-            String words = arguments.length() > 5 ? arguments.substring(6).strip() : "";
-            if (words.isBlank()) throw new IllegalArgumentException("用法：/lora query <模型搜索词>");
-            startLora(event, "正在搜索 Civitai LoRA。", false, () -> {
-                List<CivitaiClient.SearchResult> results = new CivitaiClient(settings.root, Json.obj(settings.snapshot(), "civitai")).query(words);
-                registerLoraSearch(event, results);
-                if (results.isEmpty()) return new LoraResult("未找到匹配的 LoRA。",false);
+        Matcher searching = Pattern.compile("(?i)^(query|search)(?:\\s+([\\s\\S]*))?$").matcher(arguments);
+        if (searching.matches()) {
+            LoraSearchQuery parsed = parseLoraSearch(searching.group(2));
+            startLora(event, "正在搜索 Civitai LoRA（第 " + parsed.page() + " 页）。", false, () -> {
+                CivitaiClient.SearchPage page = new CivitaiClient(settings.root, Json.obj(settings.snapshot(), "civitai"))
+                        .search(parsed.words(), parsed.page());
+                // 翻过头：登记空列表会把用户手上的编号清掉，所以这里只回报、不动编号。
+                if (page.results().isEmpty())
+                    return new LoraResult(parsed.page() == 1 ? "未找到匹配的 LoRA。" : searchPageOutOfRange(page), false);
+                registerLoraSearch(event, page);
                 // 一条 LoRA 一条消息：封面配着它自己的编号/名称/链接发出去，不把十条挤成一条
                 // （回执按出站消息分组渲染，所以控制台里也是一条一项、图文同条）。
-                for (int at = 0; at < results.size(); at++) {
-                    var result = results.get(at);
+                for (int at = 0; at < page.count(); at++) {
+                    var result = page.results().get(at);
                     JsonArray message = new JsonArray();
                     message.addAll(Maps.text("#" + (at + 1) + " " + result.name() + "\n基础模型：" + result.baseModel() + "\n" + result.url()));
                     if (!result.cover().isEmpty()) {
@@ -2687,16 +2766,17 @@ public final class Bot implements AutoCloseable {
                         // 从这一条起发不出去（常见：图床被墙或超时）：余下条目改成纯文本一次给出，编号保持不变。
                         Log.warn("LoRA 搜索结果第 " + (at + 1) + " 条发送失败，余下改用文字：" + error(error));
                         StringBuilder fallback = new StringBuilder("封面发送失败，余下条目以文字给出：\n");
-                        for (int rest = at; rest < results.size(); rest++) {
-                            var item = results.get(rest);
+                        for (int rest = at; rest < page.count(); rest++) {
+                            var item = page.results().get(rest);
                             fallback.append("#").append(rest + 1).append(' ').append(item.name()).append('\n').append(item.url()).append('\n');
                         }
                         reply(event, fallback.toString());
                         break;
                     }
                 }
-                return new LoraResult("搜索完成，共 " + results.size() + " 项。使用 /lora download #编号 [权重] 下载；"
-                        + "编号属于你在本会话的最近一次搜索（只保存在内存里，重启后必须重新搜索）。",true);
+                return new LoraResult("搜索完成，共 " + page.count() + " 项。使用 /lora download #编号 [权重] 下载；"
+                        + "编号属于你在本会话最近一次搜索的**本页**（只保存在内存里，重启后必须重新搜索）。\n"
+                        + searchPageLines(page), true);
             }); return;
         }
         if (arguments.equalsIgnoreCase("status")) { reply(event, "最近 LoRA 下载状态：\n" + loraStatus + "\n" + loraProgressLine()); return; }
@@ -2827,7 +2907,9 @@ public final class Bot implements AutoCloseable {
                 List<CivitaiClient.SearchResult> results = loraSearches.getOrDefault(conversation(event), List.of());
                 int index;
                 try { index = Integer.parseInt(parts[0].substring(1)) - 1; } catch (NumberFormatException e) { index = -1; }
-                if (index < 0 || index >= results.size()) throw new IllegalArgumentException("编号无效或已失效，请先 /lora query <搜索词>。");
+                if (index < 0 || index >= results.size())
+                    throw new IllegalArgumentException("编号无效：本次搜索的**本页**只有 " + results.size() + " 项"
+                            + (results.isEmpty() ? "；先用 .lora search <搜索词> [页码] 搜索。" : "（#N 指本页第 N 条）。"));
                 parts[0] = results.get(index).url();
             }
             double weight = parts.length == 2 ? loraWeight(parts[1]) : 1.0;
@@ -2875,7 +2957,7 @@ public final class Bot implements AutoCloseable {
             // 展示图样式要连模型参数一起存：底模按优先级识别（Civitai → Forge 元数据 → 预设推断），
             // 采样方法/步数/CFG/Shift/尺寸取当前 Forge 预设栈。
             JsonObject styleModel = loraStyleModel(downloaded.path().getFileName().toString(), downloaded.path(), downloaded.baseModel());
-            showcaseReport = CivitaiStyleSync.sync(settings.root, downloaded, tag, sd, true, civitaiClientOrNull(), styleModel);
+            showcaseReport = CivitaiStyleSync.sync(settings.root, downloaded, tag, sd, true, civitaiClientOrNull(), styleModel, showcaseLimit());
             // 回执要短：触发词和"展示图 N → 样式名"的逐条清单又长又只是参考，全部留给日志与本机记录，
             // 回执只说"成了、标签是什么、有没有动提示词、顺带存了什么"。
             String name = filename.replaceFirst("(?i)\\.safetensors$", "");
@@ -2911,7 +2993,7 @@ public final class Bot implements AutoCloseable {
      * 展示图样式报告的**汇总行**（第一行永远是"展示图样式：新增 X，修正 Y，…"）。
      * 逐条清单只在日志里看——回执里贴十几行"展示图 N → 样式名"没人读。
      */
-    private static String showcaseSummary(String report) {
+    static String showcaseSummary(String report) {
         if (report == null || report.isBlank()) return "展示图样式：未处理。";
         int cut = report.indexOf('\n');
         return cut < 0 ? report : report.substring(0, cut);
@@ -2925,6 +3007,13 @@ public final class Bot implements AutoCloseable {
     /** 机器人自己的 Civitai 客户端（补展示图 / 样式预览图）；只是构造，不发请求。 */
     private CivitaiClient civitaiClient() throws java.io.IOException {
         return new CivitaiClient(settings.root, Json.obj(settings.snapshot(), "civitai"));
+    }
+    /**
+     * 展示图样式的张数上限：config.json 的 {@code civitai.showcase_limit}（默认 0 = 不限）。
+     * 超过上限的展示图会按「超出上限」计数并提示怎么调大，不再静默少做几张。
+     */
+    private int showcaseLimit() {
+        return CivitaiClient.showcaseLimit(Json.obj(settings.snapshot(), "civitai"));
     }
     /**
      * 补预览图是附加功能，配置不全（比如没配 civitai.lora_dir）时不能把主流程一起拖垮：
@@ -3195,7 +3284,7 @@ public final class Bot implements AutoCloseable {
                     List.of(), file, true, modelId, versionId, showcases);
             // 补图顺手把模型参数补齐：v1.0.10 之前存的展示图样式只有提示词，没有底模/采样参数。
             JsonObject model = loraStyleModel(file.getFileName().toString(), file, Json.str(record, "base_model", ""));
-            CivitaiStyleSync.Outcome outcome = CivitaiStyleSync.run(settings.root, download, tag, sd, true, client, model);
+            CivitaiStyleSync.Outcome outcome = CivitaiStyleSync.run(settings.root, download, tag, sd, true, client, model, showcaseLimit());
             int previews = (int) Math.max(0, stylePreviewCount() - before);
             return new StyleBackfill(previews, outcome.sized(), outcome.text().split("\n", 2)[0]);
         } catch (Exception error) {
@@ -5694,15 +5783,23 @@ public final class Bot implements AutoCloseable {
      * `.lora download #编号` 仍然指向这次搜索。
      */
     public JsonObject webCivitaiSearch(String scope, String query) throws Exception {
+        return webCivitaiSearch(scope, query, 1);
+    }
+    /**
+     * @param page 页码，从 1 开始（网页的「上一页/下一页」）。翻过头时返回空结果 + {@code note}，
+     *             并且**不动**已登记的编号列表，前端把注记显示在空列表里即可。
+     */
+    public JsonObject webCivitaiSearch(String scope, String query, int page) throws Exception {
         String words = query == null ? "" : query.strip();
         if (words.isEmpty()) throw new IllegalArgumentException("请填写搜索词。");
         if (words.length() > 200) throw new IllegalArgumentException("搜索词最多 200 个字符。");
-        List<CivitaiClient.SearchResult> results = new CivitaiClient(settings.root, Json.obj(settings.snapshot(), "civitai")).query(words);
+        CivitaiClient.SearchPage found = new CivitaiClient(settings.root, Json.obj(settings.snapshot(), "civitai")).search(words, page);
         JsonObject event = webEvent(scope, "lora query");
-        registerLoraSearch(event, results);
+        // 空页不登记：网页/QQ 手上的"本页编号"要保持原样，不能被一次翻过头清空。
+        if (!found.results().isEmpty()) registerLoraSearch(event, found);
         JsonArray items = new JsonArray();
         int number = 0;
-        for (CivitaiClient.SearchResult result : results) {
+        for (CivitaiClient.SearchResult result : found.results()) {
             JsonObject item = new JsonObject();
             item.addProperty("number", ++number);
             item.addProperty("name", result.name());
@@ -5719,7 +5816,24 @@ public final class Bot implements AutoCloseable {
         response.addProperty("query", words);
         response.add("results", items);
         response.addProperty("count", items.size());
+        // 页码与翻页依据：Civitai 关键词搜索不返回总数，所以 totalPages 给 -1、totalPagesKnown=false，
+        // 前端按 hasMore 决定「下一页」能不能点（宁可说不知道页数，也不编一个）。
+        response.addProperty("page", found.page());
+        response.addProperty("pageSize", found.pageSize());
+        response.addProperty("hasMore", found.hasMore());
+        response.addProperty("totalPages", found.totalPagesKnown() ? found.totalPages() : -1);
+        response.addProperty("totalPagesKnown", found.totalPagesKnown());
+        response.addProperty("nextPage", found.hasMore() ? found.nextPage() : 0);
+        if (items.isEmpty() && found.page() > 1) response.addProperty("note", searchPageOutOfRange(found).split("\n", 2)[0]);
+        response.addProperty("hint", "本页编号：卡片上的「下载」用 #N，指这一页的第 N 条");
         return response;
+    }
+
+    /** 网页搜索请求体里的页码：缺省 1；乱填直接报错，别悄悄按第 1 页搜。 */
+    public static int webSearchPage(JsonObject body) {
+        if (body == null || !body.has("page") || body.get("page").isJsonNull()) return 1;
+        try { return Integer.parseInt(body.get("page").getAsString().strip()); }
+        catch (Exception error) { throw new IllegalArgumentException("page 必须是正整数。"); }
     }
 
     /** 封面图代理：网页的 <img> 打到机器人这边，由机器人带着登录态去 Civitai 取图。 */

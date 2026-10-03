@@ -1,11 +1,57 @@
-# Pixiko v1.0.12 发行说明
+# Pixiko v1.0.13 发行说明
 
-- **版本**：v1.0.12
+- **版本**：v1.0.13
 - **日期**：2026-10-04
 - **作者**：loriko（deloriko@outlook.com）
 - **当前实现**：Java 版（`src/`）。另有一次**未完成的** Next.js 重构，见 `nextjs-wip/`，**不可运行**。
 
 ---
+
+## 〇、本版新增（v1.0.13）
+
+**「跳过 9」不再是一个黑盒，搜索到的 LoRA 能翻页了**。这一版先把上一版留下的两个实际问题查清楚：
+下载 LoRA 时那个「展示图样式：…跳过 9…」到底跳过了什么；以及"搜索到的 LoRA 只能看第一页"。
+
+- **「跳过」按原因分类计数（先查清、再如实说）**：
+  - 真实原因：用户那次的 9 张展示图**在 Civitai 上根本没有提示词元数据**（`metadata` 里连 `meta`
+    字段都没有，作者没传 A1111 参数也没传 ComfyUI 工作流），所以一条样式都建不出来。真机核对：
+    `GET /api/v1/model-versions/29367` 的 9 张图全部没有 `meta`，本地记录
+    `data/civitai/tsumugiANY2.0.safetensors.json` 的 9 条 `showcase_prompts` 也全都带跳过原因。
+  - 回执改成按原因分类：`展示图样式：新增 0，修正 0，复用 0，跳过 9（该图没有提示词元数据 9），失败 0。`
+    后面再接一句可操作说明（`跳过原因：这些图在 Civitai 上就没有提示词，做不成样式。`），第 2 行起按原因
+    给"提示（原因）：怎么办"。**不伪造提示词**——这类图就是做不成样式，如实说。
+  - 跳过原因共四类，都对应一条现有可走的路径：`该图没有提示词元数据`、`同名样式内容不同`、
+    `该图没有对应样式且本次不新建`（只补图不建样式的重跑路径）、`超出展示图样式上限`。
+    「同名已存在」用的是**已有的「修正」语义**（`.lora cover <LoRA名>` / 网页「补展示图/样式」；
+    旧内容先备份到 `data/civitai-style-backups`），没有另造一套 `overwrite`。
+  - **硬编码上限清理**：展示图样式新增可配置上限 `config.json` 的 `civitai.showcase_limit`
+    （默认 `0` = 不限；以前没有上限，也就没有静默丢图）。撞上限的那些按「超出展示图样式上限」计数并提示调大。
+- **Civitai 搜索翻页（真机确认过分页协议）**：
+  - **不能用 `page`**：带 `query` 的搜索一旦出现 `page`，Civitai 直接返回
+    `{"error":"Cannot use page param with query search. Use cursor-based pagination."}`
+    （`civitai.red` 与 `civitai.com` 实测都一样）。关键词搜索的 `cursor` **就是偏移量**
+    （第一页 `metadata.nextCursor` = `"10"`、下一页 `"20"`…，`limit=1&cursor=20` 命中的正是
+    `limit=10&cursor=20` 的第 1 条），所以第 N 页 = `cursor=(N-1)*每页条数`，可顺序翻也可直达。
+  - **`hasMore` 是探出来的**：非空页永远带 `nextCursor`（＝`offset+limit`），"有 nextCursor"≠"还有下一页"，
+    所以用一次 `limit=1` + 下一页游标的请求探一下。**总页数常常不知道**：关键词搜索的响应里没有结果总数，
+    于是 `totalPages` 给 `-1` 且 `totalPagesKnown=false`，网页只在知道时写「第 X/Y 页」，**不编页数**。
+  - 命令：`.lora search <关键词> [页码]`（`.lora query` 是同一个命令，语义不变）；
+    回执给「第 X 页，本次返回 N 项（每页 10 条）」「本页编号：.lora download #N 指本页第 N 条」
+    与「下一页：.lora search <词> <X+1>」。搜索词以数字结尾时用双引号：`.lora search "milf 2"`。
+  - **本页编号语义**：`.lora download #N` 只认**当前这一页**的编号（`select()` / `selectionContext` 的
+    编号列表与规划层看到的 `civitai` 列表都只放本页；上下文另给 `civitai_page`{page,hasMore,hint}）。
+    翻过头（第 N 页为空）时**不动**已登记的编号，只回报「第 N 页没有内容…回到第一页：…」。
+  - 网页：「Civitai 搜索」卡片加了「上一页 / 下一页 / 第 X 页」控件（搜索一次后可用，翻页保留搜索词），
+    `/api/civitai/search` 请求体接受 `page`，响应给出 `page`、`pageSize`、`count`、`hasMore`、
+    `totalPages`、`totalPagesKnown`、`nextPage`（越界时另给 `note`）。
+  - 每页条数可配：`config.json` 的 `civitai.search_page_size`（默认 10，范围 1–50）。
+- **前端**：`webui/index.html` 资源版本 `?v=1.0.17`；LoRA 搜索卡片的翻页控件与页数标签。
+- **测试**：新增 `LoraPaginationTest`（68 条断言：cursor 分页、`hasMore` 探针、可配置每页条数、
+  页码解析、越界文案、本页编号语义）与 `ShowcaseSkipTest`（42 条断言：真机形状的 9 张无提示词图按原因
+  计数、同名 vs 无匹配分开计数、修正覆盖并备份、上限可配置）。全量 `build.ps1 -Test` 56 个 suite 全绿。
+
+<details>
+<summary>上一版（v1.0.12）</summary>
 
 ## 〇、本版新增（v1.0.12）
 
@@ -49,6 +95,8 @@
   字段时不报错也不被重写、**用临时目录里现生成的真 96×64 PNG/JPEG 与手写 WebP 头验证尺寸读取**、
   尺寸优先级（展示图盖掉预设的 1024×1024）与「补尺寸」回执、载入样式后尺寸真的套回机器人设置。
   全量 `build.ps1 -Test` 54 个 suite 全绿。
+
+</details>
 
 <details>
 <summary>上一版（v1.0.11）</summary>

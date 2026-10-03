@@ -77,6 +77,8 @@ public final class CivitaiClient {
     /** Primary Civitai host used for API calls and generated links (configurable mirror). */
     private final String baseUrl;
     private final String baseHost;
+    /** 每页条数（config.json 的 {@code civitai.search_page_size}，默认 {@value #DEFAULT_PAGE_SIZE}）。 */
+    private final int searchPageSize;
     private final long maxBytes, timeoutNanos;
     private final boolean proxyConfigured;
     private final Transport transport;
@@ -103,6 +105,7 @@ public final class CivitaiClient {
             timeoutNanos = Duration.ofSeconds(seconds).toNanos();
             if (maxBytes <= 0 || timeoutNanos <= 0) throw new IllegalArgumentException();
         } catch (Exception e) { throw new IOException("Civitai 目录或下载限制配置无效；max_download_mb 和 timeout_seconds 须为正整数。"); }
+        searchPageSize = pageSize(config);
         String configuredToken = environmentToken != null && !environmentToken.isBlank() ? environmentToken : Json.str(config, "api_token", "");
         token = configuredToken.strip();
         if (token.chars().anyMatch(c -> c < 32 || c == 127)) throw new IOException("Civitai API Token 不能包含换行或控制字符。");
@@ -130,6 +133,32 @@ public final class CivitaiClient {
         displayBaseUrl = configuredBase;
     }
 
+    /** 每页条数：{@code civitai.search_page_size} 给了就用（夹在 1–{@value #MAX_PAGE_SIZE}），乱填就退回默认值。 */
+    private static int pageSize(JsonObject config) {
+        try {
+            long value = config.has("search_page_size") ? config.get("search_page_size").getAsBigDecimal().longValueExact() : DEFAULT_PAGE_SIZE;
+            if (value < 1) return 1;
+            return (int) Math.min(value, MAX_PAGE_SIZE);
+        } catch (Exception error) {
+            Log.warn("civitai.search_page_size 不是整数，本页条数按默认 " + DEFAULT_PAGE_SIZE + " 处理。");
+            return DEFAULT_PAGE_SIZE;
+        }
+    }
+
+    /**
+     * 展示图样式上限：config.json 的 {@code civitai.showcase_limit}。
+     * 0（默认）表示不限；大于 0 时每个 LoRA 只为前 N 张有提示词的展示图建样式，其余按"超出上限"计数并提示。
+     */
+    public static int showcaseLimit(JsonObject config) {
+        try {
+            long value = config.has("showcase_limit") ? config.get("showcase_limit").getAsBigDecimal().longValueExact() : 0L;
+            return value <= 0 ? 0 : (int) Math.min(value, 1000L);
+        } catch (Exception error) {
+            Log.warn("civitai.showcase_limit 不是整数，按不限（0）处理。");
+            return 0;
+        }
+    }
+
     /**
      * 一条搜索结果。除了模型名/基础模型/封面，还带上网页卡片要显示的信息：
      * 下载数、训练词、文件大小、是否 NSFW（旧写法只给前 5 个字段，多出来的有默认值）。
@@ -143,37 +172,147 @@ public final class CivitaiClient {
     }
     /** 一张抓回来的封面图（网页通过 /api/civitai/thumb 代理，浏览器不直连图床）。 */
     public record Image(byte[] bytes, String contentType) { }
-    public List<SearchResult> query(String words) throws Exception {
-        if (words.isBlank() || words.length() > 200) throw new IllegalArgumentException("搜索词须为 1–200 个字符。");
+
+    /** 每页条数的默认值与上限（config.json 的 {@code civitai.search_page_size}）。 */
+    public static final int DEFAULT_PAGE_SIZE = 10, MAX_PAGE_SIZE = 50;
+    /** 页码上限：防止有人填一个天文数字让机器人狂翻页。 */
+    public static final int MAX_PAGE = 200;
+
+    /**
+     * 一页搜索结果（含分页信息）。
+     *
+     * <p><b>为什么不用 API 的 {@code page} 参数</b>：实测（civitai.red 与 civitai.com 行为一致）
+     * 带 {@code query} 的搜索一旦出现 {@code page} 就被服务端拒绝：
+     * {@code {"error":"Cannot use page param with query search. Use cursor-based pagination."}}。
+     * 关键词搜索的正确分页参数是 {@code cursor}，而且它的取值就是**偏移量**：第 1 页返回的
+     * {@code metadata.nextCursor} 是 {@code "10"}、再下一页是 {@code "20"}…
+     * （{@code limit=1&cursor=20} 命中的正是 {@code limit=10&cursor=20} 的第 1 条）。
+     * 所以第 N 页 = {@code cursor=(N-1)*pageSize}，既能顺序翻页也能直接跳到第 N 页。
+     *
+     * <p><b>{@code hasMore} 为什么要单独探一次</b>：非空页永远带 {@code nextCursor}（它就是
+     * {@code offset+limit}），"有 nextCursor"并不等于"还有下一页"。真正的判据是下一页有没有条目，
+     * 这里用 {@code limit=1} 加下一页游标探一次（一个只含一条的响应，代价很小）。
+     *
+     * <p>Civitai 的关键词搜索**不返回结果总数**（metadata 只有 nextCursor/nextPage），所以
+     * {@code totalPages} 给 {@code -1} 且 {@code totalPagesKnown=false}：宁可如实说"不知道总数"，
+     * 也不编一个页数出来。
+     */
+    public record SearchPage(List<SearchResult> results, String query, int page, int pageSize,
+                             boolean hasMore, int totalPages, boolean totalPagesKnown) {
+        public SearchPage { results = List.copyOf(results); }
+        public int count() { return results.size(); }
+        /** 下一页页码（回执里的"下一页：.lora search <词> <页码>"用它）。 */
+        public int nextPage() { return page + 1; }
+    }
+
+    /** 每页条数：config.json 的 {@code civitai.search_page_size}（默认 {@value #DEFAULT_PAGE_SIZE}，夹在 1–{@value #MAX_PAGE_SIZE}）。 */
+    public int pageSize() { return searchPageSize; }
+
+    /**
+     * 搜索一页。{@code page} 从 1 开始；页码越界时返回空结果的 {@link SearchPage}（由调用方决定怎么提示）。
+     */
+    public SearchPage search(String words, int page) throws Exception {
+        return search(words, page, searchPageSize);
+    }
+
+    /** 与 {@link #search(String, int)} 同一件事，只是这一页的条数也一并指定（测试与特殊调用方用）。 */
+    public SearchPage search(String words, int page, int pageSize) throws Exception {
+        String query = checkQuery(words, page, pageSize);
         try {
-            JsonObject response = api("/api/v1/models?types=LORA&limit=10&query=" + URLEncoder.encode(words, StandardCharsets.UTF_8),
-                    System.nanoTime() + Math.min(timeoutNanos, Duration.ofSeconds(60).toNanos()));
-            List<SearchResult> results = new ArrayList<>();
-            JsonArray items = response.has("items") ? response.getAsJsonArray("items") : new JsonArray();
-            for (JsonElement item : items) {
-                JsonObject model = item.getAsJsonObject();
-                if (!"LORA".equalsIgnoreCase(Json.str(model, "type", ""))) continue;
-                JsonArray versions = model.getAsJsonArray("modelVersions");
-                if (versions == null || versions.isEmpty()) continue;
-                JsonObject version = versions.get(0).getAsJsonObject(); String cover = "";
-                JsonArray images = version.getAsJsonArray("images");
-                if (images != null) for (JsonElement image : images) {
-                    JsonObject im = image.getAsJsonObject();
-                    if (!Json.str(im, "type", "image").equals("image")) continue;
-                    try {
-                        URI uri = URI.create(Json.str(im, "url", ""));
-                        if ("https".equalsIgnoreCase(uri.getScheme()) && ("image.civitai.com".equalsIgnoreCase(uri.getHost()) || ("image." + baseHost).equalsIgnoreCase(uri.getHost()))
-                                && uri.getUserInfo() == null && uri.getPort() == -1) { cover = uri.toString(); break; }
-                    } catch (IllegalArgumentException ignored) { }
-                }
-                results.add(new SearchResult(positiveLong(model, "id"), positiveLong(version, "id"),
-                        Json.str(model, "name", "未命名"), Json.str(version, "baseModel", "未知"), cover,
-                        Math.max(0, Json.num(Json.obj(model, "stats"), "downloadCount", 0L)),
-                        trainedWords(version), fileSizeKb(version), Json.bool(model, "nsfw", false)));
-                if (results.size() == 10) break;
-            }
-            return List.copyOf(results);
+            JsonObject response = pageResponse(query, page, pageSize);
+            SearchPage result = parsePage(response, query, page, pageSize);
+            if (result.results().isEmpty()) return result;
+            String next = cursorOf(response);
+            boolean more = !next.isBlank() && !cursorResponse(query, next).isEmpty();
+            return new SearchPage(result.results(), query, page, pageSize, more, -1, false);
         } catch (Exception e) { throw new IOException("Civitai 搜索失败，请检查网络、访问权限或稍后重试。"); }
+    }
+
+    /**
+     * 只要第 1 页的结果（老调用方的写法）。不做 {@code hasMore} 探测，所以只发一个请求。
+     */
+    public List<SearchResult> query(String words) throws Exception {
+        String query = checkQuery(words, 1, searchPageSize);
+        try { return parsePage(pageResponse(query, 1, searchPageSize), query, 1, searchPageSize).results(); }
+        catch (Exception e) { throw new IOException("Civitai 搜索失败，请检查网络、访问权限或稍后重试。"); }
+    }
+
+    /** 校验搜索词与页码，返回去掉首尾空白的搜索词。 */
+    private static String checkQuery(String words, int page, int pageSize) {
+        String query = words == null ? "" : words.strip();
+        if (query.isBlank() || query.length() > 200) throw new IllegalArgumentException("搜索词须为 1–200 个字符。");
+        if (page < 1) throw new IllegalArgumentException("页码从 1 开始。");
+        if (page > MAX_PAGE) throw new IllegalArgumentException("页码最大 " + MAX_PAGE + "。");
+        if (pageSize < 1 || pageSize > MAX_PAGE_SIZE) throw new IllegalArgumentException("每页条数须在 1–" + MAX_PAGE_SIZE + " 之间。");
+        return query;
+    }
+
+    /**
+     * 取第 {@code page} 页的原始响应。
+     *
+     * <p>关键词搜索的 cursor 实测是偏移量，能直接跳到目标页；万一某个站点给的是不透明游标，
+     * 就顺着 {@code nextCursor} 一页一页走到目标页（受 {@link #MAX_PAGE} 限制）。
+     */
+    private JsonObject pageResponse(String query, int page, int pageSize) throws Exception {
+        JsonObject first = models(query, pageSize, "");
+        if (page == 1) return first;
+        String cursor = cursorOf(first);
+        if (cursor.isBlank()) return first;
+        if (cursor.matches("[0-9]+")) return models(query, pageSize, Long.toString((long) (page - 1) * pageSize));
+        JsonObject current = first;
+        for (int at = 2; at <= page && !cursor.isBlank(); at++) {
+            current = models(query, pageSize, cursor);
+            cursor = cursorOf(current);
+        }
+        return current;
+    }
+
+    /** 一次 {@code /api/v1/models} 搜索请求；{@code cursor} 为空表示第一页。 */
+    private JsonObject models(String query, int pageSize, String cursor) throws Exception {
+        String path = "/api/v1/models?types=LORA&limit=" + pageSize
+                + "&query=" + URLEncoder.encode(query, StandardCharsets.UTF_8)
+                + (cursor.isBlank() ? "" : "&cursor=" + URLEncoder.encode(cursor, StandardCharsets.UTF_8));
+        return api(path, System.nanoTime() + Math.min(timeoutNanos, Duration.ofSeconds(60).toNanos()));
+    }
+
+    /** {@code hasMore} 的探针：下一页游标 + {@code limit=1}，只取一条，代价很小。 */
+    private List<SearchResult> cursorResponse(String query, String cursor) throws Exception {
+        return parsePage(models(query, 1, cursor), query, 1, 1).results();
+    }
+
+    private static String cursorOf(JsonObject response) {
+        return Json.str(Json.obj(response, "metadata"), "nextCursor", "").strip();
+    }
+
+    /** 把一页响应解析成结果（过滤非 LoRA、挑封面等规则与老版本一致，只是条数由 {@code pageSize} 决定）。 */
+    private SearchPage parsePage(JsonObject response, String query, int page, int pageSize) throws IOException {
+        List<SearchResult> results = new ArrayList<>();
+        JsonArray items = response.has("items") && response.get("items").isJsonArray() ? response.getAsJsonArray("items") : new JsonArray();
+        for (JsonElement item : items) {
+            if (!item.isJsonObject()) continue;
+            JsonObject model = item.getAsJsonObject();
+            if (!"LORA".equalsIgnoreCase(Json.str(model, "type", ""))) continue;
+            JsonArray versions = model.getAsJsonArray("modelVersions");
+            if (versions == null || versions.isEmpty()) continue;
+            JsonObject version = versions.get(0).getAsJsonObject(); String cover = "";
+            JsonArray images = version.getAsJsonArray("images");
+            if (images != null) for (JsonElement image : images) {
+                if (!image.isJsonObject()) continue;
+                JsonObject im = image.getAsJsonObject();
+                if (!Json.str(im, "type", "image").equals("image")) continue;
+                try {
+                    URI uri = URI.create(Json.str(im, "url", ""));
+                    if ("https".equalsIgnoreCase(uri.getScheme()) && ("image.civitai.com".equalsIgnoreCase(uri.getHost()) || ("image." + baseHost).equalsIgnoreCase(uri.getHost()))
+                            && uri.getUserInfo() == null && uri.getPort() == -1) { cover = uri.toString(); break; }
+                } catch (IllegalArgumentException ignored) { }
+            }
+            results.add(new SearchResult(positiveLong(model, "id"), positiveLong(version, "id"),
+                    Json.str(model, "name", "未命名"), Json.str(version, "baseModel", "未知"), cover,
+                    Math.max(0, Json.num(Json.obj(model, "stats"), "downloadCount", 0L)),
+                    trainedWords(version), fileSizeKb(version), Json.bool(model, "nsfw", false)));
+            if (results.size() == pageSize) break;
+        }
+        return new SearchPage(results, query, page, pageSize, false, -1, false);
     }
 
     /** 版本自带的训练词（卡片上给一行提示，下载后也知道该用什么触发词）。 */

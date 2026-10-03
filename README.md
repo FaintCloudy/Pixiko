@@ -167,6 +167,8 @@ run.bat --set-map yh "路径"       # 命令行设置地图（需先停止机器
 | | `base_url` | 默认 `https://civitai.red`（镜像）；`api_token` 一般留空 |
 | | `proxy_url` | 只接受本机 HTTP 代理，例如 `http://127.0.0.1:7890` |
 | | `max_download_mb` / `timeout_seconds` / `admin_only` | 下载上限、超时、是否仅 owner/admin 可下载 |
+| | `search_page_size` | 搜索**每页条数**（默认 `10`，范围 1–50）。Civitai 的关键词搜索用 cursor 分页，见下文 |
+| | `showcase_limit` | **每个 LoRA 最多把前 N 张有提示词的展示图做成样式**（默认 `0` = 不限）。超出的按「超出展示图样式上限」计数并提示调大 |
 | `webui` | `enabled` / `host` / `port` | 网页控制台开关与监听地址（默认 `0.0.0.0:8787`） |
 | | `access_token` | **网页控制台访问令牌。示例里是 `"change-me"`，请务必改掉**；首次启动若为空会自动生成并写回 `config.json`，日志里有 |
 | | `scope` | 控制台操作归属的会话作用域 |
@@ -339,6 +341,45 @@ run.bat --set-map yh "路径"       # 命令行设置地图（需先停止机器
 - `.style load`（命令与网页）会把记着的尺寸一起套回机器人设置；分类是 `LoRA 附带` 而它记的栈与当前栈
   不一致时，仍然照旧提示"底模没有随之切换"，**不偷偷切栈**。
 
+### 展示图样式的「跳过」按原因分类，不做成的不骗你
+
+下载 LoRA / 补展示图时，回执不再只给一个「跳过 9」，而是**按原因分类计数**再给下一步：
+
+| 原因 | 什么情况 | 怎么办 |
+|---|---|---|
+| 该图没有提示词元数据 | 这张展示图在 Civitai 上**没有公开提示词**（A1111 参数与 ComfyUI 工作流都没有，`meta` 字段整个缺失） | 做不成样式，**绝不伪造提示词**；换一个有提示词的版本，或自己写一条样式 |
+| 同名样式内容不同 | `模型名 N` 这个位置被一条内容不同的样式占着（多半是你手动改过它） | 用 `.lora cover <LoRA名>`（网页「本机 LoRA」卡片的「补展示图/样式」）重跑：有展示图映射的那条会按展示图**修正**、旧内容先备份到 `data/civitai-style-backups`，没有映射的会另挑一个空号新建；要让展示图直接顶掉同名样式，先 `.style rename <同名样式> <新名>` 腾出名字 |
+| 该图没有对应样式且本次不新建 | 走的是「只补图、不新建样式」的重跑路径（离线计划/老迁移） | 用 `.lora cover <LoRA名>`（网页「补展示图/样式」）把它建出来 |
+| 超出展示图样式上限 | 超过 `civitai.showcase_limit`（默认 `0` = 不限） | 调大该配置后重跑 `.lora cover <LoRA名>` |
+
+- **原本就没有硬编码上限**：这次顺手加了可配置的 `civitai.showcase_limit`（默认不限），撞上限的那些
+  **会计数并提示**，不再可能悄悄少做几张；
+- 「复用」「修正」是原有语义：同名且提示词一致＝复用，同名但 LoRA 标签变了＝修正（旧内容先备份）；
+  这次没有新造 `overwrite` 指令，`.style import webui overwrite` / `.style overwrite` 那套语义不变；
+- 每类原因在第 2 行起都有一条 `提示（原因）：…`，逐条清单（`展示图 N → 样式名`）仍在日志与本机记录里。
+
+### Civitai 搜索翻页：为什么用 cursor、页数为什么常常"不知道"
+
+- 命令：`.lora search <关键词> [页码]`，`.lora query` 是同一个命令（语义不变，页码默认 1）；
+- **必须用 cursor，不能用 `page`**：Civitai 的 `/api/v1/models` 在带 `query` 时只要出现 `page` 就直接报
+  `Cannot use page param with query search. Use cursor-based pagination.`（实测 civitai.red 与 civitai.com
+  行为一致）。关键词搜索的 `cursor` **就是偏移量**（第一页 `metadata.nextCursor` 是 `"10"`、下一页 `"20"`…，
+  且 `limit=1&cursor=20` 命中的正是 `limit=10&cursor=20` 的第 1 条），所以第 N 页 = `cursor=(N-1)*每页条数`：
+  既能一页页往后翻，也能直接跳到第 N 页；
+- **`hasMore` 是探出来的**：非空页永远带 `nextCursor`（它就是 `offset+limit`），所以"有 nextCursor"不等于
+  "还有下一页"；机器人在需要时用一个 `limit=1` + 下一页游标的请求探一下，下一页为空才算到底；
+- **总页数常常不知道**：关键词搜索的响应里没有结果总数，所以 `/api/civitai/search` 的 `totalPages` 给 `-1`
+  且 `totalPagesKnown=false`，网页只在知道时写「第 X/Y 页」，否则写「第 X 页」，能不能再翻由 `hasMore` 决定。
+  宁可说"不知道"，也不编一个页数；
+- **每页条数**：`config.json` 的 `civitai.search_page_size`（默认 10，范围 1–50）；
+- **本页编号**：`.lora download #N` 指**当前这一页**的第 N 条（网页卡片上的编号同理）。翻页会整体换掉这份编号
+  列表，和回执里的 `#N` 一一对应；翻过头（第 N 页为空）时**不会清掉**你手上的编号，只回报
+  「第 N 页没有内容…回到第一页：`.lora search <词> 1`」。搜索词自己以数字结尾（例如 `milf 2`）时把整段用
+  双引号包起来：`.lora search "milf 2"`；含空格的搜索词在"下一页"提示里也会自动加引号；
+- 网页「Civitai 搜索」卡片下方有「上一页 / 下一页 / 第 X 页」控件，搜索一次后可用，翻页时搜索词保留；
+- 接口：`POST /api/civitai/search` 的请求体接受 `page`，响应给出 `page`、`pageSize`、`count`、`hasMore`、
+  `totalPages`、`totalPagesKnown`、`nextPage`（越界时另给 `note`，列表区直接显示这句）。
+
 ### 底模归属栈：它属于哪一栈、要切到哪个预设
 
 Forge／Forge Neo 把「底模 + VAE + 文本编码器」按预设分成一栈一栈（`anima` / `xl` / `sd` / `flux` /
@@ -385,8 +426,8 @@ Forge／Forge Neo 把「底模 + VAE + 文本编码器」按预设分成一栈�
 | `.progress` | 查看 SD WebUI 当前生成进度与机器人队列状态 |
 | `.sd` / `.sd start` | 查看 SD 与自启动状态／现在就拉起来并等到就绪 |
 | `.sd auto on\|off` / `.sd boot on\|off` | 生成前自动启动（默认开）／随机器人启动（默认关） |
-| `.lora query <模型搜索词>` | 搜索 Civitai，显示编号及封面 |
-| `.lora download #编号 [权重]` / `.lora download <Civitai链接> [权重]` | 下载并启用，同时把展示图提示词存成样式 |
+| `.lora search <关键词> [页码]`（= `.lora query`） | 搜索 Civitai 并**翻页**：回执给「第 X 页」「本页编号」与「下一页」；关键词以数字结尾时用双引号，如 `.lora search "milf 2"` |
+| `.lora download #编号 [权重]` / `.lora download <Civitai链接> [权重]` | 下载并启用，同时把展示图提示词存成样式；`#编号` 指**当前这一页**的第 N 条 |
 | `.lora status` | 查看最近下载状态 |
 | `.lora list` | 列出 WebUI 本地 LoRA（每项标出底模与**归属栈**，并在上方按栈分组） |
 | `.lora detail <名称\|#编号>` | 查看一个本地 LoRA 的底模（含来源与判据）、归属栈、Civitai 记录与它的展示图样式 |
