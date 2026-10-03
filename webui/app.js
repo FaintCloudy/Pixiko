@@ -2508,7 +2508,7 @@
       if (PAGE === 'setup') { await loadSetup(); banner(''); return; }
       await loadStatus();                      // 顶栏、健康点、共享状态（约 15ms）
       if (PAGE === 'chat') await loadChatHistory();
-      else if (PAGE === 'gen') await Promise.all([loadOptions(), loadPresets(), loadImages(), loadTasks()]);
+      else if (PAGE === 'gen') await Promise.all([loadOptions(), loadPresets(), loadForgePresets(), loadImages(), loadTasks()]);
       else if (PAGE === 'prompt') await loadPrompt();
       else if (PAGE === 'styles') await loadStyles();
       else if (PAGE === 'loras') {
