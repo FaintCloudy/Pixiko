@@ -6,6 +6,8 @@
   const state = { token: localStorage.getItem(TOKEN_KEY) || '', status: null, options: null, pollTimer: null, followTimer: null, busy: 0,
     seenImages: new Map(), seenGroups: new Map(), followUntil: 0, receiptKey: '', receiptTexts: 0, receiptImages: 0,
     receiptCount: 0, receiptBox: null, receiptToasted: '',
+    // 面板底部回执栏的图片是增量追加的：记住当前那张图集卡 / 单张卡，新图到了就地更新，不整块重建。
+    receiptGallery: null, receiptSingle: null, receiptSingleFile: '',
     // 「回执」栏：全部回执列表 + 未查看（unread）标记。字段与 /api/quests 契约一致。
     quests: { unread: 0, latest: 0, retainedMinutes: 0 }, questPollTimer: null,
     questList: null, questListError: '', questListLoading: false, questListWarned: false,
@@ -39,19 +41,51 @@
 
   // ---------------------------------------------------------------- 图片查看器
 
+  /** 缩放范围与滚轮步进：0.2×–8×，一格滚轮 20%。 */
+  const VIEWER_MIN_ZOOM = 0.2;
+  const VIEWER_MAX_ZOOM = 8;
+  const VIEWER_ZOOM_STEP = 0.2;
+  /** 查看器状态：`list` 是当前这一组图（单张时只有一项），`index` 是第几张，`zoom` 是倍率。 */
+  const viewerState = { list: [], index: 0, zoom: 1, caption: '' };
+  /** 浏览器原生支持 CSS zoom 就用它（能撑开滚动区，放大后拖得动）；否则退回 transform。 */
+  const VIEWER_NATIVE_ZOOM = (() => { try { return 'zoom' in document.createElement('div').style; } catch (error) { return false; } })();
+
+  /** 一组图里的一项：字符串地址或 {src, caption} 都认。 */
+  function viewerItem(entry) {
+    if (typeof entry === 'string') return entry ? { src: entry, caption: '' } : null;
+    if (entry && typeof entry === 'object') {
+      const src = entry.src || entry.file || entry.url || '';
+      return src ? { src: String(src), caption: String(entry.caption || entry.alt || entry.name || '') } : null;
+    }
+    return null;
+  }
+
   /**
-   * 点图放大：弹出查看器（背景压暗），点图在「适应屏幕 / 1:1 原图」之间切换，
-   * Esc、点背景或「关闭」收起。Ctrl/中键仍然走浏览器的新标签打开。
+   * 点图放大：弹出查看器（背景压暗）。滚轮缩放（向上放大 / 向下缩小，钳在 0.2×–8×），
+   * 点图在「适应屏幕 / 1:1 原图」之间切换，← / → 换图（配合图集），
+   * Esc、点图片周围的空白或「关闭」收起。Ctrl/中键仍然走浏览器的新标签打开。
+   *
+   * 向后兼容：单张就是 openViewer(src, caption)，前后按钮与计数自动隐藏/禁用；
+   * 一组图用 openViewer(src, caption, list, index)，list 可以是地址数组，也可以是 {src, caption} 数组。
    */
-  function openViewer(src, caption) {
+  function openViewer(src, caption, list, index) {
     const viewer = $('viewer');
     if (!viewer || !src) return;
+    const items = (Array.isArray(list) ? list.map(viewerItem).filter(Boolean) : []);
+    if (!items.length) items.push({ src: String(src), caption: caption || '' });
+    let current = Math.floor(Number(index));
+    current = Number.isFinite(current) ? Math.min(items.length - 1, Math.max(0, current)) : 0;
+    // 点的那一张以节点上的实际地址为准（封面代理兜底可能换过地址），说明优先用图集里那一项。
+    items[current] = { src: String(src), caption: items[current].caption || caption || '' };
+    viewerState.list = items;
+    viewerState.index = current;
+    viewerState.caption = caption || '';
+    viewerState.zoom = 1;
     viewer.classList.remove('actual');
-    document.getElementById('viewer-image').src = src;
-    $('viewer-caption').textContent = caption || '';
-    $('viewer-toggle').textContent = '1:1 原图';
     viewer.hidden = false;
     document.body.classList.add('viewer-open');   // 查看器打开时锁住页面滚动
+    viewerShowCurrent();
+    viewerApplyZoom();
     $('viewer-close').focus();
   }
 
@@ -60,20 +94,99 @@
     if (!viewer || viewer.hidden) return;
     viewer.hidden = true;
     viewer.classList.remove('actual');
+    viewerState.list = []; viewerState.index = 0; viewerState.zoom = 1; viewerState.caption = '';
     document.body.classList.remove('viewer-open');
-    document.getElementById('viewer-image').removeAttribute('src');
+    const image = $('viewer-image');
+    if (image) image.removeAttribute('src');
+    viewerSyncControls();
   }
 
+  /** 工具条一次算齐：倍率、第几张/共几张、前后按钮、1:1 按钮文字（缩放与翻页都调它）。 */
+  function viewerSyncControls() {
+    const total = viewerState.list.length;
+    const many = total > 1;
+    const prev = $('viewer-prev'), next = $('viewer-next'), count = $('viewer-count');
+    if (prev) { prev.hidden = !many; prev.disabled = !many; }
+    if (next) { next.hidden = !many; next.disabled = !many; }
+    if (count) { count.hidden = !many; count.textContent = many ? (viewerState.index + 1) + ' / ' + total : ''; }
+    const zoom = $('viewer-zoom');
+    if (zoom) zoom.textContent = Math.round(viewerState.zoom * 100) + '%';
+    const toggle = $('viewer-toggle');
+    const viewer = $('viewer');
+    if (toggle && viewer) toggle.textContent = viewer.classList.contains('actual') ? '适应屏幕' : '1:1 原图';
+  }
+
+  /** 当前这一张显示出来：地址、说明、按钮状态。 */
+  function viewerShowCurrent() {
+    const item = viewerState.list[viewerState.index];
+    const image = $('viewer-image');
+    if (!item || !image) return;
+    if (image.getAttribute('src') !== item.src) image.src = item.src;   // 同一张不重设，免得闪
+    image.alt = item.caption || '图片';
+    const caption = $('viewer-caption');
+    if (caption) caption.textContent = item.caption || viewerState.caption || '';
+    viewerSyncControls();
+  }
+
+  /** 落倍率：钳在上下限内（缩到最小再往下滚只是停在 20%，不会把查看器关掉）。 */
+  function viewerSetZoom(value) {
+    const wanted = Number(value);
+    const clamped = Math.min(VIEWER_MAX_ZOOM, Math.max(VIEWER_MIN_ZOOM, Number.isFinite(wanted) ? wanted : 1));
+    viewerState.zoom = Math.round(clamped * 100) / 100;
+    viewerApplyZoom();
+  }
+
+  /** 把倍率落到图上（原生 zoom 优先，退回 transform），并刷新工具条上的百分比提示。 */
+  function viewerApplyZoom() {
+    const image = $('viewer-image');
+    if (!image) return;
+    const zoom = viewerState.zoom;
+    if (VIEWER_NATIVE_ZOOM) {
+      image.style.zoom = zoom === 1 ? '' : String(zoom);
+    } else {
+      image.style.transform = zoom === 1 ? '' : 'scale(' + zoom + ')';
+      image.style.transformOrigin = zoom > 1 ? 'top left' : 'center center';
+    }
+    const label = $('viewer-zoom');
+    if (label) label.textContent = Math.round(zoom * 100) + '%';
+  }
+
+  /** 滚轮：向上放大、向下缩小。preventDefault 掉，别让页面跟着滚。 */
+  function viewerWheel(event) {
+    const viewer = $('viewer');
+    if (!viewer || viewer.hidden) return;
+    event.preventDefault();
+    const delta = Number(event.deltaY) || 0;
+    if (!delta) return;
+    viewerSetZoom(viewerState.zoom + (delta < 0 ? VIEWER_ZOOM_STEP : -VIEWER_ZOOM_STEP));
+  }
+
+  /** ← / → 换图：到头循环（和图集的前后按钮一个行为）。 */
+  function viewerStep(delta) {
+    const total = viewerState.list.length;
+    if (total < 2) return false;
+    viewerState.index = (viewerState.index + delta + total) % total;
+    const stage = $('viewer-stage');
+    if (stage) { stage.scrollTop = 0; stage.scrollLeft = 0; }
+    viewerShowCurrent();
+    return true;
+  }
+
+  /** 「1:1 原图 / 适应屏幕」：切换的同时把倍率归一到 100%，按钮文字与倍率提示一起回到正确状态。 */
   function toggleViewerScale() {
     const viewer = $('viewer');
-    if (!viewer) return;
+    if (!viewer) return false;
     const actual = viewer.classList.toggle('actual');
-    $('viewer-toggle').textContent = actual ? '适应屏幕' : '1:1 原图';
-    if (!actual) $('viewer-stage').scrollTop = 0;
+    viewerSetZoom(1);
+    const stage = $('viewer-stage');
+    if (stage) { stage.scrollTop = 0; stage.scrollLeft = 0; }
+    viewerSyncControls();
+    return actual;
   }
 
-  /** 统一的图片节点：包一层链接（中键可以新标签打开），左键点击打开查看器。 */
-  function imageNode(src, caption, className) {
+  /** 统一的图片节点：包一层链接（中键可以新标签打开），左键点击打开查看器。
+   *  传了 list/index 就是图集里的一张：点击时把整组交给查看器翻页（list 可以是活的数组，后到的图也算）。 */
+  function imageNode(src, caption, className, list, index) {
     const link = el('a', 'image-link');
     link.href = src;
     link.title = (caption ? caption + ' · ' : '') + '点击放大（Esc 关闭）';
@@ -100,10 +213,12 @@
       }).catch(() => link.replaceChild(el('div', 'civitai-nocover', '封面取不到（点刷新重试）'), img));
     });
     link.appendChild(img);
+    link._viewerList = list || null;                      // 点击时才读：图集里后到的图也能翻到
+    link._viewerIndex = Number.isFinite(Number(index)) ? Math.max(0, Math.floor(Number(index))) : 0;
     link.addEventListener('click', (event) => {
       if (event.metaKey || event.ctrlKey || event.shiftKey) return;   // 保留浏览器的新标签行为
       event.preventDefault();
-      openViewer(img.getAttribute('src'), caption);                   // 兜底换过的地址也照样放大
+      openViewer(img.getAttribute('src'), caption, link._viewerList, link._viewerIndex);   // 兜底换过的地址也照样放大
     });
     return link;
   }
@@ -326,31 +441,38 @@
 
     const groups = Array.isArray(data.messages) && data.messages.length ? data.messages : null;
     const steps = groups || (data.texts || []).map((text) => [{ type: 'text', text }]);
-    const flatImages = groups ? [] : (data.images || []).map((image) => ({ type: 'image', file: image.file }));
-    if (!steps.length && !flatImages.length) {
+    // 同一条回执里的图片属于**一个图集**：不管分在 messages 的哪一步，都收进同一张图集卡（不重复渲染）。
+    const files = [];
+    steps.forEach((pieces) => (pieces || []).forEach((piece) => { if (piece.type === 'image' && piece.file) files.push(piece.file); }));
+    if (!groups) (data.images || []).forEach((image) => { if (image && image.file) files.push(image.file); });
+    if (!steps.length && !files.length) {
       body.appendChild(el('div', 'quest-empty', '这条任务还没有输出。'));
     }
+    const base = '任务 #' + number + ' 的图';
+    let picture = null;
+    const picturesOnce = () => {
+      if (!picture) {
+        picture = pictureArea(files, base, { singleClass: 'quest-images', imageClass: 'quest-image',
+          cardClass: 'quest-step gallery-step', gridClass: 'gallery-grid' });
+      }
+      return picture;
+    };
+    let placed = false;
     steps.forEach((pieces, index) => {
+      const text = (pieces || []).filter((piece) => piece.type !== 'image' && piece.text).map((piece) => piece.text).join('\n');
+      const hasPicture = !!groups && (pieces || []).some((piece) => piece.type === 'image' && piece.file);
+      const galleryHere = hasPicture && !placed && files.length > 0;   // 图集放在第一处出现图片的位置
+      if (!text && hasPicture && !galleryHere) return;                 // 图片已经被图集收走：这一步不再单独出一张空卡
       const step = el('div', 'quest-step');
       step.appendChild(el('div', 'head', groups ? '第 ' + (index + 1) + ' 步' : '输出'));
-      const text = (pieces || []).filter((piece) => piece.type !== 'image' && piece.text).map((piece) => piece.text).join('\n');
       if (text) {
         if (/(^|\n)[^\n]{0,16}(失败|错误|不正确|无效|超时|拒绝|找不到)[:：]/.test(text)) step.classList.add('err');
         step.appendChild(el('div', 'quest-text', text));
       }
-      const pictures = (pieces || []).filter((piece) => piece.type === 'image' && piece.file);
-      if (pictures.length) {
-        const box = el('div', 'quest-images');
-        pictures.forEach((piece) => box.appendChild(imageNode(imageUrl(piece.file), '任务 #' + number + ' 的图', 'quest-image')));
-        step.appendChild(box);
-      }
+      if (galleryHere) { placed = true; const area = picturesOnce(); if (area) step.appendChild(area); }
       body.appendChild(step);
     });
-    if (flatImages.length) {
-      const box = el('div', 'quest-images');
-      flatImages.forEach((piece) => box.appendChild(imageNode(imageUrl(piece.file), '任务 #' + number + ' 的图', 'quest-image')));
-      body.appendChild(box);
-    }
+    if (!groups && files.length) { const area = picturesOnce(); if (area) body.appendChild(area); }
     if (running) body.appendChild(el('div', 'quest-empty', '（还在跑，实时刷新中…）'));
   }
 
@@ -594,13 +716,21 @@
     const texts = capture.texts || [], images = capture.images || [];
     if (state.receiptKey !== key) {
       state.receiptKey = key; state.receiptTexts = 0; state.receiptImages = 0; state.receiptCount = 0; state.receiptBox = null;
+      state.receiptGallery = null; state.receiptSingle = null; state.receiptSingleFile = '';
     }
     for (const id of RECEIPT_BOXES) {
       const box = $(id);
       if (!box) continue;
       const visible = box.closest('.panel').classList.contains('active');
       if (!visible) continue;
-      if (state.receiptBox !== box) { box.innerHTML = ''; state.receiptTexts = 0; state.receiptImages = 0; state.receiptCount = 0; }
+      if (state.receiptBox !== box) {
+        box.innerHTML = '';
+        state.receiptTexts = 0; state.receiptImages = 0; state.receiptCount = 0;
+        state.receiptGallery = null; state.receiptSingle = null; state.receiptSingleFile = '';
+      }
+      // 认下当前这条回执画在哪张卡里：下一次同一回执的轮询就只追加新内容。
+      // （以前这里漏了赋值，等于每轮都把整块清空重建 —— 出图时图集/图片会跟着闪。）
+      state.receiptBox = box;
       // 判"是不是报错"看**短标签＋冒号**（"操作失败："／"刷新/确认本机标签失败："）。
       // 不能见到"失败"就判错：成功回执里也有"失败 0"这种统计字样。
       for (let index = state.receiptTexts; index < texts.length; index++) {
@@ -611,12 +741,36 @@
         card.appendChild(el('div', null, text));
         box.appendChild(card);
       }
+      // 图片：同一条回执里的图属于**一个图集** —— 2 张以上只出一张卡，1 张时还是原来那张单张图片卡。
+      // 增量（图片是陆续到的）：第一张先按单张出；第二张到达时**复用同一张卡**就地改成图集
+      // （卡里那张已经加载好的 <a>/<img> 直接挪进网格，图不重新加载、位置不跳），之后每来一张
+      // 只往网格里 append 一个缩略图并改表头张数：卡片节点从头到尾是同一个，滚动与其它卡片都不受影响。
+      const pictureBase = capture.command ? '指令 · ' + capture.command + ' 的图' : '生成结果图';
       for (let index = state.receiptImages; index < images.length; index++) {
-        // 生成的图片只在这里出现一次；回溯/领取的图也走它，点一下弹查看器放大。
-        const card = el('div', 'receipt ok image-receipt');
-        const name = String(images[index].file).replace(/^.*[\\/]/, '');
-        card.appendChild(imageNode(imageUrl(images[index].file), name, 'receipt-image'));
-        box.appendChild(card);
+        const file = images[index].file;
+        if (images.length < 2) {
+          // 生成的图片只在这里出现一次；回溯/领取的图也走它，点一下弹查看器放大。
+          const card = el('div', 'receipt ok image-receipt');
+          card.appendChild(imageNode(imageUrl(file), shortName(file), 'receipt-image'));
+          box.appendChild(card);
+          state.receiptSingle = card;
+          state.receiptSingleFile = file;
+          continue;
+        }
+        let gallery = state.receiptGallery;
+        if (!gallery) {
+          const reuse = state.receiptSingle && state.receiptSingle.parentNode === box ? state.receiptSingle : null;
+          const first = reuse ? (state.receiptSingleFile || file) : file;
+          gallery = createGallery({ base: pictureBase, cardClass: 'receipt ok image-receipt gallery-receipt',
+            gridClass: 'gallery-grid', reuse, firstFile: first });
+          if (!reuse) box.appendChild(gallery.card);
+          state.receiptGallery = gallery;
+          state.receiptSingle = null;
+          state.receiptSingleFile = '';
+          if (reuse) gallery.add(file);   // 复用的那张卡已经是第 1 张，当前这张得补进网格
+          continue;
+        }
+        gallery.add(file);
       }
       state.receiptTexts = Math.max(state.receiptTexts, texts.length);
       state.receiptImages = Math.max(state.receiptImages, images.length);
@@ -645,6 +799,93 @@
     if (/^https?:\/\//i.test(value)) return coverUrl(value);
     const path = value.replace(/\\/g, '/').replace(/^.*?(data\/generated\/)/, '$1');
     return '/api/image?token=' + encodeURIComponent(state.token) + '&path=' + encodeURIComponent(path);
+  }
+
+  // ---------------------------------------------------------------- 图集（一条回执里的多张图 = 一个图集）
+
+  /** 路径 → 文件名（图片说明用）。 */
+  function shortName(file) { return String(file || '').replace(/^.*[\\/]/, ''); }
+
+  /** 缩略图 / 查看器的说明文字：第几张 + 文件名（alt 要有意义）。 */
+  function imageAlt(base, index, file) {
+    const name = shortName(file).split('?')[0];
+    return (base ? base + ' ' : '') + '第 ' + (index + 1) + ' 张' + (name ? '：' + name : '');
+  }
+
+  /** <a> 当前真正在显示的地址（封面兜底可能换过）。 */
+  function viewerSrcOf(link) {
+    const img = link && link.querySelector('img');
+    return (img && img.getAttribute('src')) || (link && link.getAttribute('href')) || '';
+  }
+
+  /**
+   * 一个图集卡片：表头「图集 · 共 N 张（点击看大图）」+ 缩略图网格，点任意一张用查看器翻整组。
+   * `items` 是**活的**数组（缩略图点击的那一刻才交给查看器），所以后到的图也能翻到。
+   *
+   * 增量渲染靠它：`add()` 只往网格里 append 一张缩略图并就地改表头张数，卡片节点从头到尾是同一个 ——
+   * 图片陆续到达时不会整块重建，滚动位置与其它卡片都不受影响。
+   * `reuse` 用来把已经渲染好的单张图片卡**就地**改成图集：卡片节点不换，里面那张已经加载好的
+   * <a>/<img> 直接挪进网格（图不重新加载，页面上也不闪）。
+   *
+   * @param {{base?:string, cardClass:string, gridClass?:string, reuse?:object, firstFile?:string}} options
+   */
+  function createGallery(options) {
+    const base = options.base || '';
+    const card = options.reuse || el('div', options.cardClass);
+    const moved = options.reuse ? options.reuse.querySelector('a.image-link') : null;   // 单张卡里那张已经加载好的图
+    card.className = options.cardClass;
+    card.innerHTML = '';                                    // 只清内容：节点本身（位置、滚动）不动
+    const head = el('div', 'head');
+    const grid = el('div', options.gridClass || 'gallery-grid');
+    card.appendChild(head);
+    card.appendChild(grid);
+    const items = [];
+    const syncHead = () => { head.textContent = '图集 · 共 ' + items.length + ' 张（点击看大图）'; };
+    const gallery = {
+      card, head, grid, items,
+      /** 追加一张缩略图；`existing` 是要复用/挪进来的那个 <a>。 */
+      add(file, alt, existing) {
+        const index = items.length;
+        const caption = alt || imageAlt(base, index, file);
+        const src = existing ? (viewerSrcOf(existing) || imageUrl(file)) : imageUrl(file);
+        items.push({ src, caption });
+        let link = existing || null;
+        if (link) {
+          link._viewerList = items;                         // 接管成图集里的第 index 张（点击行为本来就读这两项）
+          link._viewerIndex = index;
+          link.classList.add('gallery-thumb');
+          const img = link.querySelector('img');
+          if (img) { img.className = 'gallery-thumb-image'; img.alt = caption; img.loading = 'lazy'; }
+        } else {
+          link = imageNode(src, caption, 'gallery-thumb-image', items, index);
+          link.classList.add('gallery-thumb');
+        }
+        link.title = caption + ' · 点击看大图';
+        grid.appendChild(link);
+        syncHead();
+        return index;
+      }
+    };
+    if (options.firstFile) gallery.add(options.firstFile, null, moved);
+    syncHead();
+    return gallery;
+  }
+
+  /**
+   * 一条回执的图片区：**1 张**还是原来那张单张图片卡（说明文字照旧，不套图集壳），
+   * **2 张以上**合成只有一张卡的图集。回执页（#quest-body）与面板底部回执栏都按这个判定，样子才一致。
+   */
+  function pictureArea(files, base, options) {
+    const list = (files || []).filter(Boolean);
+    if (!list.length) return null;
+    if (list.length === 1) {
+      const box = el('div', options.singleClass);
+      box.appendChild(imageNode(imageUrl(list[0]), base, options.imageClass));
+      return box;
+    }
+    const gallery = createGallery({ base, cardClass: options.cardClass, gridClass: options.gridClass, firstFile: list[0] });
+    list.slice(1).forEach((file) => gallery.add(file));
+    return gallery.card;
   }
 
   /** 回执里新到的一条消息 → 对话里的一条机器人消息（文字在上、图片在下，同属一条）。 */
@@ -3153,12 +3394,23 @@
     on('logs-reload', 'click', loadLogs);
     on('logs-filter', 'input', () => { logKey = ''; loadLogs(); });
     on('logs-source', 'change', () => { logKey = ''; loadLogs(); });
-    // 图片查看器
+    // 图片查看器：滚轮缩放、点图切 1:1/适应屏幕、点图片周围的空白关闭、←/→ 换图（图集翻页）
     on('viewer-close', 'click', closeViewer);
     on('viewer-toggle', 'click', toggleViewerScale);
-    on('viewer-stage', 'click', toggleViewerScale);
+    on('viewer-image', 'click', toggleViewerScale);
+    on('viewer-prev', 'click', () => viewerStep(-1));
+    on('viewer-next', 'click', () => viewerStep(1));
+    on('viewer-stage', 'click', (event) => { if (event.target === $('viewer-stage')) closeViewer(); });   // 图片周围的空白
     on('viewer', 'click', (event) => { if (event.target === $('viewer')) closeViewer(); });
+    const viewerNode = $('viewer');
+    if (viewerNode) viewerNode.addEventListener('wheel', viewerWheel, { passive: false });   // 滚轮缩放，preventDefault 掉页面滚动
     document.addEventListener('keydown', (event) => {
+      const viewer = $('viewer');
+      if (viewer && !viewer.hidden && (event.key === 'ArrowLeft' || event.key === 'ArrowRight')) {
+        event.preventDefault();
+        viewerStep(event.key === 'ArrowRight' ? 1 : -1);
+        return;
+      }
       if (event.key === 'Escape') closeViewer();
     });
 

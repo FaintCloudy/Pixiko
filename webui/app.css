@@ -569,6 +569,21 @@ body.viewer-open { overflow: hidden; }
 .viewer-caption { color: #cfe0f7; font-size: 13px; word-break: break-all; flex: 1 1 160px; }
 .viewer-hint { color: var(--muted); font-size: 12px; }
 .viewer-bar button { min-height: 34px; padding: 5px 12px; font-size: 12.5px; }
+/* 工具条上的倍率提示与「第几张 / 共几张」计数（单张时计数不显示） */
+.viewer-count { color: #cfe0f7; font-size: 12.5px; font-variant-numeric: tabular-nums; }
+.viewer-zoom { color: var(--accent); font-size: 12.5px; font-variant-numeric: tabular-nums; min-width: 42px; text-align: right; }
+/* 一组图片时左右两侧的翻页按钮：垂直居中、压在图上但不挡中间的画面（单张时 [hidden] 直接隐藏） */
+.viewer-nav {
+  position: absolute; top: calc(50% - 38px); transform: translateY(-50%); z-index: 2;
+  width: 44px; height: 76px; min-height: 76px; padding: 0; font-size: 26px; font-weight: 400; line-height: 1;
+  border-radius: 14px; background: rgba(11, 18, 32, .6); color: #e4eeff;
+  border: 1px solid rgba(120, 150, 200, .3); box-shadow: none; opacity: .8;
+  transition: opacity .18s var(--ease), background .18s var(--ease), border-color .18s var(--ease);
+}
+.viewer-nav:hover { opacity: 1; background: rgba(17, 27, 46, .82); border-color: rgba(120, 160, 220, .6); }
+.viewer-nav:active { transform: translateY(-50%) scale(.96); }
+#viewer-prev { left: 12px; }
+#viewer-next { right: 12px; }
 
 /* 图片链接：点一下打开查看器（Ctrl/中键仍然是新标签打开）
    display 交给上下文（.grid a 是块级卡片、.msg a.msg-image 是行内块），这里只压掉行高缝隙。 */
@@ -708,5 +723,28 @@ a.image-link img:hover { border-color: rgba(120, 160, 220, .55); }
   /* 窄屏：列表与详情改成上下堆叠 */
   .quest-split { grid-template-columns: minmax(0, 1fr); }
   .quest-list { max-height: 40vh; }
+  /* 窄屏：翻页按钮贴边收窄一点，别压住画面 */
+  .viewer-nav { width: 38px; height: 62px; min-height: 62px; font-size: 22px; }
+  #viewer-prev { left: 6px; }
+  #viewer-next { right: 6px; }
 }
+
+/* ---------------------------------------------------------------- 图集（一条回执的多张图 = 一张卡）
+   缩略图网格：每格固定 140px 见方（object-fit: cover、圆角），点任意一张用查看器打开**整组**
+   （查看器里前后按钮 / ←→ 在组内翻页，计数显示 i / N）。只有一张图时不用图集，仍是单张图片卡。 */
+.gallery-grid {
+  display: grid; grid-template-columns: repeat(auto-fill, 140px);
+  justify-content: start; gap: 8px;
+}
+a.image-link.gallery-thumb {
+  display: block; line-height: 0; overflow: hidden; border-radius: 10px;
+  border: 1px solid var(--line); background: rgba(6, 11, 20, .6);
+  transition: transform .18s var(--ease), border-color .2s var(--ease);
+}
+a.image-link.gallery-thumb:hover { transform: translateY(-2px); border-color: rgba(120, 160, 220, .55); }
+.gallery-grid img, .gallery-grid img.gallery-thumb-image {
+  display: block; width: 100%; height: auto; aspect-ratio: 1; object-fit: cover;
+  max-width: none; max-height: none; border: 0; border-radius: 0;
+}
+.gallery-receipt { padding: 8px; }
 

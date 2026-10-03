@@ -5,7 +5,7 @@ Pixiko 是一个自用的 QQ 机器人：接 **NapCat** 收消息，接 **Stable
 领图；机器人自己把生成好的图片发回对话。
 
 - **作者**：loriko（deloriko@outlook.com）
-- **版本**：v1.0.16（发行说明见 [`RELEASE.md`](RELEASE.md)）
+- **版本**：v1.0.17（发行说明见 [`RELEASE.md`](RELEASE.md)）
 - **当前实现**：**Java 版**（`src/`）——这是线上一直在跑的那一份
 - **网页控制台**：`webui/`（纯静态 HTML/CSS/JS，随机器人一起由内嵌 Spring Boot 提供）
 - **SD WebUI 桥接扩展**：`webui-extension/pixiko-bridge/`（把文生图页正在编辑的提示词同步给机器人）
@@ -343,6 +343,16 @@ run.bat --set-map yh "路径"       # 命令行设置地图（需先停止机器
   `GET /api/status` 顶层带 `quests:{unread,latest}`（控制台靠它更新页签徽标）。
 - 新回执到来时右下角仍会弹一条**回执云**，点它跳 `/quest#N`。
 
+### 图片查看器与多图图集（v1.0.17）
+
+- **查看器**：点任何一张图放大。**点图片周围的空白处**、按 `Esc`、或点右上角 `×` 都能退出；
+  **鼠标滚轮缩放**（0.2×–8×，工具条显示当前倍率），原有的「1:1 原图 / 适应屏幕」按钮照旧可用；
+  一组图片时左右两侧有**上一张 / 下一张**按钮，键盘 `←` / `→` 也能翻页，计数显示「3 / 12」。
+- **多图任务渲染成一个图集**：一个任务出了多张图（`/gen N`、一次 `.get` 领多张、`.rg` 回溯多张），
+  回执里只出现**一个图集卡片**（缩略图网格 + 「图集 · 共 N 张」），点任意一张就用上面的查看器
+  在**整个图集**里翻；只有一张图时仍是普通的单张卡片。回执页与各面板底部的回执栏都是这个行为，
+  生成过程中新图到达时图集卡片就地更新张数，不会整块闪一下。
+
 ### 样式分类：一个 LoRA 一个分类，其余按归属栈
 
 样式库里每条样式都可以有分类（`data/local-styles.json` 的 `category` 字段）。**手动设过的分类优先**；
@@ -515,7 +525,7 @@ Civitai 下载记录里的 `base_model` → Forge 的 LoRA 元数据（`/sdapi/v
 ```
 pixiko\
 ├─ README.md                       本文件
-├─ RELEASE.md                      v1.0.16 发行说明（含版权声明与已知限制）
+├─ RELEASE.md                      v1.0.17 发行说明（含版权声明与已知限制）
 ├─ THIRD-PARTY-LICENSES.md         随二进制包分发的第三方组件与许可
 ├─ config.example.json             脱敏配置模板（复制成 config.json 再改）
 ├─ .gitignore                      config.json / data / logs / lib jar 等一律不入库

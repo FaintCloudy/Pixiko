@@ -43,6 +43,18 @@ public final class Bot implements AutoCloseable {
             for (JsonArray message : messages) chain = chain.thenCompose(ignored -> send(event, message));
             return chain;
         }
+        /**
+         * true = 这个传输层真的会发合并转发（重写了 {@link #sendRecord}）。
+         *
+         * <p>上面的默认实现只是给"不支持合并转发"的传输层留的兼容回退（逐条发出去，没有节点概念）。
+         * 机器人在把一批图片合成合并转发之前会先问这一句：不支持时就保持它原来就有的发法
+         * （一次领取一条消息、地图逐张发送），绝不因为多了一段回退逻辑就把一批图片拆成一串消息。
+         */
+        default boolean supportsRecord() {
+            try {
+                return getClass().getMethod("sendRecord", JsonObject.class, List.class).getDeclaringClass() != Sender.class;
+            } catch (NoSuchMethodException | SecurityException ignored) { return false; }
+        }
         /** QQ API passthrough used for member lookups; transports that cannot do it fail explicitly. */
         default CompletableFuture<JsonElement> callApi(String action, JsonObject params) {
             return CompletableFuture.failedFuture(new IOException("当前传输不支持 " + action + " 查询。"));
@@ -60,6 +72,8 @@ public final class Bot implements AutoCloseable {
     private final ChatService chat;
     private final SdClient sd;
     private final Sender sender;
+    /** 传输层真的会发合并转发时才把多张图合成一条（见 {@link Sender#supportsRecord()}）。 */
+    private final boolean forwardRecords;
     /** Every user owns a private prompt pair, persisted under data/prompts/. */
     private final UserPromptStore userPrompts;
     /** 机器人自己的样式库：与 WebUI 的预设样式完全分开，同名也不会冲突。 */
@@ -1200,6 +1214,8 @@ public final class Bot implements AutoCloseable {
                 Json.obj(settings.snapshot(), "civitai")).download(url, stage, meter));
     }
     public Bot(Settings settings, SdClient sd, Sender sender, LoraDownloader loraDownloader) {        this.settings = settings; this.sd = sd; this.sender = muteAware(webAware(sender)); this.loraDownloader = Objects.requireNonNull(loraDownloader);
+        // 传输层是否真的实现了合并转发（要在包装之前问原始传输层：包装器自己会转发 sendRecord）。
+        this.forwardRecords = sender.supportsRecord();
         // 回执索引：只存摘要与已读标记，列表在重启后也还在（读失败就是空索引，不影响回执）。
         this.questFile = settings.root.resolve("data/quests.json");
         this.questIndex = new QuestIndex();
@@ -4845,7 +4861,7 @@ public final class Bot implements AutoCloseable {
                         for (List<Path> batch : imageBatches(pending, settings.imageCount())) {
                         batchNumber++;
                         long started = System.nanoTime();
-                        sender.send(context, Maps.localImages(batch)).get();
+                        sendBatch(context, batch).get();
                         try { if (recentCount == 0) sd.acknowledgeImages(batch.stream().filter(path -> {
                             Path owner = path.getParent().getParent();
                             return owner == null || !previewTasks.contains(owner.getFileName().toString());
@@ -4868,6 +4884,17 @@ public final class Bot implements AutoCloseable {
                 reply(context, notice);
             });
         } catch (RejectedExecutionException e) { if (automaticImages == null) drainingImages.set(false); throw new IllegalStateException("机器人正在关闭，请稍后重试。"); }
+    }
+    /**
+     * 一批图片的发送方式：多于一张时合成一条「合并转发」（每张图一个节点），单张图保持普通发送。
+     * 返回的 future 在传输层确认之后才完成——调用方据此决定是否 acknowledge。
+     */
+    private CompletableFuture<Void> sendBatch(JsonObject event, List<Path> batch) throws IOException {
+        if (batch.size() <= 1 || !forwardRecords) return sender.send(event, Maps.localImages(batch));
+        // 每个节点只含一张图；仍用本地文件引用（不把图片字节塞进 JSON），顺序与 batch 一致。
+        List<JsonArray> nodes = new ArrayList<>(batch.size());
+        for (Path path : batch) nodes.add(Maps.localImages(List.of(path)));
+        return sender.sendRecord(event, nodes);
     }
     static List<List<Path>> imageBatches(List<Path> paths, int limit) {
         if (limit < 1) throw new IllegalArgumentException("图片上限须为正整数。");
@@ -6933,13 +6960,26 @@ public final class Bot implements AutoCloseable {
         if (!imageBatches.tryAcquire()) throw new IllegalStateException("正在发送图片，请稍后再试。");
         // 说明放在抢到发送名额之后：被拒时用户看到的是"正在发送图片"，而不是一条其实没发出去的说明。
         if (!label.isBlank()) reply(event, label + "：" + paths.size() + " 张（" + String.join("、", paths.stream().map(path -> path.getFileName().toString()).toList()) + "）");
-        // Bound outstanding batches and read only the next image after its predecessor is acknowledged.
-        CompletableFuture<Void> sent = CompletableFuture.completedFuture(null);
+        // 合并转发一次性发出整批；逐张发送时则只在前一张确认之后才读下一张。
+        CompletableFuture<Void> sent;
         try {
-            for (Path path : paths) sent = sent.thenComposeAsync(v -> {
-                try { return sender.sendMap(event, Maps.image(path)); }
-                catch (Exception e) { return CompletableFuture.failedFuture(e); }
-            }, imageIO);
+            if (paths.size() > 1 && forwardRecords) {
+                // 多于一张：合成一条合并转发（每张图一个节点），图片在 imageIO 上读好后一次发出。
+                sent = CompletableFuture.completedFuture(paths).thenComposeAsync(batch -> {
+                    try {
+                        List<JsonArray> built = new ArrayList<>(batch.size());
+                        for (Path path : batch) built.add(Maps.image(path));
+                        return sender.sendRecord(event, built);
+                    } catch (Exception e) { return CompletableFuture.<Void>failedFuture(e); }
+                }, imageIO);
+            } else {
+                // 单张，或传输层不会发合并转发：照旧逐张普通发送（读下一张要等前一张确认）。
+                sent = CompletableFuture.completedFuture(null);
+                for (Path path : paths) sent = sent.thenComposeAsync(v -> {
+                    try { return sender.sendMap(event, Maps.image(path)); }
+                    catch (Exception e) { return CompletableFuture.failedFuture(e); }
+                }, imageIO);
+            }
             sent.whenComplete((v, e) -> {
                 imageBatches.release();
                 if (e != null) { Log.error("图片发送失败（" + describeConversation(event) + "）", e); reply(event, "图片发送失败：" + error(e)); }
