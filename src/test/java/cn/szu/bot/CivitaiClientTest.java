@@ -29,7 +29,140 @@ public final class CivitaiClientTest {
         redirectsDnsAndTokenIsolation();
         proxyPolicy();
         deadlineInterruptsBlockedBody();
+        previewPickingAndNaming();
+        showcasePromptsFromA1111AndComfyUI();
         System.out.println("CivitaiClientTest: " + assertions + " assertions passed.");
+    }
+
+    /**
+     * 展示图提示词：A1111 直接给 prompt；ComfyUI 只把提示词放在工作流里，必须能把它们挖出来，
+     * 否则整个模型的展示图都会被判成"没有提示词"而跳过。
+     */
+    private static void showcasePromptsFromA1111AndComfyUI() {
+        // A1111：老样子
+        JsonObject a1111meta = new JsonObject();
+        a1111meta.addProperty("prompt", "a1111 positive");
+        a1111meta.addProperty("negativePrompt", "a1111 negative");
+        var a1111 = CivitaiClient.showcasePrompts(imageWith(a1111meta));
+        check(a1111.size() == 1 && a1111.get(0).positive().equals("a1111 positive")
+                        && a1111.get(0).negative().equals("a1111 negative") && a1111.get(0).skippedReason().isEmpty(),
+                "A1111 的 prompt/negativePrompt 照旧读得到");
+
+        // 标准 ComfyUI：默认工作流把两个文本编码节点命名为 Positive / Negative
+        JsonObject standard = imageWith(comfyMeta(comfyGraphOf(
+                comfyNode("CLIPTextEncode", "Positive", "text", "comfy positive, masterpiece"),
+                comfyNode("CLIPTextEncode", "Negative", "text", "comfy negative"))));
+        var comfy = CivitaiClient.showcasePrompts(standard);
+        check(comfy.size() == 1 && comfy.get(0).positive().equals("comfy positive, masterpiece")
+                        && comfy.get(0).negative().equals("comfy negative") && comfy.get(0).skippedReason().isEmpty(),
+                "标准 ComfyUI 工作流（Positive/Negative 节点）也能读出正反向：" + comfy);
+
+        // 中文插件：正向在名为 positive 的输入里，负面在标题写着"负面"的节点里，另有 temp_str 这种长 JSON
+        JsonObject editor = comfyNode("WeiLinPromptUIWithoutLora", "WeiLin 提示词编辑器", "positive", "1girl, silver hair, detailed");
+        editor.getAsJsonObject("inputs").addProperty("temp_str", "[{\"id\":\"token_1888\",\"text\":\"noise\"}]");
+        var chinese = CivitaiClient.showcasePrompts(imageWith(comfyMeta(comfyGraphOf(
+                editor, comfyNode("ZML_TextInput", "负面", "文本", "worst quality, blurry")))));
+        check(chinese.size() == 1 && chinese.get(0).positive().equals("1girl, silver hair, detailed")
+                        && chinese.get(0).negative().equals("worst quality, blurry") && chinese.get(0).skippedReason().isEmpty(),
+                "中文 ComfyUI 插件（positive 输入 + 标题「负面」）也能读出来：" + chinese);
+        check(chinese.get(0).positive().indexOf("token_1888") < 0, "插件里的 temp_str 不会被误当成提示词");
+
+        // 文本放在 PrimitiveStringMultiline 的 value 里，旁边还挂着一条"给模型的系统提示词"——
+        // 那条通常比画面提示词更长，按长度挑必然挑错。
+        var primitive = CivitaiClient.showcasePrompts(imageWith(comfyMeta(comfyGraphOf(
+                comfyNode("PrimitiveStringMultiline", "Text String (System Prompt)", "value", "You are an expert prompt engineer for text-to-image models."),
+                comfyNode("PrimitiveStringMultiline", "Text String (User Prompt)", "value", "1girl, blue hair, maid outfit"),
+                comfyNode("PrimitiveStringMultiline", "Text String (LoRA Trigger Word)", "value", "deepseek_whale_girl")))));
+        check(primitive.size() == 1 && primitive.get(0).positive().equals("1girl, blue hair, maid outfit")
+                        && primitive.get(0).skippedReason().isEmpty(),
+                "PrimitiveString 工作流读得出提示词，且不会把系统提示词当画面提示词：" + primitive);
+
+        // Civitai 会写出非法的 "workflow": undefined，容错后仍要能解析
+        JsonObject brokenMeta = new JsonObject();
+        brokenMeta.addProperty("comfy", comfyGraphOf(
+                comfyNode("CLIPTextEncode", "Positive", "text", "tolerated positive")).toString()
+                .replaceFirst("\\}$", ", \"workflow\": undefined}"));
+        JsonObject broken = imageWith(brokenMeta);
+        var tolerated = CivitaiClient.showcasePrompts(broken);
+        check(tolerated.size() == 1 && tolerated.get(0).positive().equals("tolerated positive"),
+                "comfy 里出现非法的 undefined 时仍能读出提示词：" + tolerated);
+
+        // 真的什么都没有（meta 为空）：保持跳过，但理由要说清查过哪里
+        var empty = CivitaiClient.showcasePrompts(imageWith(new JsonObject()));
+        check(empty.size() == 1 && !empty.get(0).skippedReason().isEmpty()
+                        && empty.get(0).skippedReason().contains("ComfyUI"),
+                "确实没有提示词时才跳过，并说明 A1111 与 ComfyUI 都查过：" + empty.get(0).skippedReason());
+
+        // meta 整个缺失也不能炸
+        var missing = CivitaiClient.showcasePrompts(imageWith(null));
+        check(missing.size() == 1 && !missing.get(0).skippedReason().isEmpty(), "meta 缺失时按跳过处理，不抛异常");
+    }
+
+    /** 一个只含单张展示图的版本对象。 */
+    private static JsonObject imageWith(JsonObject meta) {
+        JsonObject image = new JsonObject();
+        if (meta != null) image.add("meta", meta);
+        JsonArray images = new JsonArray();
+        images.add(image);
+        JsonObject version = new JsonObject();
+        version.add("images", images);
+        return version;
+    }
+
+    /** Civitai 的 meta.comfy 是一个"装 JSON 的字符串"。 */
+    private static JsonObject comfyMeta(JsonObject graph) {
+        JsonObject meta = new JsonObject();
+        meta.addProperty("comfy", graph.toString());
+        return meta;
+    }
+
+    /** ComfyUI 工作流的节点表：{"prompt": {"1": 节点…}}。 */
+    private static JsonObject comfyGraphOf(JsonObject... nodes) {
+        JsonObject table = new JsonObject();
+        for (int i = 0; i < nodes.length; i++) table.add(String.valueOf(i + 1), nodes[i]);
+        JsonObject graph = new JsonObject();
+        graph.add("prompt", table);
+        return graph;
+    }
+
+    private static JsonObject comfyNode(String type, String title, String inputKey, String text) {
+        JsonObject node = new JsonObject();
+        node.addProperty("class_type", type);
+        JsonObject meta = new JsonObject();
+        meta.addProperty("title", title);
+        node.add("_meta", meta);
+        JsonObject inputs = new JsonObject();
+        inputs.addProperty(inputKey, text);
+        node.add("inputs", inputs);
+        return node;
+    }
+
+    /** 展示图：挑哪一张、存成什么名字。纯函数，不碰网络。 */
+    private static void previewPickingAndNaming() throws Exception {
+        Path lora = Path.of("/models/Lora/My Lora.safetensors");
+        check(CivitaiClient.previewPath(lora).getFileName().toString().equals("My Lora.preview.png"),
+                "preview saved next to the model as <name>.preview.png");
+        check(CivitaiClient.previewPath(lora).getParent().equals(lora.getParent()), "preview stays in the same directory");
+        check(CivitaiClient.previewPath(Path.of("/models/Lora/NoExt")).getFileName().toString().equals("NoExt.preview.png"),
+                "a name without .safetensors still gets a sane preview name");
+
+        check(CivitaiClient.previewUrl(new JsonObject()).isEmpty(), "no images means no preview URL");
+        check(CivitaiClient.previewUrl(Json.parse("{\"images\":[{\"url\":\"https://evil.example/x.png\"}]}")).isEmpty(),
+                "non-Civitai hosts are refused (not an open image proxy)");
+        check(CivitaiClient.previewUrl(Json.parse("{\"images\":[{\"url\":\"https://image.civitai.com/a.mp4\",\"type\":\"video\"}]}")).isEmpty(),
+                "videos are skipped (saving one as .png would be a broken image)");
+        check(CivitaiClient.previewUrl(Json.parse("{\"images\":[{\"url\":\"https://image.civitai.com/a.jpeg\"}]}"))
+                        .equals("https://image.civitai.com/a.jpeg"),
+                "a plain image on the Civitai CDN is used");
+        check(CivitaiClient.previewUrl(Json.parse("{\"images\":[{\"url\":\"https://image.civitai.com/r18.jpeg\",\"nsfwLevel\":8},{\"url\":\"https://image.civitai.com/safe.jpeg\",\"nsfwLevel\":1}]}"))
+                        .equals("https://image.civitai.com/safe.jpeg"),
+                "the safe image wins over the R18 one");
+        check(CivitaiClient.previewUrl(Json.parse("{\"images\":[{\"url\":\"https://image.civitai.com/only.jpeg\",\"nsfwLevel\":8}]}"))
+                        .equals("https://image.civitai.com/only.jpeg"),
+                "an R18-only model still gets a cover instead of nothing");
+        check(CivitaiClient.previewUrl(Json.parse("{\"images\":[{\"url\":\"https://evil.example/x.png\"},{\"url\":\"https://image.civitai.com/good.png\"}]}"))
+                        .equals("https://image.civitai.com/good.png"),
+                "a bad host earlier in the list does not block a good one later");
     }
 
     private static void successfulDownloadAndReuse() throws Exception {

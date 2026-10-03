@@ -21,7 +21,16 @@ import cn.szu.bot.Log;
 
 /** Downloads only verified Civitai LoRA safetensors. No user URL is used as an arbitrary fetch target. */
 public final class CivitaiClient {
-    public record ShowcasePrompt(int number, String positive, String negative, boolean negativeProvided, String skippedReason) {}
+    /**
+     * 一张展示图：{@code positive/negative} 是它的生成提示词，{@code cover} 是图片地址（控制台给样式配预览图用；
+     * 老版本没有这个字段，反序列化回来是 null，所以统一归一成空串）。
+     */
+    public record ShowcasePrompt(int number, String positive, String negative, boolean negativeProvided, String skippedReason, String cover) {
+        public ShowcasePrompt { cover = cover == null ? "" : cover; }
+        public ShowcasePrompt(int number, String positive, String negative, boolean negativeProvided, String skippedReason) {
+            this(number, positive, negative, negativeProvided, skippedReason, "");
+        }
+    }
     public record DownloadedLora(String modelName, String versionName, String baseModel, List<String> trainedWords,
                                  Path path, boolean reused, long modelId, long versionId, List<ShowcasePrompt> showcases) {
         public DownloadedLora { trainedWords = List.copyOf(trainedWords); showcases = List.copyOf(showcases); }
@@ -300,6 +309,8 @@ public final class CivitaiClient {
         }
         DownloadedLora result = new DownloadedLora(selected.modelName(), Json.str(version, "name", ""),
                 Json.str(version, "baseModel", "未知"), words, target, reused, selected.modelId(), selected.versionId(), showcasePrompts(version));
+        // 展示图跟着模型一起下来：控制台的 LoRA 列表、WebUI 的模型卡片都靠它显示封面。
+        Path preview = saveLoraPreview(version, target, progress);
         JsonObject manifest = new JsonObject();
         manifest.addProperty("model_id", result.modelId()); manifest.addProperty("version_id", result.versionId());
         manifest.addProperty("file_id", fileId); manifest.addProperty("model_name", result.modelName());
@@ -307,6 +318,7 @@ public final class CivitaiClient {
         manifest.addProperty("version_name", result.versionName()); manifest.addProperty("base_model", result.baseModel());
         manifest.add("trained_words", Json.GSON.toJsonTree(words)); manifest.addProperty("sha256", hash);
         manifest.add("showcase_prompts", Json.GSON.toJsonTree(result.showcases()));
+        manifest.addProperty("preview", preview == null ? "" : preview.getFileName().toString());
         manifest.addProperty("path", target.toString()); manifest.addProperty("verified_at", Instant.now().toString());
         Json.atomicWrite(manifests.resolve(filename + ".json"), manifest);
         emit(progress, reused ? "已有 LoRA 文件校验通过，可直接使用。" : "LoRA 下载和校验成功。");
@@ -351,18 +363,199 @@ public final class CivitaiClient {
             index++;
             JsonObject item = image.isJsonObject() ? image.getAsJsonObject() : new JsonObject();
             JsonObject meta = Json.obj(item, "meta");
-            String positive = metadataText(meta, "prompt"), negative = metadataText(meta, "negativePrompt");
-            if (negative == null) negative = metadataText(meta, "negative_prompt");
+            String[] prompts = metadataPrompts(meta);
+            String positive = prompts[0], negative = prompts[1];
             String reason = "";
-            if (positive == null && negative == null) reason = "未提供可读取的正反向提示词";
+            if (positive == null && negative == null) reason = "元数据里没有可读取的提示词（A1111 与 ComfyUI 都查过了）";
             else if ((positive == null || positive.isBlank()) && (negative == null || negative.isBlank())) reason = "正反向提示词均为空";
-            result.add(new ShowcasePrompt(index, Objects.requireNonNullElse(positive, ""), Objects.requireNonNullElse(negative, ""), negative != null, reason));
+            result.add(new ShowcasePrompt(index, Objects.requireNonNullElse(positive, ""), Objects.requireNonNullElse(negative, ""),
+                    negative != null, reason, showcaseImage(item)));
         }
         return List.copyOf(result);
     }
     private static String metadataText(JsonObject meta, String key) {
         JsonElement value = meta.get(key);
         return value != null && value.isJsonPrimitive() && value.getAsJsonPrimitive().isString() ? value.getAsString() : null;
+    }
+
+    /**
+     * 一张展示图的正反向提示词。
+     *
+     * <p>先认 A1111 的 {@code meta.prompt / negativePrompt}；没有就翻 ComfyUI 的 {@code meta.comfy}
+     * —— 这一步是必须的：用 ComfyUI 出图的作者，提示词只存在于工作流里，A1111 那几个字段是空的，
+     * 只看它们会把整个模型的展示图全判成"没有提示词"而跳过（实测某模型 4/4 被跳过就是这个原因）。
+     *
+     * @return 长度 2 的数组 {positive, negative}，缺的那个是 null
+     */
+    private static String[] metadataPrompts(JsonObject meta) {
+        String positive = metadataText(meta, "prompt");
+        if (positive == null) positive = metadataText(meta, "Prompt");
+        String negative = metadataText(meta, "negativePrompt");
+        if (negative == null) negative = metadataText(meta, "negative_prompt");
+        if (positive != null || negative != null) return new String[]{positive, negative};
+        return comfyPrompts(meta);
+    }
+
+    /**
+     * ComfyUI 工作流里的提示词。
+     *
+     * <p>工作流是任意图，"哪个节点是正向"没有标准答案，所以给每个候选**打分**再挑最高的：
+     * 明确写着 positive/正向、或 user prompt/用户提示词的最可信；标准文本编码节点次之；
+     * 只写 prompt/提示词的再次。给大模型看的"系统提示词／说明书"（很多工作流里挂着一条
+     * {@code Text String (System Prompt)} 或 TextGenerate 指令）直接判负——它比画面提示词还长，
+     * 光按长度挑必然挑错。负面只认明确写着 negative/负面/反向的节点。
+     */
+    private static String[] comfyPrompts(JsonObject meta) {
+        JsonObject graph = comfyGraph(meta);
+        if (graph == null) return new String[]{null, null};
+        JsonObject nodes = Json.obj(graph, "prompt");            // API 格式：{"prompt": {"1": {...}}}
+        if (nodes.size() == 0) nodes = graph;
+        String positive = null, negative = null;
+        int bestScore = -1;
+        for (Map.Entry<String, JsonElement> entry : nodes.entrySet()) {
+            if (!entry.getValue().isJsonObject()) continue;
+            JsonObject node = entry.getValue().getAsJsonObject();
+            String type = Json.str(node, "class_type", "");
+            String label = type + " " + Json.str(Json.obj(node, "_meta"), "title", "");
+            for (String text : nodeTexts(type, Json.obj(node, "inputs"))) {
+                if (negativeLabel(label)) { negative = longest(negative, text); continue; }
+                int score = positiveScore(label);
+                if (score < 0) continue;
+                if (score > bestScore || (score == bestScore && text.length() > length(positive))) {
+                    bestScore = score; positive = text;
+                }
+            }
+        }
+        return new String[]{positive, negative};
+    }
+
+    /** {@code meta.comfy} 解析成对象：它有时是 JSON 字符串，而且 Civitai 会写出非法的 {@code undefined}。 */
+    private static JsonObject comfyGraph(JsonObject meta) {
+        JsonElement raw = meta.get("comfy");
+        if (raw == null || raw.isJsonNull()) return null;
+        if (raw.isJsonObject()) return raw.getAsJsonObject();
+        if (!raw.isJsonPrimitive() || !raw.getAsJsonPrimitive().isString()) return null;
+        String source = raw.getAsString().strip();
+        if (source.isEmpty()) return null;
+        for (String candidate : List.of(source, source.replace("undefined", "null"))) {
+            try { return Json.parse(candidate); }
+            catch (Exception ignored) { /* 换下一种写法再试 */ }
+        }
+        return null;
+    }
+
+    /** 只认"确实装文本"的输入名：插件的工作流里还有 temp_str 这种长 JSON，不能乱捡。 */
+    private static final Set<String> TEXT_KEYS = Set.of(
+            "text", "text_0", "text_1", "文本", "提示词", "prompt", "positive", "negative",
+            "positive_prompt", "negative_prompt");
+
+    private static List<String> nodeTexts(String type, JsonObject inputs) {
+        List<String> texts = new ArrayList<>();
+        boolean stringNode = type.toLowerCase(Locale.ROOT).matches(".*(string|text).*");
+        for (Map.Entry<String, JsonElement> entry : inputs.entrySet()) {
+            String key = entry.getKey().toLowerCase(Locale.ROOT);
+            // PrimitiveString* 这类节点把文本放在 value 里；别的节点的 value 是数字或开关，不能乱认。
+            if (!TEXT_KEYS.contains(key) && !(stringNode && key.equals("value"))) continue;
+            JsonElement value = entry.getValue();
+            if (!value.isJsonPrimitive() || !value.getAsJsonPrimitive().isString()) continue;
+            String text = value.getAsString().strip();
+            if (!text.isEmpty()) texts.add(text);
+        }
+        return texts;
+    }
+
+    private static boolean negativeLabel(String label) {
+        return label.matches("(?is).*(negative|负面|反向).*");
+    }
+
+    /** 越大越像"画面提示词"；负数表示"这不是画面提示词"。 */
+    private static int positiveScore(String label) {
+        String text = label.toLowerCase(Locale.ROOT);
+        if (text.matches("(?is).*(system|系统|instruction|指令|说明书).*")) return -1;   // 给模型看的说明书
+        if (text.matches("(?is).*(user prompt|用户提示词|用户).*")) return 3;
+        if (text.matches("(?is).*(positive|正向).*")) return 3;
+        if (text.contains("cliptextencode")) return 2;
+        if (text.matches("(?is).*(提示词|prompt).*")) return 1;
+        return 0;
+    }
+
+    private static int length(String value) { return value == null ? -1 : value.length(); }
+
+    private static String longest(String current, String candidate) {
+        return current == null || candidate.length() > current.length() ? candidate : current;
+    }
+
+
+    /**
+     * 展示图落盘位置：与 LoRA 同名的 {@code <模型名>.preview.png}。
+     *
+     * <p>用 WebUI 认的命名（{@code foo.safetensors} → {@code foo.preview.png}），控制台的 LoRA 列表、
+     * WebUI 自己的模型卡片都按这个约定找图；文件落在 civitai.lora_dir 里，不额外开目录。
+     */
+    public static Path previewPath(Path lora) {
+        String stem = lora.getFileName().toString().replaceFirst("(?i)\\.safetensors$", "");
+        return lora.resolveSibling(stem + ".preview.png");
+    }
+
+    /**
+     * 从版本信息里挑一张能用的展示图：只认 Civitai 自己的图床（别把这里变成任意 URL 代理），
+     * 跳过视频（存成 .png 会是一张坏图），非 R18 优先但不强求。
+     */
+    public static String previewUrl(JsonObject version) {
+        JsonElement images = version.get("images");
+        if (images == null || !images.isJsonArray()) return "";
+        String fallback = "";
+        for (JsonElement element : images.getAsJsonArray()) {
+            if (!element.isJsonObject()) continue;
+            JsonObject item = element.getAsJsonObject();
+            String url = showcaseImage(item);
+            if (url.isEmpty()) continue;
+            if (Json.num(item, "nsfwLevel", 0) <= 1) return url;
+            if (fallback.isEmpty()) fallback = url;
+        }
+        return fallback;
+    }
+
+    /** 单张展示图能不能拿来用：只认 Civitai 图床，且跳过视频（存成 .png 会是一张坏图）。 */
+    private static String showcaseImage(JsonObject item) {
+        if ("video".equalsIgnoreCase(Json.str(item, "type", "image"))) return "";
+        String url = Json.str(item, "url", "");
+        return url.isBlank() || !coverHostAllowed(url) ? "" : url;
+    }
+
+    /**
+     * 顺带抓一张展示图存到 LoRA 旁边。抓不到只回报一句原因，绝不让已经落盘的 LoRA 变成失败下载。
+     *
+     * @return 落盘路径；没抓到返回 null
+     */
+    public Path saveLoraPreview(JsonObject version, Path lora, Consumer<String> progress) {
+        Path target = previewPath(lora);
+        if (Files.isRegularFile(target)) { emit(progress, "已有展示图，跳过：" + target.getFileName()); return target; }
+        String url = previewUrl(version);
+        if (url.isEmpty()) { emit(progress, "Civitai 这个版本没有可用的展示图。"); return null; }
+        try {
+            emit(progress, "正在下载展示图。");
+            Image image = cover(url);
+            Files.write(target, image.bytes());
+            emit(progress, "展示图已保存：" + target.getFileName());
+            return target;
+        } catch (Exception error) {
+            String message = error.getMessage() == null || error.getMessage().isBlank()
+                    ? error.getClass().getSimpleName() : error.getMessage();
+            emit(progress, "展示图没抓到（" + message.replaceAll("(?i)https?://\\S+", "[地址已隐藏]") + "），不影响 LoRA 使用。");
+            return null;
+        }
+    }
+
+    /**
+     * 取一个版本的元数据（补展示图、补样式预览都用它），并确认它真的属于链接里那个模型。
+     */
+    public JsonObject versionInfo(long modelId, long versionId) throws Exception {
+        long deadline = System.nanoTime() + timeoutNanos;
+        JsonObject version = api("/api/v1/model-versions/" + versionId, deadline);
+        if (positiveLong(version, "id") != versionId) throw new IOException("Civitai 返回的版本 ID 与本地记录不一致。");
+        if (positiveLong(version, "modelId") != modelId) throw new IOException("Civitai 返回的模型 ID 与本地记录不一致。");
+        return version;
     }
 
     private Selection select(Link link, long deadline) throws Exception {

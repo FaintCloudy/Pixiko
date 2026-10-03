@@ -31,6 +31,8 @@ public final class LoraCommandsTest {
         failuresKeepFileAndAllowRetry();
         permissionsValidationAndLazyConfiguration();
         deletingLocalLoras();
+        previewFilesFollowRename();
+        coverCommandGuards();
         capturedGenerationIsUnchanged();
         closeInterruptsWorker();
         System.out.println("LoraCommandsTest: " + assertions + " assertions passed: download/load/list/delete/status, group/private, bounded worker, redaction, retry, permissions, snapshot, shutdown.");
@@ -42,7 +44,11 @@ public final class LoraCommandsTest {
             for (String type : List.of("group", "private")) {
                 f.command(type, ".lora download " + URL);
                 String report = f.take(type).text();
-                check(report.contains("已加载") && report.contains("测试模型 1"), type + " automatic model load and showcase save both reported");
+                // 回执要简洁：只报"标签 + 顺带存了什么"，逐条"展示图 N → 样式名"留给日志。
+                check(report.contains("本机标签：<lora:") && report.contains("展示图样式：新增"),
+                        type + " download reports the local tag and the showcase summary");
+                check(report.split("\n").length <= 4 && !report.contains("展示图 1 →"),
+                        type + " download receipt stays short (no per-image dump): " + report);
                 // 展示图样式现在写进机器人自己的样式库（data/local-styles.json），不再写 WebUI 预设样式。
                 JsonObject showcase = f.localStyle("测试模型 1");
                 check(showcase != null && showcase.get("positive").getAsString().startsWith("example +, <lora:"),
@@ -65,13 +71,18 @@ public final class LoraCommandsTest {
                 int refreshes = f.refreshes.get();
                 check(f.command(type, ".lora download " + URL).text().contains("开始下载"), type + " immediate download acknowledgement");
                 Reply success = f.take(type);
-                check(success.text().contains("下载成功") && success.text().contains("已加载：" + NAME), type + " download automatically loads correct file");
-                check(success.text().contains("<lora:中文别名" + ":1>"), type + " default weight is one");
-                check(success.text().contains("SD 1.5") && success.text().contains("trigger words"), type + " base model and optional trigger words shown");
-                check(success.text().contains("Civitai 返回的触发词（原文，未自动添加）：\n"), type + " trigger words distinguished from activation tag");
+                check(success.text().contains("下载成功") && success.text().contains("本机标签：<lora:中文别名:1>"),
+                        type + " download reports the verified local tag without loading it into any prompt");
+                check(success.text().contains("本机标签：<lora:中文别名" + ":1>"), type + " default weight reported");
+                // 回执不再一股脑贴触发词原文（有的模型一条就是整段 prompt），只报条数。
+                check(success.text().contains("触发词") && success.text().contains("条")
+                                && !success.text().contains("Civitai 返回的触发词"),
+                        type + " receipt only counts trained words instead of pasting them");
+                check(success.text().split("\n").length <= 4, type + " download receipt stays within four lines: " + success.text());
                 check(f.refreshes.get() > refreshes, type + " WebUI catalog refreshed");
                 String positive = f.stateCopy().get("positive").getAsString();
-                check(positive.contains("<lora:中文别名" + ":1>") && !positive.contains("trigger words"), type + " only tag added, no automatic trigger words");
+                check(positive.equals("initial +") && !positive.contains("trigger words"),
+                        type + " download leaves the prompt completely alone (no tag, no trigger words): " + positive);
                 check(f.command(type, ".lora status").text().contains("下载成功"), type + " completed status retained");
                 check(f.command(type, ".lora list").text().contains("正在读取"), type + " list acknowledged");
                 check(f.take(type).text().contains(NAME), type + " local list returned");
@@ -119,7 +130,8 @@ public final class LoraCommandsTest {
             f.refreshStatus = 500;
             f.command("private", ".lora download " + URL + " 0.6");
             String failure = f.take("private").text();
-            check(failure.contains("文件已保存") && failure.contains("自动加载失败"), "load failure distinguishes successful file download");
+            check(failure.contains("文件已保存") && failure.contains("刷新/确认本机标签失败"),
+                    "tag resolution failure still reports the file was saved");
             check(failure.contains(".lora load \"" + NAME + ".safetensors\" 0.6"), "load failure provides exact filename retry");
             check(!failure.contains("已加载：") && Files.exists(f.file), "failed load never claims enabled and keeps file");
             check(!f.stateCopy().get("positive").getAsString().contains("<lora:"), "failed refresh does not modify prompt");
@@ -146,16 +158,49 @@ public final class LoraCommandsTest {
 
     /** 删除本机 LoRA：按 #编号/名称都能删，只删配置目录里的文件，找不到时给出明确提示。 */
     private static void deletingLocalLoras() throws Exception {
-        try (Fixture f = new Fixture(false, false)) {
-            new Settings(f.root).civitaiSetting("lora_dir", new JsonPrimitive(f.file.getParent().toString().replace('\\', '/')));
+        try (Fixture f = new Fixture(false, false, true)) {
+            Path preview = CivitaiClient.previewPath(f.file);
+            Files.write(preview, new byte[]{9, 9});
             f.command("private", ".lora list");
             check(f.take("private").text().contains(NAME), "列表里能看到待删除的 LoRA");
             String deleted = f.command("private", ".lora delete #1").text();
             check(deleted.contains("已从磁盘删除") && deleted.contains(NAME), "按 #编号 删除并说明结果：" + deleted);
             check(!Files.exists(f.file), "LoRA 文件真的从磁盘上删掉了");
+            check(!Files.exists(preview), "删 LoRA 时连它的展示图一起删（不留对不上号的 .preview.png）");
             check(f.command("private", ".lora delete " + NAME).text().contains("找不到"), "删过的文件再删会明确报找不到");
             check(f.command("private", ".lora delete ../evil").text().contains("找不到"), "带路径分隔符的名字不会越界删除");
             check(f.command("private", ".lora delete").text().startsWith("操作失败："), "缺少名称时给出用法");
+        }
+    }
+
+    /** 展示图跟着模型改名走：不然改完名封面文件还在，却再也按不上号。 */
+    private static void previewFilesFollowRename() throws Exception {
+        try (Fixture f = new Fixture(false, false, true)) {
+            Path preview = CivitaiClient.previewPath(f.file);
+            Files.write(preview, new byte[]{9, 9});
+            check(f.command("private", ".lora rename \"" + NAME + "\" \"renamed-lora\"").text().contains("已重命名"), "改名成功");
+            check(Files.isRegularFile(f.file.getParent().resolve("renamed-lora.safetensors")), "新名字的模型文件在");
+            check(!Files.exists(preview) && Files.isRegularFile(f.file.getParent().resolve("renamed-lora.preview.png")),
+                    "展示图跟着改成了新名字");
+        }
+    }
+
+    /**
+     * 补展示图的护栏：没参数给用法、名字不存在报找不到、没有 Civitai 下载记录时说明原因
+     * （而不是瞎猜一个版本号去请求网络，更不能假装成功）。
+     */
+    private static void coverCommandGuards() throws Exception {
+        try (Fixture f = new Fixture(false, false, true)) {
+            String usage = f.command("private", ".lora cover").text();
+            check(usage.contains("用法：") && usage.contains("cover") && usage.contains("all"), "缺少参数时给出用法：" + usage);
+            // 补图是后台任务：先回"正在补抓"，结果（找不到 / 成功几个）随后单独一条。
+            f.command("private", ".lora cover 没有这个 LoRA");
+            check(f.take("private").text().contains("找不到"), "名字不存在时明确报找不到");
+            String started = f.command("private", ".lora cover all").text();
+            check(started.contains("正在补抓"), "补图先回一条开始消息：" + started);
+            String result = f.take("private").text();
+            check(result.contains("没有 Civitai 下载记录"),
+                    "没有下载记录时说明原因而不是假装成功：" + result);
         }
     }
 
@@ -199,7 +244,8 @@ public final class LoraCommandsTest {
             check(payload != null && payload.get("prompt").getAsString().equals("initial +"), "generation captures prompt before LoRA change");
             f.command("private", ".lora download " + URL);
             check(f.take("private").text().contains("下载成功"), "LoRA can download/load while another image generates");
-            check(f.stateCopy().get("positive").getAsString().contains("<lora:"), "future prompt receives LoRA tag");
+            check(f.stateCopy().get("positive").getAsString().equals("initial +"),
+                    "download never touches the prompt, not even for future generations");
             equal("initial +", payload.get("prompt").getAsString(), "accepted generation stays unchanged");
             f.generationRelease.countDown();
             check(f.take("group").text().contains("生成成功"), "generation completes in original group");
@@ -273,6 +319,14 @@ public final class LoraCommandsTest {
         volatile boolean blockGeneration;
 
         Fixture(boolean adminOnly, boolean defaultDownloaderWithoutConfiguration) throws Exception {
+            this(adminOnly, defaultDownloaderWithoutConfiguration, false);
+        }
+        /**
+         * @param withLoraDirectory 把 civitai.lora_dir 指到夹具自己的模型目录。涉及真实目录操作的用例
+         *                          （改名/删除展示图/补抓展示图）需要它；别的用例保持"没配置"以免
+         *                          改变替身下载器报错的内容。
+         */
+        Fixture(boolean adminOnly, boolean defaultDownloaderWithoutConfiguration, boolean withLoraDirectory) throws Exception {
             Path work = Path.of(System.getProperty("bot.test.work", "work"), "lora-command-tests").toAbsolutePath();
             Files.createDirectories(work); root = Files.createTempDirectory(work, "case-");
             file = root.resolve("models/LoRA/" + NAME + ".safetensors"); Files.createDirectories(file.getParent()); Files.write(file, new byte[]{1, 2, 3});
@@ -287,6 +341,7 @@ public final class LoraCommandsTest {
             JsonObject config = new JsonObject(); config.add("sd", sd);
             JsonArray admins = new JsonArray(); admins.add(123); config.add("admin_user_ids", admins);
             JsonObject civitai = new JsonObject(); civitai.addProperty("admin_only", adminOnly); civitai.addProperty("api_token", "cfg-secret");
+            if (withLoraDirectory) civitai.addProperty("lora_dir", file.getParent().toString().replace('\\', '/'));
             config.add("civitai", civitai); config.addProperty("gen_auto_get", false); Json.atomicWrite(root.resolve("config.json"), config);
             client = new SdClient(root, sd);
             Bot.Sender sender = (event, segments) -> {

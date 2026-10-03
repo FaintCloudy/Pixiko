@@ -92,6 +92,10 @@ public final class Bot implements AutoCloseable {
     private volatile String loraStatus = "尚未下载 LoRA。";
     /** Live download meter so .lora status can report MiB/total, percent and an ETA. */
     private volatile long loraDownloaded, loraTotal = -1, loraStartedNanos;
+    /** 正在下载（而不是加载）——控制台据此决定要不要显示进度条。 */
+    private volatile boolean loraDownloading;
+    /** 当前 LoRA 任务的回执（网页接口触发的才有）：进度与结果都要能进 /quest/#N。 */
+    private volatile WebCapture loraReceipt;
     private final Map<String, List<CivitaiClient.SearchResult>> loraSearches = new ConcurrentHashMap<>();
     private static String conversation(JsonObject event) {
         return Json.str(event, "self_id", "") + ":" + Json.str(event, "message_type", "") + ":"
@@ -1019,6 +1023,7 @@ public final class Bot implements AutoCloseable {
         } catch (Exception ignored) { }
     }
     private void completeChatWorkflowStep(JsonObject event,boolean success) {
+        if (event == null) return;                      // 控制台内部接口没有会话步骤要收尾
         String step=Json.str(event,"_chat_workflow_step","");CompletableFuture<Boolean> future=chatWorkflowSteps.get(step);
         if(future!=null) future.complete(success);
     }
@@ -2702,6 +2707,13 @@ public final class Bot implements AutoCloseable {
             });
             return;
         }
+        if (arguments.equalsIgnoreCase("cover") || arguments.toLowerCase(Locale.ROOT).startsWith("cover ")) {
+            String value = arguments.length() > 5 ? arguments.substring(5).strip() : "";
+            if (value.isBlank())
+                throw new IllegalArgumentException("用法：/lora cover <名称|#编号|all>——给已经下载好的 LoRA 补抓 Civitai 展示图（all 表示所有还缺图的）。");
+            startLora(event, "正在补抓 Civitai 展示图；进度看控制台进度条或 /lora status。", true, () -> loraCover(event, value));
+            return;
+        }
         if (arguments.equalsIgnoreCase("rename") || arguments.toLowerCase(Locale.ROOT).startsWith("rename ")) {
             String value = arguments.length() > 6 ? arguments.substring(6).strip() : "";
             String[] parts = renameNames(value, "用法：/lora rename <旧本地名称> <新本地名称>（名称含空格时用双引号）");
@@ -2723,6 +2735,10 @@ public final class Bot implements AutoCloseable {
             Path destination = directory.resolve(target);
             if (Files.exists(destination)) throw new IllegalArgumentException("已存在同名文件：" + target + "；请换一个名称。");
             Files.move(source, destination);
+            // 展示图跟着改名走：不然改完名封面就"丢了"（文件还在，但按新名字找不到了）。
+            Path oldPreview = CivitaiClient.previewPath(source), newPreview = CivitaiClient.previewPath(destination);
+            try { if (Files.isRegularFile(oldPreview)) Files.move(oldPreview, newPreview); }
+            catch (Exception error) { Log.warn("LoRA 展示图改名失败：" + error(error)); }
             String oldStem = source.getFileName().toString().replaceFirst("(?i)\\.safetensors$", "");
             String newStem = target.replaceFirst("(?i)\\.safetensors$", "");
             sd.loras();
@@ -2748,6 +2764,9 @@ public final class Bot implements AutoCloseable {
             if (!Files.isRegularFile(target)) throw new IllegalArgumentException("不是可删除的文件：" + target.getFileName());
             String stem = target.getFileName().toString().replaceFirst("(?i)\\.safetensors$", "");
             Files.delete(target);
+            // 删模型就删封面：不然 LoRA 目录里会攒一堆再也对不上号的 .preview.png。
+            try { Files.deleteIfExists(CivitaiClient.previewPath(target)); }
+            catch (Exception error) { Log.warn("LoRA 展示图删除失败：" + error(error)); }
             try { sd.refreshLoras(); } catch (Exception refresh) { Log.warn("删除后刷新 WebUI LoRA 列表失败：" + error(refresh)); }
             List<String> referenced = new ArrayList<>();
             for (String tag : loraTagsIn(userPrompts.prompts(promptScope(event)).positive()))
@@ -2780,33 +2799,8 @@ public final class Bot implements AutoCloseable {
                 parts[0] = results.get(index).url();
             }
             double weight = parts.length == 2 ? loraWeight(parts[1]) : 1.0;
-            startLora(event, "开始下载 LoRA，完成后自动保存展示图样式并加载模型；使用 /lora status 查看状态。", true, () -> {
-                loraStartedNanos = System.nanoTime(); loraDownloaded = 0; loraTotal = -1;
-                CivitaiClient.DownloadedLora downloaded = loraDownloader.download(parts[0],
-                        stage -> loraStatus = safeLoraText(stage),
-                        (done, size) -> { loraDownloaded = done; loraTotal = size; });
-                loraTotal = -1;
-                String filename = downloaded.path().getFileName().toString();
-                String showcaseReport = "展示图样式尚未处理：须先确认本机 LoRA 标签。";
-                loraStatus = safeLoraText("文件已保存：" + filename + "；正在刷新并加载到 WebUI。");
-                try {
-                    SdClient.LoadedLora loaded = sd.loadLora(downloaded.path(), weight);
-                    userPrompts.withLoraTag(loraScope, loaded.tag());
-                    showcaseReport = CivitaiStyleSync.sync(settings.root, downloaded, loaded.tag(), sd, true);
-                    String message = "LoRA " + (downloaded.reused() ? "本地文件已复用" : "下载成功") + "，已加载：" + loaded.name()
-                            + "\n已加入你个人的正向 prompt：" + loaded.tag() + "\n用于下一次生成。"
-                            + "\n基础模型：" + display(Objects.requireNonNullElse(downloaded.baseModel(), ""))
-                            + "\nCivitai 返回的触发词（原文，未自动添加）：\n"
-                            + (downloaded.trainedWords().isEmpty() ? "（无）" : String.join("\n", downloaded.trainedWords()))
-                            + "\n提示词来源：" + loaded.prompts().source() + "\n" + showcaseReport;
-                    loraStatus = safeLoraText(message); return new LoraResult(loraStatus,true);
-                } catch (Exception e) {
-                    String retry = new JsonPrimitive(filename).toString();
-                    loraStatus = safeLoraText("LoRA 文件已保存：" + filename + "。\n自动加载失败：" + error(e)
-                            + "\n请检查 WebUI 后发送 /lora load " + retry + " " + weight + " 重试。\n" + showcaseReport);
-                    return new LoraResult(loraStatus,false);
-                }
-            });
+            startLora(event, "开始下载 LoRA，完成后自动保存展示图样式并加载模型；使用 /lora status 查看状态。", true,
+                    () -> downloadAndLoad(parts[0], weight));
         } else {
             LoraSelection parsed = loraSelection(value);
             LoraSelection selected = new LoraSelection(select(event, "lora", parsed.name()), parsed.weight());
@@ -2814,12 +2808,157 @@ public final class Bot implements AutoCloseable {
                 SdClient.LoadedLora loaded = sd.loadLora(selected.name(), selected.weight());
                 userPrompts.withLoraTag(loraScope, loaded.tag());
                 String styleReport;
-                try { styleReport = CivitaiStyleSync.syncLoaded(settings.root, sd, loaded); }
+                try { styleReport = CivitaiStyleSync.syncLoaded(settings.root, sd, loaded, civitaiClientOrNull()); }
                 catch (Exception e) { styleReport = "LoRA 已加载，但样式同步失败：" + error(e); }
                 return new LoraResult(safeLoraText("LoRA 已加载：" + loaded.name() + "\n已加入你个人的正向 prompt：" + loaded.tag()
                         + "\n用于下一次生成。\n提示词来源：" + loaded.prompts().source() + (styleReport.isEmpty() ? "" : "\n" + styleReport)),true);
             });
         }
+    }
+    /**
+     * 下载一个 LoRA：抓模型 + 展示图、刷新 WebUI 目录、把展示图存成样式。
+     *
+     * <p><b>不碰提示词</b>：既不改你个人的 prompt，也不改写 WebUI 页面上的 prompt——
+     * 下载只负责"把模型放到本机、让 WebUI 能选到它"。要不要用这个 LoRA（把 {@code <lora:...>}
+     * 写进出图提示词）是用户自己的事：点本地列表的「加载」，或自己把标签写进去。
+     *
+     * <p>QQ 指令（{@code .lora download}）和控制台内部接口（{@code /api/lora/download}）走的是同一段。
+     */
+    private LoraResult downloadAndLoad(String link, double weight) throws Exception {
+        loraStartedNanos = System.nanoTime(); loraDownloaded = 0; loraTotal = -1;
+        CivitaiClient.DownloadedLora downloaded;
+        try {
+            downloaded = loraDownloader.download(link,
+                    this::loraStage,
+                    (done, size) -> { loraDownloaded = done; loraTotal = size; });
+        } finally { loraTotal = -1; }
+        String filename = downloaded.path().getFileName().toString();
+        Path previewFile = CivitaiClient.previewPath(downloaded.path());
+        boolean hasPreview = Files.isRegularFile(previewFile);
+        String showcaseReport = "展示图样式尚未处理：须先确认本机 LoRA 标签。";
+        loraStatus = safeLoraText("文件已保存：" + filename + "；正在刷新 WebUI 的 LoRA 列表。");
+        try {
+            // 刷新 WebUI 的 LoRA 目录并解析出本机标签（<lora:名字:权重>）——只读，不改任何 prompt。
+            String tag = sd.resolvedLoraTag(downloaded.path(), weight);
+            showcaseReport = CivitaiStyleSync.sync(settings.root, downloaded, tag, sd, true, civitaiClientOrNull());
+            // 回执要短：触发词和"展示图 N → 样式名"的逐条清单又长又只是参考，全部留给日志与本机记录，
+            // 回执只说"成了、标签是什么、有没有动提示词、顺带存了什么"。
+            String name = filename.replaceFirst("(?i)\\.safetensors$", "");
+            StringBuilder message = new StringBuilder("LoRA ")
+                    .append(downloaded.reused() ? "本地文件已复用" : "下载成功").append("：").append(name)
+                    .append("\n本机标签：").append(tag).append("（没有改动提示词；要用就点本机列表的「加载」）");
+            if (hasPreview || !downloaded.trainedWords().isEmpty()) {
+                message.append("\n");
+                if (hasPreview) message.append("展示图：").append(previewFile.getFileName());
+                if (!downloaded.trainedWords().isEmpty()) {
+                    if (hasPreview) message.append("｜");
+                    message.append("触发词 ").append(downloaded.trainedWords().size()).append(" 条");
+                }
+                message.append("（详情已存进本机记录，需要时再查）");
+            }
+            message.append("\n").append(showcaseSummary(showcaseReport));
+            Log.info("LoRA 详情（" + name + "）：基础模型=" + display(Objects.requireNonNullElse(downloaded.baseModel(), ""))
+                    + "；展示图=" + (hasPreview ? previewFile.getFileName().toString() : "无")
+                    + "；触发词=" + downloaded.trainedWords().size() + " 条\n" + showcaseReport);
+            loraStatus = safeLoraText(message.toString());
+            return new LoraResult(loraStatus, true);
+        } catch (Exception e) {
+            String retry = new JsonPrimitive(filename).toString();
+            loraStatus = safeLoraText("LoRA 文件已保存：" + filename + "。\n刷新/确认本机标签失败：" + error(e)
+                    + "\n发送 /lora load " + retry + " " + weight + " 可重试。\n" + showcaseSummary(showcaseReport));
+            return new LoraResult(loraStatus, false);
+        }
+    }
+    /**
+     * 展示图样式报告的**汇总行**（第一行永远是"展示图样式：新增 X，修正 Y，…"）。
+     * 逐条清单只在日志里看——回执里贴十几行"展示图 N → 样式名"没人读。
+     */
+    private static String showcaseSummary(String report) {
+        if (report == null || report.isBlank()) return "展示图样式：未处理。";
+        int cut = report.indexOf('\n');
+        return cut < 0 ? report : report.substring(0, cut);
+    }
+    /** 报一次 LoRA 进度：既写进面板用的 loraStatus，也进当前回执（如果有）。 */
+    private void loraStage(String stage) {
+        loraStatus = safeLoraText(stage);
+        WebCapture receipt = loraReceipt;
+        if (receipt != null) receipt.capture(Maps.text(stage));
+    }
+    /** 机器人自己的 Civitai 客户端（补展示图 / 样式预览图）；只是构造，不发请求。 */
+    private CivitaiClient civitaiClient() throws java.io.IOException {
+        return new CivitaiClient(settings.root, Json.obj(settings.snapshot(), "civitai"));
+    }
+    /**
+     * 补预览图是附加功能，配置不全（比如没配 civitai.lora_dir）时不能把主流程一起拖垮：
+     * 构造不出来就当作"没有客户端"，样式文本照旧同步，只是没有预览图。
+     */
+    private CivitaiClient civitaiClientOrNull() {
+        try { return civitaiClient(); }
+        catch (Exception error) {
+            Log.warn("Civitai 未配置完整，本次不抓展示图/样式预览图：" + error(error));
+            return null;
+        }
+    }
+    /**
+     * 控制台「下载」按钮：走控制台自己的接口，<b>不</b>再借道指令通道。
+     *
+     * <p>不等下载跑完就返回——面板靠 /api/lora/progress 每秒轮询真实进度，
+     * 接口要是阻塞到下载结束，进度条就没意义了。
+     */
+    public JsonObject webLoraDownload(String url, double weight, String scope) {
+        String link = url == null ? "" : url.strip();
+        if (link.isBlank()) throw new IllegalArgumentException("请给出要下载的 Civitai 模型链接。");
+        if (Double.isNaN(weight) || weight < 0 || weight > 2) throw new IllegalArgumentException("权重范围 0–2，默认 1。");
+        requireLoraPermission(webEvent(scope == null ? "" : scope, "lora download"));
+        WebCapture receipt = newCapture(".lora download " + link);
+        if (!startLoraJob(null, receipt, "正在下载 LoRA，完成后自动保存展示图样式并加载模型。", true, () -> downloadAndLoad(link, weight))) {
+            webCaptures.remove(receipt.id());
+            return loraBusyJson();
+        }
+        JsonObject started = loraStartedJson();
+        started.addProperty("quest", receipt.number());
+        started.addProperty("captureId", receipt.id());
+        return started;
+    }
+    /**
+     * 控制台「补抓展示图」按钮：给还没配图的 LoRA 按本地 Civitai 记录补一张，同样不等它跑完。
+     * {@code name} 为空或 {@code all} 表示补全所有缺图的。
+     */
+    public JsonObject webLoraCover(String name, String scope) {
+        String value = name == null || name.isBlank() ? "all" : name.strip();
+        requireLoraPermission(webEvent(scope == null ? "" : scope, "lora cover"));
+        WebCapture receipt = newCapture(".lora cover " + value);
+        if (!startLoraJob(null, receipt, "正在补抓 Civitai 展示图。", true, () -> loraCover(null, value))) {
+            webCaptures.remove(receipt.id());
+            return loraBusyJson();
+        }
+        JsonObject started = loraStartedJson();
+        started.addProperty("quest", receipt.number());
+        started.addProperty("captureId", receipt.id());
+        return started;
+    }
+    /** 任务已经开跑：带上 started 让接口回 202，前端据此开始轮询进度。 */
+    private JsonObject loraStartedJson() {
+        JsonObject result = loraProgress();
+        result.addProperty("started", true);
+        return result;
+    }
+    /** 已经有 LoRA 任务在跑时的统一回应（接口据此回 409，不排队）。 */
+    private JsonObject loraBusyJson() {
+        JsonObject result = loraProgress();
+        result.addProperty("started", false);
+        result.addProperty("error", "已有 LoRA 下载或加载操作正在处理，请等它结束后再试。");
+        return result;
+    }
+    /**
+     * 控制台接口的权限判断：和指令通道同一条规则（{@code civitai.admin_only} 只管下载/加载，
+     * 搜索和查看列表不受限），只是"当前用户"取的是网页会话的身份。
+     */
+    private void requireLoraPermission(JsonObject event) {
+        JsonObject civitai = Json.obj(settings.snapshot(), "civitai");
+        if (!Json.bool(civitai, "admin_only", false)) return;
+        if (!settings.isAdmin(Json.str(event, "user_id", "")))
+            throw new IllegalArgumentException("LoRA 下载和加载已设为仅管理员可用；请在本机 config.json 的 admin_user_ids 配置管理员。");
     }
     /**
      * "12.3 MiB / 245.6 MiB（5.0%），速度 1.2 MiB/s，预计剩余 3 分 12 秒" — or a plain note when no
@@ -2843,15 +2982,60 @@ public final class Bot implements AutoCloseable {
         }
         return line.toString();
     }
-    private void startLora(JsonObject event, String start, boolean downloading, LoraAction action) {
-        if (loraClosed.get()) throw new IllegalStateException("机器人正在关闭，请稍后重试。");
-        if (!loraBusy.compareAndSet(false, true)) {
-            reply(event, "已有 LoRA 下载或加载操作正在处理，请稍后重试；/lora status 可查看最近下载状态。");completeChatWorkflowStep(event,false);return;
+    /**
+     * 控制台进度条用的实时状态。和 {@link #loraProgressLine()} 同源，只是给网页一份结构化的。
+     *
+     * <p>{@code metered} 为假时也要给出 {@code stage}：下载前的"正在读取模型信息"、下载后的
+     * "正在加载到 WebUI"都没有字节数可报，进度条退回不确定态（来回滚动），不能显示成 0%。
+     */
+    public JsonObject loraProgress() {
+        JsonObject result = new JsonObject();
+        boolean downloading = loraDownloading, busy = loraBusy.get();
+        result.addProperty("busy", busy);
+        result.addProperty("downloading", downloading);
+        result.addProperty("stage", loraStatus == null ? "" : loraStatus);
+        long total = loraTotal, done = loraDownloaded;
+        boolean metered = downloading && total > 0 && done >= 0;
+        result.addProperty("metered", metered);
+        if (metered) {
+            long elapsed = Math.max(1, System.nanoTime() - loraStartedNanos);
+            double seconds = elapsed / 1_000_000_000.0;
+            double speed = done / seconds;
+            result.addProperty("done", done);
+            result.addProperty("total", total);
+            result.addProperty("percent", Math.min(100.0, done * 100.0 / total));
+            result.addProperty("speed", speed);
+            if (speed > 0 && total > done) result.addProperty("etaSeconds", (long) Math.ceil((total - done) / speed));
         }
-        JsonObject context = event.deepCopy();
-        if (downloading) loraStatus = "下载已开始，正在获取模型信息。";
-        Log.info("LoRA 操作开始（" + describeConversation(event) + "）：" + Log.text(start));
-        reply(context, start);
+        return result;
+    }
+    private void startLora(JsonObject event, String start, boolean downloading, LoraAction action) {
+        if (startLoraJob(event, start, downloading, action)) return;
+        reply(event, "已有 LoRA 下载或加载操作正在处理，请稍后重试；/lora status 可查看最近下载状态。");
+        completeChatWorkflowStep(event, false);
+    }
+    /**
+     * 启动一个后台 LoRA 任务（下载 / 加载 / 补展示图）。
+     *
+     * @param event 要回执的会话；控制台内部接口触发时传 {@code null}——它不回执，结果只写进
+     *              {@link #loraStatus}，由面板轮询 {@code /api/lora/progress} 取。
+     * @return false 表示已经有任务在跑（调用方自己决定是回"稍后再试"还是回 409）
+     */
+    private boolean startLoraJob(JsonObject event, String start, boolean downloading, LoraAction action) {
+        return startLoraJob(event, null, start, downloading, action);
+    }
+    /**
+     * @param receipt 网页接口触发的任务带上自己的回执：进度与结果都会进 /quest/#N（QQ/聊天路径传 null）
+     */
+    private boolean startLoraJob(JsonObject event, WebCapture receipt, String start, boolean downloading, LoraAction action) {
+        if (loraClosed.get()) throw new IllegalStateException("机器人正在关闭，请稍后重试。");
+        if (!loraBusy.compareAndSet(false, true)) return false;
+        JsonObject context = event == null ? null : event.deepCopy();
+        loraReceipt = receipt;
+        if (receipt != null) receipt.capture(Maps.text(start));
+        if (downloading) { loraStatus = safeLoraText(start); loraDownloading = true; }
+        Log.info("LoRA 操作开始（" + (context == null ? "控制台" : describeConversation(context)) + "）：" + Log.text(start));
+        if (context != null) reply(context, start);
         try {
             loraIO.execute(() -> {
                 LoraResult result;
@@ -2859,16 +3043,156 @@ public final class Bot implements AutoCloseable {
                 catch (Exception e) {
                     result = new LoraResult(safeLoraText((downloading ? "LoRA 下载失败：" : "LoRA 操作失败：") + error(e)),false);
                     if (downloading) loraStatus = result.text();
-                } finally { loraBusy.set(false); }
+                } finally { if (downloading) loraDownloading = false; loraBusy.set(false); loraReceipt = null; }
                 Log.info("LoRA 操作完成（成功=" + result.success() + "）：" + Log.text(result.text()));
-                reply(context, result.text());completeChatWorkflowStep(context,result.success());
+                if (context != null) reply(context, result.text());
+                // 控制台触发的任务没有 QQ 回执通道：把最终结论写进 loraStatus，进度条收起时显示的就是它。
+                else loraStatus = result.text();
+                if (receipt != null) { receipt.capture(Maps.text(result.text())); receipt.finish(); }
+                completeChatWorkflowStep(context, result.success());
             });
         } catch (RejectedExecutionException e) {
             loraBusy.set(false);
-            if (downloading) loraStatus = "下载未启动；机器人正在关闭，请稍后重试。";
-            completeChatWorkflowStep(event,false);
+            loraDownloading = false;
+            loraReceipt = null;
+            if (downloading) loraStatus = "操作未启动；机器人正在关闭，请稍后重试。";
+            if (receipt != null) { receipt.capture(Maps.text("操作失败：机器人正在关闭，请稍后重试。")); receipt.finish(); }
+            completeChatWorkflowStep(context, false);
             throw new IllegalStateException("机器人正在关闭，请稍后重试。");
         }
+        return true;
+    }
+    /**
+     * 补展示图：按本地 Civitai 记录里的版本号去取图，不重新下载模型文件。一次把两样都照顾到——
+     * LoRA 旁边的封面（{@code <模型名>.preview.png}）和展示图样式的预览图。
+     * 已有的直接跳过，所以重复点是安全的（只会多问几次 Civitai 的版本信息）。
+     */
+    private LoraResult loraCover(JsonObject event, String value) throws Exception {
+        JsonObject civitai = Json.obj(settings.snapshot(), "civitai");
+        Path directory = Path.of(Json.str(civitai, "lora_dir", ""));
+        if (!Files.isDirectory(directory)) throw new IllegalStateException("未配置可用的 LoRA 目录（civitai.lora_dir），无法补抓展示图。");
+        List<SdClient.Lora> catalog;
+        try { catalog = sd.loras(); }
+        catch (Exception error) { throw new IllegalStateException("读不到 WebUI 的 LoRA 列表：" + error(error)); }
+        Path records = settings.root.resolve("data/civitai");
+        List<Path> targets = new ArrayList<>();
+        if (value.equalsIgnoreCase("all")) {
+            // 不是"只挑缺封面的"：封面齐了也得走一遍，样式的预览图可能还没补过。
+            for (SdClient.Lora item : catalog) {
+                Path file = loraFile(directory, item.name());
+                if (file != null && Files.isRegularFile(records.resolve(file.getFileName() + ".json"))) targets.add(file);
+            }
+            if (targets.isEmpty())
+                return new LoraResult(safeLoraText("本机 " + catalog.size() + " 个 LoRA 都没有 Civitai 下载记录，没有可补的展示图。"), true);
+        } else {
+            // "#编号" 只有聊天会话里有（那是"你刚看过的那份列表"）；控制台按名字点名，编号没有意义。
+            String requested = value.startsWith("#") && event != null ? select(event, "lora", value) : value;
+            Path file = loraFile(directory, requested);
+            if (file == null) throw new IllegalArgumentException("LoRA 目录里找不到「" + requested + "」；用 /lora list 核对名称。");
+            targets.add(file);
+        }
+        CivitaiClient client = new CivitaiClient(settings.root, civitai);
+        int covers = 0, failed = 0, index = 0, stylePreviews = 0;
+        List<String> lines = new ArrayList<>();
+        for (Path file : targets) {
+            index++;
+            final int position = index;
+            String filename = file.getFileName().toString();
+            String where = "补展示图（" + position + "/" + targets.size() + "）" + filename + "：";
+            loraStatus = safeLoraText(where + "正在读取 Civitai 版本信息。");
+            JsonObject record = readManifest(records.resolve(filename + ".json"));
+            if (record == null) {
+                failed++;
+                lines.add(filename + "：没有 Civitai 下载记录，无法确定版本；重新用 /lora download 下一个才会有记录。");
+                continue;
+            }
+            try {
+                long modelId = record.get("model_id").getAsLong(), versionId = record.get("version_id").getAsLong();
+                JsonObject version = client.versionInfo(modelId, versionId);
+                Path previewFile = CivitaiClient.previewPath(file);
+                boolean hadCover = Files.isRegularFile(previewFile);
+                Path preview = client.saveLoraPreview(version, file, stage -> loraStatus = safeLoraText(where + stage));
+                if (preview != null && !hadCover) covers++;
+                stylePreviews += backfillStylePreviews(client, version, file, modelId, versionId, record);
+                if (preview == null && !hadCover) lines.add(filename + "：这个版本在 Civitai 上没有可用的展示图。");
+                else if (!hadCover) lines.add(filename + " → " + preview.getFileName());
+            } catch (Exception error) {
+                failed++;
+                lines.add(filename + "：" + error(error));
+            }
+        }
+        String message = "补展示图：LoRA 封面 " + covers + " 张，样式预览图 " + stylePreviews + " 张，失败 " + failed + " 个，处理 " + targets.size() + " 个。"
+                + (covers == 0 && stylePreviews == 0 && failed == 0 ? "\n本来就没有缺的，不用补。" : "")
+                + (lines.isEmpty() ? "" : "\n" + String.join("\n", lines));
+        return new LoraResult(safeLoraText(message), failed == 0);
+    }
+    /**
+     * 补齐展示图样式与它们的预览图：同一个版本的展示图就是那几条样式的配图，按本地记录里的
+     * {@code showcase_prompts} 对应回去。
+     *
+     * <p>{@code create=true}：缺的样式**要建出来**。老版本只认 A1111 元数据，ComfyUI 出图的模型
+     * 整批被判成"没有提示词"，样式一条都没落盘；只补图不建样式的话，那些模型永远补不回来。
+     * 已经存在的样式按内容匹配复用，不会重复建。
+     *
+     * @return 这次新存下来的预览图张数
+     */
+    private int backfillStylePreviews(CivitaiClient client, JsonObject version, Path file, long modelId, long versionId, JsonObject record) {
+        try {
+            String tag = sd.resolvedLoraTag(file, 1);
+            List<CivitaiClient.ShowcasePrompt> showcases = CivitaiClient.showcasePrompts(version);
+            if (showcases.isEmpty()) return 0;
+            long before = stylePreviewCount();
+            CivitaiClient.DownloadedLora download = new CivitaiClient.DownloadedLora(
+                    Json.str(record, "model_name", ""), Json.str(record, "version_name", ""), Json.str(record, "base_model", ""),
+                    List.of(), file, true, modelId, versionId, showcases);
+            CivitaiStyleSync.sync(settings.root, download, tag, sd, true, client);
+            return (int) Math.max(0, stylePreviewCount() - before);
+        } catch (Exception error) {
+            Log.warn("补样式预览图失败（" + file.getFileName() + "）：" + error(error));
+            return 0;
+        }
+    }
+    /** 现在一共存了多少张样式预览图（补图前后各数一次，差值就是要报的张数）。 */
+    private long stylePreviewCount() {
+        Path directory = cn.szu.bot.sd.StylePreviews.dir(settings.root);
+        try (var files = Files.list(directory)) { return files.filter(Files::isRegularFile).count(); }
+        catch (Exception ignored) { return 0; }
+    }
+    /** 读 Civitai 下载记录（data/civitai/<文件名>.json）；读不到就当没有，别让补图整个失败。 */
+    private static JsonObject readManifest(Path file) {
+        try { return Files.isRegularFile(file) ? Json.parse(Files.readString(file)) : null; }
+        catch (Exception error) { return null; }
+    }
+    /**
+     * 本机 LoRA 有没有展示图（{@code <模型名>.preview.png}）。控制台据此决定显示缩略图还是占位。
+     * 名称来自 WebUI 的 LoRA 列表，可能是子目录相对名，所以这里必须把解析结果锁在 lora_dir 里。
+     */
+    private static boolean hasLoraPreview(String directory, String name) {
+        return loraPreview(directory, name) != null;
+    }
+    /** 展示图文件本身（不存在返回 null）；越界、目录没配、名称空都按"没有"处理。 */
+    private static Path loraPreview(String directory, String name) {
+        if (directory == null || directory.isBlank() || name == null || name.isBlank()) return null;
+        try {
+            Path base = Path.of(directory).toAbsolutePath().normalize();
+            Path file = base.resolve(name + ".preview.png").normalize();
+            return file.startsWith(base) && Files.isRegularFile(file) ? file : null;
+        } catch (Exception ignored) { return null; }
+    }
+    /** 控制台取本机 LoRA 展示图用：返回可读的绝对路径，其余一律 null。 */
+    public Path loraPreviewFile(String name) {
+        return loraPreview(Json.str(Json.obj(settings.snapshot(), "civitai"), "lora_dir", ""), name);
+    }
+    /**
+     * 控制台取样式预览图（只给网页看）：必须是样式库里真的存在的样式，路径由名字哈希算出来，
+     * 不存在、名字为空、样式已删都返回 null。
+     */
+    public Path stylePreviewFile(String name) {
+        try {
+            if (name == null || name.isBlank() || localStyles.get(name) == null) return null;
+            Path file = cn.szu.bot.sd.StylePreviews.file(settings.root, name);
+            return file != null && Files.isRegularFile(file) ? file : null;
+        } catch (Exception ignored) { return null; }
     }
     private record LoraSelection(String name, double weight) {}
     private static LoraSelection loraSelection(String value) {
@@ -3999,8 +4323,12 @@ public final class Bot implements AutoCloseable {
     // WebUI 桥：网页控制台是机器人的另一个入口，走的仍是同一套指令、权限、守卫与回执。
     // ---------------------------------------------------------------------------------------------
     /** 一条网页指令（或一次网页对话的执行链）产生的回执：按<b>出站消息</b>分组，组内文字与图片保持原顺序。 */
+    /** 任务号的发号器：/quest/#22 里的 22 就是它，从 1 开始，进程内唯一。 */
+    private static final java.util.concurrent.atomic.AtomicInteger WEB_QUEST_SEQ = new java.util.concurrent.atomic.AtomicInteger();
     public static final class WebCapture {
         private final String id, command;
+        /** 这条回执的任务号：网页用 /quest/#N 直接定位它。 */
+        private final int number = WEB_QUEST_SEQ.incrementAndGet();
         private final List<String> texts = new CopyOnWriteArrayList<>();
         private final List<JsonObject> images = new CopyOnWriteArrayList<>();
         /** 每条出站消息一组（组内是有序的 text / image 片段）：LoRA 搜索就是一条一项，回执也照这个渲染。 */
@@ -4018,6 +4346,7 @@ public final class Bot implements AutoCloseable {
         WebCapture(String id, String command, Path imageRoot) { this.id = id; this.command = command; this.imageRoot = imageRoot; }
         public String id() { return id; }
         public String command() { return command; }
+        public int number() { return number; }
         /** 收下一条出站消息：文本进 texts、图片段进 images（扁平视图），同时按原顺序记进 {@link #messages}。 */
         void capture(JsonArray segments) {
             if (segments == null) return;
@@ -4112,6 +4441,7 @@ public final class Bot implements AutoCloseable {
         public JsonObject json(boolean busy) {
             JsonObject result = new JsonObject();
             result.addProperty("id", id);
+            result.addProperty("quest", number);
             result.addProperty("command", command);
             result.add("texts", Json.GSON.toJsonTree(new ArrayList<>(texts)));
             result.add("images", Json.GSON.toJsonTree(new ArrayList<>(images)));
@@ -4356,6 +4686,55 @@ public final class Bot implements AutoCloseable {
         });
         return capture;
     }
+    /**
+     * 按**任务号**取一条回执（网页 /quest/#22）。
+     *
+     * <p>number ≤ 0 表示"最新一条"。回执只在内存里留 30 分钟（见 {@link #pruneWebCaptures()}），
+     * 过期就如实说过期，不假装还在跑。
+     */
+    public JsonObject webQuest(int number) {
+        pruneWebCaptures();
+        WebCapture capture = null;
+        for (WebCapture item : webCaptures.values()) {
+            if (number <= 0 ? (capture == null || item.number > capture.number) : item.number == number) {
+                capture = item;
+                if (number > 0) break;
+            }
+        }
+        if (capture == null) {
+            JsonObject missing = new JsonObject();
+            missing.addProperty("quest", number);
+            missing.addProperty("latest", latestQuest());
+            missing.addProperty("error", number <= 0 ? "还没有任何任务回执。" : "回执 #" + number + " 不在了（回执只保留 30 分钟）。");
+            return missing;
+        }
+        capture.read();
+        // "还在跑"必须把出图队列算进去：生成一张图要几十秒，只报 busy（DeepSeek/LoRA）
+        // 会让回执页在生成期间就停表——用户就永远等不到那张图。
+        JsonObject result = capture.json(webBusy() || generationQueued());
+        result.addProperty("latest", latestQuest());
+        return result;
+    }
+    /** 出图队列里还有任务吗（含正在生成的那一个）。 */
+    public boolean generationQueued() {
+        synchronized (generationLock) { return !generationJobs.isEmpty(); }
+    }
+    /** 最近一条回执的任务号（没有就是 0）。 */
+    public int latestQuest() {
+        pruneWebCaptures();
+        int latest = 0;
+        for (WebCapture item : webCaptures.values()) latest = Math.max(latest, item.number);
+        return latest;
+    }
+    /**
+     * 建一条回执（内部接口触发的任务也得有回执，不然"每次任务一个回执"就漏了）。
+     * 和 {@link #webCommand} 一样登记进 webCaptures，网页照常轮询、/quest/#N 也能看。
+     */
+    private WebCapture newCapture(String label) {
+        WebCapture capture = new WebCapture(UUID.randomUUID().toString(), label, settings.root.resolve("data/generated"));
+        webCaptures.put(capture.id(), capture);
+        return capture;
+    }
     /** 正在执行的网页指令条数（日志与网页面板用）。 */
     public int webRunning() {
         int running = 0;
@@ -4374,12 +4753,18 @@ public final class Bot implements AutoCloseable {
         webCaptures.values().removeIf(capture -> capture.startedNanos < deadline);
         webCurrent.values().removeIf(capture -> !webCaptures.containsKey(capture.id()));
     }
-    /** 关闭收集器：之后这个会话的消息重新发往 QQ（网页不再接收）。 */
+    /**
+     * 关闭收集器：之后这个会话的消息重新发往 QQ（网页不再接收）。
+     *
+     * <p>回执本身**留着**——它现在是 /quest/#N 这种可分享的链接，关掉收集不该让链接失效；
+     * 真正过期由 {@link #pruneWebCaptures()} 统一回收。{@code closed} 标记已经足够让
+     * {@link #webCaptureFor} 与 {@link #webActive} 不再把它当成活动回执。
+     */
     public void webClose(String id) {
         WebCapture capture = webCapture(id);
         if (capture == null) return;
         capture.close();
-        webCaptures.values().removeIf(value -> value == capture);
+        webCurrent.values().removeIf(value -> value == capture);
     }
     /** 是否还有后台工作在跑：网页据此决定要不要继续轮询。 */
     public boolean webBusy() { return activeChatWorkflows.get() > 0 || progenBusy.get() || loraBusy.get(); }
@@ -4444,7 +4829,11 @@ public final class Bot implements AutoCloseable {
         result.addProperty("reply", Bot.publicCommands(plan.reply()));
         result.add("commands", Json.GSON.toJsonTree(plan.commands()));
         result.addProperty("interest", plan.interest());
-        if (execute && !plan.commands().isEmpty()) result.addProperty("captureId", webCommand(scope, plan.commands()).id());
+        if (execute && !plan.commands().isEmpty()) {
+            WebCapture capture = webCommand(scope, plan.commands());
+            result.addProperty("captureId", capture.id());
+            result.addProperty("quest", capture.number());
+        }
         return result;
     }
     private JsonObject speakerFor(String scope) {
@@ -5079,6 +5468,8 @@ public final class Bot implements AutoCloseable {
         item.addProperty("name", name);
         item.addProperty("source", source);
         item.addProperty("local", "local".equals(source));
+        // 展示图（控制台「样式」页的缩略图）：没有就是没有，前端给占位。
+        item.addProperty("preview", cn.szu.bot.sd.StylePreviews.has(settings.root, name));
         try {
             LocalStyles.Style style = localStyles.get(name);
             if (style != null) {
@@ -5152,18 +5543,23 @@ public final class Bot implements AutoCloseable {
             loras = List.of();
             failure = error(error);
         }
+        String directory = Json.str(Json.obj(settings.snapshot(), "civitai"), "lora_dir", "");
         for (int index = 0; index < loras.size(); index++) {
             JsonObject item = new JsonObject();
             item.addProperty("number", index + 1);
             item.addProperty("name", loras.get(index).name());
             item.addProperty("alias", loras.get(index).alias());
+            // 有展示图才给 true：前端据此决定显示缩略图还是"无图"占位，不必自己去猜文件名。
+            item.addProperty("preview", hasLoraPreview(directory, loras.get(index).name()));
             items.add(item);
         }
         JsonObject result = new JsonObject();
         result.add("loras", items);
         result.addProperty("count", items.size());
-        result.addProperty("directory", Json.str(Json.obj(settings.snapshot(), "civitai"), "lora_dir", ""));
+        result.addProperty("directory", directory);
         result.addProperty("downloadStatus", loraStatus);
+        // 实时进度和 /api/lora/progress 同一份数据：面板一进来就能接着显示正在跑的下载。
+        result.add("download", loraProgress());
         if (!failure.isBlank()) {
             result.addProperty("error", failure);
             result.addProperty("status", "读取本机 LoRA 失败");

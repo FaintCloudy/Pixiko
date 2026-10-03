@@ -234,34 +234,112 @@
 
   function activeReceiptBoxes() { return RECEIPT_BOXES.filter((id) => $(id) && $(id).closest('.panel').classList.contains('active')); }
 
-  /** 一条出站消息 → 一张回执卡：卡内文字与图片按原顺序排列（LoRA 搜索就是一条一项）。 */
-  function receiptGroup(capture, segments) {
-    const pieces = segments || [];
-    const text = pieces.filter((piece) => piece.type !== 'image' && piece.text).map((piece) => piece.text).join('\n');
-    const card = el('div', 'receipt' + (/操作失败|失败|未完成|错误|不正确/.test(text) ? ' err' : ' ok'));
-    card.appendChild(el('div', 'head', capture.command ? '指令 · ' + capture.command : '执行回执'));
-    pieces.forEach((piece) => {
-      if (piece.type === 'image') {
-        const name = String(piece.file).replace(/^.*[\\/]/, '');
-        card.appendChild(imageNode(imageUrl(piece.file), name, 'receipt-image'));
-      } else if (piece.text) {
-        card.appendChild(el('div', null, piece.text));
-      }
-    });
-    return card;
+  // ---------------------------------------------------------------- 任务回执（/quest/#N）
+
+  /** 见过的图片数（用来判断"出图完成"该不该再冒一条云）。 */
+  const questCloudSeen = new Map();
+
+  /**
+   * 任务信息云：从屏幕下方冒一条，带跳去 /quest/#N 的链接。
+   * 任务下达时冒一条（普通样式），出图完成后再冒一条（done 样式，留久一点）。
+   */
+  function questCloud(text, number, options) {
+    const box = $('quest-clouds');
+    if (!box || !number) { toast(text); return; }
+    const cloud = el('div', 'quest-cloud' + (options && options.done ? ' done' : ''));
+    cloud.appendChild(el('div', 'quest-cloud-text', text));
+    const link = el('a', 'quest-cloud-link', '查看回执 #' + number + ' →');
+    link.href = '/quest/#' + number;
+    cloud.appendChild(link);
+    box.appendChild(cloud);
+    requestAnimationFrame(() => cloud.classList.add('show'));
+    const ttl = options && options.done ? 15000 : 9000;
+    setTimeout(() => { cloud.classList.remove('show'); setTimeout(() => cloud.remove(), 300); }, ttl);
+  }
+
+  const questWatch = { timer: null, number: 0 };
+
+  /** 当前地址里的任务号（/quest/#22 → 22）；没有就是 0（表示"最新一条"）。 */
+  function questNumberFromLocation() {
+    const value = Number(String(location.hash || '').replace(/^#/, '').trim());
+    return Number.isFinite(value) && value > 0 ? Math.floor(value) : 0;
   }
 
   /**
-   * 回执渲染：只追加新到的消息，不再每次轮询清空重建——否则整块回执一直在闪。
-   * state.receipt 记住当前回执 id 与已渲染条数；换了一条指令（id 变化）才重画。
+   * 回执页：跟着一条回执实时刷新（指令结果 + 生成图片都在里面）。
+   * 跑完就停表；换任务号（点另一条云）会重新开始跟。
+   */
+  async function loadQuest(number) {
+    clearInterval(questWatch.timer);
+    questWatch.number = number || questNumberFromLocation() || 0;
+    const tick = async () => {
+      let data;
+      try { data = await api('/api/quest', { body: { id: questWatch.number } }); }
+      catch (error) {
+        clearInterval(questWatch.timer);
+        if (String(error.message) !== 'unauthorized' && $('quest-state')) $('quest-state').textContent = '读取失败：' + error.message;
+        return;
+      }
+      renderQuest(data);
+      if (data.done && !data.busy) clearInterval(questWatch.timer);
+    };
+    await tick();
+    questWatch.timer = setInterval(tick, 900);
+  }
+
+  function renderQuest(data) {
+    const body = $('quest-body');
+    if (!body) return;
+    const number = data.quest || questWatch.number;
+    const field = $('quest-number');
+    if (field && document.activeElement !== field) field.value = number || '';
+    const running = !data.error && !(data.done && !data.busy);
+    $('quest-state').textContent = data.error ? data.error : '#' + number + (running ? '（进行中…）' : '（已完成）');
+    $('quest-command').textContent = data.command ? '指令：' + data.command : '';
+    $('quest-progress').textContent = data.latest ? '最新一条是 #' + data.latest : '';
+    body.innerHTML = '';
+    if (data.error) { body.appendChild(el('div', 'quest-empty', data.error)); return; }
+
+    const groups = Array.isArray(data.messages) && data.messages.length ? data.messages : null;
+    const steps = groups || (data.texts || []).map((text) => [{ type: 'text', text }]);
+    const flatImages = groups ? [] : (data.images || []).map((image) => ({ type: 'image', file: image.file }));
+    if (!steps.length && !flatImages.length) {
+      body.appendChild(el('div', 'quest-empty', '这条任务还没有输出。'));
+    }
+    steps.forEach((pieces, index) => {
+      const step = el('div', 'quest-step');
+      step.appendChild(el('div', 'head', groups ? '第 ' + (index + 1) + ' 步' : '输出'));
+      const text = (pieces || []).filter((piece) => piece.type !== 'image' && piece.text).map((piece) => piece.text).join('\n');
+      if (text) {
+        if (/(^|\n)[^\n]{0,16}(失败|错误|不正确|无效|超时|拒绝|找不到)[:：]/.test(text)) step.classList.add('err');
+        step.appendChild(el('div', 'quest-text', text));
+      }
+      const pictures = (pieces || []).filter((piece) => piece.type === 'image' && piece.file);
+      if (pictures.length) {
+        const box = el('div', 'quest-images');
+        pictures.forEach((piece) => box.appendChild(imageNode(imageUrl(piece.file), '任务 #' + number + ' 的图', 'quest-image')));
+        step.appendChild(box);
+      }
+      body.appendChild(step);
+    });
+    if (flatImages.length) {
+      const box = el('div', 'quest-images');
+      flatImages.forEach((piece) => box.appendChild(imageNode(imageUrl(piece.file), '任务 #' + number + ' 的图', 'quest-image')));
+      body.appendChild(box);
+    }
+    if (running) body.appendChild(el('div', 'quest-empty', '（还在跑，实时刷新中…）'));
+  }
+
+  /**
+   * 回执渲染：**面板底部不再追加"指令 · …"那张卡**。结果由面板自己刷新 + 右上角 toast 呈现，
+   * 想看原文就在控制台（系统页）或终端里敲同一条指令——那里是完整输出。
    *
-   * 后端给了 {@code messages}（按出站消息分组）就按它渲染：一条消息一张卡，卡里文字与图片保持原顺序，
-   * 于是 LoRA 搜索是「一条一项、图文同条」，而不是所有文字一堆、所有图片一堆。
+   * <p>仍然留卡的两类：**报错**（失败不能没声）和**图片**（出图/领取的图就得在这儿看）。
+   * 只追加新到的内容，不清空重建，否则整块会一直闪。state.receipt 记住当前回执 id 与已渲染条数。
    */
   function renderCapture(capture) {
     const key = String(capture.id || capture.command || '');
     const texts = capture.texts || [], images = capture.images || [];
-    const groups = Array.isArray(capture.messages) && capture.messages.length ? capture.messages : null;
     if (state.receiptKey !== key) {
       state.receiptKey = key; state.receiptTexts = 0; state.receiptImages = 0; state.receiptCount = 0; state.receiptBox = null;
     }
@@ -271,24 +349,22 @@
       const visible = box.closest('.panel').classList.contains('active');
       if (!visible) continue;
       if (state.receiptBox !== box) { box.innerHTML = ''; state.receiptTexts = 0; state.receiptImages = 0; state.receiptCount = 0; }
-      if (groups) {
-        for (let index = state.receiptCount; index < groups.length; index++) box.appendChild(receiptGroup(capture, groups[index]));
-        state.receiptCount = Math.max(state.receiptCount, groups.length);
-      } else {
-        for (let index = state.receiptTexts; index < texts.length; index++) {
-          const text = texts[index];
-          const card = el('div', 'receipt' + (/操作失败|失败|未完成|错误|不正确/.test(text) ? ' err' : ' ok'));
-          card.appendChild(el('div', 'head', capture.command ? '指令 · ' + capture.command : '执行回执'));
-          card.appendChild(el('div', null, text));
-          box.appendChild(card);
-        }
-        for (let index = state.receiptImages; index < images.length; index++) {
-          // 回溯/领取/生成的图片直接显示在回执里，点一下弹查看器放大。
-          const card = el('div', 'receipt ok image-receipt');
-          const name = String(images[index].file).replace(/^.*[\\/]/, '');
-          card.appendChild(imageNode(imageUrl(images[index].file), name, 'receipt-image'));
-          box.appendChild(card);
-        }
+      // 判"是不是报错"看**短标签＋冒号**（"操作失败："／"刷新/确认本机标签失败："）。
+      // 不能见到"失败"就判错：成功回执里也有"失败 0"这种统计字样。
+      for (let index = state.receiptTexts; index < texts.length; index++) {
+        const text = texts[index];
+        if (!/(^|\n)[^\n]{0,16}(失败|错误|不正确|无效|超时|拒绝|找不到)[:：]/.test(text)) continue;
+        const card = el('div', 'receipt err');
+        card.appendChild(el('div', 'head', capture.command ? '指令 · ' + capture.command : '执行回执'));
+        card.appendChild(el('div', null, text));
+        box.appendChild(card);
+      }
+      for (let index = state.receiptImages; index < images.length; index++) {
+        // 生成的图片只在这里出现一次；回溯/领取的图也走它，点一下弹查看器放大。
+        const card = el('div', 'receipt ok image-receipt');
+        const name = String(images[index].file).replace(/^.*[\\/]/, '');
+        card.appendChild(imageNode(imageUrl(images[index].file), name, 'receipt-image'));
+        box.appendChild(card);
       }
       state.receiptTexts = Math.max(state.receiptTexts, texts.length);
       state.receiptImages = Math.max(state.receiptImages, images.length);
@@ -354,6 +430,15 @@
           loadImages().catch(() => {});
         }
       }
+      // 出图成功再冒一条信息云（第一次看到新图片时）：任务回执里已经附了图，这里只负责提醒。
+      const imageCount = (capture.images || []).length;
+      const seenImages = questCloudSeen.get(id) || 0;
+      if (capture.quest && imageCount > seenImages) {
+        questCloudSeen.set(id, imageCount);
+        if (seenImages > 0 || imageCount > 0) {
+          questCloud('任务 #' + capture.quest + ' 出图完成：' + imageCount + ' 张', capture.quest, { done: true });
+        }
+      }
       const busy = capture.busy || (!capture.closed && capture.ageMillis < 1200 && attempt < 3);
       if (attempt % 4 === 0) await loadStatus().catch(() => {});
       const generating = !!state.status?.generation?.status;
@@ -372,6 +457,8 @@
       state.busy++;
       const capture = await api('/api/command', { body: { command: list.join('\n'), scope: scope() } });
       renderCapture({ texts: [], images: [], command: list.join(' ; '), busy: true });
+      // 任务一受理就从下方冒一条信息云，带跳去 /quest/#N 的链接（一个回执 = 一次任务，可多步）。
+      if (capture.quest) questCloud('任务 #' + capture.quest + ' 已下达：' + list.join(' ; '), capture.quest);
       // 出图/领取这类要等的指令：顺便开始轮询 SD 的生成进度。
       if (follow) { state.followUntil = Date.now() + 20 * 60 * 1000; startProgressPolling(); }
       // 下达任务后自动刷新任务队列（不用再手点「刷新队列」）。
@@ -425,6 +512,7 @@
       $('chat-interest').textContent = result.interest != null ? '相关度 ' + result.interest : '';
       if (result.commands && result.commands.length) {
         appendMessage('sys', '执行指令：' + result.commands.join('  '));
+        if (result.quest) questCloud('任务 #' + result.quest + ' 已下达：' + result.commands.join(' ; '), result.quest);
         if (result.captureId) {
           // 网页对话里要图的请求：一直跟到图片回来，直接发在对话里。
           state.followUntil = Date.now() + 20 * 60 * 1000;
@@ -821,6 +909,7 @@
   function styleRow(item) {
     const li = el('li', 'fresh');
     li.appendChild(el('span', 'num', '#' + (item.number || '')));
+    li.appendChild(previewThumb(item.preview ? stylePreviewUrl(item.name) : '', item.name));
     const name = el('span', 'name');
     name.appendChild(el('span', 'tag on', '样式'));
     const label = el('span', 'editable', ' ' + item.name);
@@ -932,6 +1021,99 @@
     renderLoras(state.loras);
     $('lora-status').textContent = data.status || ('本机 ' + state.loras.length + ' 个 LoRA');
     if (count) count.textContent = '共 ' + state.loras.length + ' 个' + (data.directory ? '（' + data.directory + '）' : '');
+    // 进面板时后台可能正在下载（甚至刷新过页面）：接着把进度条挂上，不然进度就"看不见了"。
+    if (data.download && (data.download.busy || data.download.downloading)) watchLoraProgress();
+  }
+
+  // ------------------------------------------------- LoRA 下载实时进度
+
+  const loraWatch = { timer: null, hideTimer: null };
+
+  /**
+   * 控制台的 LoRA 写操作（下载 / 补展示图）：走内部接口，<b>不</b>借道指令通道——
+   * 指令通道要等整件事做完才结束回执，进度就没法实时显示了。
+   * 接口只负责"启动"，发完立刻挂上每秒轮询；轮询结束时会刷新本机列表。
+   */
+  async function startLoraJob(path, body) {
+    try {
+      const started = await api(path, { body: Object.assign({ scope: scope() }, body || {}) });
+      if (started && started.quest) questCloud('任务 #' + started.quest + ' 已下达（' + path + '）', started.quest);
+      watchLoraProgress();
+      return true;
+    } catch (error) {
+      if (String(error.message) !== 'unauthorized') toast(error.message);
+      return false;
+    }
+  }
+
+  /** 秒数转成人话（和机器人的 /lora status 一个口径）。 */
+  function describeEta(seconds) {
+    const total = Math.max(1, Math.round(seconds));
+    if (total >= 3600) return Math.floor(total / 3600) + ' 小时 ' + Math.floor((total % 3600) / 60) + ' 分';
+    if (total >= 60) return Math.floor(total / 60) + ' 分 ' + (total % 60) + ' 秒';
+    return total + ' 秒';
+  }
+
+  /**
+   * 画一次进度：机器人给字节数就按百分比画，没给（正在读模型信息/正在加载到 WebUI/正在补图）
+   * 就退回不确定态——不能显示成 0%，那会让人以为卡死了。
+   */
+  function renderLoraProgress(data) {
+    const box = $('lora-progress'), fill = $('lora-progress-fill'), text = $('lora-progress-text');
+    if (!box || !fill || !text) return;
+    clearTimeout(loraWatch.hideTimer);
+    box.hidden = false;
+    const running = !!(data && (data.busy || data.downloading));
+    if (data && data.metered) {
+      box.classList.remove('indeterminate');
+      fill.style.width = Math.max(0, Math.min(100, data.percent)).toFixed(1) + '%';
+      const mib = 1024 * 1024;
+      let line = (data.done / mib).toFixed(1) + ' / ' + (data.total / mib).toFixed(1) + ' MiB（' + data.percent.toFixed(1) + '%）';
+      if (data.speed > 0) line += ' · ' + (data.speed / mib).toFixed(2) + ' MiB/s';
+      if (data.etaSeconds > 0) line += ' · 剩余约 ' + describeEta(data.etaSeconds);
+      text.textContent = line;
+    } else {
+      box.classList.add('indeterminate');
+      fill.style.width = '';
+      // 结束后的完整报告很长（触发词、展示图清单十几行）：进度条上只留第一行，细节看下面/控制台。
+      const stage = String((data && data.stage) || (running ? '正在处理…' : '已结束')).trim();
+      const first = stage.split('\n')[0].trim();
+      text.textContent = stage === first ? first : first + ' …';
+    }
+    // 结束后让最后一行（"展示图已保存…"/"下载成功…"）停一会儿再收起来，别一闪而过。
+    if (!running) loraWatch.hideTimer = setTimeout(() => { box.hidden = true; box.classList.remove('indeterminate'); }, 6000);
+  }
+
+  /**
+   * 每秒问一次 /api/lora/progress，直到这次下载/补图结束；结束时顺带刷新本机列表，
+   * 新 LoRA 和它的展示图就一起出现了（不用用户再点一次「刷新」）。
+   *
+   * <p>不能一看到"没在下载"就收手：点下「下载」到机器人真正登记任务之间有一小段空窗，
+   * 第一次轮询常常正好落在里面。所以要么先看到过"正在下载"，要么等满宽限期才判定没跑起来。
+   */
+  function watchLoraProgress() {
+    clearInterval(loraWatch.timer);
+    let misses = 0, grace = 0, seenRunning = false;
+    const tick = async () => {
+      let data;
+      try { data = await api('/api/lora/progress'); }
+      catch (error) {
+        if (String(error.message) === 'unauthorized') { clearInterval(loraWatch.timer); return; }
+        if (++misses >= 3) clearInterval(loraWatch.timer);      // 机器人没了就别一直敲
+        return;
+      }
+      misses = 0;
+      const running = !!(data.busy || data.downloading);
+      if (running) { seenRunning = true; grace = 0; }
+      else if (!seenRunning && ++grace <= 20) return;            // 空窗期：先不画也不收手
+      renderLoraProgress(data);
+      if (!running) {
+        clearInterval(loraWatch.timer);
+        loadLoras().catch(() => {});
+      }
+    };
+    loraWatch.timer = setInterval(tick, 1000);
+    tick();
   }
 
   /** 渲染本机 LoRA 列表（同样增量同步：加载/删除后不整表重画，列表不会晃）。 */
@@ -949,9 +1131,28 @@
 
   const loraRows = new Map();
 
+  /**
+   * 本机 LoRA 的展示图：机器人下载 LoRA 时会连图一起存成 `<模型名>.preview.png`，
+   * 这里按名字回读（/api/lora/preview）。老下载没有图就显示"无图"，可以点上面「补抓展示图」。
+   */
+  /**
+   * 列表行里的竖版小封面：本机 LoRA 的展示图、样式的预览图共用。
+   * 没有图给"无图"占位；图取不到（401/404）也退回占位，不显示成坏图。
+   */
+  function previewThumb(src, caption) {
+    const box = el('div', 'row-thumb');
+    if (!src) { box.appendChild(el('div', 'row-nocover', '无图')); return box; }
+    const link = imageNode(src, caption, 'row-cover');
+    const image = link.querySelector('img');
+    if (image) image.addEventListener('error', () => box.replaceChild(el('div', 'row-nocover', '无图'), link));
+    box.appendChild(link);
+    return box;
+  }
+
   function loraRow(item) {
     const li = el('li', 'fresh');
     li.appendChild(el('span', 'num', '#' + (item.number || '')));
+    li.appendChild(previewThumb(item.preview ? loraPreviewUrl(item.name) : '', item.name));
     const name = el('span', 'name');
     const label = el('span', 'editable', item.name);
     label.title = '点一下直接改名';
@@ -1039,10 +1240,9 @@
         meta.appendChild(line);
       }
       const acts = el('div', 'civitai-acts');
-      const weight = el('input');
-      weight.type = 'number'; weight.step = '0.05'; weight.value = '1'; weight.title = '下载时写入 prompt 的权重';
-      acts.appendChild(weight);
-      acts.appendChild(actionButton('下载', () => runCommands(['.lora download #' + number + ' ' + weight.value]).then(loadLoras)));
+      // 权重不在这里给：机器人默认就是 1，要别的权重可以下载后用本地列表的「加载」调。
+      // 走控制台自己的接口（不是指令通道），发完立刻开始轮询进度，不等下载跑完。
+      acts.appendChild(actionButton('下载', () => startLoraJob('/api/lora/download', { url: item.url, weight: 1 })));
       if (item.url) {
         const link = el('a', 'civitai-link', '打开模型页');
         link.href = item.url; link.target = '_blank'; link.rel = 'noreferrer';
@@ -1059,6 +1259,18 @@
   /** 封面代取地址（<img src> 只能带查询串，所以 token 也放在 query 上）。 */
   function coverUrl(url) {
     return '/api/civitai/thumb?token=' + encodeURIComponent(state.token) + '&url=' + encodeURIComponent(url);
+  }
+
+  /**
+   * 本机 LoRA 展示图 / 样式预览图的地址。同样是 `<img>` 带不了 Authorization 头，
+   * 令牌只能挂在查询串上（少了它图会 401，页面上看起来就是"无图"）。
+   */
+  function loraPreviewUrl(name) {
+    return '/api/lora/preview?token=' + encodeURIComponent(state.token) + '&name=' + encodeURIComponent(name);
+  }
+
+  function stylePreviewUrl(name) {
+    return '/api/style/preview?token=' + encodeURIComponent(state.token) + '&name=' + encodeURIComponent(name);
   }
 
   // ---------------------------------------------------------------- 提示词集
@@ -1520,11 +1732,13 @@
     try {
       if (command) {
         const capture = await api('/api/command', { body: { command, scope: scope() } });
+        if (capture.quest) questCloud('任务 #' + capture.quest + ' 已下达：' + command, capture.quest);
         if (/\b(gen|get|rg)\b/i.test(command)) loadTasks().catch(() => {});
         await followTerminal(capture.id);
         if (/\b(gen|get|rg)\b/i.test(command)) loadTasks().catch(() => {});
       } else {
         const result = await api('/api/chat', { body: { message: text, execute: true, scope: scope() } });
+        if (result.quest) questCloud('任务 #' + result.quest + ' 已下达：' + text, result.quest);
         (result.reply || '(空回复)').split('\n').forEach((line) => appendTerminal('out', line));
         if (result.commands && result.commands.length) appendTerminal('sys', '执行指令：' + result.commands.join('  '));
         if (result.captureId) await followTerminal(result.captureId);
@@ -1533,6 +1747,17 @@
       if (String(error.message) !== 'unauthorized') appendTerminal('err', error.message);
     }
     appendTerminal('out', '');
+  }
+
+  /**
+   * 跑一条"目的是看内容"的指令（`.help`／`.style list`／`.chat model` 这类），
+   * 把最后一段回复弹进对话框——面板底部不再堆回执卡，这些内容总得有个地方看。
+   */
+  async function runInfo(command, title) {
+    const capture = await runCommands([command]);
+    const texts = ((capture && capture.texts) || []).filter((line) => line && !/正在通过 DeepSeek/.test(line));
+    if (texts.length) showInfo(title || command, texts[texts.length - 1]);
+    else toast('没有可显示的内容。');
   }
 
   /** 队列里还有等待/生成中/挂起的任务吗（终端跟随用，只读接口、不重画面板）。 */
@@ -1964,13 +2189,25 @@
       await loadPrompt().catch(() => {});
     });
     on('infix-filter', 'change', (event) => setOption('infixFilter', event.target.checked ? 'on' : 'off'));
-    on('progen-btn', 'click', () => { const v = $('progen-input').value.trim(); if (v) runCommands(['.progen ' + v]); });
+    on('progen-btn', 'click', () => {
+      const v = $('progen-input').value.trim();
+      if (v) runInfo('.progen ' + v, 'DeepSeek 生成的提示词');
+    });
     on('usage-btn', 'click', () => loadUsage($('usage-query').value.trim()));
 
     // 样式（本机样式库走 /api/styles/edit；只有「导入 WebUI 预设样式」和查看原文要读桥接）
+    // 查看原文走弹窗（和列表行上的「查看原文」同一个对话框）：面板底部不再放回执行。
     on('style-prompt-btn', 'click', () => {
-      const name = $('style-prompt-name').value.trim();
-      runCommands([name ? '.style prompt ' + name : '.style list']);
+      const wanted = $('style-prompt-name').value.trim().replace(/^#/, '');
+      const names = [...styleItems.keys()];
+      const name = names.find((item) => item === wanted)
+        || names.find((item) => item.toLowerCase() === wanted.toLowerCase())
+        || names[Number(wanted) - 1];
+      if (!name) { toast(wanted ? '样式库里没有「' + wanted + '」；列表见下方。' : '样式库是空的。'); return; }
+      const data = styleItems.get(name) || {};
+      showInfo('样式原文：' + name,
+        '正向：\n' + (data.positive || '（空）') + '\n\n反向：\n' + (data.negative || '（空）'),
+        { text: '这是一份固定模板：载入会把这两段原样写进你个人的提示词。' });
     });
     on('style-save', 'click', () => {
       const name = $('style-save-name').value.trim();
@@ -2007,7 +2244,7 @@
       try {
         const data = await api('/api/civitai/search', { body: { query, scope: scope() } });
         renderCivitai(data.results, { empty: '没有找到匹配的 LoRA。' });
-        if ($('lora-status')) $('lora-status').textContent = '「' + (data.query || query) + '」找到 ' + (data.count || 0) + ' 项（下载用卡片上的权重 + 下载）';
+        if ($('lora-status')) $('lora-status').textContent = '「' + (data.query || query) + '」找到 ' + (data.count || 0) + ' 项（点卡片上的「下载」即可）';
       } catch (error) {
         renderCivitai([], { empty: '搜索失败：' + error.message });
       }
@@ -2016,6 +2253,8 @@
     on('lora-auto-get', 'change', (event) => setOption('autoGet', event.target.checked ? 'on' : 'off'));
     on('lora-filter', 'input', () => renderLoras(state.loras));
     on('lora-reload', 'click', loadLoras);
+    // 补抓展示图：早先下载的 LoRA 没有配图，按本地 Civitai 记录去补一张（不重新下载模型文件）。
+    on('lora-cover-btn', 'click', () => startLoraJob('/api/lora/cover', {}));
 
     // 提示词集
     on('function-save', 'click', () => { const n = $('function-save-name').value.trim(); if (n) editFunctions('save', n); });
@@ -2032,7 +2271,7 @@
     on('set-image-thinking', 'change', (event) => setOption('imageThinking', event.target.checked ? 'on' : 'off'));
     on('apply-chat-model', 'click', () => { const v = $('set-chat-model').value.trim(); if (v) setOption('chatModel', v); });
     on('apply-image-model', 'click', () => { const v = $('set-image-model').value.trim(); if (v) runCommands(['.model set ' + v]).then(loadStatus); });
-    on('chat-model-info', 'click', () => runCommands(['.chat model']));
+    on('chat-model-info', 'click', () => runInfo('.chat model', '聊天模型'));
     on('apply-personality', 'click', () => setOption('personality', $('set-personality').value));
     on('apply-personality-add', 'click', () => { const v = $('personality-add').value.trim(); if (v) runCommands(['.chat add ' + v]).then(loadStatus); });
     on('apply-personality-infix', 'click', () => { const v = $('personality-infix').value.trim(); if (v) runCommands(['.chat infix ' + v]).then(loadStatus); });
@@ -2147,6 +2386,22 @@
     on('terminal-clear', 'click', clearTerminal);
     bindTerminalTail();
     on('terminal-fullscreen', 'click', () => applyConsoleFullscreen(!consoleFullscreen()));
+    // 任务回执页：地址里的 #N 就是任务号；点信息云里的链接会直接进来。
+    on('quest-open', 'click', () => {
+      const value = Number($('quest-number').value.trim().replace(/^#/, ''));
+      if (!Number.isFinite(value) || value <= 0) { toast('请填任务号，例如 22。'); return; }
+      location.hash = '#' + Math.floor(value);
+      loadQuest(Math.floor(value));
+    });
+    on('quest-latest-btn', 'click', async () => {
+      const data = await api('/api/quest', { body: { id: 0 } });
+      if (data.quest) { location.hash = '#' + data.quest; loadQuest(data.quest); }
+      else toast(data.error || '还没有任何任务回执。');
+    });
+    on('quest-reload', 'click', () => loadQuest(questNumberFromLocation()));
+    if ($('quest-number')) on('quest-number', 'keydown', (event) => { if (event.key === 'Enter') { event.preventDefault(); $('quest-open').click(); } });
+    window.addEventListener('hashchange', () => { if (PAGE === 'quest') loadQuest(questNumberFromLocation()); });
+
     on('terminal-form', 'submit', async (event) => { event.preventDefault(); await submitTerminal(); });
     // 点终端任意位置都聚焦到提示符（真终端就是这样）
     on('terminal-body', 'click', (event) => {
@@ -2165,7 +2420,7 @@
 
     const shortcuts = $('shortcuts');
     if (shortcuts) ['.style list', '.lora list', '.function list', '.preset list', '.settings', '.gen status', '.progress', '.chat', '.help']
-      .forEach((command) => shortcuts.appendChild(actionButton(command, () => runCommands([command]), 'ghost')));
+      .forEach((command) => shortcuts.appendChild(actionButton(command, () => runInfo(command, command), 'ghost')));
   }
 
   /**
@@ -2190,7 +2445,8 @@
         resetTerminalTail();                   // 进控制台时把提示符下面那片"被顶上去"的空白收回默认高度
         await loadLogs();
         if ($('terminal-input')) $('terminal-input').focus();
-      } else if (PAGE === 'help') await loadHelp();
+      } else if (PAGE === 'quest') await loadQuest();
+      else if (PAGE === 'help') await loadHelp();
       else if (PAGE === 'system') await loadChannels();
       // chatcfg / system 只要状态，上面已经拉过
       if (state.options) {

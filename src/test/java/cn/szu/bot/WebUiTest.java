@@ -204,8 +204,9 @@ public final class WebUiTest {
         // 同时每个栏目都能用自己的 URL 打开（见 columnPages）。
         check(index.body().contains("id=\"panel-chat\"") && !index.body().contains("id=\"panel-styles\""),
                 "首页只有对话栏目自己的面板（不是把所有栏目塞进一页）");
-        check(countOf(index.body(), "role=\"tab\"") == 11 && index.body().contains("href=\"/styles\"")
-                        && index.body().contains("href=\"/setup\"") && index.body().contains("href=\"/\""),
+        check(countOf(index.body(), "role=\"tab\"") == 12 && index.body().contains("href=\"/styles\"")
+                        && index.body().contains("href=\"/quest\"") && index.body().contains("href=\"/setup\"")
+                        && index.body().contains("href=\"/\""),
                 "页签是十一个真链接（每个栏目一个 URL，含 Setup）");
         check(index.body().contains("id=\"viewer\"") && index.body().contains("id=\"viewer-image\"")
                         && index.body().contains("id=\"viewer-stage\""),
@@ -226,6 +227,8 @@ public final class WebUiTest {
         check(css.body().contains("font: 15px/1.72") && css.body().contains("font: 15px/1.6"),
                 "控制台正文与提示符都是 15px（日志/回执看着不费劲）");
         check(css.body().contains("max-width: min(100%, 700px)"), "对话/回执里的图片最大给到 700px");
+        check(css.body().contains("img.civitai-cover") && css.body().contains("aspect-ratio: 832 / 1216"),
+                "LoRA 搜索结果的封面按 832:1216 竖版显示（不再裁成正方形）");
         check(css.body().contains("::-webkit-scrollbar") && css.body().contains("scrollbar-color"),
                 "滚动条统一美化（webkit + Firefox）");
         check(css.body().contains(".dialog-pre"), "信息框里有展示原文的区域");
@@ -259,11 +262,48 @@ public final class WebUiTest {
                 "图片查看器支持放大、适应屏幕/1:1 切换与关闭");
         check(script.body().contains("function imageNode") && countOf(script.body(), "imageNode(") >= 5,
                 "所有出图位置（对话、回执、网格、控制台）都走同一个图片节点");
-        check(script.body().contains("function receiptGroup") && script.body().contains("function appendCaptureGroup"),
-                "回执与对话都按出站消息分条渲染（一条消息 = 一张卡 / 一条聊天记录）");
+        check(!script.body().contains("function receiptGroup") && script.body().contains("function appendCaptureGroup"),
+                "面板底部不再渲染回执卡（对话仍按出站消息分条渲染）");
         check(script.body().contains("openViewer(src, caption)") && script.body().contains("点击放大（Esc 关闭）"),
                 "点图直接调查看器，链接上只留提示不再跳转");
         check(script.body().contains("applyGeneration(true)"), "点「开始生成」前先把面板里没提交的改动发出去");
+        check(script.body().contains("function questCloud") && script.body().contains("function loadQuest")
+                        && script.body().contains("function renderQuest") && script.body().contains("/api/quest")
+                        && script.body().contains("'/quest/#' + number"),
+                "任务信息云带 /quest/#N 链接，回执页实时轮询 /api/quest");
+        check(css.body().contains(".quest-clouds") && css.body().contains(".quest-cloud")
+                        && css.body().contains(".quest-step"),
+                "信息云与回执页的样式都在");
+        check(script.body().contains("/api/lora/download") && !script.body().contains("weight.value"),
+                "LoRA 下载走控制台自己的接口（不是指令通道），也不带权重输入框");
+        check(css.body().contains("img.row-cover") && css.body().contains(".lora-progress-fill")
+                        && css.body().contains("@keyframes lora-slide"),
+                "列表小封面与下载进度条的样式都在（进度条有不确定态动画）");
+        // LoRA 那块只在 /loras 这一页里（每页只留自己栏目的 DOM），所以单独取一次。
+        HttpResponse<String> lorasPage = HTTP.send(HttpRequest.newBuilder(URI.create(base + "/loras")).GET().build(),
+                HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+        check(lorasPage.statusCode() == 200 && lorasPage.body().contains("id=\"lora-progress\"")
+                        && lorasPage.body().contains("id=\"lora-progress-fill\"")
+                        && lorasPage.body().contains("id=\"lora-cover-btn\""),
+                "LoRA 面板带下载进度条与「补抓展示图」按钮");
+        check(lorasPage.body().contains("id=\"lora-list\"") && !lorasPage.body().contains("id=\"panel-chat\""),
+                "/loras 只渲染 LoRA 这一块");
+        check(script.body().contains("function watchLoraProgress") && script.body().contains("/api/lora/progress")
+                        && script.body().contains("setInterval(tick, 1000)"),
+                "下载进度每秒轮询一次（实时显示字节/百分比）");
+        check(script.body().contains("function renderLoraProgress") && script.body().contains("indeterminate")
+                        && script.body().contains("data.metered"),
+                "没字节数可报时进度条走不确定态，不显示成 0%");
+        check(script.body().contains("function loraPreviewUrl") && script.body().contains("'/api/lora/preview?token='")
+                        && script.body().contains("function previewThumb"),
+                "本机 LoRA 列表用 /api/lora/preview 显示真的展示图（<img> 只能把令牌挂查询串上）");
+        check(script.body().contains("function stylePreviewUrl") && script.body().contains("'/api/style/preview?token='")
+                        && script.body().contains("previewThumb(item.preview ? stylePreviewUrl"),
+                "样式列表也带预览图（同样走查询串上的令牌）");
+        check(script.body().contains("startLoraJob('/api/lora/cover'") && script.body().contains("function describeEta"),
+                "「补抓展示图」按钮走 /api/lora/cover（顺带把 ETA 转成人话）");
+        check(script.body().contains("(失败|错误|不正确|无效|超时|拒绝|找不到)[:：]") && script.body().contains("function runInfo"),
+                "成功类回执不再往面板底部堆卡片（错误与图片仍然保留），要看内容走对话框");
         check(script.body().contains("function updateQueueSummary") && script.body().contains("updateQueueSummary(queue)")
                         && script.body().contains("updateQueueSummary(status.generation?.status)"),
                 "任务队列摘要同时由状态接口与进度轮询刷新（1.5 秒一次）");
@@ -336,9 +376,33 @@ public final class WebUiTest {
         check(withLocal.getAsJsonArray("styles").get(0).getAsJsonObject().has("positive")
                         && withLocal.getAsJsonArray("styles").get(0).getAsJsonObject().has("negative"),
                 "样式列表带正反向原文：" + withLocal.getAsJsonArray("styles").get(0));
+        // 样式的预览图（只给网页看）：每项带 preview 标志，没有图就是 false。
+        check(withLocal.getAsJsonArray("styles").get(0).getAsJsonObject().has("preview")
+                        && !withLocal.getAsJsonArray("styles").get(0).getAsJsonObject().get("preview").getAsBoolean(),
+                "样式列表带 preview 标志（这个用例没放图，必须是 false）：" + withLocal.getAsJsonArray("styles").get(0));
+        JsonObject missingStylePreview = get(base, "/api/style/preview?name=小鸟风格", token);
+        check(missingStylePreview.has("error"), "样式没有预览图时接口给明确错误：" + missingStylePreview);
         JsonObject loras = get(base, "/api/loras", token);
         check(loras.getAsJsonArray("loras").size() == 1 && loras.getAsJsonArray("loras").get(0).getAsJsonObject().get("name").getAsString().equals("kotori.safetensors"),
                 "LoRA 列表正确");
+        check(loras.getAsJsonArray("loras").get(0).getAsJsonObject().has("preview"),
+                "每项都带 preview 标志（前端据此显示缩略图或「无图」）：" + loras.getAsJsonArray("loras").get(0));
+        check(!loras.getAsJsonArray("loras").get(0).getAsJsonObject().get("preview").getAsBoolean(),
+                "这个临时目录里没有 .preview.png，preview 必须是 false 而不是靠猜");
+        JsonObject loraProgress = get(base, "/api/lora/progress", token);
+        check(loraProgress.has("busy") && loraProgress.has("downloading") && loraProgress.has("metered")
+                        && loraProgress.has("stage"),
+                "进度接口给出 busy/downloading/metered/stage：" + loraProgress);
+        check(!loraProgress.get("metered").getAsBoolean(), "没在下载时不能报字节进度");
+        JsonObject missingPreview = get(base, "/api/lora/preview?name=nope", token);
+        check(missingPreview.has("error"), "没有展示图时接口给明确错误而不是空图：" + missingPreview);
+        // 控制台自己的 LoRA 写接口：缺参数要报明确错误（400），不能 500，也不能悄悄变成一次真下载。
+        JsonObject blankDownload = postRaw(base, "/api/lora/download", token, new JsonObject());
+        check(blankDownload.has("error") && blankDownload.get("error").getAsString().contains("链接"),
+                "下载接口缺链接时给明确错误：" + blankDownload);
+        JsonObject coverStatus = postRaw(base, "/api/lora/cover", token, new JsonObject());
+        check(coverStatus.has("error") || coverStatus.has("busy"),
+                "补展示图接口要么启动任务、要么说明原因（这里没配 lora_dir）：" + coverStatus);
         JsonObject logs = get(base, "/api/logs", token);
         check(logs.has("lines"), "日志接口可用");
         // SD 自启动：状态接口给"是否在跑 + 开关 + 启动入口"，网页据此显示卡片。
@@ -557,8 +621,26 @@ public final class WebUiTest {
         String token = "test-token-123456";
         JsonObject capture = post(base, "/api/command", token, body(".prompt set 网页端, 红发"));
         String id = capture.get("id").getAsString();
+        check(capture.has("quest") && capture.get("quest").getAsInt() > 0,
+                "每条任务回执都带任务号（/quest/#N 用它定位）：" + capture.get("quest"));
+        int quest = capture.get("quest").getAsInt();
         String texts = waitCapture(base, token, id);
         check(texts.contains("正向 prompt 已更新"), "指令回执能取回：" + texts);
+        JsonObject questQuery = new JsonObject();
+        questQuery.addProperty("id", quest);
+        JsonObject byNumber = post(base, "/api/quest", token, questQuery);
+        check(byNumber.has("id") && byNumber.get("id").getAsString().equals(id)
+                        && byNumber.get("quest").getAsInt() == quest
+                        && byNumber.has("messages") && byNumber.has("done"),
+                "按任务号能取到同一条回执：" + byNumber);
+        check(byNumber.get("closed").getAsBoolean(), "这条回执已经被 close 关掉（waitCapture 会关），但依然查得到");
+        JsonObject latest = post(base, "/api/quest", token, new JsonObject());
+        check(latest.get("quest").getAsInt() == quest, "不带任务号时给最新一条：" + latest.get("quest"));
+        JsonObject outdated = new JsonObject();
+        outdated.addProperty("id", 999999);
+        JsonObject expired = postRaw(base, "/api/quest", token, outdated);
+        check(expired.has("error") && expired.get("error").getAsString().contains("999999"),
+                "过期的任务号要明确指出，不假装还在跑：" + expired);
         JsonObject prompt = post(base, "/api/prompt", token, body(null));
         check(prompt.get("positive").getAsString().equals("网页端, 红发"), "提示词已写入：" + prompt.get("positive").getAsString());
         // 词条带中文释义（词库里查得到才有），网页的提示词面板按词条原文移除。

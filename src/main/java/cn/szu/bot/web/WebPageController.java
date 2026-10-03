@@ -44,6 +44,7 @@ public class WebPageController {
         PAGES.put("/functions", "functions");
         PAGES.put("/chatcfg", "chatcfg");
         PAGES.put("/system", "system");
+        PAGES.put("/quest", "quest");
         PAGES.put("/setup", "setup");
         PAGES.put("/logs", "logs");
         PAGES.put("/help", "help");
@@ -90,9 +91,14 @@ public class WebPageController {
         }
     }
 
-    /** 栏目页：公共外壳 + 该栏目自己的面板。 */
-    @RequestMapping(value = {"/", "/gen", "/prompt", "/styles", "/loras", "/functions", "/chatcfg", "/system", "/setup", "/logs", "/help"},
-            method = RequestMethod.GET)
+    /**
+     * 栏目页：公共外壳 + 该栏目自己的面板。
+     *
+     * <p>注意：这里的路径列表是编译期常量，**新增栏目要同时改这里和上面的 PAGES**
+     * （只加 PAGES 会 404：PAGES 负责"路径→面板"，这里负责放行路由）。
+     */
+    @RequestMapping(value = {"/", "/gen", "/prompt", "/styles", "/loras", "/functions", "/chatcfg", "/system",
+            "/quest", "/setup", "/logs", "/help"}, method = RequestMethod.GET)
     public ResponseEntity<byte[]> page(HttpServletRequest request) {
         return renderPage(request.getRequestURI());
     }

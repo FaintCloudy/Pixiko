@@ -41,6 +41,7 @@
     <a class="tab" data-tab="setup" role="tab" href="/setup">配置</a>
     <a class="tab" data-tab="logs" role="tab" href="/logs">控制台</a>
     <a class="tab" data-tab="help" role="tab" href="/help">帮助</a>
+    <a class="tab" data-tab="quest" role="tab" href="/quest">回执</a>
   </nav>
 
   <!--#panel:chat-->
@@ -239,7 +240,12 @@
         <button class="ghost" type="button" id="lora-status-btn">下载状态</button>
       </div>
       <div class="row wrap">
-        <label class="check"><input type="checkbox" id="lora-auto-get"> 下载后自动领取展示图</label>
+        <label class="check"><input type="checkbox" id="lora-auto-get"> 出图后自动领取（LoRA 的展示图始终随下载一起抓取）</label>
+      </div>
+      <!-- 下载进度：只在真的下载/补图时出现，平时整块隐藏不占位 -->
+      <div class="lora-progress" id="lora-progress" hidden>
+        <div class="lora-progress-track"><div class="lora-progress-fill" id="lora-progress-fill"></div></div>
+        <div class="lora-progress-text" id="lora-progress-text"></div>
       </div>
       <!-- 搜索结果直接显示在这张卡片里：封面图 + 信息，不再当成一条消息发出去 -->
       <div class="civitai-grid" id="civitai-list"></div>
@@ -249,6 +255,7 @@
       <div class="row wrap">
         <input id="lora-filter" placeholder="筛选本地 LoRA">
         <button class="ghost" type="button" id="lora-reload">刷新</button>
+        <button class="ghost" type="button" id="lora-cover-btn" title="按本地 Civitai 记录补齐展示图、缺的展示图样式和样式预览图（不重新下载模型）">补展示图/样式</button>
       </div>
       <ul class="list" id="lora-list"></ul>
     </div>
@@ -494,6 +501,26 @@
   </section>
   <!--#/panel:logs-->
 
+  <!--#panel:quest-->
+  <!-- ============================ 任务回执 ============================ -->
+  <section class="panel" id="panel-quest">
+    <div class="card">
+      <div class="card-head"><b>任务回执</b><span class="muted" id="quest-state"></span></div>
+      <div class="row wrap">
+        <input id="quest-number" placeholder="任务号，例如 22" inputmode="numeric">
+        <button type="button" id="quest-open">打开回执</button>
+        <button class="ghost" type="button" id="quest-latest-btn">最新一条</button>
+        <button class="ghost" type="button" id="quest-reload">刷新</button>
+      </div>
+      <div class="muted" id="quest-command"></div>
+    </div>
+    <div class="card">
+      <div class="card-head"><b>执行结果</b><span class="muted" id="quest-progress"></span></div>
+      <div id="quest-body" class="quest-body"></div>
+    </div>
+  </section>
+  <!--#/panel:quest-->
+
   <!--#panel:help-->
   <!-- ============================ 帮助 ============================ -->
   <section class="panel" id="panel-help">
@@ -548,6 +575,8 @@
 </div>
 
 <div id="toast" class="toast" hidden></div>
+<!-- 任务信息云：从下方弹出，带跳去 /quest/#N 的链接 -->
+<div id="quest-clouds" class="quest-clouds" aria-live="polite"></div>
 <script src="/app.js"></script>
 </body>
 </html>

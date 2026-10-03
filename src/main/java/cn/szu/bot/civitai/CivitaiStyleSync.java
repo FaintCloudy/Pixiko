@@ -51,11 +51,21 @@ public final class CivitaiStyleSync {
         return result;
     }
     public static String sync(Path root, CivitaiClient.DownloadedLora download, String tag, SdClient sd, boolean create) {
-        return sync(root, download, tag, store(root), create);
+        return sync(root, download, tag, store(root), create, null);
+    }
+    /**
+     * @param client 给了它才会顺手把展示图存成样式的预览图（控制台用）；测试/离线场景传 null，
+     *               样式文本照旧同步，只是没有预览图。
+     */
+    public static String sync(Path root, CivitaiClient.DownloadedLora download, String tag, SdClient sd, boolean create, CivitaiClient client) {
+        return sync(root, download, tag, store(root), create, client);
     }
     public static String sync(Path root, CivitaiClient.DownloadedLora download, String tag, Store store, boolean create) {
+        return sync(root, download, tag, store, create, null);
+    }
+    public static String sync(Path root, CivitaiClient.DownloadedLora download, String tag, Store store, boolean create, CivitaiClient client) {
         if (download.showcases().isEmpty()) return "展示图样式：没有可用展示图元数据。";
-        int saved = 0, corrected = 0, reused = 0, skipped = 0, failed = 0;
+        int saved = 0, corrected = 0, reused = 0, skipped = 0, failed = 0, previews = 0;
         List<String> lines = new ArrayList<>();
         try {
             Path linksFile = root.resolve("data/civitai-style-links.json");
@@ -100,13 +110,30 @@ public final class CivitaiStyleSync {
                         if (old == null) saved++; else corrected++;
                         catalog.put(name, new SdClient.StylePrompt(name, positive, negative));
                     }
+                    if (saveStylePreview(root, name, image, client)) previews++;
                     if (create) { links.addProperty(key, name); Json.atomicWrite(linksFile, links); }
                     lines.add("展示图 " + image.number() + " → " + name);
                 } catch (Exception e) { failed++; lines.add("样式 " + name + " 处理失败：" + Bot.error(e)); }
             }
         } catch (Exception e) { return "展示图样式处理失败：" + Bot.error(e); }
         return "展示图样式：新增 " + saved + "，修正 " + corrected + "，复用 " + reused + "，跳过 " + skipped + "，失败 " + failed
+                + (previews == 0 ? "" : "，预览图 " + previews)
                 + "。\n本机标签：" + tag + (lines.isEmpty() ? "" : "\n" + String.join("\n", lines));
+    }
+
+    /**
+     * 把这张展示图存成样式的预览图（<b>只有控制台会看它</b>）。已经有图就跳过，抓不到也只是少一张图，
+     * 绝不影响样式本身——所以这里吞掉异常、只记一条日志。
+     */
+    private static boolean saveStylePreview(Path root, String name, CivitaiClient.ShowcasePrompt image, CivitaiClient client) {
+        if (client == null || image.cover().isEmpty() || cn.szu.bot.sd.StylePreviews.has(root, name)) return false;
+        try {
+            cn.szu.bot.sd.StylePreviews.save(root, name, client.cover(image.cover()).bytes());
+            return true;
+        } catch (Exception error) {
+            cn.szu.bot.Log.warn("样式预览图抓取失败（" + name + "）：" + Bot.error(error));
+            return false;
+        }
     }
     public static String migrate(Path root, SdClient sd) throws Exception {
         List<String> reports = new ArrayList<>(); Path directory = root.resolve("data/civitai");
@@ -138,6 +165,9 @@ public final class CivitaiStyleSync {
         return String.join("\n\n", reports);
     }
     public static String syncLoaded(Path root, SdClient sd, SdClient.LoadedLora loaded) throws Exception {
+        return syncLoaded(root, sd, loaded, null);
+    }
+    public static String syncLoaded(Path root, SdClient sd, SdClient.LoadedLora loaded, CivitaiClient client) throws Exception {
         Path directory = root.resolve("data/civitai"); List<String> reports = new ArrayList<>();
         if (!Files.isDirectory(directory)) return "";
         try (var files = Files.list(directory)) {
@@ -147,7 +177,7 @@ public final class CivitaiStyleSync {
                 if (!filename.equalsIgnoreCase(loaded.name() + ".safetensors") || !record.has("showcase_prompts")) continue;
                 var images = Arrays.asList(Json.GSON.fromJson(record.get("showcase_prompts"), CivitaiClient.ShowcasePrompt[].class));
                 reports.add(sync(root, new CivitaiClient.DownloadedLora(record.get("model_name").getAsString(), "", "", List.of(), path, true,
-                        record.get("model_id").getAsLong(), record.get("version_id").getAsLong(), images), loaded.tag(), sd, true));
+                        record.get("model_id").getAsLong(), record.get("version_id").getAsLong(), images), loaded.tag(), sd, true, client));
             }
         }
         return String.join("\n", reports);

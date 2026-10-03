@@ -110,6 +110,23 @@ public class WebApiController {
             }
             case "/api/styles": return WebJson.ok(bot.webStyles());
             case "/api/loras": return WebJson.ok(bot.webLoras());
+            // 控制台自己的 LoRA 接口：不走指令通道，也不等下载跑完（进度由下面这条轮询）。
+            case "/api/lora/download": {
+                requirePost(method);
+                // 权重是真小数（0.8 这种），不能用取整的那两个 num()。
+                JsonElement weight = body.get("weight");
+                return loraJob(bot.webLoraDownload(Json.str(body, "url", ""),
+                        weight == null || weight.isJsonNull() ? 1.0 : weight.getAsDouble(), scope));
+            }
+            case "/api/lora/cover": {
+                requirePost(method);
+                return loraJob(bot.webLoraCover(Json.str(body, "name", ""), scope));
+            }
+            // 下载进度单独一条轻接口：面板每秒轮询，不能顺带把 SD 的 LoRA 列表也拉一遍。
+            case "/api/lora/progress": return WebJson.ok(bot.loraProgress());
+            case "/api/lora/preview": return serveLoraPreview(loraNameQuery(request, body));
+            // 样式的预览图（只给网页看）：和 LoRA 展示图一样，<img> 只能把令牌挂查询串上。
+            case "/api/style/preview": return serveStylePreview(loraNameQuery(request, body));
             case "/api/images": {
                 JsonObject result = new JsonObject();
                 result.add("images", bot.webImages(Json.num(body, "limit", 60)));
@@ -132,6 +149,8 @@ public class WebApiController {
                 Bot.WebCapture capture = bot.webCommand(scope, commands);
                 return WebJson.of(HttpStatus.ACCEPTED, capture.json(bot.webBusy()));
             }
+            // 任务回执（/quest/#22）：按任务号取那一条，实时返回指令结果与图片。
+            case "/api/quest": return WebJson.ok(bot.webQuest(Json.num(body, "id", 0)));
             case "/api/capture": {
                 Bot.WebCapture capture = bot.webCapture(Json.str(body, "id", ""));
                 if (capture == null) throw new IllegalArgumentException("回执已结束或不存在。");
@@ -220,6 +239,14 @@ public class WebApiController {
         }
     }
 
+    /**
+     * LoRA 任务接口的状态码：启动成功 202（前端开始轮询进度），已经有任务在跑 409（不排队），
+     * 参数不对 400——都由机器人那边的一句话说明原因，网页直接弹出来。
+     */
+    private static ResponseEntity<?> loraJob(JsonObject result) {
+        return WebJson.of(Json.bool(result, "started", false) ? HttpStatus.ACCEPTED : HttpStatus.CONFLICT, result);
+    }
+
     private static void requirePost(String method) {
         if (!"POST".equals(method)) throw new IllegalArgumentException("请使用 POST。");
     }
@@ -250,6 +277,28 @@ public class WebApiController {
         if (!path.isBlank()) return path;
         String value = request.getParameter("path");
         return value == null ? "" : value;
+    }
+
+    /** LoRA 名称同理：<img src="/api/lora/preview?name=..."> 只能走查询串。 */
+    static String loraNameQuery(HttpServletRequest request, JsonObject body) {
+        String name = Json.str(body, "name", "");
+        if (!name.isBlank()) return name;
+        String value = request.getParameter("name");
+        return value == null ? "" : value;
+    }
+
+    /** 本机 LoRA 的展示图（civitai.lora_dir 里的 <模型名>.preview.png），路径校验在 Bot 里做。 */
+    private ResponseEntity<?> serveLoraPreview(String name) throws IOException {
+        Path file = bot.loraPreviewFile(name);
+        if (file == null) return WebJson.of(HttpStatus.NOT_FOUND, WebJson.error("这个 LoRA 还没有展示图。"));
+        return WebJson.bytes(HttpStatus.OK, Files.readAllBytes(file), WebJson.contentTypeOf("x.png"), "private, max-age=300");
+    }
+
+    /** 样式的预览图（data/style-previews 里按名字哈希存的那张）。 */
+    private ResponseEntity<?> serveStylePreview(String name) throws IOException {
+        Path file = bot.stylePreviewFile(name);
+        if (file == null) return WebJson.of(HttpStatus.NOT_FOUND, WebJson.error("这个样式还没有预览图。"));
+        return WebJson.bytes(HttpStatus.OK, Files.readAllBytes(file), WebJson.contentTypeOf("x.png"), "private, max-age=300");
     }
 
     /** 只允许读取机器人目录内的 data/generated 图片，杜绝路径穿越。 */

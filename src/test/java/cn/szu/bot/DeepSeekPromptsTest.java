@@ -83,9 +83,10 @@ public final class DeepSeekPromptsTest {
                 if(chatCalls.incrementAndGet()==1) return response("stop","   ");
                 return response("stop","{\"reply\":\"收到\",\"execute\":false,\"commands\":[]}");
             });
-            // L1 日常兜底：这条闲聊回复是短句且没有 ！，会被补成带短断言的形式。
-            assert chatClient.chatPlan("personality",new JsonArray(),"hello",new JsonObject()).reply().equals("收到！")
-                    : "L1 日常回合的感叹号兜底应生效";
+            // L1 日常兜底只兜"几乎没有内容"的回复：有内容的短句保持原样（语料里句号收尾占 50%、
+            // 46% 的台词不超过 8 字，含 ！ 的只有 8%），纯省略号/单个语气词才补一句短断言。
+            assert chatClient.chatPlan("personality",new JsonArray(),"hello",new JsonObject()).reply().equals("收到")
+                    : "有内容的短回复不该被改成感叹号";
             assert chatCalls.get()==2 : "invalid planner response should be retried";
             // Two invalid planner replies degrade to a plain chat answer instead of dropping the turn.
             // Stepwise planning engages only for multi-clause requests, so simple turns stay single-call.
@@ -99,8 +100,8 @@ public final class DeepSeekPromptsTest {
                 return response("stop","降级回答");
             });
             var degraded=degradedClient.chatPlan("personality",new JsonArray(),"hello",new JsonObject());
-            // L1 日常兜底同样作用于降级回复（"降级回答" → "降级回答！"）。
-            assert degraded.reply().equals("降级回答！") && degraded.commands().isEmpty() : "invalid plans must degrade to a plain reply";
+            // 降级回复是有内容的短句，L1 不再改它（只有纯省略号/单个语气词才兜底）。
+            assert degraded.reply().equals("降级回答") && degraded.commands().isEmpty() : "invalid plans must degrade to a plain reply";
             assert degraded.interest()==100 : "a degraded reply is always sent";
             assert degradedCalls.get()==5 : "four planner attempts plus one plain fallback: " + degradedCalls.get();
             var researchCalls=new java.util.concurrent.atomic.AtomicInteger();

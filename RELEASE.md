@@ -1,13 +1,53 @@
-# Pixiko v1.0.6 发行说明
+# Pixiko v1.0.7 发行说明
 
-- **版本**：v1.0.6
-- **日期**：2026-09-27
+- **版本**：v1.0.7
+- **日期**：2026-10-03
 - **作者**：loriko（deloriko@outlook.com）
 - **当前实现**：Java 版（`src/`）。另有一次**未完成的** Next.js 重构，见 `nextjs-wip/`，**不可运行**。
 
 ---
 
-## 〇、本版新增（v1.0.6）
+## 〇、本版新增（v1.0.7）
+
+**任务回执：每条任务一个回执页 `/quest/#N`，配下方弹出的信息云**。任务一下达，屏幕下方就冒出一条信息云，
+带「查看回执 #N →」链接；`/quest` 页面按任务号实时轮询（`POST /api/quest`，`id=0` 取最新），
+逐步显示这条任务每一步的指令结果，**任务里如果有生成，图片就附在同一条回执里**；出图完成后再冒一条信息云。
+一条回执对应一次任务（可以是 `.infix … → .prompt add … → .gen` 这样的多步链路），任务号由程序发号，
+网页按钮、终端、对话三条入口走的是同一条回执通道。回执在内存里保留 30 分钟；
+`/api/capture/close` 只停止收集、**不再删除回执**——否则分享出去的 `/quest/#22` 链接会失效。
+出图队列计入回执的「还在跑」状态：生成一张图要几十秒，只看 DeepSeek/LoRA 会让页面提前停表、永远等不到那张图。
+
+**控制台底部不再堆回执卡**：指令成功的结果由面板自己刷新 + 右上角 toast 呈现，完整输出在控制台（系统页）
+或终端里看；面板底部只保留**报错卡**与**图片卡**（失败不能没声，出图/领取的图本来就在那儿看）。
+「查看样式原文」「提示词生成」「聊天模型」与 `.help` / `.style list` 这类快捷指令改走信息框。
+
+**LoRA 这一串**（都走控制台自己的接口，不再借道指令通道）：
+
+- 新接口：`POST /api/lora/download`、`POST /api/lora/cover`、`GET /api/lora/progress`、`GET /api/lora/preview`。
+- 下载时顺带抓 Civitai 展示图，存成 `<模型名>.preview.png`（WebUI 认这个命名）；LoRA 列表显示竖版缩略图（832:1216）。
+- **下载不再改动任何提示词**：去掉自动写入的 `<lora:…>` 标签，也不再走会改写提示词的加载流程，
+  只刷新 WebUI 的 LoRA 目录、解析出本机标签；要用就点列表里的「加载」。
+- 下载回执从 20+ 行压到 4 行：触发词逐条原文、展示图逐条映射只进日志与 `data/civitai` 记录。
+- 「补展示图」按本地 Civitai 记录补齐封面、缺的展示图样式与样式预览图（不重新下载模型文件）。
+
+**样式预览图（仅网页端）**：展示图样式现在带配图，在「样式」页显示缩略图。图按样式名的 SHA-256 前 16 位
+存成 `data/style-previews/<哈希>.png`——样式名带 `/`、空格、中文，不能直接当文件名，用哈希就不需要索引文件；
+`.style rename` / `.style delete` 会跟着搬走或清掉；接口 `GET /api/style/preview`。
+
+**修掉「展示图样式整批被跳过」**：原来只认 A1111 的 `meta.prompt`，凡是 ComfyUI 出图的模型
+（提示词只存在于 `meta.comfy` 的工作流里）会被整批判成「没有提示词」——实测一个模型 4/4、另一个 3/4 被跳过。
+现在解析 `meta.comfy` 并按可信度打分挑正反向（`positive` / `user prompt` > 标准文本编码节点 > `提示词`），
+跳过给大模型看的「系统提示词」节点，并容错 Civitai 自己写出的非法 `"workflow": undefined`。
+
+**小鸟说话风格按原作语料拟合**：新增 [`docs/KOTORI-STYLE.md`](docs/KOTORI-STYLE.md)（结论）、
+[`docs/KOTORI-STYLE-STATS.md`](docs/KOTORI-STYLE-STATS.md)（数据，脚本生成）与
+[`tools/kotori-style-fit.mjs`](tools/kotori-style-fit.mjs)（拿 `data/kotori-corpus.txt` 重新量一遍）。
+按 2,660 条台词修正了提示词里的风格规则：终助词以「呢」为先（10.1%）、句号是默认收尾（50.2%）、
+含 `！` 的台词只有 8.4%（旧规则要求「每 3～5 轮一个」，明显超标）、称呼默认「瑚太朗君」；
+并修掉 `withAssertionMark` 给每条日常短回复强塞感叹号的问题（现在只兜底「几乎没有内容」的回复）。
+
+<details>
+<summary>上一版（v1.0.6）</summary>
 
 **《Rewrite》原作对白语料随仓库与发行包分发**：`data/kotori-corpus.txt`（324 KB，45 个场景、
 2,707 句小鸟台词 + 瑚太朗等角色 2,820 句，共 122,675 字符）进了仓库、源码包与开箱即用包，
@@ -21,6 +61,8 @@
 > **权利人若提出异议，会立即删除该文件**（连同 `.gitignore` 里的白名单行），
 > 机器人随后静默降级为只走口癖锚点，其余功能不受影响。
 > 明细见 `THIRD-PARTY-LICENSES.md` 与 `README.md` 版权一节。
+
+</details>
 
 <details>
 <summary>上一版（v1.0.5）</summary>
@@ -151,7 +193,7 @@ Danbooru 词条（↑↓ 选择、Esc 关闭；空词条上按 **Ctrl+Space** �
 
 ## 三、安装与启动（三步）
 
-### 开箱即用包 `pixiko-v1.0.6-runnable.zip`
+### 开箱即用包 `pixiko-v1.0.7-runnable.zip`
 
 1. 装好 **JDK 17+**。
 2. **双击 `start.bat`**。第一次运行会自动生成 `config.json`（照 `config.example.json` 起一份），
@@ -161,7 +203,7 @@ Danbooru 词条（↑↓ 选择、Esc 关闭；空词条上按 **Ctrl+Space** �
 
 > `start.bat` 跑的是包内已编译好的 `build/pixiko.jar`；只有需要改代码时才用 `build.ps1` + `run.bat`。
 
-### 源码包 `pixiko-v1.0.6.zip`
+### 源码包 `pixiko-v1.0.7.zip`
 
 1. 装好 **JDK 17+**。
 2. 在项目根目录准备好依赖 jar：`lib/gson-2.13.1.jar` 由 `build.ps1` **自动下载并校验**，
@@ -226,8 +268,8 @@ copy config.example.json config.json
 
 ## 六、在 GitHub Releases 里发布这个 zip
 
-1. 打开仓库 → 右侧 **Releases** → **Draft a new release**，Tag 填 `v1.0.6`（新建 tag），标题填 `Pixiko v1.0.6`。
-2. 把 `pixiko-v1.0.6.zip` 与 `pixiko-v1.0.6-runnable.zip`（以及各自的 `.sha256`）拖进附件区，
+1. 打开仓库 → 右侧 **Releases** → **Draft a new release**，Tag 填 `v1.0.7`（新建 tag），标题填 `Pixiko v1.0.7`。
+2. 把 `pixiko-v1.0.7.zip` 与 `pixiko-v1.0.7-runnable.zip`（以及各自的 `.sha256`）拖进附件区，
    正文粘贴本文件内容后点 **Publish release**。
 
 > 建仓库时 License 请选 **None**（本项目保留所有权利，不使用开源许可证）。

@@ -24,8 +24,13 @@ public final class LocalStyles {
     public record ImportResult(int imported, int skipped) {}
 
     private final Path file;
+    /** 机器人根目录：样式的展示图（data/style-previews）也挂在下面。 */
+    private final Path root;
 
-    public LocalStyles(Path root) { this.file = root.toAbsolutePath().normalize().resolve("data/local-styles.json"); }
+    public LocalStyles(Path root) {
+        this.root = root.toAbsolutePath().normalize();
+        this.file = this.root.resolve("data/local-styles.json");
+    }
 
     public synchronized List<String> names() {
         List<String> names = new ArrayList<>();
@@ -104,6 +109,9 @@ public final class LocalStyles {
         // 原地改名：列表顺序保持，编号和 #6-#9 这类区间操作才不会错位。
         styles.set(at, new Style(requested, source.positive(), source.negative(), Instant.now().toString()));
         write(styles);
+        // 网页上那张展示图跟着改名走；覆盖同名样式时旧图先丢掉，别张冠李戴。
+        if (target >= 0) StylePreviews.delete(root, requested);
+        StylePreviews.rename(root, source.name(), requested);
         return styles.get(at);
     }
 
@@ -113,6 +121,7 @@ public final class LocalStyles {
         List<Style> styles = new ArrayList<>(all());
         styles.removeIf(style -> style.name().equals(target.name()));
         write(styles);
+        StylePreviews.delete(root, target.name());
         return target;
     }
 

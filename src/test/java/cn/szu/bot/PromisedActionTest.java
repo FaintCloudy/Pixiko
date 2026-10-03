@@ -66,14 +66,15 @@ public final class PromisedActionTest {
             assert plan.reply().contains("这次没有执行任何操作") : "要如实说没做：" + plan.reply();
             assert calls.get() == 4 : "四次重试后按「要求执行却没有指令」处理：" + calls.get();
 
-            // 普通闲聊里的同一句"我在呢"不受影响：一次调用直接发出（L1 会给日常短回复补一个感叹号）。
+            // 普通闲聊里的同一句"我在呢"不受影响：一次调用直接发出（L1 只兜底"几乎没有内容"的回复，
+            // 有内容的句号收尾保持原样——语料里句号收尾占 50%）。
             AtomicInteger chatCalls = new AtomicInteger();
             var chatty = new DeepSeekPrompts(f.root, new JsonObject(), (body, key, timeout) -> {
                 chatCalls.incrementAndGet();
                 return response("{\"reply\":\"嗯，我在呢。\",\"execute\":false,\"commands\":[],\"interest\":60}");
             });
             ChatActions.Plan chat = chatty.chatPlan("性格", new JsonArray(), "在吗", new JsonObject(), new JsonObject());
-            assert chat.reply().equals("嗯，我在呢！") && chatCalls.get() == 1 : "闲聊不能被误伤：" + chat.reply();
+            assert chat.reply().equals("嗯，我在呢。") && chatCalls.get() == 1 : "闲聊不能被误伤：" + chat.reply();
         }
         System.out.println("PromisedActionTest PASS: 将来时承诺被拦下并如实说明，闲聊不误伤");
     }

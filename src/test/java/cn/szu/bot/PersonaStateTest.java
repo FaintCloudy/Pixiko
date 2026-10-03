@@ -126,10 +126,15 @@ public final class PersonaStateTest {
         check(PersonaState.of(bare).affinity("x") == 50, "文件损坏时不报错、按默认值工作");
 
         // 9) L1：日常回合缺 `！` 时轻量修补；敏感/执行/沉重回合一律不动
-        check(CN.mark(plan("唔～，那就少干点嘛。", List.of()), "今天有点累").reply().endsWith("！"),
-                "日常回合末尾句号补成感叹号：" + CN.mark(plan("唔～，那就少干点嘛。", List.of()), "今天有点累").reply());
-        check(CN.mark(plan("发呆哦…", List.of()), "你在干什么").reply().contains("！"),
-                "日常回合以省略号结尾时补一句极短断言");
+        // 语料口径：句号收尾占 50%、短句是常态，所以正常的短回复**不再**被改成感叹号。
+        check(CN.mark(plan("唔～，那就少干点嘛。", List.of()), "今天有点累").reply().equals("唔～，那就少干点嘛。"),
+                "有内容的句号收尾保持原样（含 ！ 的台词在语料里只占 8%）");
+        check(CN.mark(plan("发呆哦…", List.of()), "你在干什么").reply().equals("发呆哦…"),
+                "短但完整的回复保持原样（语料里 46% 不超过 8 字）");
+        check(CN.mark(plan("……", List.of()), "今天有点累").reply().contains("！"),
+                "几乎没有内容的回复才兜底补一句短断言");
+        check(CN.mark(plan("嗯", List.of()), "今天有点累").reply().contains("！"),
+                "只剩一个语气词也算没内容，照样兜底");
         String longReply = ("这是很长的一句话").repeat(4) + "。";
         check(CN.mark(plan(longReply, List.of()), "今天有点累").reply().equals(longReply), "超过 30 字的回复不修补");
         check(CN.mark(plan("………", List.of()), "你父母呢？").reply().equals("………"), "敏感话题回合不得修补");

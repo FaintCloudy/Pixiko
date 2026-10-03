@@ -213,6 +213,32 @@ code { background: rgba(120, 160, 220, .14); padding: 1px 5px; border-radius: 6p
 .list li .star { color: var(--accent-2); }
 .list li .acts { display: flex; gap: 6px; flex: 0 0 auto; flex-wrap: wrap; justify-content: flex-end; }
 .list li .acts button { padding: 7px 11px; min-height: 36px; font-size: 13px; }
+/* 列表行里的竖版小封面（本机 LoRA 的展示图、样式的预览图都走它）：和 Civitai 搜索结果同一个 832:1216 */
+.row-thumb { flex: 0 0 48px; }
+.row-thumb a.image-link { display: block; }
+.row-thumb img.row-cover {
+  width: 48px; aspect-ratio: 832 / 1216; height: auto; object-fit: cover; border-radius: 8px; display: block;
+  border: 1px solid var(--line); background: rgba(6, 11, 20, .6);
+}
+.row-nocover {
+  width: 48px; aspect-ratio: 832 / 1216; height: auto; border-radius: 8px; border: 1px dashed var(--line);
+  display: flex; align-items: center; justify-content: center; color: var(--muted); font-size: 11px; text-align: center;
+}
+/* LoRA 下载进度：有字节数就按百分比，没有（读信息/加载中）就走不确定态的来回滚动 */
+.lora-progress { margin-top: 10px; display: flex; flex-direction: column; gap: 6px; }
+.lora-progress-track {
+  height: 8px; border-radius: 999px; background: rgba(6, 11, 20, .7); border: 1px solid var(--line); overflow: hidden;
+}
+.lora-progress-fill {
+  height: 100%; width: 0; border-radius: 999px; transition: width .35s var(--ease);
+  background: linear-gradient(90deg, var(--accent), var(--accent-2));
+}
+.lora-progress.indeterminate .lora-progress-fill { width: 35%; animation: lora-slide 1.15s ease-in-out infinite; }
+.lora-progress-text {
+  color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; word-break: break-word;
+  display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
+}
+@keyframes lora-slide { from { margin-left: -35%; } to { margin-left: 100%; } }
 
 .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(136px, 1fr)); gap: 9px; }
 .grid a {
@@ -231,12 +257,13 @@ code { background: rgba(120, 160, 220, .14); padding: 1px 5px; border-radius: 6p
 }
 .civitai-thumb { flex: 0 0 96px; }
 .civitai-thumb a.image-link { display: block; }
+/* 封面按生成常用的竖版比例显示（832×1216 ≈ 2:3），不再裁成正方形；object-fit 负责填满、不拉伸。 */
 .civitai-thumb img.civitai-cover {
-  width: 96px; height: 96px; object-fit: cover; border-radius: 10px; display: block;
+  width: 96px; aspect-ratio: 832 / 1216; height: auto; object-fit: cover; border-radius: 10px; display: block;
   border: 1px solid var(--line); background: rgba(6, 11, 20, .6);
 }
 .civitai-nocover {
-  width: 96px; height: 96px; border-radius: 10px; border: 1px dashed var(--line);
+  width: 96px; aspect-ratio: 832 / 1216; height: auto; border-radius: 10px; border: 1px dashed var(--line);
   display: flex; align-items: center; justify-content: center; color: var(--muted); font-size: 12px; text-align: center;
 }
 .civitai-meta { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; gap: 4px; }
@@ -250,7 +277,6 @@ code { background: rgba(120, 160, 220, .14); padding: 1px 5px; border-radius: 6p
 .civitai-badge { font-size: 11px; border-radius: 999px; padding: 1px 8px; margin-left: 6px; border: 1px solid var(--line); }
 .civitai-badge.warn { color: #f2c14e; border-color: rgba(242, 193, 78, .45); }
 .civitai-acts { display: flex; align-items: center; gap: 6px; margin-top: 2px; flex-wrap: wrap; }
-.civitai-acts input { width: 74px; min-height: 32px; padding: 3px 8px; }
 .civitai-acts button { padding: 5px 12px; min-height: 32px; font-size: 12.5px; }
 .civitai-link { color: var(--accent); font-size: 12.5px; text-decoration: none; }
 .civitai-link:hover { text-decoration: underline; }
@@ -559,3 +585,37 @@ a.image-link img:hover { border-color: rgba(120, 160, 220, .55); }
   word-wrap: break-word; overflow-wrap: break-word; pointer-events: none;
 }
 .terminal-body::-webkit-scrollbar-thumb:hover { background: rgba(140, 180, 240, .6); background-clip: padding-box; }
+/* ---------------------------------------------------------------- 任务信息云（下方弹出）
+   每次下达任务都从屏幕下方冒一条，带跳去 /quest/#N 的链接；出图完成后再冒一条。 */
+.quest-clouds {
+  position: fixed; left: 50%; bottom: 18px; transform: translateX(-50%);
+  z-index: 60; display: flex; flex-direction: column-reverse; gap: 8px; align-items: center;
+  pointer-events: none; max-width: min(92vw, 560px);
+}
+.quest-cloud {
+  pointer-events: auto; opacity: 0; transform: translateY(14px);
+  transition: opacity .24s var(--ease), transform .24s var(--ease);
+  background: linear-gradient(135deg, rgba(31, 44, 66, .97), rgba(23, 33, 51, .97));
+  border: 1px solid rgba(120, 160, 220, .32); border-radius: 14px;
+  box-shadow: var(--shadow); padding: 10px 14px; max-width: 100%;
+  display: flex; flex-direction: column; gap: 4px;
+}
+.quest-cloud.show { opacity: 1; transform: none; }
+.quest-cloud.done { border-color: rgba(79, 215, 168, .5); }
+.quest-cloud-text { font-size: 14px; word-break: break-word; }
+.quest-cloud-link { color: var(--accent); font-size: 13px; text-decoration: none; }
+.quest-cloud-link:hover { text-decoration: underline; }
+
+/* ---------------------------------------------------------------- 任务回执页 */
+.quest-body { display: flex; flex-direction: column; gap: 10px; }
+.quest-step {
+  border: 1px solid var(--line); border-radius: 12px; padding: 10px 12px;
+  background: linear-gradient(135deg, rgba(31, 44, 66, .5), rgba(23, 33, 51, .42));
+  display: flex; flex-direction: column; gap: 8px;
+}
+.quest-step .head { color: var(--muted); font-size: 12px; }
+.quest-step.err { border-color: rgba(255, 125, 138, .45); }
+.quest-text { white-space: pre-wrap; word-break: break-word; }
+.quest-images { display: flex; flex-wrap: wrap; gap: 8px; }
+.quest-images img { max-width: min(100%, 260px); max-height: 260px; border-radius: 10px; border: 1px solid var(--line); }
+.quest-empty { color: var(--muted); }
