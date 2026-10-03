@@ -34,7 +34,7 @@ Pixiko 是一个自用的 QQ 机器人：接 **NapCat** 收消息，接 **Stable
 | 操作系统 | Windows 10 / 11 |
 | 脚本宿主 | Windows PowerShell 5.1（系统自带；`build.ps1`/`run.bat` 按 5.1 写，**文件保持 ASCII**） |
 | JDK | **JDK 17 或更高**，`javac` 与 `jar` 必须在 `PATH` 里（构建用 `javac --release 17`） |
-| Stable Diffusion | SD WebUI（A1111 系）启动参数**必须含 `--api`**，默认地址 `http://127.0.0.1:7860` |
+| Stable Diffusion | **A1111 或 Forge / Forge Neo**，默认地址 `http://127.0.0.1:7860`；A1111 启动参数必须含 `--api`（Forge 默认开）。Forge 的「底模 + VAE + 文本编码器」按**预设栈**分，用 `.model preset` 或网页「模型预设」切换，别只换底模 |
 | NapCat | 可选。开启**正向 WebSocket 服务器**，把端口与 Token 填进配置（默认 `ws://127.0.0.1:3001`） |
 | DeepSeek API Key | **两条独立通道各一个**：生图频道（`progen`）与聊天频道（`chat_api`） |
 | Node.js | **可选**，只有自检脚本与中文词库工具需要（`node tools\webui-selfcheck.mjs` 等） |
