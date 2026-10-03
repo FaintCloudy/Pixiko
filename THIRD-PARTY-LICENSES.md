@@ -4,9 +4,9 @@ Pixiko 本身的代码版权归 **loriko** 所有，**保留所有权利**（见
 本文件只说明 **Pixiko 依赖的第三方组件**。
 
 适用范围：
-- **源码包 `pixiko-v1.0.7.zip`**：不含任何第三方 jar，因此下面「随包分发的二进制组件」一节的**二进制不在源码包里**；
+- **源码包 `pixiko-v1.0.8.zip`**：不含任何第三方 jar，因此下面「随包分发的二进制组件」一节的**二进制不在源码包里**；
   但**中文词库与词表（第〇节）在源码包里全部都有**，包括 `data/danbooru/` 下的上游原始词表。
-- **开箱即用包 `pixiko-v1.0.7-runnable.zip`**：随包分发 `lib/gson-2.13.1.jar` 与 `lib/spring/` 下 23 个 jar，
+- **开箱即用包 `pixiko-v1.0.8-runnable.zip`**：随包分发 `lib/gson-2.13.1.jar` 与 `lib/spring/` 下 23 个 jar，
   即下表全部内容；中文词库（`data/prompt-*`）也有，但**不含** `data/danbooru/` 下的上游原始词表
   （运行时不需要它，需要重建词库时请用源码包）。这些 jar **未做任何修改**，原样来自 Maven Central。
 

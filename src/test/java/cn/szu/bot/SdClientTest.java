@@ -23,6 +23,7 @@ public final class SdClientTest {
         offlineFallback();
         generatedImagesAndManifest();
         invalidResponsesPreserveLatest();
+        forgePresetsAndAnimaDefaults();
         timeoutIsNotAnOfflineFallback();
         System.out.println("SdClientTest: " + assertions + " assertions passed.");
     }
@@ -137,6 +138,51 @@ public final class SdClientTest {
         }
     }
 
+    /** Forge／Forge Neo：预设列表、切预设（响应体是空的）、以及 Anima 的参数要进生成请求。 */
+    private static void forgePresetsAndAnimaDefaults() throws Exception {
+        try (Fixture fixture = new Fixture()) {
+            fixture.images = List.of(image("png"));
+            SdClient client = fixture.client();
+            check(!client.forge(), "A1111（没有 forge_preset）不当成 Forge");
+            fixture.forge = true;
+            check(client.forge(), "识别 Forge／Forge Neo");
+            equal(List.of("anima", "sd", "xl"), client.forgePresets(), "从 forge_checkpoint_* 推出预设列表");
+            equal("xl", client.forgePreset(), "当前预设");
+
+            JsonObject defaults = client.setForgePreset("anima");
+            check(fixture.lastOptions != null && "anima".equals(Json.str(fixture.lastOptions, "forge_preset", "")),
+                    "切预设只发 forge_preset，实际发出：" + fixture.lastOptions);
+            equal("anima", fixture.forgePreset, "假 WebUI 也切过去了");
+            equal("ER SDE", defaults.get("sampler").getAsString(), "读预设自带采样方法");
+            equal("Beta", defaults.get("scheduler").getAsString(), "读预设自带调度器");
+            equal(32, defaults.get("steps").getAsInt(), "读预设自带步数");
+            equal(4.0, defaults.get("cfg").getAsDouble(), "读预设自带 CFG");
+            equal(3.0, defaults.get("distilledCfg").getAsDouble(), "读预设自带蒸馏 CFG（界面上的 Shift）");
+            equal(1024, defaults.get("width").getAsInt(), "读预设自带尺寸");
+            check(defaults.getAsJsonArray("modules").size() == 1, "读预设自带模块");
+            equal(List.of("automatic", "beta", "simple"), client.schedulers(), "调度器列表");
+            equal(List.of("qwen_image_vae.safetensors"), client.modules(), "额外模块列表");
+            expectFailure(() -> client.setForgePreset("nope"), "未知预设", "未知预设要报错并列出可用的");
+
+            // 采纳预设参数后，生成请求必须带上调度器与蒸馏 CFG（Anima 没有这两个就跑不出正常图）。
+            client.setForgeExtras("Beta", 3);
+            client.generate(new SdClient.Prompts("p", "n", "test"));
+            equal("Beta", fixture.lastGeneration.get("scheduler").getAsString(), "生成请求带调度器");
+            equal(3.0, fixture.lastGeneration.get("distilled_cfg_scale").getAsDouble(), "生成请求带蒸馏 CFG");
+            // 没设调度器/蒸馏 CFG 时不要发这两个字段（A1111 与旧配置照常）。
+            SdClient plain = fixture.client();
+            plain.setForgeExtras("", 0);
+            plain.generate(new SdClient.Prompts("p", "n", "test"));
+            check(!fixture.lastGeneration.has("scheduler") && !fixture.lastGeneration.has("distilled_cfg_scale"),
+                    "没设就不发这两个字段");
+
+            // 预设里存的是没有哈希后缀的文件名，而模型列表标题带 " [哈希]"，也要能对上。
+            equal("animaCatTower_v11-full.safetensors [0351429bd9]",
+                    client.setParameter("model", "animaCatTower_v11-full.safetensors").checkpoint(), "无哈希后缀也能固定底模");
+            equal("", client.setParameter("model", "auto").checkpoint(), ".model set auto 表示跟随 WebUI");
+        }
+    }
+
     private static void invalidResponsesPreserveLatest() throws Exception {
         try (Fixture fixture = new Fixture()) {
             SdClient client = fixture.client();
@@ -205,6 +251,10 @@ public final class SdClientTest {
         volatile long delayMillis;
         volatile List<String> images = List.of();
         volatile JsonObject lastGeneration;
+        /** Forge：开关、当前预设、最后一次 POST /sdapi/v1/options 的内容。 */
+        volatile boolean forge;
+        volatile String forgePreset = "xl";
+        volatile JsonObject lastOptions;
 
         Fixture() throws IOException {
             Path work = Path.of("work", "sd-client-tests").toAbsolutePath();
@@ -256,6 +306,50 @@ public final class SdClientTest {
                 } else if (path.equals("/config")) {
                     configReads.incrementAndGet();
                     send(exchange, 200, "{\"components\":[{\"props\":{\"elem_id\":\"txt2img_prompt\",\"value\":\"startup positive\"}},{\"props\":{\"elem_id\":\"txt2img_neg_prompt\",\"value\":\"startup negative\"}}]}");
+                } else if (path.equals("/sdapi/v1/options")) {
+                    if (exchange.getRequestMethod().equals("POST")) {
+                        // 真实 Forge 的 POST /sdapi/v1/options 返回**空响应体**，不是 JSON。
+                        lastOptions = Json.parse(new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8));
+                        if (lastOptions.has("forge_preset")) forgePreset = lastOptions.get("forge_preset").getAsString();
+                        send(exchange, 200, "");
+                        return;
+                    }
+                    JsonObject options = new JsonObject();
+                    options.addProperty("sd_model_checkpoint", forgePreset.equals("anima")
+                            ? "animaCatTower_v11-full.safetensors" : "waiIllustriousSDXL_v170.safetensors");
+                    if (forge) {
+                        options.addProperty("forge_preset", forgePreset);
+                        options.addProperty("forge_checkpoint_sd", "Counterfeit-V3.0_fp16.safetensors");
+                        options.addProperty("forge_checkpoint_xl", "waiIllustriousSDXL_v170.safetensors");
+                        options.addProperty("forge_checkpoint_anima", "animaCatTower_v11-full.safetensors");
+                        options.add("forge_additional_modules_anima", Json.GSON.toJsonTree(List.of("qwen_image_vae.safetensors")));
+                        options.addProperty("sd_t2i_sampler", "Euler a"); options.addProperty("sd_t2i_scheduler", "Automatic");
+                        options.addProperty("sd_t2i_step", 32); options.addProperty("sd_t2i_cfg", 6);
+                        options.addProperty("xl_t2i_sampler", "Euler a"); options.addProperty("xl_t2i_scheduler", "Automatic");
+                        options.addProperty("xl_t2i_step", 24); options.addProperty("xl_t2i_cfg", 4.5); options.addProperty("xl_t2i_dcfg", 9);
+                        options.addProperty("anima_t2i_sampler", "ER SDE"); options.addProperty("anima_t2i_scheduler", "Beta");
+                        options.addProperty("anima_t2i_step", 32); options.addProperty("anima_t2i_cfg", 4);
+                        options.addProperty("anima_t2i_dcfg", 3); options.addProperty("anima_t2i_width", 1024);
+                        options.addProperty("anima_t2i_height", 1024);
+                    }
+                    send(exchange, 200, Json.GSON.toJson(options));
+                } else if (path.equals("/sdapi/v1/schedulers")) {
+                    JsonArray list = new JsonArray();
+                    for (String name : List.of("automatic", "beta", "simple")) {
+                        JsonObject item = new JsonObject(); item.addProperty("name", name); list.add(item);
+                    }
+                    send(exchange, 200, Json.GSON.toJson(list));
+                } else if (path.equals("/sdapi/v1/sd-modules")) {
+                    JsonArray list = new JsonArray();
+                    JsonObject item = new JsonObject(); item.addProperty("model_name", "qwen_image_vae.safetensors"); list.add(item);
+                    send(exchange, 200, Json.GSON.toJson(list));
+                } else if (path.equals("/sdapi/v1/sd-models")) {
+                    JsonArray list = new JsonArray();
+                    for (String title : List.of("animaCatTower_v11-full.safetensors [0351429bd9]",
+                            "waiIllustriousSDXL_v170.safetensors [f116b0c78f]")) {
+                        JsonObject item = new JsonObject(); item.addProperty("title", title); list.add(item);
+                    }
+                    send(exchange, 200, Json.GSON.toJson(list));
                 } else if (path.equals("/sdapi/v1/txt2img")) {
                     lastGeneration = Json.parse(new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8));
                     JsonObject response = new JsonObject();

@@ -12,6 +12,11 @@ public final class Json {
     public static JsonObject obj(JsonObject o, String key) { return o.has(key) && o.get(key).isJsonObject() ? o.getAsJsonObject(key) : new JsonObject(); }
     public static String str(JsonObject o, String key, String fallback) { return o.has(key) && !o.get(key).isJsonNull() ? o.get(key).getAsString() : fallback; }
     public static int num(JsonObject o, String key, int fallback) { return o.has(key) ? o.get(key).getAsInt() : fallback; }
+    /** 小数型字段（CFG、蒸馏 CFG 这类）。 */
+    public static double decimal(JsonObject o, String key, double fallback) {
+        if (o == null || !o.has(key) || o.get(key).isJsonNull()) return fallback;
+        try { return o.get(key).getAsDouble(); } catch (Exception error) { return fallback; }
+    }
     /** Epoch milliseconds do not fit in an int, so timestamps need the long overload. */
     public static long num(JsonObject o, String key, long fallback) { return o.has(key) ? o.get(key).getAsLong() : fallback; }
     public static boolean bool(JsonObject o, String key, boolean fallback) { return o.has(key) ? o.get(key).getAsBoolean() : fallback; }

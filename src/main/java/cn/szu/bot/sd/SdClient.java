@@ -24,12 +24,31 @@ public final class SdClient {
     public record StylePrompt(String name, String positive, String negative) {}
     public record Lora(String name, String alias, String path) {}
     public record LoadedLora(String name, String tag, Prompts prompts) {}
-    public record GenerationSettings(String samplerName, List<String> styles, int width, int height, String source) {
+    /**
+     * 一次生成用的"界面侧"设置。
+     *
+     * @param scheduler    调度器：空串＝不发送，用 WebUI 当前值（Forge Neo 的 anima/flux 系列要它，
+     *                     例如 Anima 配 {@code beta}／{@code simple}／{@code normal}）
+     * @param distilledCfg 蒸馏 CFG（Forge 的 "Distilled CFG"／Shift，Anima 推荐 3）；0＝不发送
+     */
+    public record GenerationSettings(String samplerName, String scheduler, List<String> styles, int width, int height,
+                                     double distilledCfg, String source) {
         public GenerationSettings {
             Objects.requireNonNull(samplerName);
+            scheduler = scheduler == null ? "" : scheduler.strip();
             styles = List.copyOf(styles);
+            if (!Double.isFinite(distilledCfg) || distilledCfg < 0) distilledCfg = 0;
             Objects.requireNonNull(source);
         }
+        /** 老写法：不带调度器与蒸馏 CFG。 */
+        public GenerationSettings(String samplerName, List<String> styles, int width, int height, String source) {
+            this(samplerName, "", styles, width, height, 0, source);
+        }
+        public GenerationSettings withSampler(String value) { return new GenerationSettings(value, scheduler, styles, width, height, distilledCfg, source); }
+        public GenerationSettings withStyles(List<String> value) { return new GenerationSettings(samplerName, scheduler, value, width, height, distilledCfg, source); }
+        public GenerationSettings withSize(int w, int h) { return new GenerationSettings(samplerName, scheduler, styles, w, h, distilledCfg, source); }
+        public GenerationSettings withForge(String scheduler, double distilled) { return new GenerationSettings(samplerName, scheduler, styles, width, height, distilled, source); }
+        public GenerationSettings withSource(String value) { return new GenerationSettings(samplerName, scheduler, styles, width, height, distilledCfg, value); }
     }
     public record GenerationRequest(Prompts prompts, GenerationSettings settings, GenerationParameters parameters) {
         public GenerationRequest(Prompts prompts, GenerationSettings settings) { this(prompts, settings, null); }
@@ -74,6 +93,14 @@ public final class SdClient {
     private final Duration requestTimeout, generationTimeout;
     private Prompts cached;
     private GenerationSettings cachedSettings;
+    /**
+     * Forge 的调度器与蒸馏 CFG（界面上的 Shift）。
+     *
+     * <p>为什么要单独存一份：WebUI 的桥接扩展不认识这两个字段，每次 {@code refresh()} 从桥接重建
+     * {@code cachedSettings} 都会把它们冲掉。所以以这里的值为准，读设置与落盘时再合并回去。
+     */
+    private volatile String activeScheduler = "";
+    private volatile double activeDistilledCfg;
     private JsonElement revision;
     private boolean bridgeAvailable;
     private boolean settingsBridgeAvailable, settingsInitialized;
@@ -120,6 +147,8 @@ public final class SdClient {
         if (Files.exists(settingsFile)) {
             try {
                 cachedSettings = readSettings(Json.parse(Files.readString(settingsFile, StandardCharsets.UTF_8)), LOCAL_SOURCE);
+                activeScheduler = cachedSettings.scheduler();
+                activeDistilledCfg = cachedSettings.distilledCfg();
             } catch (Exception e) {
                 throw new IOException("无法读取 data/sd-settings.json；请检查或恢复此配置文件。", e);
             }
@@ -134,7 +163,7 @@ public final class SdClient {
 
     public synchronized GenerationSettings settings() throws Exception {
         refresh(true);
-        return cachedSettings;
+        return cachedSettings.withForge(activeScheduler, activeDistilledCfg);
     }
 
     /** Capture prompts and parameters from one bridge revision, before queuing a generation. */
@@ -149,10 +178,15 @@ public final class SdClient {
         if (!current.checkpoint().isBlank()) return current;
         String model = "";
         try {
-            JsonObject options = responseJson(request("/sdapi/v1/options", "GET", null, false, true), "读取当前基础模型");
-            model = Json.str(options, "sd_model_checkpoint", "");
+            model = Json.str(options(), "sd_model_checkpoint", "");
         } catch (BridgeUnavailable ignored) { /* Older/offline API: explicitly report that no model was captured. */ }
         return new GenerationParameters(current.steps(), current.cfgScale(), current.seed(), model);
+    }
+
+    /** "跟随 WebUI 当前模型"的写法。 */
+    public static boolean isAutoModel(String value) {
+        String text = value == null ? "" : value.strip();
+        return text.isEmpty() || text.equalsIgnoreCase("auto") || text.equals("跟随") || text.equals("自动");
     }
 
     public List<String> models() throws Exception {
@@ -162,10 +196,131 @@ public final class SdClient {
         return List.copyOf(names);
     }
 
+    // ---------------------------------------------------------------- Forge / Forge Neo
+
+    /** 读一次 WebUI 选项（Forge 的预设、模块、当前模型都在这里）。 */
+    private JsonObject options() throws Exception {
+        return responseJson(request("/sdapi/v1/options", "GET", null, false, true), "读取 WebUI 选项");
+    }
+
+    /**
+     * 当前 WebUI 是不是 Forge / Forge Neo。
+     *
+     * <p>判据是它的 options 里有没有 {@code forge_preset}：Forge 把「底模 + VAE + 文本编码器」按
+     * **预设**分成一栈一栈（sd / xl / anima / flux / qwen …），预设与检查点必须一起换，
+     * 否则会出现「preset=anima 却加载着 SDXL 检查点」这种错配。
+     */
+    public synchronized boolean forge() {
+        try { return options().has("forge_preset"); }
+        catch (Exception error) { return false; }
+    }
+
+    /** Forge 的预设列表：从 {@code forge_checkpoint_<名字>} 这些选项推出来，按名字排序。 */
+    public synchronized List<String> forgePresets() throws Exception {
+        JsonObject options = options();
+        List<String> presets = new ArrayList<>();
+        for (String key : options.keySet())
+            if (key.startsWith("forge_checkpoint_")) presets.add(key.substring("forge_checkpoint_".length()));
+        presets.sort(String::compareTo);
+        return List.copyOf(presets);
+    }
+
+    /** 当前预设（不是 Forge 就是空串）。 */
+    public synchronized String forgePreset() throws Exception { return Json.str(options(), "forge_preset", ""); }
+
+    /**
+     * 读某个预设自己的推荐参数。Forge Neo 给每个预设都存了一套 {@code <preset>_t2i_*}：
+     * Anima 是「ER SDE + beta + 32 步 + CFG 4 + Shift 3 + 它自己的尺寸」，Flux/Qwen 同理。
+     * 把这些采纳进机器人自己的设置，出图参数才跟得上换模型。
+     */
+    public synchronized JsonObject forgePresetDefaults(String preset) throws Exception {
+        JsonObject options = options();
+        JsonObject result = new JsonObject();
+        result.addProperty("preset", preset);
+        result.addProperty("checkpoint", Json.str(options, "forge_checkpoint_" + preset, ""));
+        result.add("modules", options.has("forge_additional_modules_" + preset)
+                ? options.get("forge_additional_modules_" + preset).deepCopy() : new JsonArray());
+        result.addProperty("sampler", Json.str(options, preset + "_t2i_sampler", ""));
+        result.addProperty("scheduler", Json.str(options, preset + "_t2i_scheduler", ""));
+        result.addProperty("steps", Json.num(options, preset + "_t2i_step", 0));
+        result.addProperty("cfg", Json.decimal(options, preset + "_t2i_cfg", 0));
+        result.addProperty("distilledCfg", Json.decimal(options, preset + "_t2i_dcfg", 0));
+        result.addProperty("width", Json.num(options, preset + "_t2i_width", 0));
+        result.addProperty("height", Json.num(options, preset + "_t2i_height", 0));
+        return result;
+    }
+
+    /** 切 Forge 预设（预设与检查点是一栈的，切完返回这一栈的推荐参数）。 */
+    public synchronized JsonObject setForgePreset(String requested) throws Exception {
+        List<String> presets = forgePresets();
+        if (presets.isEmpty()) throw new IOException("当前 WebUI 不是 Forge／Forge Neo（没有 forge_preset 这套预设）。");
+        String wanted = requested == null ? "" : requested.strip();
+        String preset = presets.stream().filter(name -> name.equalsIgnoreCase(wanted)).findFirst()
+                .orElseThrow(() -> new IOException("未知预设：" + wanted + "；可用：" + String.join("、", presets) + "。"));
+        JsonObject payload = new JsonObject();
+        payload.addProperty("forge_preset", preset);
+        // 注意：/sdapi/v1/options 的 POST 返回空响应体（不是 JSON），所以这里只看状态码。
+        HttpResponse<String> response = request("/sdapi/v1/options", "POST", payload, false, false);
+        if (response.statusCode() < 200 || response.statusCode() >= 300)
+            throw new IOException("切换 Forge 预设失败：HTTP " + response.statusCode() + "。");
+        return forgePresetDefaults(preset);
+    }
+
+    /**
+     * 设置调度器与蒸馏 CFG（Forge 的 anima／flux 这类流匹配模型要用）。
+     * 只写机器人自己的记录：桥接扩展不认这两个字段，而它们是**随请求发送**的，不需要和页面同步。
+     */
+    public synchronized GenerationSettings setForgeExtras(String scheduler, double distilled) throws Exception {
+        refresh(true);
+        activeScheduler = scheduler == null ? "" : scheduler.strip();
+        activeDistilledCfg = Double.isFinite(distilled) && distilled > 0 ? distilled : 0;
+        GenerationSettings updated = cachedSettings.withForge(activeScheduler, activeDistilledCfg).withSource(LOCAL_SOURCE);
+        persist(updated);
+        cachedSettings = updated;
+        return updated;
+    }
+
+    /** WebUI 可用的调度器（随模型/预设变：加载 Anima 后会多出 beta / turbo / flow_match 等）。 */
+    public List<String> schedulers() throws Exception {
+        JsonArray catalog = responseArray(request("/sdapi/v1/schedulers", "GET", null, false, false), "读取调度器列表");
+        List<String> names = new ArrayList<>();
+        for (JsonElement item : catalog) {
+            if (!item.isJsonObject()) continue;
+            String name = Json.str(item.getAsJsonObject(), "name", "");
+            if (!name.isBlank()) names.add(name);
+        }
+        return List.copyOf(names);
+    }
+
+    /** Forge 的额外模块（VAE / 文本编码器）：Anima 要 qwen_image_vae 与 qwen_3_06b_base。 */
+    public List<String> modules() throws Exception {
+        JsonArray catalog = responseArray(request("/sdapi/v1/sd-modules", "GET", null, false, false), "读取额外模块列表");
+        List<String> names = new ArrayList<>();
+        for (JsonElement item : catalog) {
+            if (!item.isJsonObject()) continue;
+            String name = Json.str(item.getAsJsonObject(), "model_name", "");
+            if (!name.isBlank()) names.add(name);
+        }
+        return List.copyOf(names);
+    }
+
     private String canonicalModel(String requested) throws Exception {
-        List<String> exact = models().stream().filter(name -> name.equalsIgnoreCase(requested)).toList();
-        if (exact.size() != 1) throw new IOException("基础模型不存在或名称不唯一；请用 .model list 查看完整名称。");
-        return exact.get(0);
+        List<String> all = models();
+        List<String> exact = all.stream().filter(name -> name.equalsIgnoreCase(requested)).toList();
+        if (exact.size() == 1) return exact.get(0);
+        // Forge 的预设里存的是**没有哈希后缀**的文件名（animaCatTower_v11-full.safetensors），
+        // 而模型列表的标题带 " [哈希]"；去掉后缀再比一次，仍然要求唯一命中。
+        String bare = bareModel(requested);
+        List<String> loose = all.stream().filter(name -> bareModel(name).equalsIgnoreCase(bare)).toList();
+        if (loose.size() == 1) return loose.get(0);
+        throw new IOException("基础模型不存在或名称不唯一；请用 .model list 查看完整名称。");
+    }
+
+    /** 去掉标题里的 " [哈希]" 后缀。 */
+    private static String bareModel(String name) {
+        String value = name == null ? "" : name.strip();
+        int mark = value.indexOf(" [");
+        return mark > 0 ? value.substring(0, mark) : value;
     }
 
     public synchronized GenerationParameters setParameter(String field, String value) throws Exception {
@@ -176,7 +331,10 @@ public final class SdClient {
                 case "steps" -> new GenerationParameters(Integer.parseInt(value), old.cfgScale(), old.seed(), old.checkpoint());
                 case "cfg" -> new GenerationParameters(old.steps(), Double.parseDouble(value), old.seed(), old.checkpoint());
                 case "seed" -> new GenerationParameters(old.steps(), old.cfgScale(), Long.parseLong(value), old.checkpoint());
-                case "model" -> new GenerationParameters(old.steps(), old.cfgScale(), old.seed(), canonicalModel(value));
+                // auto（跟随）：不固定底模，提交任务时读 WebUI 当前模型——Forge Neo 的预设栈就是这么用的，
+                // 固定成某个检查点会盖掉预设（预设=anima 却加载 SDXL 的错配就是这么来的）。
+                case "model" -> new GenerationParameters(old.steps(), old.cfgScale(), old.seed(),
+                        isAutoModel(value) ? "" : canonicalModel(value));
                 default -> throw new IOException("未知生成参数。");
             };
         } catch (NumberFormatException e) { throw new IOException("参数数值格式不正确。", e); }
@@ -637,8 +795,7 @@ public final class SdClient {
             throw new IOException((matches.isEmpty() ? "未知采样方法：" : "采样方法名称有歧义：") + requested
                     + "。使用 .sampler list 查看可用名称。");
         String canonical = matches.iterator().next();
-        return changeSettings(Set.of("sampler_name"), current -> new GenerationSettings(canonical,
-                current.styles(), current.width(), current.height(), LOCAL_SOURCE));
+        return changeSettings(Set.of("sampler_name"), current -> current.withSampler(canonical).withSource(LOCAL_SOURCE));
     }
 
     public synchronized GenerationSettings setStyles(List<String> names) throws Exception {
@@ -651,14 +808,12 @@ public final class SdClient {
             for (String name : selected) if (!available.contains(name))
                 throw new IOException("未知预设样式：" + name + "。使用 .style list 查看可用名称（区分大小写）。");
         }
-        return changeSettings(Set.of("styles"), current -> new GenerationSettings(current.samplerName(),
-                selected, current.width(), current.height(), LOCAL_SOURCE));
+        return changeSettings(Set.of("styles"), current -> current.withStyles(selected).withSource(LOCAL_SOURCE));
     }
 
     public synchronized GenerationSettings setSize(int width, int height) throws Exception {
         validateSize(width, height);
-        return changeSettings(Set.of("width", "height"), current -> new GenerationSettings(current.samplerName(),
-                current.styles(), width, height, LOCAL_SOURCE));
+        return changeSettings(Set.of("width", "height"), current -> current.withSize(width, height).withSource(LOCAL_SOURCE));
     }
 
     private GenerationSettings changeSettings(Set<String> fields,
@@ -849,6 +1004,8 @@ public final class SdClient {
         validateSize(settings.width(), settings.height());
         if (settings.samplerName().isBlank()) throw new IOException("采样方法不能为空；请先使用 .sampler set 设置。");
         GenerationParameters parameters = generation.parameters() == null ? parameters() : generation.parameters();
+        // 调度器与蒸馏 CFG 以本地权威值为准（桥接刷新会把 settings 里那两个字段冲掉）。
+        settings = settings.withForge(activeScheduler, activeDistilledCfg);
         // Initialize/migrate delivery state before spending time on a generation.
         outbox();
         JsonObject payload = new JsonObject();
@@ -859,6 +1016,10 @@ public final class SdClient {
         payload.addProperty("height", settings.height());
         payload.addProperty("cfg_scale", parameters.cfgScale());
         payload.addProperty("sampler_name", settings.samplerName());
+        // Forge Neo 的 anima / flux 这类流匹配模型靠这两个参数：调度器（beta/simple/normal）与
+        // 蒸馏 CFG（界面上叫 Shift，Anima 推荐 3）。A1111 收下未知字段也不报错，所以只在设了时发送。
+        if (!settings.scheduler().isBlank()) payload.addProperty("scheduler", settings.scheduler());
+        if (settings.distilledCfg() > 0) payload.addProperty("distilled_cfg_scale", settings.distilledCfg());
         payload.add("styles", Json.GSON.toJsonTree(settings.styles()));
         payload.addProperty("seed", parameters.seed());
         if (!parameters.checkpoint().isBlank()) {
@@ -1085,7 +1246,18 @@ public final class SdClient {
         int width = requireInteger(state.get("width"), "width");
         int height = requireInteger(state.get("height"), "height");
         validateSize(width, height);
-        return new GenerationSettings(sampler, selected, width, height, source);
+        return new GenerationSettings(sampler, forgeScheduler(state), selected, width, height, forgeDistilledCfg(state), source);
+    }
+
+    /** 调度器：没存过就是"不发送"（旧文件读回来仍然兼容）。 */
+    private static String forgeScheduler(JsonObject state) {
+        JsonElement value = state.get("scheduler");
+        return value != null && value.isJsonPrimitive() && value.getAsJsonPrimitive().isString() ? value.getAsString() : "";
+    }
+
+    private static double forgeDistilledCfg(JsonObject state) {
+        JsonElement value = state.get("distilled_cfg");
+        return value != null && value.isJsonPrimitive() && value.getAsJsonPrimitive().isNumber() ? value.getAsDouble() : 0;
     }
 
     private static List<String> stringList(JsonElement value, String name) throws IOException {
@@ -1117,11 +1289,14 @@ public final class SdClient {
         state.add("styles", Json.GSON.toJsonTree(settings.styles()));
         state.addProperty("width", settings.width());
         state.addProperty("height", settings.height());
+        // 调度器与蒸馏 CFG 只在真的设了的时候落盘：老的 sd-settings.json 读回来仍是"不发送"。
+        if (!settings.scheduler().isBlank()) state.addProperty("scheduler", settings.scheduler());
+        if (settings.distilledCfg() > 0) state.addProperty("distilled_cfg", settings.distilledCfg());
         return state;
     }
 
     private void persist(GenerationSettings settings) throws IOException {
-        JsonObject state = settingsJson(settings);
+        JsonObject state = settingsJson(settings.withForge(activeScheduler, activeDistilledCfg));
         state.addProperty("source", settings.source());
         state.addProperty("updated_at", Instant.now().toString());
         Json.atomicWrite(settingsFile, state);

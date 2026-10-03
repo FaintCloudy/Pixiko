@@ -277,7 +277,56 @@ public final class Settings {
     /** 命中时最多注入几条原作问答（chat.corpus_top_k，默认 3）。 */
     public synchronized int corpusTopK() { return Math.max(1, Math.min(5, (int) Json.num(Json.obj(data, "chat"), "corpus_top_k", 3))); }
     public synchronized int chatContextSeconds() { return Math.max(300, Math.min(86400, Json.num(Json.obj(data, "chat"), "context_seconds", 1800))); }
-    public synchronized String chatPersonality() { return Json.str(Json.obj(data, "chat"), "personality", "你是一个友善、自然、简洁的聊天机器人，用对方使用的语言交流。"); }
+    /**
+     * 生效的人设文本。
+     *
+     * <p><b>优先读文件</b> {@code data/chat-personality-kotori.txt}：那份是随仓库同步的（换台机器接着干），
+     * config.json 里的 {@code chat.personality} 只是它不存在时的退路。改人设请改文件，或者用
+     * {@code .chat personality}／{@code .chat infix}——它们会写回文件。
+     */
+    public synchronized String chatPersonality() {
+        String fromFile = readPersonalityFile();
+        return fromFile.isEmpty() ? Json.str(Json.obj(data, "chat"), "personality", DEFAULT_PERSONALITY) : fromFile;
+    }
+    /** 人设文本文件（不存在就退回 config.json）。 */
+    public Path chatPersonalityFile() { return root.resolve("data/chat-personality-kotori.txt"); }
+    /** 写人设：有文件就写文件（同步用），否则写 config.json。 */
+    public synchronized void setChatPersonality(String text) throws IOException {
+        String value = text == null ? "" : text.strip();
+        if (value.isEmpty()) throw new IllegalArgumentException("人设文本不能为空。");
+        Path file = chatPersonalityFile();
+        if (Files.isRegularFile(file)) {
+            // 原子替换：先写同目录临时文件再 move，避免写到一半停电把同步用的人设弄坏。
+            Path temp = file.resolveSibling(file.getFileName() + ".tmp");
+            Files.writeString(temp, value + System.lineSeparator(), java.nio.charset.StandardCharsets.UTF_8);
+            Files.move(temp, file, java.nio.file.StandardCopyOption.REPLACE_EXISTING,
+                    java.nio.file.StandardCopyOption.ATOMIC_MOVE);
+            personalityStamp = stamp(file);
+        } else {
+            chatSetting("personality", new JsonPrimitive(value));
+        }
+    }
+    /** 文件内容按 mtime 缓存：聊天每轮都要读人设，别每次都去碰磁盘。 */
+    private String readPersonalityFile() {
+        Path file = chatPersonalityFile();
+        try {
+            if (!Files.isRegularFile(file)) return "";
+            long current = stamp(file);
+            if (current == personalityStamp && personalityCache != null) return personalityCache;
+            String text = Files.readString(file, java.nio.charset.StandardCharsets.UTF_8).strip();
+            personalityStamp = current;
+            personalityCache = text;
+            return text;
+        } catch (Exception error) {
+            return personalityCache == null ? "" : personalityCache;
+        }
+    }
+    private static long stamp(Path file) {
+        try { return Files.getLastModifiedTime(file).toMillis(); } catch (IOException error) { return -1; }
+    }
+    private static final String DEFAULT_PERSONALITY = "你是一个友善、自然、简洁的聊天机器人，用对方使用的语言交流。";
+    private String personalityCache;
+    private long personalityStamp = Long.MIN_VALUE;
     public synchronized void chatSetting(String key, JsonElement value) throws IOException {
         JsonObject next = freshSnapshot(), chat = Json.obj(next, "chat"); chat.add(key, value); next.add("chat", chat);
         Json.atomicWrite(root.resolve("config.json"), next); data = next;

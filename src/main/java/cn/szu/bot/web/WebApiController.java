@@ -347,7 +347,8 @@ public class WebApiController {
             }
             case "personality" -> {
                 if (value.length() > 20000) throw new IllegalArgumentException("性格设定超过 20000 字符。");
-                settings.chatSetting("personality", new JsonPrimitive(value));
+                // 有人设文件（data/chat-personality-kotori.txt）时就写那个文件：它才是随仓库同步的生效人设。
+                settings.setChatPersonality(value);
             }
             case "chatModel" -> {
                 if (value.isBlank() || value.length() > 100 || value.codePoints().anyMatch(Character::isISOControl))

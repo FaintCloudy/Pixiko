@@ -1,13 +1,37 @@
-# Pixiko v1.0.7 发行说明
+# Pixiko v1.0.8 发行说明
 
-- **版本**：v1.0.7
+- **版本**：v1.0.8
 - **日期**：2026-10-03
 - **作者**：loriko（deloriko@outlook.com）
 - **当前实现**：Java 版（`src/`）。另有一次**未完成的** Next.js 重构，见 `nextjs-wip/`，**不可运行**。
 
 ---
 
-## 〇、本版新增（v1.0.7）
+## 〇、本版新增（v1.0.8）
+
+**适配 Forge／Forge Neo 的预设体系（尤其是 Anima）**。Forge Neo 把「底模 + VAE + 文本编码器」按**预设**
+分成一栈一栈（`sd` / `xl` / `flux` / `qwen` / `anima` …），而机器人以前只知道 A1111 的 `sd_model_checkpoint`，
+于是很容易变成「预设是 anima、检查点却加载着 SDXL」——实测这种错配**出的是 3.5 KB 的废图**，
+预设与检查点对上之后才是正常的 0.9 MB 出图。
+
+- `.model preset` — 列出全部预设：每个栈的底模、采样方法 / 调度器 / 步数 / CFG / 蒸馏 CFG / 尺寸 / 模块数。
+- `.model preset <名字>` — 切到某个预设，并把该预设自己的参数**采纳**成机器人设置
+  （Anima 就是「ER SDE + beta + 32 步 + CFG 4 + Shift 3 + 它自己的尺寸」），底模也对齐到这一栈。
+- `.model set auto` — 不固定底模，每次提交任务时用 WebUI 当前模型。Forge 的预设栈就该这么用：固定成
+  某个检查点的话，出图时会用 `override_settings` 把上一个预设的模型塞回来，盖掉刚切的预设。
+- 生成请求新增 `scheduler` 与 `distilled_cfg_scale`（界面上叫 **Shift**）——Anima／Flux 这类流匹配模型的
+  关键参数；`.sampler`／`.settings` 现在也会把它们显示出来。生成的图里能核对到
+  `Schedule type: Beta` 与 `Shift: 3.0`。
+- 底模写成**没有哈希后缀**的文件名（Forge 预设里存的就是这种写法，如 `animaCatTower_v11-full.safetensors`）
+  也能对上模型列表里带 ` [哈希]` 的标题。
+
+**人设以文件为准**：`data/chat-personality-kotori.txt` 现在**直接生效**。v1.0.6 起这份文件就随仓库同步，
+但代码并不读它——实际生效的一直是 `config.json` 里那份被 gitignore 掉的短卡片，换台机器同步不过去。
+现在：优先读这个文件（按 mtime 缓存，改完立刻生效），`config.json` 的 `chat.personality` 只是文件不存在时的退路；
+`.chat personality`／`.chat infix` 与网页「聊天」页的修改都**写回文件**（同目录原子替换），人设才会跟着仓库走。
+
+<details>
+<summary>上一版（v1.0.7）</summary>
 
 **任务回执：每条任务一个回执页 `/quest/#N`，配下方弹出的信息云**。任务一下达，屏幕下方就冒出一条信息云，
 带「查看回执 #N →」链接；`/quest` 页面按任务号实时轮询（`POST /api/quest`，`id=0` 取最新），
@@ -45,6 +69,8 @@
 按 2,660 条台词修正了提示词里的风格规则：终助词以「呢」为先（10.1%）、句号是默认收尾（50.2%）、
 含 `！` 的台词只有 8.4%（旧规则要求「每 3～5 轮一个」，明显超标）、称呼默认「瑚太朗君」；
 并修掉 `withAssertionMark` 给每条日常短回复强塞感叹号的问题（现在只兜底「几乎没有内容」的回复）。
+
+</details>
 
 <details>
 <summary>上一版（v1.0.6）</summary>
@@ -193,7 +219,7 @@ Danbooru 词条（↑↓ 选择、Esc 关闭；空词条上按 **Ctrl+Space** �
 
 ## 三、安装与启动（三步）
 
-### 开箱即用包 `pixiko-v1.0.7-runnable.zip`
+### 开箱即用包 `pixiko-v1.0.8-runnable.zip`
 
 1. 装好 **JDK 17+**。
 2. **双击 `start.bat`**。第一次运行会自动生成 `config.json`（照 `config.example.json` 起一份），
@@ -203,7 +229,7 @@ Danbooru 词条（↑↓ 选择、Esc 关闭；空词条上按 **Ctrl+Space** �
 
 > `start.bat` 跑的是包内已编译好的 `build/pixiko.jar`；只有需要改代码时才用 `build.ps1` + `run.bat`。
 
-### 源码包 `pixiko-v1.0.7.zip`
+### 源码包 `pixiko-v1.0.8.zip`
 
 1. 装好 **JDK 17+**。
 2. 在项目根目录准备好依赖 jar：`lib/gson-2.13.1.jar` 由 `build.ps1` **自动下载并校验**，
@@ -268,8 +294,8 @@ copy config.example.json config.json
 
 ## 六、在 GitHub Releases 里发布这个 zip
 
-1. 打开仓库 → 右侧 **Releases** → **Draft a new release**，Tag 填 `v1.0.7`（新建 tag），标题填 `Pixiko v1.0.7`。
-2. 把 `pixiko-v1.0.7.zip` 与 `pixiko-v1.0.7-runnable.zip`（以及各自的 `.sha256`）拖进附件区，
+1. 打开仓库 → 右侧 **Releases** → **Draft a new release**，Tag 填 `v1.0.8`（新建 tag），标题填 `Pixiko v1.0.8`。
+2. 把 `pixiko-v1.0.8.zip` 与 `pixiko-v1.0.8-runnable.zip`（以及各自的 `.sha256`）拖进附件区，
    正文粘贴本文件内容后点 **Publish release**。
 
 > 建仓库时 License 请选 **None**（本项目保留所有权利，不使用开源许可证）。

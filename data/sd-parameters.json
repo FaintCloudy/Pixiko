@@ -1,6 +1,6 @@
 {
-  "steps": 20,
-  "cfg_scale": 5.2,
+  "steps": 32,
+  "cfg_scale": 4.0,
   "seed": -1,
-  "checkpoint": "waiIllustriousSDXL_v170.safetensors [f116b0c78f]"
+  "checkpoint": "animaCatTower_v11-full.safetensors [0351429bd9]"
 }

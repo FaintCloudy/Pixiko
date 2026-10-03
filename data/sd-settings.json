@@ -1,8 +1,10 @@
 {
-  "sampler_name": "DPM++ 2M",
+  "sampler_name": "ER SDE",
   "styles": [],
-  "width": 832,
-  "height": 1216,
-  "source": "WebUI 桥接状态（页面未实时连接）",
-  "updated_at": "2026-09-30T09:30:55.918207800Z"
+  "width": 768,
+  "height": 1024,
+  "scheduler": "Beta",
+  "distilled_cfg": 3.0,
+  "source": "WebUI 当前页面（实时同步）",
+  "updated_at": "2026-10-03T05:14:31.713919Z"
 }

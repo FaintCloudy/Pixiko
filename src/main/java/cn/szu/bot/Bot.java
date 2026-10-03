@@ -1122,6 +1122,9 @@ public final class Bot implements AutoCloseable {
         /model — 查看机器人当前基础模型
         /model list — 列出基础模型完整名称
         /model set <完整名称> — 指定后续生成使用的基础模型
+        /model set auto — 不固定底模，每次提交任务时用 WebUI 当前模型（Forge Neo 的预设栈用这个）
+        /model preset — 列出 Forge／Forge Neo 的预设（底模 + VAE + 文本编码器一栈一栈）
+        /model preset <名字> — 切到某个预设，并采纳它自己的采样方法、调度器、尺寸、步数、CFG
         /preset list — 查看已保存的参数预设
         /preset save <名称> — 保存当前尺寸、采样方法、步数、CFG、种子和基础模型
         /preset overwrite <名称> — 覆盖同名参数预设
@@ -1587,7 +1590,7 @@ public final class Bot implements AutoCloseable {
             requireOwner(event, "/chat personality");
             String value=arguments.substring(12).strip();
             if(value.isBlank() || value.length()>8000) throw new IllegalArgumentException("性格设定须为 1–8000 字符。");
-            settings.chatSetting("personality",new JsonPrimitive(value)); chat.changed(true);
+            settings.setChatPersonality(value); chat.changed(true);
             Log.info("聊天性格设定已更新："+value.length()+" 字符");
         } else if(lower.startsWith("add ")) {
             requireOwner(event, "/chat add");
@@ -1595,7 +1598,7 @@ public final class Bot implements AutoCloseable {
             if(value.isBlank() || value.length()>8000) throw new IllegalArgumentException("追加内容须为 1–8000 字符。");
             String current=settings.chatPersonality(),updated=current.isBlank()?value:current+"\n"+value;
             if(updated.length()>20000) throw new IllegalArgumentException("追加后性格设定超过 20000 字符，请缩短内容。");
-            settings.chatSetting("personality",new JsonPrimitive(updated));chat.changed(true);
+            settings.setChatPersonality(updated);chat.changed(true);
             Log.info("聊天性格设定已追加："+value.length()+" 字符，共 "+updated.length()+" 字符");
             reply(event,"已追加到基础性格设定末尾：\n"+value);return;
         } else if(lower.equals("model") || lower.startsWith("model ")) {
@@ -3237,6 +3240,88 @@ public final class Bot implements AutoCloseable {
         return safe.replaceAll("(?i)https?://\\S+", "（链接已隐藏）")
                 .replaceAll("(?i)(token|api[_-]?key|authorization)(\\s*[:=]\\s*)[^\\s,;&]+", "$1$2（凭据已隐藏）");
     }
+    /**
+     * Forge / Forge Neo 的预设：列出、切换，并**采纳**该预设自己的推荐参数。
+     *
+     * <p>Forge 把「底模 + VAE + 文本编码器」按预设分成一栈一栈，例如 {@code anima} 这一栈默认是
+     * 「animaCatTower + ER SDE + beta + 32 步 + CFG 4 + 蒸馏 CFG（界面上的 Shift）3」。
+     * 机器人出图时会把自己的采样方法/步数/CFG 发过去覆盖页面默认值，所以换预设之后必须把这些
+     * 一起采纳过来，不然就会拿 SD1.5 的参数去跑 Anima。
+     */
+    private void forgePreset(JsonObject event, String wanted) throws Exception {
+        if (!sd.forge())
+            throw new IllegalStateException("当前 WebUI 不是 Forge／Forge Neo（没有 forge_preset 这套预设）；A1111 直接 /model list 换底模即可。");
+        String active = sd.forgePreset();
+        if (wanted.isBlank()) {
+            StringBuilder text = new StringBuilder("Forge 预设（当前：" + active + "）：");
+            for (String name : sd.forgePresets()) {
+                JsonObject defaults = sd.forgePresetDefaults(name);
+                text.append("\n").append(name.equalsIgnoreCase(active) ? "▶ " : "  ").append(name)
+                        .append(" ← ").append(Json.str(defaults, "checkpoint", "（该栈还没有检查点）"))
+                        .append("\n      ").append(Json.str(defaults, "sampler", "?"))
+                        .append(" / ").append(Json.str(defaults, "scheduler", "?"))
+                        .append(" / ").append(Json.num(defaults, "steps", 0)).append(" 步")
+                        .append(" / CFG ").append(trimNumber(Json.decimal(defaults, "cfg", 0)));
+                double distilled = Json.decimal(defaults, "distilledCfg", 0);
+                if (distilled > 0) text.append(" / 蒸馏 CFG ").append(trimNumber(distilled));
+                int width = Json.num(defaults, "width", 0), height = Json.num(defaults, "height", 0);
+                if (width > 0 && height > 0) text.append(" / ").append(width).append("×").append(height);
+                if (defaults.has("modules") && defaults.getAsJsonArray("modules").size() > 0)
+                    text.append(" / 模块 ").append(defaults.getAsJsonArray("modules").size()).append(" 个");
+            }
+            text.append("\n切换：.model preset <名字>（会把该预设的采样方法、调度器、尺寸、步数、CFG 采纳成机器人设置）");
+            reply(event, text.toString());
+            return;
+        }
+        JsonObject defaults = sd.setForgePreset(wanted);
+        String preset = Json.str(defaults, "preset", wanted);
+        List<String> applied = new ArrayList<>();
+        String sampler = Json.str(defaults, "sampler", "");
+        if (!sampler.isBlank()) {
+            try { sd.setSampler(sampler); applied.add("采样方法 " + sampler); }
+            catch (Exception error) { applied.add("采样方法 " + sampler + "（该模型不可用，保留原值：" + error(error) + "）"); }
+        }
+        String scheduler = Json.str(defaults, "scheduler", "");
+        double distilled = Json.decimal(defaults, "distilledCfg", 0);
+        if (!scheduler.isBlank() || distilled > 0) {
+            sd.setForgeExtras(scheduler, distilled);
+            applied.add("调度器 " + (scheduler.isBlank() ? "（不变）" : scheduler)
+                    + (distilled > 0 ? "，蒸馏 CFG " + trimNumber(distilled) : ""));
+        }
+        int width = Json.num(defaults, "width", 0), height = Json.num(defaults, "height", 0);
+        if (width > 0 && height > 0) { sd.setSize(width, height); applied.add("尺寸 " + width + "×" + height); }
+        int steps = Json.num(defaults, "steps", 0);
+        if (steps > 0) { sd.setParameter("steps", String.valueOf(steps)); applied.add("步数 " + steps); }
+        double cfg = Json.decimal(defaults, "cfg", 0);
+        if (cfg > 0) { sd.setParameter("cfg", trimNumber(cfg)); applied.add("CFG " + trimNumber(cfg)); }
+        String checkpoint = Json.str(defaults, "checkpoint", "");
+        // 预设与底模是一栈的：把机器人固定的底模也对齐到这一栈（没有就改成"跟随"），
+        // 否则出图时会用 override_settings 把上一个预设的检查点塞回来，盖掉刚切的预设。
+        try {
+            if (!checkpoint.isBlank()) { sd.setParameter("model", checkpoint); applied.add("底模 " + checkpoint); }
+            else { sd.setParameter("model", "auto"); applied.add("底模改为跟随 WebUI（该预设栈里没有检查点）"); }
+        } catch (Exception error) {
+            // 预设已经切了，固定底模失败不该让整条命令看起来失败：如实说，并改成跟随。
+            sd.setParameter("model", "auto");
+            applied.add("底模与预设名字对不上（" + error(error) + "），已改为跟随 WebUI 当前模型");
+        }
+        StringBuilder text = new StringBuilder("已切到 Forge 预设：" + preset);
+        if (!checkpoint.isBlank()) text.append("\n底模：").append(checkpoint).append("（预设自带的那一个）");
+        JsonArray modules = defaults.has("modules") ? defaults.getAsJsonArray("modules") : new JsonArray();
+        text.append("\n该预设的额外模块：").append(modules.size() == 0 ? "（空）" : modules.toString());
+        if (modules.size() == 0 && preset.equalsIgnoreCase("anima")) {
+            text.append("\n⚠ Anima 通常要 qwen_image_vae.safetensors 与 qwen_3_06b_base.safetensors"
+                    + "（在 Forge 的「VAE / Text Encoder」里选，或让它自动挑）；这两个文件本机已经有了。");
+        }
+        text.append(applied.isEmpty() ? "" : "\n已采纳：" + String.join("、", applied));
+        reply(event, text.toString());
+    }
+
+    /** 3.0 显示成 "3"，3.5 保持 "3.5"（回执里别出现 4.0 这种零头）。 */
+    private static String trimNumber(double value) {
+        return value == Math.rint(value) ? String.valueOf((long) value) : String.valueOf(value);
+    }
+
     private void sdSettings(JsonObject event, String option, String arguments) throws Exception {
         arguments = selectedArguments(event, option, arguments);
         if (option.equals("function")) { function(event, arguments); return; }
@@ -3245,6 +3330,13 @@ public final class Bot implements AutoCloseable {
             if (arguments.isEmpty()) { reply(event, sd.parameters().describe() + "\n步数、CFG、种子使用机器人持久化参数。"); return; }
             if (option.equals("model") && arguments.equalsIgnoreCase("list")) {
                 reply(event, "WebUI 基础模型：" + numbered(event, "model", sd.models())); return;
+            }
+            // Forge / Forge Neo：底模、VAE、文本编码器是按「预设」分栈的（anima / flux / xl …），
+            // 切模型得连着预设一起看，否则会出现 preset=anima 却加载着 SDXL 这种错配。
+            if (option.equals("model") && (arguments.equalsIgnoreCase("preset")
+                    || arguments.toLowerCase(Locale.ROOT).startsWith("preset "))) {
+                forgePreset(event, arguments.length() > 6 ? arguments.substring(6).strip() : "");
+                return;
             }
             Matcher assignment = SET_VALUE.matcher(arguments);
             if (!assignment.matches() || assignment.group(1) == null || assignment.group(1).isBlank())
@@ -3568,7 +3660,7 @@ public final class Bot implements AutoCloseable {
             throw new IllegalStateException("等待 DeepSeek 时性格设定已被修改，本次结果未覆盖新内容，请重新 /chat infix。");
         if (updated == null || updated.isBlank()) throw new IOException("DeepSeek 返回的性格设定为空，未修改。");
         if (updated.length() > 20000) throw new IOException("DeepSeek 返回的性格设定超过 20000 字符，未应用。");
-        settings.chatSetting("personality", new JsonPrimitive(updated));
+        settings.setChatPersonality(updated);
         return updated;
     }
     /**
