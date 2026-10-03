@@ -10,7 +10,7 @@
 <link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <title>Pixiko · 控制台</title>
-<link rel="stylesheet" href="/app.css?v=1.0.15">
+<link rel="stylesheet" href="/app.css?v=1.0.16">
 </head>
 <body>
 <div class="aurora" aria-hidden="true"></div>
@@ -228,14 +228,18 @@
       <div class="row wrap">
         <input id="style-range" placeholder="#12-#16 或 #12,#15">
         <input id="style-range-name" placeholder="改名时的新名称/前缀">
+        <input id="style-range-category" placeholder="改分类时的分类名（留空＝自动）">
         <button type="button" id="style-batch-rename">批量改名</button>
+        <button type="button" id="style-batch-category">批量改分类</button>
         <button class="danger" type="button" id="style-batch-delete">批量删除</button>
       </div>
     </div>
     <div class="row wrap">
-      <input id="style-filter" placeholder="筛选样式">
+      <input id="style-filter" placeholder="筛选样式（名称 / 分类 / 底模）">
+      <select id="style-category-filter" title="按分类筛选"></select>
       <button class="ghost" type="button" id="style-reload">刷新列表</button>
     </div>
+    <datalist id="style-category-options"></datalist>
     <ul class="list" id="style-list"></ul>
     <div class="receipts" id="style-receipts"></div>
   </section>
@@ -589,6 +593,6 @@
 <div id="toast" class="toast" hidden></div>
 <!-- 任务信息云：从下方弹出，带跳去 /quest/#N 的链接 -->
 <div id="quest-clouds" class="quest-clouds" aria-live="polite"></div>
-<script src="/app.js?v=1.0.15"></script>
+<script src="/app.js?v=1.0.16"></script>
 </body>
 </html>

@@ -1114,6 +1114,7 @@ public final class Bot implements AutoCloseable {
         /style load <名称|#编号> [nolora] — 用样式替换当前正反向 prompt；nolora 表示不加载样式里的 LoRA
         /style rename [overwrite] <旧名称|#编号|#6-#9> <新名称或前缀> — 样式改名
         /style delete <名称|#编号|#6-#9> — 删除样式
+        /style category <名称|#编号|#6-#9> [分类名] — 查看或修改样式分类；分类名给 - 表示恢复自动分类（LoRA 附带的展示图样式自动归到「LoRA 附带」）
         /size — 查看图片宽高（像素）
         /size set <宽> <高> — 修改宽高，例如 /size set 768 512
         /steps [set <步数>] — 查看或设置机器人迭代步数
@@ -3129,7 +3130,7 @@ public final class Bot implements AutoCloseable {
             targets.add(file);
         }
         CivitaiClient client = new CivitaiClient(settings.root, civitai);
-        int covers = 0, failed = 0, index = 0, stylePreviews = 0;
+        int covers = 0, failed = 0, index = 0, stylePreviews = 0, styleSizes = 0;
         List<String> lines = new ArrayList<>();
         for (Path file : targets) {
             index++;
@@ -3150,7 +3151,10 @@ public final class Bot implements AutoCloseable {
                 boolean hadCover = Files.isRegularFile(previewFile);
                 Path preview = client.saveLoraPreview(version, file, stage -> loraStatus = safeLoraText(where + stage));
                 if (preview != null && !hadCover) covers++;
-                stylePreviews += backfillStylePreviews(client, version, file, modelId, versionId, record);
+                StyleBackfill backfill = backfillStylePreviews(client, version, file, modelId, versionId, record);
+                stylePreviews += backfill.previews();
+                styleSizes += backfill.sized();
+                if (!backfill.report().isEmpty()) lines.add(filename + "：" + backfill.report());
                 if (preview == null && !hadCover) lines.add(filename + "：这个版本在 Civitai 上没有可用的展示图。");
                 else if (!hadCover) lines.add(filename + " → " + preview.getFileName());
             } catch (Exception error) {
@@ -3158,8 +3162,9 @@ public final class Bot implements AutoCloseable {
                 lines.add(filename + "：" + error(error));
             }
         }
-        String message = "补展示图：LoRA 封面 " + covers + " 张，样式预览图 " + stylePreviews + " 张，失败 " + failed + " 个，处理 " + targets.size() + " 个。"
-                + (covers == 0 && stylePreviews == 0 && failed == 0 ? "\n本来就没有缺的，不用补。" : "")
+        String message = "补展示图：LoRA 封面 " + covers + " 张，样式预览图 " + stylePreviews + " 张，"
+                + "补展示图尺寸 " + styleSizes + " 条，失败 " + failed + " 个，处理 " + targets.size() + " 个。"
+                + (covers == 0 && stylePreviews == 0 && styleSizes == 0 && failed == 0 ? "\n本来就没有缺的，不用补。" : "")
                 + (lines.isEmpty() ? "" : "\n" + String.join("\n", lines));
         return new LoraResult(safeLoraText(message), failed == 0);
     }
@@ -3171,24 +3176,31 @@ public final class Bot implements AutoCloseable {
      * 整批被判成"没有提示词"，样式一条都没落盘；只补图不建样式的话，那些模型永远补不回来。
      * 已经存在的样式按内容匹配复用，不会重复建。
      *
-     * @return 这次新存下来的预览图张数
+     * <p>这条重跑路径同时补两样老数据缺的东西：v1.0.10 之前没有模型参数、v1.0.12 之前没有展示图尺寸
+     * （{@code model.width/height}，来自展示图本身的像素）。
      */
-    private int backfillStylePreviews(CivitaiClient client, JsonObject version, Path file, long modelId, long versionId, JsonObject record) {
+    private record StyleBackfill(int previews, int sized, String report) { }
+
+    /**
+     * @return 这次新存下来的预览图张数、补上尺寸的样式条数，以及同步回执（供「补展示图」汇总）
+     */
+    private StyleBackfill backfillStylePreviews(CivitaiClient client, JsonObject version, Path file, long modelId, long versionId, JsonObject record) {
         try {
             String tag = sd.resolvedLoraTag(file, 1);
             List<CivitaiClient.ShowcasePrompt> showcases = CivitaiClient.showcasePrompts(version);
-            if (showcases.isEmpty()) return 0;
+            if (showcases.isEmpty()) return new StyleBackfill(0, 0, "");
             long before = stylePreviewCount();
             CivitaiClient.DownloadedLora download = new CivitaiClient.DownloadedLora(
                     Json.str(record, "model_name", ""), Json.str(record, "version_name", ""), Json.str(record, "base_model", ""),
                     List.of(), file, true, modelId, versionId, showcases);
             // 补图顺手把模型参数补齐：v1.0.10 之前存的展示图样式只有提示词，没有底模/采样参数。
             JsonObject model = loraStyleModel(file.getFileName().toString(), file, Json.str(record, "base_model", ""));
-            CivitaiStyleSync.sync(settings.root, download, tag, sd, true, client, model);
-            return (int) Math.max(0, stylePreviewCount() - before);
+            CivitaiStyleSync.Outcome outcome = CivitaiStyleSync.run(settings.root, download, tag, sd, true, client, model);
+            int previews = (int) Math.max(0, stylePreviewCount() - before);
+            return new StyleBackfill(previews, outcome.sized(), outcome.text().split("\n", 2)[0]);
         } catch (Exception error) {
             Log.warn("补样式预览图失败（" + file.getFileName() + "）：" + error(error));
-            return 0;
+            return new StyleBackfill(0, 0, "");
         }
     }
     /** 现在一共存了多少张样式预览图（补图前后各数一次，差值就是要报的张数）。 */
@@ -3700,7 +3712,8 @@ public final class Bot implements AutoCloseable {
             case "sampler" -> "用法：/sampler、/sampler list 或 /sampler set <完整名称>";
             case "style" -> "用法：/style、/style list、/style save <名称>、/style overwrite <名称>、"
                     + "/style import webui [overwrite]、/style prompt <名称|#编号>、/style load <名称|#编号> [nolora]、"
-                    + "/style rename [overwrite] <名称|#编号|#起-#止> <新名称或前缀>、/style delete <名称|#编号|#起-#止>";
+                    + "/style rename [overwrite] <名称|#编号|#起-#止> <新名称或前缀>、/style delete <名称|#编号|#起-#止>、"
+                    + "/style category <名称|#编号|#起-#止> [分类名]";
             default -> "用法：/size 或 /size set <宽> <高>；宽高须为 64–2048 的整数且为 8 的倍数。";
         };
         if (arguments.isEmpty()) {
@@ -3721,12 +3734,20 @@ public final class Bot implements AutoCloseable {
                 // 样式只有一份：机器人自己的样式库。载入时直接套用到个人提示词，不依赖 WebUI。
                 // 不再记录"上一次载入哪个样式"：样式是固定模板，提示词文本才是唯一事实。
                 List<String> local = localStyles.names();
+                // 编号列表里带出分类：`#12 名字 ［LoRA 附带］`——编号仍按列表顺序，编号与分类是两件事。
+                List<String> labels = new ArrayList<>();
+                for (String name : local) {
+                    LocalStyles.Style style = localStyles.get(name);
+                    labels.add(style == null ? name : name + " ［" + localStyles.categoryOf(style) + "］");
+                }
                 reply(event, "样式列表（共 " + local.size() + " 个）："
-                        + numbered(event, option, local)
+                        + numbered(event, option, local, labels)
                         + (local.isEmpty() ? "\n还没有样式：用 .style save <名称> 保存当前提示词；"
                             + "要把 WebUI 里已有的预设样式搬进来，用 .style import webui。" : "")
+                        + categorySummary()
                         + "\n样式只属于机器人：.style load <名称|#编号> 用样式替换你个人的正反向 prompt（替换后 prompt 就是你自己的，"
-                        + "再改 prompt 不会自动恢复成样式），与 WebUI 无关。");
+                        + "再改 prompt 不会自动恢复成样式），与 WebUI 无关。"
+                        + "\n改分类：.style category <名称|#编号|#起-#止> <分类名>；分类名给 - 恢复自动分类。");
                 return;
             }
             reply(event, "WebUI 可用采样方法：" + numbered(event, option, sd.samplers()));
@@ -3781,6 +3802,7 @@ public final class Bot implements AutoCloseable {
                                                 : "\n已套用样式的模型参数：" + (params.isEmpty() ? "（没有可用项）" : String.join("、", params)))
                                     : "")
                             + styleStackNotice(local)
+                            + "\n分类：" + localStyles.categoryOf(local) + (local.hasCategory() ? "（手动设置）" : "（按规则自动）")
                             + "\n（替换后的 prompt 就是你自己的文本，之后改 prompt 不会再被样式覆盖；用 .prompt 查看完整提示词）");
                 } else {
                     if (name.isEmpty()) throw new IllegalArgumentException("用法：/style prompt <名称|#编号>，查看样式原文。");
@@ -3791,10 +3813,55 @@ public final class Bot implements AutoCloseable {
                     LocalStyles.Style local = localStyles.get(name);
                     if (local == null) throw new IllegalArgumentException("没有这个样式：" + name + "。用 .style list 查看全部样式。");
                     values.add("样式：" + local.name()
+                            + "\n分类：" + localStyles.categoryOf(local) + (local.hasCategory() ? "（手动设置）" : "（按规则自动）")
+                            + (local.hasModel() ? "\n模型参数：" + local.modelSummary() : "")
                             + "\n正向 prompt 原文：\n" + display(local.positive())
                             + "\n反向 prompt 原文：\n" + display(local.negative()));
                     reply(event, String.join("\n\n", values));
                 }
+                return;
+            }
+            Matcher category = Pattern.compile("^category(?:\\s+([\\s\\S]*))?$", Pattern.CASE_INSENSITIVE).matcher(arguments);
+            if (category.matches()) {
+                String rest = Objects.requireNonNullElse(category.group(1), "").strip();
+                if (rest.isEmpty())
+                    throw new IllegalArgumentException("用法：/style category <名称|#编号|#起-#止> [分类名]；只给名称时查看当前分类，"
+                            + "分类名给 - 恢复自动分类（LoRA 附带的展示图样式自动归到「" + LocalStyles.LORA_CATEGORY + "」）。");
+                // 名称可能含空格：整段恰好是一条已存在的样式名时按"只看不改"处理，否则按"目标 + 分类名"拆开。
+                String spec = rest;
+                String value = null;
+                if (localStyles.get(stripQuotes(rest)) == null) {
+                    Matcher split = Pattern.compile("^(\\S+)\\s+([\\s\\S]+)$").matcher(rest);
+                    if (split.matches()) {
+                        spec = split.group(1);
+                        value = stripQuotes(split.group(2).strip());
+                    }
+                }
+                List<String> targets = styleTargets(event, spec);
+                if (value == null) {
+                    List<String> lines = new ArrayList<>();
+                    for (String target : targets) {
+                        LocalStyles.Style style = localStyles.get(target);
+                        if (style == null) { lines.add("没有这个样式：" + target); continue; }
+                        lines.add(style.name() + "：" + localStyles.categoryOf(style)
+                                + (style.hasCategory() ? "（手动设置）" : "（按规则自动）"));
+                    }
+                    reply(event, "样式分类：\n" + String.join("\n", lines)
+                            + "\n改分类：.style category <名称|#编号|#起-#止> <分类名>；分类名给 - 恢复自动分类。");
+                    return;
+                }
+                boolean clear = value.equals("-") || value.equals("清除") || value.equals("清空");
+                List<String> done = new ArrayList<>(), failed = new ArrayList<>();
+                for (String target : targets) {
+                    try {
+                        LocalStyles.Style updated = localStyles.setCategory(target, clear ? "" : value);
+                        done.add(updated.name() + " → " + localStyles.categoryOf(updated) + (updated.hasCategory() ? "" : "（按规则自动）"));
+                    } catch (Exception error) { failed.add(target + "（" + error(error) + "）"); }
+                }
+                reply(event, reportBatch("样式分类", done, failed, List.of())
+                        + (clear ? "\n已清空手动分类：这些样式回到默认规则（" + LocalStyles.LORA_CATEGORY + " → 归属栈 → "
+                            + LocalStyles.OTHER_CATEGORY + "）。" : "")
+                        + "\n网页「样式」页按分类分组，也可以在那里改。");
                 return;
             }
             Matcher rename = Pattern.compile("^rename(?:\\s+(overwrite))?\\s+(\\S+)\\s+([\\s\\S]+)$", Pattern.CASE_INSENSITIVE).matcher(arguments);
@@ -3913,9 +3980,20 @@ public final class Bot implements AutoCloseable {
         StringBuilder text = new StringBuilder();
         text.append("样式库：").append(local.isEmpty() ? "（空；.style save <名称> 保存当前提示词，或 .style import webui 搬入 WebUI 预设样式）"
                 : local.size() + " 个：" + String.join("、", local));
+        text.append(categorySummary());
         text.append("\n样式完全独立在机器人这边：载入会替换你个人的正反向 prompt，不需要 WebUI 在线，也不会改动 WebUI。");
         text.append("\n样式是固定模板，prompt 才是你自己的内容：不记录「上一次载入哪个样式」，改 prompt 之后不会被自动覆盖。");
         return text.toString();
+    }
+
+    /** 样式分类的一行汇总（`.style` 与 `.style list` 都用它；没有样式就没有这一行）。 */
+    private String categorySummary() {
+        Map<String, Integer> counts = localStyles.categoryCounts();
+        if (counts.isEmpty()) return "";
+        List<String> parts = new ArrayList<>();
+        for (Map.Entry<String, Integer> entry : counts.entrySet()) parts.add(entry.getKey() + " " + entry.getValue());
+        return "\n分类：" + String.join("、", parts)
+                + "（" + LocalStyles.LORA_CATEGORY + "＝下载 LoRA 时用展示图生成的样式，自动归到一起）";
     }
     private void function(JsonObject event, String arguments) throws Exception {        String scope = promptScope(event);
         PromptFunctions functions = new PromptFunctions(settings.root);
@@ -5771,11 +5849,20 @@ public final class Bot implements AutoCloseable {
     }
 
     /**
-     * 样式面板：保存/覆盖/改名/删除/载入。样式库是机器人自己的 JSON，不需要 WebUI；
+     * 样式面板：保存/覆盖/改名/删除/载入/改分类。样式库是机器人自己的 JSON，不需要 WebUI；
      * 「导入 WebUI 预设样式」要读桥接，仍走指令通道。
      */
     public JsonObject webStylesEdit(String scope, String action, String name, String newName,
                                     boolean overwrite, boolean noLora) throws Exception {
+        return webStylesEdit(scope, action, name, newName, overwrite, noLora, "");
+    }
+
+    /**
+     * @param category 只给 {@code action=category} 用：新分类名（空串或 {@code -}/{@code 清除}＝清空手动分类，
+     *                 回到默认规则）。复用现有接口，不另造一条。
+     */
+    public JsonObject webStylesEdit(String scope, String action, String name, String newName,
+                                    boolean overwrite, boolean noLora, String category) throws Exception {
         String op = String.valueOf(action == null ? "" : action).strip().toLowerCase(Locale.ROOT);
         JsonObject event = webEvent(scope, op);
         String message;
@@ -5817,6 +5904,23 @@ public final class Bot implements AutoCloseable {
                 }
                 message = reportBatch("样式删除", done, failed, List.of());
             }
+            case "category" -> {
+                // 改分类（与 QQ 侧 `.style category` 同一套规则）：name 允许 #编号 与 #起-#止 批量，
+                // category 为空或 - 表示清空手动分类、回到默认规则。
+                List<String> targets = styleTargets(event, name == null ? "" : name);
+                String value = String.valueOf(category == null ? "" : category).strip();
+                boolean clear = value.isEmpty() || value.equals("-") || value.equals("清除") || value.equals("清空");
+                List<String> done = new ArrayList<>(), failed = new ArrayList<>();
+                for (String target : targets) {
+                    try {
+                        LocalStyles.Style updated = localStyles.setCategory(target, clear ? "" : value);
+                        done.add(updated.name() + " → " + localStyles.categoryOf(updated) + (updated.hasCategory() ? "" : "（按规则自动）"));
+                    } catch (Exception error) { failed.add(target + "（" + error(error) + "）"); }
+                }
+                message = reportBatch("样式分类", done, failed, List.of())
+                        + (clear ? "；已清空手动分类，回到默认规则（" + LocalStyles.LORA_CATEGORY + " → 归属栈 → "
+                            + LocalStyles.OTHER_CATEGORY + "）" : "");
+            }
             case "load" -> {
                 // 修 bug 1（与 QQ 侧 `.style load` 同一处）：网页控制台与角色链会带引号传名称，
                 // 这里同样要先 stripQuotes；#编号 也按实时样式列表解析。
@@ -5843,6 +5947,7 @@ public final class Bot implements AutoCloseable {
                         + diffCount(previous.negative(), updated.negative()) + " 处变化）"
                         + (skippedLora.isEmpty() ? "" : "；已按 nolora 跳过 " + String.join("、", skippedLora))
                         + (local.hasModel() ? "；模型参数：" + (params.isEmpty() ? "未套用" : String.join("、", params)) : "")
+                        + "；分类：" + localStyles.categoryOf(local)
                         + styleStackNotice(local);
             }
             default -> throw new IllegalArgumentException("不支持的样式操作：" + op);
@@ -5939,6 +6044,21 @@ public final class Bot implements AutoCloseable {
         result.add("local", Json.GSON.toJsonTree(local));
         result.addProperty("library", local.size());
         result.add("baseModelGroups", styleBaseModelGroups(byBase));
+        // 分类清单（组头与「改分类」下拉都读它）：只读地现算，不往 data/local-styles.json 里写东西。
+        result.add("categories", categoryItems());
+        return result;
+    }
+
+    /** 分类清单：名称 + 条数（顺序固定：LoRA 附带 → 各栈 → 未分类 → 自定义分类按名字）。 */
+    private JsonArray categoryItems() {
+        JsonArray result = new JsonArray();
+        for (Map.Entry<String, Integer> entry : localStyles.categoryCounts().entrySet()) {
+            JsonObject item = new JsonObject();
+            item.addProperty("name", entry.getKey());
+            item.addProperty("count", entry.getValue());
+            item.addProperty("lora", LocalStyles.LORA_CATEGORY.equals(entry.getKey()));
+            result.add(item);
+        }
         return result;
     }
 
@@ -5970,6 +6090,10 @@ public final class Bot implements AutoCloseable {
             if (style != null) {
                 item.addProperty("positive", style.positive() == null ? "" : style.positive());
                 item.addProperty("negative", style.negative() == null ? "" : style.negative());
+                // 分类：生效值（手动优先、否则默认规则）+ 是不是手动设的（前端据此提示"留空=自动"）。
+                item.addProperty("category", localStyles.categoryOf(style));
+                item.addProperty("categoryStored", style.category());
+                item.addProperty("categoryAuto", !style.hasCategory());
                 // 样式记着的模型参数（底模 + 采样方法/调度器/步数/CFG/Shift/尺寸）：面板直接显示摘要，
                 // 底模还给一份单独的字段，方便按底模标注。
                 if (style.hasModel()) {
@@ -5983,6 +6107,12 @@ public final class Bot implements AutoCloseable {
                     item.addProperty("stack", stack);
                     item.addProperty("stackLabel", cn.szu.bot.sd.StackClassifier.stackLabel(stack));
                     item.addProperty("forgePreset", Json.str(style.model(), "forge_preset", ""));
+                    // 尺寸单独给一份（展示图样式记的就是这张展示图自己的像素）：面板单独标一个尺寸标签。
+                    item.addProperty("width", Json.num(style.model(), "width", 0));
+                    item.addProperty("height", Json.num(style.model(), "height", 0));
+                    item.addProperty("sizeSource", Json.str(style.model(), "sizeSource", ""));
+                    item.addProperty("previewImage", Json.str(style.model(), "previewImage", ""));
+                    item.addProperty("loraName", Json.str(style.model(), "lora", ""));
                 }
             }
         } catch (Exception error) { /* 单条读不出来不影响列表 */ }

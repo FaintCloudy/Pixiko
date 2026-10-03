@@ -99,9 +99,11 @@ public class WebApiController {
             }
             case "/api/styles/edit": {
                 requirePost(method);
+                // category 只给 action=category 用（改分类）；其余动作忽略它。
                 return WebJson.ok(bot.webStylesEdit(scope, Json.str(body, "action", ""),
                         Json.str(body, "name", ""), Json.str(body, "newName", ""),
-                        Json.bool(body, "overwrite", false), Json.bool(body, "noLora", false)));
+                        Json.bool(body, "overwrite", false), Json.bool(body, "noLora", false),
+                        Json.str(body, "category", "")));
             }
             case "/api/presets/edit": {
                 requirePost(method);

@@ -880,13 +880,19 @@
   const styleRows = new Map();
   /** 样式数据缓存（行 DOM 只负责显示，"查看原文"要的是数据）。 */
   const styleItems = new Map();
+  /** 分类清单（组头顺序、筛选下拉、改分类的候选都用它；每次 /api/styles 都刷新）。 */
+  let styleCategories = [];
+  /** 最近一次 /api/styles 的完整返回（筛选是纯前端的事，不必再打一次接口）。 */
+  let lastStyles = null;
+  /** 分类清单的指纹：一样就不重建筛选下拉/候选表（在筛选框里打字时别抖）。 */
+  let categorySignature = '';
 
   async function loadStyles() {
     return renderStyles(await api('/api/styles'));
   }
 
   /**
-   * 样式库是本机 JSON（`data/local-styles.json`）：保存/覆盖/改名/删除/载入走 `/api/styles/edit`。
+   * 样式库是本机 JSON（`data/local-styles.json`）：保存/覆盖/改名/删除/载入/改分类走 `/api/styles/edit`。
    * 只有「导入 WebUI 预设样式」要读 SD 桥接，仍走指令通道。
    */
   async function editStyles(action, name, extra) {
@@ -902,41 +908,104 @@
     }
   }
 
+  /** 一条样式的生效分类（后端已经算好：手动优先、否则按规则；都没有就是「未分类」）。 */
+  function styleCategory(item) {
+    return (item && item.category) || '未分类';
+  }
+
   function renderStyles(data) {
+    if (!data) return;
+    lastStyles = data;
     $('style-loaded').textContent = '载入即替换，之后 prompt 由你自己改';
     $('style-pageselected').textContent = '样式库 ' + (data.library ?? (data.styles || []).length) + ' 个（只属于机器人，与 WebUI 的样式互不影响）';
-    // 底模分类：列表不按底模重排（编号是 .style load #N / 批量 #6-#9 的依据），只在上面汇总一行。
+    // 底模分类：列表按分类分组，这里只在上面汇总一行。
     const groups = (data.baseModelGroups || []).map((group) => group.baseModel + ' ' + group.count);
     if (groups.length) $('style-pageselected').textContent += '；底模：' + groups.join('、');
+    styleCategories = data.categories || [];
+    const categories = styleCategories.map((entry) => entry.name + ' ' + entry.count);
+    if (categories.length) $('style-pageselected').textContent += '；分类：' + categories.join('、');
+    fillCategoryFilter();
     const filter = $('style-filter').value.trim().toLowerCase();
-    const items = (data.styles || []).filter((item) => !filter || item.name.toLowerCase().includes(filter)
-      || String(item.baseModel || '').toLowerCase().includes(filter)
-      || String(item.stack || '').toLowerCase().includes(filter)
-      || String(item.stackLabel || '').toLowerCase().includes(filter));
+    const select = $('style-category-filter');
+    const only = select ? select.value : '';
+    const items = (data.styles || []).filter((item) => {
+      if (only && styleCategory(item) !== only) return false;
+      if (!filter) return true;
+      return item.name.toLowerCase().includes(filter)
+        || styleCategory(item).toLowerCase().includes(filter)
+        || String(item.baseModel || '').toLowerCase().includes(filter)
+        || String(item.stack || '').toLowerCase().includes(filter)
+        || String(item.stackLabel || '').toLowerCase().includes(filter);
+    });
     styleItems.clear();
     (data.styles || []).forEach((item) => styleItems.set(item.name, item));
-    syncRows($('style-list'), styleRows, items, styleRow, '没有匹配的样式。');
+    syncRows(items, (data.styles || []).length ? '没有匹配的样式。' : '还没有样式：保存一条当前提示词就会出现在这里。');
+  }
+
+  /** 分类筛选下拉 + 改分类的候选（datalist）：保留当前选择，选项顺序与组头一致。 */
+  function fillCategoryFilter() {
+    const signature = styleCategories.map((entry) => entry.name + ':' + entry.count).join('|');
+    if (signature === categorySignature) return;      // 筛选框里打字时不必反复重建下拉
+    categorySignature = signature;
+    const select = $('style-category-filter');
+    if (select) {
+      const current = select.value;
+      select.innerHTML = '';
+      select.appendChild(new Option('全部分类', ''));
+      styleCategories.forEach((entry) => select.appendChild(new Option(entry.name + '（' + entry.count + '）', entry.name)));
+      select.value = [...select.options].some((option) => option.value === current) ? current : '';
+    }
+    const datalist = $('style-category-options');
+    if (datalist) {
+      datalist.innerHTML = '';
+      styleCategories.forEach((entry) => datalist.appendChild(new Option(entry.name, entry.name)));
+    }
+  }
+
+  /** 按分类分桶：顺序跟分类清单走（LoRA 附带 → 各栈 → 未分类 → 自定义），清单外的按出现顺序排后面。 */
+  function styleBuckets(items) {
+    const buckets = new Map();
+    styleCategories.forEach((entry) => buckets.set(entry.name, []));
+    items.forEach((item) => {
+      const name = styleCategory(item);
+      if (!buckets.has(name)) buckets.set(name, []);
+      buckets.get(name).push(item);
+    });
+    return [...buckets].filter(([, list]) => list.length).map(([name, list]) => ({ name, items: list }));
   }
 
   /**
-   * 增量同步列表：同名的行**原地复用**（只更新编号，不重建、不重放动画、不丢滚动位置），
-   * 新行插到正确位置，消失的行只摘它自己。整表 innerHTML='' 重画正是"晃"的根源。
+   * 增量同步列表：**按分类分组**（组头「LoRA 附带（12）」），同名的行原地复用（只更新编号，不重建、
+   * 不重放动画、不丢滚动位置）；分类变了的行重建一次——分类徽标与它所在的分组都得跟着变。
+   * 编号仍取自后端列表，所以 `.style load #N` / 批量 `#6-#9` 不因分组而错位。
    */
-  function syncRows(list, cache, items, build, emptyText) {
+  function syncRows(items, emptyText) {
+    const list = $('style-list');
     const wanted = new Set(items.map((item) => item.name));
-    for (const [name, row] of [...cache]) if (!wanted.has(name)) { row.remove(); cache.delete(name); }
-    for (const placeholder of [...list.querySelectorAll('li.muted')]) placeholder.remove();
+    for (const [name, row] of [...styleRows]) if (!wanted.has(name)) { row.remove(); styleRows.delete(name); }
+    list.querySelectorAll('li.cat-group, li.muted').forEach((node) => node.remove());
     if (!items.length) { list.appendChild(el('li', 'muted', emptyText)); return; }
-    let anchor = list.firstElementChild;
-    items.forEach((item) => {
-      let row = cache.get(item.name);
-      if (!row) { row = build(item); cache.set(item.name, row); }
-      if (row === anchor) anchor = anchor.nextElementSibling;
-      else list.insertBefore(row, anchor || null);
-      row.dataset.name = item.name;
-      row.dataset.number = String(item.number);
-      const number = row.querySelector('.num');
-      if (number) number.textContent = '#' + item.number;
+    styleBuckets(items).forEach((bucket) => {
+      const holder = el('li', 'cat-group');
+      const head = el('div', 'group-head');
+      head.appendChild(el('span', 'group-name', bucket.name + '（' + bucket.items.length + '）'));
+      const known = styleCategories.find((entry) => entry.name === bucket.name);
+      head.appendChild(el('span', 'tag', known && known.lora ? '下载 LoRA 时用展示图生成' : '分类'));
+      holder.appendChild(head);
+      const rows = el('ul', 'list group-rows');
+      bucket.items.forEach((item) => {
+        let row = styleRows.get(item.name);
+        if (row && row.dataset.category !== styleCategory(item)) { row.remove(); styleRows.delete(item.name); row = null; }
+        if (!row) { row = styleRow(item); styleRows.set(item.name, row); }
+        row.dataset.name = item.name;
+        row.dataset.category = styleCategory(item);
+        row.dataset.number = String(item.number);
+        const number = row.querySelector('.num');
+        if (number) number.textContent = '#' + item.number;
+        rows.appendChild(row);
+      });
+      holder.appendChild(rows);
+      list.appendChild(holder);
     });
   }
 
@@ -956,6 +1025,19 @@
     label.onclick = startRename;
     name.appendChild(label);
     name.appendChild(el('div', 'sub', '载入时替换你的个人提示词，之后 prompt 就是你自己的文本'));
+    // 分类徽标（点一下就改）+ 尺寸：展示图样式记的是展示图自己的像素，单独标出来。
+    const meta = el('div', 'sub');
+    const chip = categoryChip(item);
+    meta.appendChild(chip);
+    if (item.width > 0 && item.height > 0) {
+      const size = el('span', 'tag' + (item.sizeSource === 'preview' ? ' on' : ''), item.width + '×' + item.height);
+      size.title = item.sizeSource === 'preview'
+        ? '尺寸来自这张展示图本身（载入样式时按它出图）' : '尺寸来自样式保存时的模型参数';
+      meta.appendChild(document.createTextNode(' '));
+      meta.appendChild(size);
+    }
+    if (item.previewImage) meta.title = '展示图：' + item.previewImage;
+    name.appendChild(meta);
     // 样式保存时记下的模型参数（底模 + 归属栈 + 采样方法/调度器/步数/CFG/Shift/尺寸）：载入时一并套用。
     if (item.modelSummary) {
       const model = el('div', 'sub');
@@ -974,11 +1056,19 @@
     const rename = actionButton('改名', startRename, 'ghost');
     rename.title = '重命名这条样式（只改样式库里的名字，已生成的图片不受影响）';
     acts.appendChild(rename);
+    const recategorize = actionButton('改分类', () => startCategoryEdit(chip, item), 'ghost');
+    recategorize.title = '改这条样式的分类（可选已有分类，也可以直接输入新的分类名）';
+    acts.appendChild(recategorize);
     acts.appendChild(actionButton('查看原文', () => {
       const current = li.dataset.name || item.name;
       const data = styleItems.get(current) || item;
       showInfo('样式原文：' + current,
-        '正向：\n' + (data.positive || '（空）') + '\n\n反向：\n' + (data.negative || '（空）')
+        '分类：' + styleCategory(data) + (data.categoryAuto ? '（按规则自动）' : '（手动设置）')
+          + (data.width > 0 && data.height > 0 ? '\n尺寸：' + data.width + '×' + data.height
+              + (data.sizeSource === 'preview' ? '（展示图尺寸）' : '（保存时的模型参数）') : '')
+          + (data.previewImage ? '\n展示图：' + data.previewImage : '')
+          + (data.loraName ? '\n所属 LoRA：' + data.loraName : '')
+          + '\n\n正向：\n' + (data.positive || '（空）') + '\n\n反向：\n' + (data.negative || '（空）')
           + (data.modelSummary ? '\n\n模型参数（载入时一并套用）：\n' + data.modelSummary : '\n\n模型参数：这条样式没记录（保存时读不到 SD 参数）。'),
         { text: '这是一份固定模板：载入会把这两段原样写进你个人的提示词。' });
     }, 'ghost'));
@@ -996,6 +1086,48 @@
     }, 'danger'));
     li.appendChild(acts);
     return li;
+  }
+
+  /** 行里的分类徽标：手动设过的实心、按规则自动的描边，点一下就地改。 */
+  function categoryChip(item) {
+    const current = styleCategory(item);
+    const chip = el('span', 'tag cat' + (item.categoryAuto ? '' : ' on'), '分类：' + current);
+    chip.title = item.categoryAuto
+      ? '按默认规则归类（' + current + '）：点一下手动指定分类'
+      : '手动分类（' + current + '）：点一下改；留空或输入 - 恢复按规则自动分类';
+    chip.onclick = () => startCategoryEdit(chip, item);
+    return chip;
+  }
+
+  /**
+   * 就地改分类：输入框 + 已有分类候选（datalist），回车提交、Esc/失焦取消；留空或输入 - 恢复自动分类。
+   * 不弹浏览器的 prompt 框（和改名同一套交互）。
+   */
+  function startCategoryEdit(chip, item) {
+    if (!chip || chip.querySelector('input')) return;
+    const current = chip.textContent;
+    const input = el('input', 'rename-input');
+    input.value = item.categoryAuto ? '' : styleCategory(item);
+    input.placeholder = item.categoryAuto ? '留空＝自动（' + styleCategory(item) + '）' : '分类名（留空＝自动）';
+    input.setAttribute('list', 'style-category-options');
+    input.title = '回车保存；留空或输入 - 恢复按规则自动分类';
+    chip.textContent = '';
+    chip.appendChild(input);
+    input.focus();
+    input.select();
+    let finished = false;
+    const finish = (save) => {
+      if (finished) return;
+      finished = true;
+      const value = input.value.trim();
+      chip.textContent = current;        // 列表随后会按新分类重画这一行，这里先把徽标文字还原
+      if (save) editStyles('category', item.name, { category: value });
+    };
+    input.onkeydown = (event) => {
+      if (event.key === 'Enter') { event.preventDefault(); finish(true); }
+      else if (event.key === 'Escape') { event.preventDefault(); finish(false); }
+    };
+    input.onblur = () => finish(true);
   }
 
   /** 就地改名：把名字变成输入框，回车提交、Esc 取消，不再弹浏览器的 prompt 框。 */
@@ -2413,7 +2545,10 @@
       if (!name) { toast(wanted ? '样式库里没有「' + wanted + '」；列表见下方。' : '样式库是空的。'); return; }
       const data = styleItems.get(name) || {};
       showInfo('样式原文：' + name,
-        '正向：\n' + (data.positive || '（空）') + '\n\n反向：\n' + (data.negative || '（空）'),
+        '分类：' + styleCategory(data) + (data.categoryAuto ? '（按规则自动）' : '（手动设置）')
+          + (data.width > 0 && data.height > 0 ? '\n尺寸：' + data.width + '×' + data.height
+              + (data.sizeSource === 'preview' ? '（展示图尺寸）' : '（保存时的模型参数）') : '')
+          + '\n\n正向：\n' + (data.positive || '（空）') + '\n\n反向：\n' + (data.negative || '（空）'),
         { text: '这是一份固定模板：载入会把这两段原样写进你个人的提示词。' });
     });
     on('style-save', 'click', () => {
@@ -2434,13 +2569,20 @@
       const range = $('style-range').value.trim(), name = $('style-range-name').value.trim();
       if (range && name) editStyles('rename', range, { newName: name });
     });
+    on('style-batch-category', 'click', () => {
+      const range = $('style-range').value.trim(), category = $('style-range-category').value.trim();
+      if (!range) { toast('请先填要改分类的编号区间，例如 #12-#16。'); return; }
+      // 分类留空＝清空手动分类、回到默认规则（与 `.style category <目标> -` 同一个意思）。
+      editStyles('category', range, { category });
+    });
     on('style-batch-delete', 'click', async () => {
       const range = $('style-range').value.trim();
       if (!range) return;
       if (!await askConfirm('删除 ' + range + '？', { title: '批量删除样式', confirmText: '删除', danger: true })) return;
       editStyles('delete', range);
     });
-    on('style-filter', 'input', loadStyles);
+    on('style-filter', 'input', () => { if (lastStyles) renderStyles(lastStyles); });
+    on('style-category-filter', 'change', () => { if (lastStyles) renderStyles(lastStyles); });
     on('style-reload', 'click', loadStyles);
 
     // LoRA

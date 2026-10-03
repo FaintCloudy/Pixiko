@@ -24,9 +24,20 @@ public final class CivitaiStyleSync {
         default void save(String name, String positive, String negative, boolean overwrite, JsonObject model) throws Exception {
             save(name, positive, negative, overwrite);
         }
+        /**
+         * 连模型参数与**分类**一起保存（v1.0.12 起展示图样式一律归「LoRA 附带」大类）。
+         * 老实现可以不覆盖：那就没有分类，样式照旧可用（默认规则里还会按展示图映射兜底）。
+         */
+        default void save(String name, String positive, String negative, boolean overwrite, JsonObject model, String category) throws Exception {
+            save(name, positive, negative, overwrite, model);
+        }
         /** 这条样式现在记着的模型参数（没有就 null）；用来判断"内容没变但缺参数"要不要补写。 */
         default JsonObject model(String name) throws Exception { return null; }
     }
+    /** 展示图样式统一的大类（与本机样式库的默认规则同一个词）。 */
+    public static final String LORA_CATEGORY = cn.szu.bot.sd.LocalStyles.LORA_CATEGORY;
+    /** 这几个键只是「LoRA 附带」的标注，不是模型参数：比"要不要补写"时忽略（否则永远算"变了"）。 */
+    private static final Set<String> ANNOTATION_KEYS = Set.of("lora", "origin", "previewImage", "sizeSource");
     private static final Pattern LORA = Pattern.compile("<lora:[^<>]*>", Pattern.CASE_INSENSITIVE);
     /** 展示图样式写进机器人自己的样式库（data/local-styles.json），不再写 WebUI 的预设样式。 */
     private static Store store(Path root) {
@@ -43,6 +54,9 @@ public final class CivitaiStyleSync {
             }
             public void save(String name, String positive, String negative, boolean overwrite, JsonObject model) throws Exception {
                 local.save(name, positive, negative, overwrite, model);
+            }
+            public void save(String name, String positive, String negative, boolean overwrite, JsonObject model, String category) throws Exception {
+                local.save(name, positive, negative, overwrite, model, category);
             }
             public JsonObject model(String name) {
                 cn.szu.bot.sd.LocalStyles.Style style = local.get(name);
@@ -81,6 +95,12 @@ public final class CivitaiStyleSync {
         JsonObject params = model != null ? model : styleModel(sd, download.baseModel(), SdClient.CIVITAI_SOURCE);
         return sync(root, download, tag, store(root), create, client, params);
     }
+    /** 与上一版同一条路径，只是把计数也返回（「补展示图」要报补了几条尺寸）。 */
+    public static Outcome run(Path root, CivitaiClient.DownloadedLora download, String tag, SdClient sd, boolean create,
+                              CivitaiClient client, JsonObject model) {
+        JsonObject params = model != null ? model : styleModel(sd, download.baseModel(), SdClient.CIVITAI_SOURCE);
+        return run(root, download, tag, store(root), create, client, params);
+    }
     /**
      * 展示图样式的模型参数：底模用这个 LoRA 的（Civitai 记录），采样方法/步数/CFG/Shift/尺寸用当前
      * Forge 预设栈（没有预设就用机器人当前设置）。算不出来就返回 null（样式只存提示词，照旧可用）。
@@ -101,14 +121,24 @@ public final class CivitaiStyleSync {
     public static String sync(Path root, CivitaiClient.DownloadedLora download, String tag, Store store, boolean create, CivitaiClient client) {
         return sync(root, download, tag, store, create, client, null);
     }
+    /** 展示图样式记的尺寸来源标记：宽高来自这张展示图**自己的像素**，不是预设/当前设置。 */
+    public static final String PREVIEW_SIZE_SOURCE = "preview";
+    /** 一次展示图样式同步的结果：各类计数 + 给用户看的回执（「补展示图」要报补了几条尺寸）。 */
+    public record Outcome(int saved, int corrected, int reused, int skipped, int failed, int previews, int params,
+                          int sized, String text) { }
     /**
      * @param model 每条展示图样式要一起写进样式库的模型参数（底模 + 采样方法/调度器/步数/CFG/Shift/尺寸）；
      *              null 表示这次不写参数（老调用方、离线计划）。
      */
     public static String sync(Path root, CivitaiClient.DownloadedLora download, String tag, Store store, boolean create,
                               CivitaiClient client, JsonObject model) {
-        if (download.showcases().isEmpty()) return "展示图样式：没有可用展示图元数据。";
-        int saved = 0, corrected = 0, reused = 0, skipped = 0, failed = 0, previews = 0, params = 0;
+        return run(root, download, tag, store, create, client, model).text();
+    }
+    /** 与 {@link #sync} 同一件事，只是把计数也一并返回（例如「补展示图」要报补了几条尺寸）。 */
+    public static Outcome run(Path root, CivitaiClient.DownloadedLora download, String tag, Store store, boolean create,
+                              CivitaiClient client, JsonObject model) {
+        if (download.showcases().isEmpty()) return new Outcome(0, 0, 0, 0, 0, 0, 0, 0, "展示图样式：没有可用展示图元数据。");
+        int saved = 0, corrected = 0, reused = 0, skipped = 0, failed = 0, previews = 0, params = 0, sized = 0;
         List<String> lines = new ArrayList<>();
         try {
             Path linksFile = root.resolve("data/civitai-style-links.json");
@@ -118,6 +148,7 @@ public final class CivitaiStyleSync {
             Set<String> claimed = new HashSet<>();
             String prefix = prefix(download.modelName());
             if (prefix.isEmpty()) prefix = "模型" + download.modelId();
+            String lora = loraStem(download.path());
             for (var image : download.showcases()) {
                 if (!image.skippedReason().isEmpty()) { skipped++; continue; }
                 String key = download.modelId() + "/" + download.versionId() + "/" + download.path().getFileName() + "/" + image.number();
@@ -142,9 +173,16 @@ public final class CivitaiStyleSync {
                     String positive = correct(old == null ? image.positive() : old.positive(), tag);
                     String negative = old == null ? image.negative() : old.negative();
                     JsonObject previous = old == null ? null : store.model(name);
+                    // 展示图自己的像素尺寸：优先从刚抓到的字节读，其次读已经存下来的预览图。
+                    byte[] cover = fetchCover(root, name, image, client);
+                    if (cover != null) previews++;
+                    int[] size = cover != null ? cn.szu.bot.sd.ImageSize.of(cover)
+                            : cn.szu.bot.sd.ImageSize.of(cn.szu.bot.sd.StylePreviews.file(root, name));
                     // 这次没有新参数（老调用方/离线计划）就保留这条样式原来记着的，别把已有的覆盖成空。
-                    JsonObject recorded = model != null ? model : previous;
+                    JsonObject base = model != null ? model : previous;
+                    JsonObject recorded = applyPreview(base, lora, size, previewPath(root, name));
                     boolean textSame = old != null && old.positive().equals(positive);
+                    boolean sizeFilled = size != null && !sameSize(previous, size);
                     // 内容没变但缺模型参数（v1.0.10 之前存的展示图样式就是这样）也要补写一次，
                     // 否则"下载 LoRA 自动带上底模"对老样式永远不生效。
                     if (textSame && sameModel(previous, recorded)) reused++;
@@ -155,30 +193,77 @@ public final class CivitaiStyleSync {
                             backup.addProperty("replacement_tag", tag);
                             Json.atomicWrite(root.resolve("data/civitai-style-backups/" + UUID.randomUUID() + ".json"), backup);
                         }
-                        store.save(name, positive, negative, old != null, recorded);
+                        // 展示图样式一律归到同一个大类「LoRA 附带」（用户手动改过的分类在 save 里会被保留）。
+                        store.save(name, positive, negative, old != null, recorded, LORA_CATEGORY);
                         if (old == null) saved++;
-                        else if (textSame) params++;
-                        else corrected++;
+                        else if (!textSame) corrected++;
+                        else if (sizeFilled) sized++;
+                        else params++;
                         catalog.put(name, new SdClient.StylePrompt(name, positive, negative));
                     }
-                    if (saveStylePreview(root, name, image, client)) previews++;
                     if (create) { links.addProperty(key, name); Json.atomicWrite(linksFile, links); }
-                    lines.add("展示图 " + image.number() + " → " + name);
+                    lines.add("展示图 " + image.number() + " → " + name + (size == null ? "" : "（" + size[0] + "×" + size[1] + "）"));
                 } catch (Exception e) { failed++; lines.add("样式 " + name + " 处理失败：" + Bot.error(e)); }
             }
-        } catch (Exception e) { return "展示图样式处理失败：" + Bot.error(e); }
-        return "展示图样式：新增 " + saved + "，修正 " + corrected + "，复用 " + reused + "，跳过 " + skipped + "，失败 " + failed
+        } catch (Exception e) {
+            return new Outcome(saved, corrected, reused, skipped, failed, previews, params, sized, "展示图样式处理失败：" + Bot.error(e));
+        }
+        String text = "展示图样式：新增 " + saved + "，修正 " + corrected + "，复用 " + reused + "，跳过 " + skipped + "，失败 " + failed
                 + (params == 0 ? "" : "，补模型参数 " + params)
+                + (sized == 0 ? "" : "，补展示图尺寸 " + sized)
                 + (previews == 0 ? "" : "，预览图 " + previews)
                 + (model == null || model.size() == 0 ? "" : "。\n模型参数：" + modelText(model))
                 + "。\n本机标签：" + tag + (lines.isEmpty() ? "" : "\n" + String.join("\n", lines));
+        return new Outcome(saved, corrected, reused, skipped, failed, previews, params, sized, text);
     }
 
-    /** 两份模型参数是不是一样（有一边为空就按"空"比；只看键值，不比顺序）。 */
+    /** LoRA 文件名（去扩展名）：作为「LoRA 附带」的细分标签记进样式（大类仍是 {@link #LORA_CATEGORY}）。 */
+    static String loraStem(Path path) {
+        if (path == null || path.getFileName() == null) return "";
+        return path.getFileName().toString().replaceFirst("(?i)\\.safetensors$", "").strip();
+    }
+
+    /** 预览图在机器人根目录下的相对路径（记进样式方便核对；图本身**不复制**）。读不到就是空串。 */
+    static String previewPath(Path root, String name) {
+        Path file = cn.szu.bot.sd.StylePreviews.file(root, name);
+        if (file == null || !Files.isRegularFile(file)) return "";
+        try {
+            Path base = root.toAbsolutePath().normalize();
+            Path absolute = file.toAbsolutePath().normalize();
+            return (absolute.startsWith(base) ? base.relativize(absolute) : absolute).toString().replace('\\', '/');
+        } catch (Exception error) { return ""; }
+    }
+
+    /**
+     * 把「LoRA 附带」的标注与**展示图的实际尺寸**写进样式参数。
+     *
+     * <p>尺寸优先级：**展示图自己的像素**（{@code sizeSource=preview}）＞ 预设栈/机器人当前设置——
+     * 后者已经在 {@code model} 里了，这里只在读得到展示图尺寸时覆盖；读不到就原样留着，
+     * **绝不编一个尺寸**。{@code lora} / {@code previewImage} 只是标注，不参与"要不要补写"的比较。
+     */
+    public static JsonObject applyPreview(JsonObject model, String loraStem, int[] size, String previewPath) {
+        JsonObject result = model == null ? new JsonObject() : model.deepCopy();
+        if (loraStem != null && !loraStem.isBlank()) result.addProperty("lora", loraStem);
+        if (previewPath != null && !previewPath.isBlank()) result.addProperty("previewImage", previewPath);
+        if (size != null && size.length == 2 && size[0] > 0 && size[1] > 0) {
+            result.addProperty("width", size[0]);
+            result.addProperty("height", size[1]);
+            result.addProperty("sizeSource", PREVIEW_SIZE_SOURCE);
+        }
+        return result;
+    }
+
+    /** 样式里记着的尺寸是不是就是这张展示图的尺寸。 */
+    private static boolean sameSize(JsonObject previous, int[] size) {
+        return previous != null && Json.num(previous, "width", 0) == size[0] && Json.num(previous, "height", 0) == size[1];
+    }
+
+    /** 两份模型参数是不是一样（有一边为空就按"空"比；只看键值，不比顺序；标注键不参与比较）。 */
     static boolean sameModel(JsonObject left, JsonObject right) {
         Set<String> keys = new LinkedHashSet<>();
         if (left != null) keys.addAll(left.keySet());
         if (right != null) keys.addAll(right.keySet());
+        keys.removeAll(ANNOTATION_KEYS);
         for (String key : keys) if (!modelValue(left, key).equals(modelValue(right, key))) return false;
         return true;
     }
@@ -211,22 +296,25 @@ public final class CivitaiStyleSync {
         double distilled = Json.decimal(model, "distilledCfg", 0);
         if (distilled > 0) parts.add("Shift " + (distilled == Math.rint(distilled) ? String.valueOf((long) distilled) : String.valueOf(distilled)));
         int width = Json.num(model, "width", 0), height = Json.num(model, "height", 0);
-        if (width > 0 && height > 0) parts.add(width + "×" + height);
+        if (width > 0 && height > 0)
+            parts.add(width + "×" + height + (PREVIEW_SIZE_SOURCE.equals(Json.str(model, "sizeSource", "")) ? "（展示图尺寸）" : ""));
         return String.join("，", parts);
     }
 
     /**
-     * 把这张展示图存成样式的预览图（<b>只有控制台会看它</b>）。已经有图就跳过，抓不到也只是少一张图，
-     * 绝不影响样式本身——所以这里吞掉异常、只记一条日志。
+     * 拿这张展示图的字节：**已经有预览图就返回 null**（尺寸直接从那文件读，不必再抓一次）；
+     * 没有就抓一张存成样式预览图并返回字节。抓不到也只是少一张图，绝不影响样式本身——
+     * 所以这里吞掉异常、只记一条日志。
      */
-    private static boolean saveStylePreview(Path root, String name, CivitaiClient.ShowcasePrompt image, CivitaiClient client) {
-        if (client == null || image.cover().isEmpty() || cn.szu.bot.sd.StylePreviews.has(root, name)) return false;
+    private static byte[] fetchCover(Path root, String name, CivitaiClient.ShowcasePrompt image, CivitaiClient client) {
+        if (client == null || image.cover().isEmpty() || cn.szu.bot.sd.StylePreviews.has(root, name)) return null;
         try {
-            cn.szu.bot.sd.StylePreviews.save(root, name, client.cover(image.cover()).bytes());
-            return true;
+            byte[] bytes = client.cover(image.cover()).bytes();
+            cn.szu.bot.sd.StylePreviews.save(root, name, bytes);
+            return bytes;
         } catch (Exception error) {
             cn.szu.bot.Log.warn("样式预览图抓取失败（" + name + "）：" + Bot.error(error));
-            return false;
+            return null;
         }
     }
     public static String migrate(Path root, SdClient sd) throws Exception {

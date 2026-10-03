@@ -1,11 +1,57 @@
-# Pixiko v1.0.11 发行说明
+# Pixiko v1.0.12 发行说明
 
-- **版本**：v1.0.11
+- **版本**：v1.0.12
 - **日期**：2026-10-04
 - **作者**：loriko（deloriko@outlook.com）
 - **当前实现**：Java 版（`src/`）。另有一次**未完成的** Next.js 重构，见 `nextjs-wip/`，**不可运行**。
 
 ---
+
+## 〇、本版新增（v1.0.12）
+
+**样式会分类了，展示图样式还记住了展示图自己的尺寸**。上一版回答了"这份样式属于哪一栈"，
+这一版回答"它归在哪一类、这张展示图有多大"——LoRA 下载时批量生成的展示图样式以前混在样式库里
+和手写样式分不开，而且尺寸一律按预设/当前设置写死。
+
+- **样式分类**（`data/local-styles.json` 每条多一个 `category` 字段）：
+  - **LoRA 附带的展示图样式一律归到同一个大类「LoRA 附带」**。判据：样式记着 `model.sizeSource=preview`
+    或 `model.lora`，或者它在 `data/civitai-style-links.json` 的映射里（老样式没有标注就靠这份映射，
+    **只读它、不改它**）；
+  - 其它样式按其**归属栈**给默认分类：`Anima` / `SDXL` / `SD 1.5` / `Flux` / `Qwen`；判不出栈就是 `未分类`；
+  - **用户手动设过的分类优先**，默认规则只在"没手动设过"时生效；覆盖保存/同步/改名都不会把用户设的分类改回去；
+  - 老文件没有 `category` 字段时读成空（＝未手动分类），**不报错、也不在读取时重写文件**；写盘时只写非空分类。
+- **手动改分类两条路**：
+  - 命令 `.style category <名称|#编号|#起-#止> <分类名>`（批量区间与 `.style rename` 同一套写法）、
+    `.style category <名称>` 只查不改、分类名给 `-`/`清除`/`清空` 表示恢复默认规则；
+    `.style list` 每行带 `［分类］`、`.style prompt` 与 `.style load` 回执也报分类，`.style`/`.style list`
+    顶部给一行「分类：LoRA 附带 12、Anima 3、未分类 1」；
+  - 网页「样式」页：列表**按分类分组**（组头 `LoRA 附带（12）`、`Anima（3）`），每行显示分类徽标与尺寸，
+    点徽标或「改分类」按钮就地改（输入框带已有分类的候选，留空或 `-`＝恢复自动）；工具栏有分类筛选下拉，
+    批量区加了「批量改分类」。**复用现有 `/api/styles/edit`**（`action: "category"` + `category` 参数），
+    `/api/styles` 新增 `categories` 数组，每条带 `category` / `categoryStored` / `categoryAuto` /
+    `width` / `height` / `sizeSource` / `previewImage` / `loraName`。
+- **展示图样式读取展示图的实际像素尺寸**：新增 `cn.szu.bot.sd.ImageSize`，按 PNG / JPEG / GIF / BMP / WebP
+  **文件头**取宽高（只读前 256 KB，不解码整图；认不出的格式才问 ImageIO，且只取 reader 的宽高），
+  读不出来返回 null、**绝不编一个尺寸**。
+  - 尺寸优先级：**展示图自己的像素**（`model.sizeSource = "preview"`）＞ 预设栈的 `width/height`
+    ＞ 机器人当前设置（后两条沿用上一版的逐项回退：Anima 的 `anima_t2i_width/height` 是 0，会回退到当前设置）；
+  - 顺带把展示图的相对路径记进 `model.previewImage`（`data/style-previews/<哈希>.png`，**不复制大图**），
+    把所属 LoRA 的文件名记进 `model.lora`（`LoRA 附带` 大类的细分标签）；
+  - 「补展示图」这条重跑路径也带尺寸：已存在但缺 `width/height` 的展示图样式会**补写一次**，
+    回执里报「补展示图尺寸 N 条」（`CivitaiStyleSync.Outcome` 带计数）；重复同步仍是"复用"，不会反复重写。
+  - `.style load`（命令与网页）照旧把记着的尺寸一起套用于机器人设置（`SdClient.applyModelParams`），
+    回执里点明 `96×64` 来自展示图；分类是 `LoRA 附带` 而栈与当前不一致时，仍然沿用上一版的**栈不一致提示**，
+    **不偷偷切栈**。
+- **前端**：`webui/index.html` 资源版本 `?v=1.0.16`；样式面板按分类分组、分类徽标可在行内编辑、
+  显示尺寸标签（`96×64`）、分类筛选下拉与「批量改分类」按钮。
+- **测试**：新增 `StyleCategoryTest`（76 条断言）——默认分类规则、LoRA 附带统一大类（`sizeSource` / `lora` /
+  `civitai-style-links.json` 三种判据）、手动/批量/清空改分类（命令 + 网页接口）、老文件没有 `category`
+  字段时不报错也不被重写、**用临时目录里现生成的真 96×64 PNG/JPEG 与手写 WebP 头验证尺寸读取**、
+  尺寸优先级（展示图盖掉预设的 1024×1024）与「补尺寸」回执、载入样式后尺寸真的套回机器人设置。
+  全量 `build.ps1 -Test` 54 个 suite 全绿。
+
+<details>
+<summary>上一版（v1.0.11）</summary>
 
 ## 〇、本版新增（v1.0.11）
 
@@ -47,6 +93,8 @@
   sd2 / flux / qwen / 未知 / 占位元数据 / 截断头部 / 普通文件，以及关键词表、栈→预设映射、
   `modelInfos`、桩 Forge 下的 `/api/loras` 栈字段与分组）；`SdClientTest` 补了预设配置归属与
   `checkpointInfo` 的断言；`WebUiTest` 补了 `stack`/`modelOptions` 字段的断言。
+
+</details>
 
 <details>
 <summary>上一版（v1.0.10）</summary>

@@ -209,13 +209,17 @@ code { background: rgba(120, 160, 220, .14); padding: 1px 5px; border-radius: 6p
 .list li.current { border-color: rgba(79, 215, 168, .55); background: linear-gradient(135deg, rgba(79, 215, 168, .12), rgba(23, 33, 51, .5)); }
 .list li .num { color: var(--muted); font-variant-numeric: tabular-nums; min-width: 36px; }
 /* LoRA 面板按底模分组：组是一条不加卡片底色的"标题行"，里面再嵌一层行列表 */
-.list li.lora-group { display: block; background: none; border: none; padding: 4px 0 0; transition: none; }
-.list li.lora-group:hover { transform: none; border-color: transparent; }
-.list li.lora-group .group-head {
+.list li.lora-group, .list li.cat-group { display: block; background: none; border: none; padding: 4px 0 0; transition: none; }
+.list li.lora-group:hover, .list li.cat-group:hover { transform: none; border-color: transparent; }
+.list li.lora-group .group-head, .list li.cat-group .group-head {
   display: flex; align-items: center; gap: 8px; padding: 2px 2px 6px; color: var(--muted); font-size: 12.5px;
 }
-.list li.lora-group .group-head .group-name { color: var(--text); font-weight: 600; }
-.list li.lora-group .group-rows { gap: 7px; }
+.list li.lora-group .group-head .group-name, .list li.cat-group .group-head .group-name { color: var(--text); font-weight: 600; }
+.list li.lora-group .group-rows, .list li.cat-group .group-rows { gap: 7px; }
+/* 样式行的分类徽标：手动设过的实心，按默认规则归类的描边；点一下就地改分类 */
+.list li .tag.cat { cursor: pointer; }
+.list li .tag.cat:hover { border-color: rgba(120, 160, 220, .5); }
+.list li .tag.cat .rename-input { min-width: 120px; }
 .list li .name { flex: 1; word-break: break-word; }
 .list li .sub { color: var(--muted); font-size: 12px; word-break: break-word; }
 .list li .star { color: var(--accent-2); }
