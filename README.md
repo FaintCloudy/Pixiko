@@ -5,7 +5,7 @@ Pixiko 是一个自用的 QQ 机器人：接 **NapCat** 收消息，接 **Stable
 领图；机器人自己把生成好的图片发回对话。
 
 - **作者**：loriko（deloriko@outlook.com）
-- **版本**：v1.0.9（发行说明见 [`RELEASE.md`](RELEASE.md)）
+- **版本**：v1.0.10（发行说明见 [`RELEASE.md`](RELEASE.md)）
 - **当前实现**：**Java 版**（`src/`）——这是线上一直在跑的那一份
 - **网页控制台**：`webui/`（纯静态 HTML/CSS/JS，随机器人一起由内嵌 Spring Boot 提供）
 - **SD WebUI 桥接扩展**：`webui-extension/pixiko-bridge/`（把文生图页正在编辑的提示词同步给机器人）
@@ -297,6 +297,15 @@ run.bat --set-map yh "路径"       # 命令行设置地图（需先停止机器
 | `.preset list\|save\|overwrite\|show\|load\|remove` | 参数预设 |
 | `.function list\|save\|overwrite\|prompt\|load\|active\|remove\|clear\|delete\|rename\|reset` | 提示词集 |
 
+**样式会记下"它属于哪个底模"**：保存样式时如果读得到 SD 的模型参数，就把**底模 + 采样方法 + 调度器 +
+步数 + CFG + Shift（蒸馏 CFG）+ 尺寸**一起存进 `data/local-styles.json` 的 `model` 字段。
+下载 LoRA 时自动生成的**展示图样式**同样会带上这套参数——底模优先用这个 LoRA 自己的
+（先看 Civitai 下载记录，再看 Forge 的 LoRA 元数据），采样参数用**当前 Forge 预设栈**的推荐值，
+预设里没给（例如 Anima 不设尺寸）就回退到机器人当前设置。实在识别不出底模时按当前预设栈**推断**，
+并在样式里标成「按当前预设推断」，绝不编一个底模名出来。`.style load` 会把这份参数套回机器人设置
+（只要提示词就加 `noparams`）；网页「样式」页上方按底模汇总（例如「底模：Anima 12、NoobAI 5」），
+每条样式也标着自己的底模。
+
 ### 出图、LoRA 与图片
 
 | 指令 | 作用 |
@@ -314,7 +323,8 @@ run.bat --set-map yh "路径"       # 命令行设置地图（需先停止机器
 | `.lora query <模型搜索词>` | 搜索 Civitai，显示编号及封面 |
 | `.lora download #编号 [权重]` / `.lora download <Civitai链接> [权重]` | 下载并启用，同时把展示图提示词存成样式 |
 | `.lora status` | 查看最近下载状态 |
-| `.lora list` | 列出 WebUI 本地 LoRA |
+| `.lora list` | 列出 WebUI 本地 LoRA（每项标出底模，并在上方按底模分组） |
+| `.lora detail <名称\|#编号>` | 查看一个本地 LoRA 的底模（含来源）、Civitai 记录与它的展示图样式 |
 | `.lora load <完整本地名称> [权重]` | 重新加载或启用已有 LoRA |
 | `.lora rename <旧本地名称> <新本地名称>` | 重命名本地 LoRA 并同步个人 prompt 标签 |
 | `.lora delete <名称\|#编号>` | 删除本地 LoRA（只允许 LoRA 目录下的文件；**未列在 `--help` 输出里，但代码中可用**） |
@@ -341,6 +351,14 @@ run.bat --set-map yh "路径"       # 命令行设置地图（需先停止机器
 路径或名称含空格可以加双引号；目录按文件名发送，最多 10 张、每张最多 20MB；
 生成任务按顺序逐个运行，采用**发出指令时**的完整参数。
 
+**每个 LoRA 都带底模，网页按底模分组**：`/lora list`、`/lora detail` 与网页「LoRA」面板都会给出
+底模（基础模型），面板按底模分组显示（组头例如 `Anima（4）`），每项也有自己的底模标签。
+底模按**优先级**识别：Civitai 下载记录里的 `base_model` → Forge 的 LoRA 元数据
+（`/sdapi/v1/loras` 里每项的 `metadata.ss_base_model_version`，占位值 `model.safetensors` 不算）→
+都没有时按**当前 Forge 预设栈**推断并标注「按当前预设推断」；实在没有就如实显示「未识别」。
+`GET /api/loras` 的每一项带 `baseModel` / `baseModelSource`（`civitai` / `forge-metadata` /
+`preset-inferred`）/ `groupKey`，并在 `groups` 里给出按底模分组的结果给网页直接用。
+
 ---
 
 ## 六、目录结构
@@ -348,7 +366,7 @@ run.bat --set-map yh "路径"       # 命令行设置地图（需先停止机器
 ```
 pixiko\
 ├─ README.md                       本文件
-├─ RELEASE.md                      v1.0.9 发行说明（含版权声明与已知限制）
+├─ RELEASE.md                      v1.0.10 发行说明（含版权声明与已知限制）
 ├─ THIRD-PARTY-LICENSES.md         随二进制包分发的第三方组件与许可
 ├─ config.example.json             脱敏配置模板（复制成 config.json 再改）
 ├─ .gitignore                      config.json / data / logs / lib jar 等一律不入库

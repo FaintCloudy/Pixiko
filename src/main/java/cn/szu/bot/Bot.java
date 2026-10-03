@@ -2702,11 +2702,38 @@ public final class Bot implements AutoCloseable {
         if (arguments.equalsIgnoreCase("list")) {
             startLora(event, "正在读取 WebUI 本地 LoRA 列表。", false, () -> {
                 List<SdClient.Lora> values = sd.loras();
-                List<String> names = new ArrayList<>();
-                for (SdClient.Lora item : values)
-                    names.add(item.name() + (item.alias() == null || item.alias().isBlank() || item.alias().equals(item.name())
-                            ? "" : "（别名：" + item.alias() + "）"));
-                return new LoraResult(safeLoraText("WebUI 本地 LoRA：" + numbered(event, "lora", values.stream().map(SdClient.Lora::name).toList(), names)),true);
+                // 底模兜底（当前 Forge 预设栈）只读一次；每个 LoRA 的底模按 Civitai → Forge 元数据 → 预设 的优先级识别。
+                SdClient.BaseModel presetBase = values.isEmpty() ? SdClient.BaseModel.NONE : presetBaseModelOrNone();
+                List<String> names = new ArrayList<>(), labels = new ArrayList<>();
+                Map<String, List<String>> groups = new LinkedHashMap<>();
+                for (int index = 0; index < values.size(); index++) {
+                    SdClient.Lora item = values.get(index);
+                    String alias = item.alias() == null || item.alias().isBlank() || item.alias().equals(item.name())
+                            ? "" : "别名：" + item.alias() + "；";
+                    SdClient.BaseModel base = loraBaseModel(item.name(), item.path(), presetBase);
+                    names.add(item.name());
+                    labels.add(item.name() + "（" + alias
+                            + (base.known() ? "底模：" + base.name() + base.note() : "底模未识别") + "）");
+                    groups.computeIfAbsent(base.known() ? base.name() + base.note() : "未识别底模", ignored -> new ArrayList<>())
+                            .add("#" + (index + 1));
+                }
+                // 编号顺序保持列表顺序（#N 是 /lora load #N、/lora delete #N 的依据），
+                // 分组只在上面多给一行"哪个底模是哪几个"。
+                StringBuilder text = new StringBuilder("WebUI 本地 LoRA：" + values.size() + " 个（按底模分组）");
+                for (Map.Entry<String, List<String>> group : groups.entrySet())
+                    text.append("\n【").append(group.getKey()).append("】").append(String.join("、", group.getValue()));
+                return new LoraResult(safeLoraText(text
+                        + numbered(event, "lora", values.stream().map(SdClient.Lora::name).toList(), labels)), true);
+            });
+            return;
+        }
+        if (arguments.equalsIgnoreCase("detail") || arguments.toLowerCase(Locale.ROOT).startsWith("detail ")) {
+            String value = arguments.length() > 6 ? arguments.substring(6).strip() : "";
+            if (value.isBlank())
+                throw new IllegalArgumentException("用法：/lora detail <名称|#编号>——看一个本地 LoRA 的底模（含来源）、Civitai 记录与展示图样式。");
+            startLora(event, "正在读取 LoRA 详情。", false, () -> {
+                String requested = value.startsWith("#") ? select(event, "lora", value) : stripQuotes(value);
+                return new LoraResult(safeLoraText(loraDetailText(requested)), true);
             });
             return;
         }
@@ -2786,7 +2813,8 @@ public final class Bot implements AutoCloseable {
         }
         Matcher command = Pattern.compile("^(download|load)(?:\\s+([\\s\\S]*))?$", Pattern.CASE_INSENSITIVE).matcher(arguments);
         if (!command.matches() || command.group(2) == null || command.group(2).isBlank())
-            throw new IllegalArgumentException("用法：/lora download <Civitai链接> [权重]、/lora status、/lora list、/lora load <完整本地名称> [权重] 或 /lora delete <名称|#编号>。权重默认 1，范围 0–2。");
+            throw new IllegalArgumentException("用法：/lora download <Civitai链接> [权重]、/lora status、/lora list、/lora detail <名称|#编号>、"
+                    + "/lora load <完整本地名称> [权重] 或 /lora delete <名称|#编号>。权重默认 1，范围 0–2。");
         JsonObject civitai = Json.obj(settings.snapshot(), "civitai");
         if (Json.bool(civitai, "admin_only", false) && !settings.isAdmin(Json.str(event, "user_id", "")))
             throw new IllegalArgumentException("LoRA 下载和加载已设为仅管理员可用；请在本机 config.json 的 admin_user_ids 配置管理员。");
@@ -2843,7 +2871,10 @@ public final class Bot implements AutoCloseable {
         try {
             // 刷新 WebUI 的 LoRA 目录并解析出本机标签（<lora:名字:权重>）——只读，不改任何 prompt。
             String tag = sd.resolvedLoraTag(downloaded.path(), weight);
-            showcaseReport = CivitaiStyleSync.sync(settings.root, downloaded, tag, sd, true, civitaiClientOrNull());
+            // 展示图样式要连模型参数一起存：底模按优先级识别（Civitai → Forge 元数据 → 预设推断），
+            // 采样方法/步数/CFG/Shift/尺寸取当前 Forge 预设栈。
+            JsonObject styleModel = loraStyleModel(downloaded.path().getFileName().toString(), downloaded.path(), downloaded.baseModel());
+            showcaseReport = CivitaiStyleSync.sync(settings.root, downloaded, tag, sd, true, civitaiClientOrNull(), styleModel);
             // 回执要短：触发词和"展示图 N → 样式名"的逐条清单又长又只是参考，全部留给日志与本机记录，
             // 回执只说"成了、标签是什么、有没有动提示词、顺带存了什么"。
             String name = filename.replaceFirst("(?i)\\.safetensors$", "");
@@ -2860,7 +2891,10 @@ public final class Bot implements AutoCloseable {
                 message.append("（详情已存进本机记录，需要时再查）");
             }
             message.append("\n").append(showcaseSummary(showcaseReport));
-            Log.info("LoRA 详情（" + name + "）：基础模型=" + display(Objects.requireNonNullElse(downloaded.baseModel(), ""))
+            SdClient.BaseModel downloadBase = loraBaseModel(filename, downloaded.path().toString(), null);
+            Log.info("LoRA 详情（" + name + "）：基础模型=" + display(downloadBase.known()
+                            ? downloadBase.name() + "（" + downloadBase.sourceLabel() + "）"
+                            : "未识别（Civitai 记录里没有，Forge 元数据里也没有）")
                     + "；展示图=" + (hasPreview ? previewFile.getFileName().toString() : "无")
                     + "；触发词=" + downloaded.trainedWords().size() + " 条\n" + showcaseReport);
             loraStatus = safeLoraText(message.toString());
@@ -3148,7 +3182,9 @@ public final class Bot implements AutoCloseable {
             CivitaiClient.DownloadedLora download = new CivitaiClient.DownloadedLora(
                     Json.str(record, "model_name", ""), Json.str(record, "version_name", ""), Json.str(record, "base_model", ""),
                     List.of(), file, true, modelId, versionId, showcases);
-            CivitaiStyleSync.sync(settings.root, download, tag, sd, true, client);
+            // 补图顺手把模型参数补齐：v1.0.10 之前存的展示图样式只有提示词，没有底模/采样参数。
+            JsonObject model = loraStyleModel(file.getFileName().toString(), file, Json.str(record, "base_model", ""));
+            CivitaiStyleSync.sync(settings.root, download, tag, sd, true, client, model);
             return (int) Math.max(0, stylePreviewCount() - before);
         } catch (Exception error) {
             Log.warn("补样式预览图失败（" + file.getFileName() + "）：" + error(error));
@@ -3165,6 +3201,98 @@ public final class Bot implements AutoCloseable {
     private static JsonObject readManifest(Path file) {
         try { return Files.isRegularFile(file) ? Json.parse(Files.readString(file)) : null; }
         catch (Exception error) { return null; }
+    }
+    /**
+     * 这个 LoRA 的 Civitai 记录里的底模（{@code data/civitai/<文件名>.json} 的 base_model）。
+     *
+     * <p>记录是按**下载时的文件名**存的，所以要用本机文件去对，不能拿 WebUI 的显示名去猜。
+     */
+    private String civitaiBaseModel(Path file) {
+        if (file == null) return "";
+        try {
+            JsonObject record = readManifest(settings.root.resolve("data/civitai").resolve(file.getFileName() + ".json"));
+            return record == null ? "" : Json.str(record, "base_model", "");
+        } catch (Exception error) { return ""; }
+    }
+    /**
+     * 一个 LoRA 的底模，优先级：Civitai 下载记录 → Forge 的 LoRA 元数据 → 当前 Forge 预设栈（标成推断）。
+     * 任何一步读不到都不影响其它来源：最差也只是"按当前预设推断"或"未识别"。
+     *
+     * @param presetFallback 当前预设栈的底模（列表里算一次就够，传 null 表示现读）
+     */
+    private SdClient.BaseModel loraBaseModel(String name, String path, SdClient.BaseModel presetFallback) {
+        Path file = null;
+        try { if (path != null && !path.isBlank()) file = Path.of(path); }
+        catch (Exception ignored) { /* 列表里的路径用不了就当没有 Civitai 记录 */ }
+        if (file == null || !Files.isRegularFile(file)) file = localLoraFile(name);
+        try { return sd.resolveBaseModel(civitaiBaseModel(file), name, path, presetFallback); }
+        catch (Exception error) { return presetFallback == null ? SdClient.BaseModel.NONE : presetFallback; }
+    }
+    /** 当前 Forge 预设栈的底模（列表兜底用，读一次）；读不到就是"没有"。 */
+    private SdClient.BaseModel presetBaseModelOrNone() {
+        try { return sd.presetBaseModel(); } catch (Exception error) { return SdClient.BaseModel.NONE; }
+    }
+    /**
+     * 在 LoRA 目录里按名字找一个文件（只扫目录，不问 WebUI）：列一页 LoRA 不该为每个都多打一次接口。
+     */
+    private Path localLoraFile(String name) {
+        String directory = Json.str(Json.obj(settings.snapshot(), "civitai"), "lora_dir", "");
+        String wanted = name == null ? "" : name.strip().replace('\\', '/');
+        if (directory.isBlank() || wanted.isBlank()) return null;
+        try {
+            Path base = Path.of(directory).toAbsolutePath().normalize();
+            String filename = wanted.substring(wanted.lastIndexOf('/') + 1);
+            Path direct = base.resolve(filename).normalize();
+            if (direct.startsWith(base) && Files.isRegularFile(direct)) return direct;
+            Path withExtension = base.resolve(filename.toLowerCase(Locale.ROOT).endsWith(".safetensors") ? filename : filename + ".safetensors").normalize();
+            return withExtension.startsWith(base) && Files.isRegularFile(withExtension) ? withExtension : null;
+        } catch (Exception error) { return null; }
+    }
+    /** 本机 Civitai 记录里的模型名（展示图样式的前缀就是它，查"这个 LoRA 有哪些样式"用）。 */
+    private String loraRecordName(Path file) {
+        JsonObject record = file == null ? null : readManifest(settings.root.resolve("data/civitai").resolve(file.getFileName() + ".json"));
+        return record == null ? "" : Json.str(record, "model_name", "");
+    }
+    /**
+     * 展示图样式要记下的模型参数：底模按优先级识别（Civitai → Forge 元数据 → 预设推断），
+     * 采样方法/调度器/步数/CFG/Shift/尺寸用当前 Forge 预设栈（没有预设就用机器人当前设置）。
+     * 算不出来就返回 null（样式只存提示词，照旧可用）。
+     */
+    private JsonObject loraStyleModel(String name, Path file, String civitaiBaseModel) {
+        try {
+            SdClient.BaseModel base = sd.resolveBaseModel(civitaiBaseModel, name, file == null ? "" : file.toString());
+            JsonObject model = sd.styleModelParams(base.name(), base.source());
+            if (model.size() > 0) Log.info("展示图样式模型参数（" + name + "）：底模=" + (base.known() ? base.name() + "（" + base.sourceLabel() + "）" : "未识别"));
+            return model.size() == 0 ? null : model;
+        } catch (Exception error) {
+            Log.warn("读取样式模型参数失败（展示图样式只存提示词）：" + error(error));
+            return null;
+        }
+    }
+    /** 按底模分组（网页 LoRA 面板的组头用，例如 Anima（4））；有底模的按名字排前，未识别的排最后。 */
+    private static JsonArray loraGroups(JsonArray items) {
+        Map<String, JsonObject> groups = new LinkedHashMap<>();
+        for (JsonElement element : items) {
+            JsonObject item = element.getAsJsonObject();
+            String key = Json.str(item, "groupKey", "");
+            JsonObject group = groups.get(key);
+            if (group == null) {
+                group = new JsonObject();
+                group.addProperty("key", key);
+                group.addProperty("baseModel", Json.str(item, "baseModel", ""));
+                group.addProperty("baseModelSource", Json.str(item, "baseModelSource", ""));
+                group.add("names", new JsonArray());
+                groups.put(key, group);
+            }
+            group.getAsJsonArray("names").add(Json.str(item, "name", ""));
+            group.addProperty("count", group.getAsJsonArray("names").size());
+        }
+        List<JsonObject> ordered = new ArrayList<>(groups.values());
+        ordered.sort(Comparator.comparingInt((JsonObject group) -> Json.str(group, "key", "").isEmpty() ? 1 : 0)
+                .thenComparing(group -> Json.str(group, "baseModel", "").toLowerCase(Locale.ROOT)));
+        JsonArray result = new JsonArray();
+        for (JsonObject group : ordered) result.add(group);
+        return result;
     }
     /**
      * 本机 LoRA 有没有展示图（{@code <模型名>.preview.png}）。控制台据此决定显示缩略图还是占位。
@@ -3196,6 +3324,54 @@ public final class Bot implements AutoCloseable {
             Path file = cn.szu.bot.sd.StylePreviews.file(settings.root, name);
             return file != null && Files.isRegularFile(file) ? file : null;
         } catch (Exception ignored) { return null; }
+    }
+    /**
+     * `/lora detail <名称|#编号>`：一个 LoRA 的底模（含来源）、文件位置、Civitai 记录与它的展示图样式。
+     * 底模走和列表同一条优先级（Civitai 记录 → Forge 元数据 → 当前预设推断），识别不出来就如实说没有。
+     */
+    private String loraDetailText(String requested) throws Exception {
+        List<SdClient.Lora> catalog = sd.loras();
+        SdClient.Lora found = null;
+        for (SdClient.Lora item : catalog) {
+            String stem = item.path().replace('\\', '/');
+            stem = stem.substring(stem.lastIndexOf('/') + 1).replaceFirst("(?i)\\.safetensors$", "");
+            if (item.name().equalsIgnoreCase(requested) || item.alias().equalsIgnoreCase(requested) || stem.equalsIgnoreCase(requested)) {
+                found = item; break;
+            }
+        }
+        if (found == null) throw new IllegalArgumentException("WebUI 列表里没有「" + requested + "」；用 /lora list 核对名称（编号也行）。");
+        String directory = Json.str(Json.obj(settings.snapshot(), "civitai"), "lora_dir", "");
+        Path file = null;
+        try { file = Path.of(found.path()); } catch (Exception ignored) { /* 列表里的路径不可用时退回扫目录 */ }
+        if (file == null || !Files.isRegularFile(file)) file = localLoraFile(found.name());
+        SdClient.BaseModel base = loraBaseModel(found.name(), found.path(), presetBaseModelOrNone());
+        StringBuilder text = new StringBuilder("LoRA：" + found.name());
+        if (!found.alias().isBlank() && !found.alias().equals(found.name())) text.append("\n别名：").append(found.alias());
+        text.append("\n文件：").append(found.path());
+        text.append("\n底模：").append(base.known() ? base.name() + base.note() : "未识别");
+        if (base.known()) text.append("（来源：").append(base.sourceLabel()).append("）");
+        JsonObject record = file == null ? null : readManifest(settings.root.resolve("data/civitai").resolve(file.getFileName() + ".json"));
+        if (record == null) {
+            text.append("\nCivitai 记录：无（不是用 /lora download 下的，或记录已删）");
+        } else {
+            String recorded = Json.str(record, "base_model", "");
+            text.append("\nCivitai 记录：").append(Json.str(record, "model_name", "未命名"))
+                    .append(" / ").append(Objects.requireNonNullElse(Json.str(record, "version_name", ""), "").isBlank() ? "未知版本" : Json.str(record, "version_name", ""))
+                    .append("；记录里的底模=").append(recorded.isBlank() ? "未记录" : recorded);
+            int words = record.has("trained_words") && record.get("trained_words").isJsonArray()
+                    ? record.getAsJsonArray("trained_words").size() : 0;
+            text.append("\n触发词：").append(words).append(" 条");
+        }
+        text.append("\n展示图：").append(hasLoraPreview(directory, found.name())
+                ? found.name() + ".preview.png" : "无（/lora cover " + found.name() + " 可补抓）");
+        String recordName = loraRecordName(file);
+        List<String> styles = new ArrayList<>();
+        if (!recordName.isBlank()) {
+            String stylePrefix = CivitaiStyleSync.prefix(recordName) + " ";
+            for (String style : localStyles.names()) if (style.startsWith(stylePrefix)) styles.add(style);
+        }
+        text.append("\n展示图样式：").append(styles.isEmpty() ? "无" : styles.size() + " 个（" + String.join("、", styles) + "）");
+        return text.toString();
     }
     private record LoraSelection(String name, double weight) {}
     private static LoraSelection loraSelection(String value) {
@@ -5657,12 +5833,36 @@ public final class Bot implements AutoCloseable {
     public JsonObject webStyles() throws Exception {
         List<String> local = localStyles.names();
         JsonArray items = new JsonArray();
+        // 底模分类：列表上方的"Anima 12 个、NoobAI 5 个"用。**不重排列表**——样式编号是
+        // .style load #N、批量 #6-#9 的依据，因为分组而变号会让那些指令打错目标。
+        Map<String, Integer> byBase = new LinkedHashMap<>();
         int number = 0;
-        for (String name : local) items.add(styleItem(++number, name, "local"));
+        for (String name : local) {
+            JsonObject item = styleItem(++number, name, "local");
+            items.add(item);
+            String base = Json.str(item, "baseModel", "");
+            if (!base.isBlank()) byBase.merge(base, 1, Integer::sum);
+        }
         JsonObject result = new JsonObject();
         result.add("styles", items);
         result.add("local", Json.GSON.toJsonTree(local));
         result.addProperty("library", local.size());
+        result.add("baseModelGroups", styleBaseModelGroups(byBase));
+        return result;
+    }
+
+    /** 样式按底模分类的汇总（数量多的在前，同数量按名字）。 */
+    private static JsonArray styleBaseModelGroups(Map<String, Integer> counts) {
+        List<Map.Entry<String, Integer>> entries = new ArrayList<>(counts.entrySet());
+        entries.sort(Comparator.comparingInt((Map.Entry<String, Integer> entry) -> -entry.getValue())
+                .thenComparing(entry -> entry.getKey().toLowerCase(Locale.ROOT)));
+        JsonArray result = new JsonArray();
+        for (Map.Entry<String, Integer> entry : entries) {
+            JsonObject group = new JsonObject();
+            group.addProperty("baseModel", entry.getKey());
+            group.addProperty("count", entry.getValue());
+            result.add(group);
+        }
         return result;
     }
     /** 一行样式：带原文（网页「查看原文」直接弹信息框，不用再走指令通道）。 */
@@ -5679,6 +5879,13 @@ public final class Bot implements AutoCloseable {
             if (style != null) {
                 item.addProperty("positive", style.positive() == null ? "" : style.positive());
                 item.addProperty("negative", style.negative() == null ? "" : style.negative());
+                // 样式记着的模型参数（底模 + 采样方法/调度器/步数/CFG/Shift/尺寸）：面板直接显示摘要，
+                // 底模还给一份单独的字段，方便按底模标注。
+                if (style.hasModel()) {
+                    item.add("model", style.model().deepCopy());
+                    item.addProperty("modelSummary", style.modelSummary());
+                    item.addProperty("baseModel", Json.str(style.model(), "baseModel", ""));
+                }
             }
         } catch (Exception error) { /* 单条读不出来不影响列表 */ }
         return item;
@@ -5748,6 +5955,8 @@ public final class Bot implements AutoCloseable {
             failure = error(error);
         }
         String directory = Json.str(Json.obj(settings.snapshot(), "civitai"), "lora_dir", "");
+        // 底模兜底（当前 Forge 预设栈）只读一次：每个 LoRA 都去问一次 Forge 没必要。
+        SdClient.BaseModel presetBase = loras.isEmpty() ? SdClient.BaseModel.NONE : presetBaseModelOrNone();
         for (int index = 0; index < loras.size(); index++) {
             JsonObject item = new JsonObject();
             item.addProperty("number", index + 1);
@@ -5755,10 +5964,17 @@ public final class Bot implements AutoCloseable {
             item.addProperty("alias", loras.get(index).alias());
             // 有展示图才给 true：前端据此决定显示缩略图还是"无图"占位，不必自己去猜文件名。
             item.addProperty("preview", hasLoraPreview(directory, loras.get(index).name()));
+            // 底模（基础模型）：Civitai 记录 → Forge 元数据 → 当前预设栈（标注为推断）。前端按 groupKey 分组。
+            SdClient.BaseModel base = loraBaseModel(loras.get(index).name(), loras.get(index).path(), presetBase);
+            item.addProperty("baseModel", base.name());
+            item.addProperty("baseModelSource", base.source());
+            item.addProperty("baseModelLabel", base.known() ? "底模 " + base.name() + base.note() : "底模未识别");
+            item.addProperty("groupKey", base.groupKey());
             items.add(item);
         }
         JsonObject result = new JsonObject();
         result.add("loras", items);
+        result.add("groups", loraGroups(items));
         result.addProperty("count", items.size());
         result.addProperty("directory", directory);
         result.addProperty("downloadStatus", loraStatus);

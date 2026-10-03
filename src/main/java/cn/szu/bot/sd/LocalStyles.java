@@ -30,8 +30,14 @@ public final class LocalStyles {
         public String modelSummary() {
             if (!hasModel()) return "";
             List<String> parts = new ArrayList<>();
+            String baseModel = Json.str(model, "baseModel", "");
             String checkpoint = Json.str(model, "checkpoint", "");
-            if (!checkpoint.isBlank()) parts.add("底模 " + checkpoint);
+            // 底模是"这个样式属于哪个基础模型"的分类信息，来源也要写出来（推断的要显式标成推断）。
+            if (!baseModel.isBlank()) parts.add("底模 " + baseModel + sourceNote(Json.str(model, "baseModelSource", "")));
+            // 检查点与底模是同一个东西时（按当前预设推断出来的那种）就不重复写一遍。
+            if (!checkpoint.isBlank() && !checkpoint.equalsIgnoreCase(baseModel)
+                    && !checkpoint.toLowerCase(java.util.Locale.ROOT).startsWith(baseModel.toLowerCase(java.util.Locale.ROOT) + "."))
+                parts.add("检查点 " + checkpoint);
             String preset = Json.str(model, "forge_preset", "");
             if (!preset.isBlank()) parts.add("Forge 预设 " + preset);
             String sampler = Json.str(model, "sampler", "");
@@ -47,6 +53,15 @@ public final class LocalStyles {
             int width = Json.num(model, "width", 0), height = Json.num(model, "height", 0);
             if (width > 0 && height > 0) parts.add(width + "×" + height);
             return String.join("，", parts);
+        }
+        /** 底模来源的中文括号注（与 SdClient.BaseModel.sourceLabel 同一个词表）。 */
+        private static String sourceNote(String source) {
+            return switch (source == null ? "" : source) {
+                case SdClient.CIVITAI_SOURCE -> "（Civitai 记录）";
+                case SdClient.FORGE_SOURCE -> "（Forge 元数据）";
+                case SdClient.PRESET_SOURCE -> "（按当前预设推断）";
+                default -> "";
+            };
         }
     }
     /** 批量导入的结果：导入/覆盖了多少条、因为同名跳过多少条。 */

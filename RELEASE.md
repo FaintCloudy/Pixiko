@@ -1,13 +1,38 @@
-# Pixiko v1.0.9 发行说明
+# Pixiko v1.0.10 发行说明
 
-- **版本**：v1.0.9
-- **日期**：2026-10-03
+- **版本**：v1.0.10
+- **日期**：2026-10-04
 - **作者**：loriko（deloriko@outlook.com）
 - **当前实现**：Java 版（`src/`）。另有一次**未完成的** Next.js 重构，见 `nextjs-wip/`，**不可运行**。
 
 ---
 
-## 〇、本版新增（v1.0.9）
+## 〇、本版新增（v1.0.10）
+
+**每个 LoRA 都有底模了，样式也按底模归类**。以前 LoRA 列表只有文件名与别名，样式里只有提示词——
+这台机器上 Anima / NoobAI / SD1.5 的 LoRA 混在一堆，换上错的底模出的是全灰废图。
+
+- **底模识别**（`.lora list`、`.lora detail`、网页「LoRA」面板、`GET /api/loras`）：优先级是
+  **Civitai 下载记录**（`data/civitai/<文件名>.json` 的 `base_model`）→ **Forge 的 LoRA 元数据**
+  （`/sdapi/v1/loras` 每项的 `metadata.ss_base_model_version`；sd-scripts 的占位
+  `ss_sd_model_name=model.safetensors` 不算）→ **当前 Forge 预设栈**（标注「按当前预设推断」）。
+  三层都取不到就如实显示「未识别」，**不编造底模名**。返回值带 `baseModel` / `baseModelSource`
+  （`civitai` / `forge-metadata` / `preset-inferred`）/ `groupKey`，并在 `groups` 里给出按底模分组的结果。
+- **网页 LoRA 面板按底模分组**：组头写底模名与来源（`Anima（4）· Civitai 记录`），每项也带自己的底模标签。
+- **展示图样式带上模型参数**：下载 LoRA（以及「补展示图/样式」）时生成的样式，会把自己的底模 +
+  **采样方法 / 调度器 / 步数 / CFG / Shift（蒸馏 CFG）/ 尺寸**一起写进 `data/local-styles.json` 的
+  `model` 字段。采样参数取**当前 Forge 预设栈**的推荐值，预设里没给（例如 Anima 的尺寸是 0）就逐项
+  回退到机器人当前设置；底模只有和当前栈对得上时才写成可加载的 `checkpoint`（写别的栈的检查点会出全灰废图）。
+  老样式（v1.0.10 之前只有提示词的那些）在下次补展示图时会被补上模型参数，回执里报「补模型参数 N」。
+- **样式面板标注底模**：`GET /api/styles` 每条样式带 `model` / `modelSummary` / `baseModel`，
+  网页「样式」页上方汇总「底模：Anima 12、NoobAI 5」（列表**不重排**——编号是 `.style load #N`
+  与批量 `#6-#9` 的依据），每条样式行显示它记着的底模与参数摘要。
+- **测试**：`LoraBaseModelTest` 覆盖来源优先级（civitai → forge 元数据 → 预设推断）、占位元数据不当底模、
+  展示图样式写盘带 `model`、样式载入套用参数、以及"都识别不出来时不编造底模"；`WebUiTest` 补了
+  `/api/loras` 新字段与分组的断言。
+
+<details>
+<summary>上一版（v1.0.9）</summary>
 
 **聊天提示词自动落盘**：每次聊天都把**实际发给 DeepSeek 的那份请求**导出成可读文本
 `data/chat-prompt.txt`——`## system` 段就是系统提示词（硬规则 + 可用指令表 + 基础性格），
@@ -16,6 +41,8 @@
 默认**不含对话历史**（历史是逐轮累积的对话正文，不是提示词的一部分）；要连历史一起导出，
 把 `config.json` 里 `chat.export_history` 设为 `true`；整个开关是 `chat.export_prompt`（默认开）。
 导出失败只记日志，不影响聊天本身。
+
+</details>
 
 <details>
 <summary>上一版（v1.0.8）</summary>

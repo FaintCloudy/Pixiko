@@ -24,6 +24,34 @@ public final class SdClient {
     public record StylePrompt(String name, String positive, String negative) {}
     public record Lora(String name, String alias, String path) {}
     public record LoadedLora(String name, String tag, Prompts prompts) {}
+    /** 底模的来源标记（与网页/回执里的 baseModelSource 字段同一个词表）。 */
+    public static final String CIVITAI_SOURCE = "civitai", FORGE_SOURCE = "forge-metadata", PRESET_SOURCE = "preset-inferred";
+    /**
+     * 一个 LoRA 的底模（基础模型）：{@code name} 是展示名，{@code source} 是它是怎么来的。
+     *
+     * <p>优先级：{@code civitai}（Civitai 下载记录）→ {@code forge-metadata}（Forge 的 LoRA 元数据）
+     * → {@code preset-inferred}（两处都没有，按当前 Forge 预设栈**推断**）。推断出来的必须标明，
+     * 它是"当前这台机器在跑什么栈"，不是这个 LoRA 自己报的底模，更不许编一个名字出来。
+     */
+    public record BaseModel(String name, String source) {
+        public static final BaseModel NONE = new BaseModel("", "");
+        public BaseModel { name = name == null ? "" : name.strip(); source = source == null ? "" : source.strip(); }
+        /** 有没有真的识别（或推断）出底模。 */
+        public boolean known() { return !name.isEmpty(); }
+        /** 分组键：同一个底模的不同写法算一组（未识别为空串，排最后）。 */
+        public String groupKey() { return name.toLowerCase(java.util.Locale.ROOT); }
+        /** 回执/网页上的来源标注；推断出来的要显式写出来。 */
+        public String sourceLabel() {
+            return switch (source) {
+                case CIVITAI_SOURCE -> "Civitai 记录";
+                case FORGE_SOURCE -> "Forge 元数据";
+                case PRESET_SOURCE -> "按当前预设推断";
+                default -> source;
+            };
+        }
+        /** 拼在底模名后面的那句"这是推断的"（识别出来的不加）。 */
+        public String note() { return source.equals(PRESET_SOURCE) ? "（按当前预设推断）" : ""; }
+    }
     /**
      * 一次生成用的"界面侧"设置。
      *
@@ -106,6 +134,8 @@ public final class SdClient {
     private boolean settingsBridgeAvailable, settingsInitialized;
     private ImageOutbox imageOutbox;
     private GenerationParameters generationParameters;
+    /** 上一次读 LoRA 列表时，Forge 元数据里各 LoRA 自报的底模（键是小写名字/别名/文件名）。 */
+    private volatile Map<String, String> forgeLoraBases = Map.of();
 
     public SdClient(Path root, JsonObject config) throws IOException {
         this.root = root.toAbsolutePath().normalize();
@@ -445,6 +475,11 @@ public final class SdClient {
             try { setSize(width, height); applied.add(width + "×" + height); }
             catch (Exception error) { applied.add("尺寸 " + width + "×" + height + " 未被接受（保留原值）"); }
         }
+        // 展示图样式可能只记下了底模：那个底模不在当前 Forge 预设栈里时就没有可加载的检查点
+        // （写别的栈的检查点会出全灰废图），如实说一句，别让"样式带参数"看起来像没生效。
+        String baseModel = Json.str(model, "baseModel", "");
+        if (checkpoint.isBlank() && !baseModel.isBlank())
+            applied.add("底模 " + baseModel + "（样式记录的底模，未自动切换）");
         return applied;
     }
 
@@ -693,6 +728,7 @@ public final class SdClient {
     public List<Lora> loras() throws Exception {
         JsonArray catalog = responseArray(request("/sdapi/v1/loras", "GET", null, false, false), "读取 LoRA 列表");
         List<Lora> result = new ArrayList<>();
+        Map<String, String> bases = new HashMap<>();
         for (JsonElement item : catalog) {
             if (!item.isJsonObject()) throw new IOException("WebUI LoRA 列表格式无效。");
             JsonObject value = item.getAsJsonObject();
@@ -700,8 +736,200 @@ public final class SdClient {
             String alias = value.has("alias") && !value.get("alias").isJsonNull() ? requireString(value, "alias") : name;
             if (name.isBlank() || path.isBlank()) throw new IOException("WebUI LoRA 列表包含空名称或路径。");
             result.add(new Lora(name, alias, path));
+            // 顺手记下每项在 Forge 元数据里自报的底模：底模识别要它，但不想为此再发一次请求。
+            String base = metadataBaseModel(value.get("metadata"));
+            if (!base.isBlank()) for (String key : loraKeys(name, alias, path)) bases.putIfAbsent(key, base);
         }
+        forgeLoraBases = Map.copyOf(bases);
         return List.copyOf(result);
+    }
+
+    /**
+     * Forge 的 LoRA 元数据里自报的底模。
+     *
+     * <p>实测（Forge Neo，{@code GET /sdapi/v1/loras}）：本机一个 LoRA 的元数据里有
+     * {@code ss_base_model_version="anima"}；另一个没有这个键，只有 sd-scripts 的占位
+     * {@code ss_sd_model_name="model.safetensors"}——后者是"训练时没记底模"，必须当成没有，
+     * 拿它当底模就是编造。{@code modelspec.architecture} 是最后一条线索（如 stable-diffusion-v1/lora）。
+     */
+    static String metadataBaseModel(JsonElement metadata) {
+        if (metadata == null || !metadata.isJsonObject()) return "";
+        JsonObject value = metadata.getAsJsonObject();
+        for (String key : List.of("ss_base_model_version", "ss_sd_model_name", "modelspec.architecture")) {
+            String candidate = usableBaseModel(Json.str(value, key, ""));
+            if (!candidate.isEmpty()) return candidate;
+        }
+        return "";
+    }
+
+    /** 明显的占位值当成"没有底模"：识别不出来时宁可回退到预设栈，也不要编一个名字。 */
+    private static String usableBaseModel(String value) {
+        String text = value == null ? "" : value.strip();
+        if (text.isEmpty()) return "";
+        return switch (text.toLowerCase(java.util.Locale.ROOT)) {
+            case "unknown", "未知", "none", "null", "n/a", "na", "-", "model", "model.safetensors",
+                 "unknown.safetensors" -> "";
+            default -> text;
+        };
+    }
+
+    /** 各来源对同一个底模的写法不一样（Civitai 写 Anima，Forge 写 anima），统一成同一个展示名。 */
+    static String canonicalBaseModel(String raw) {
+        String value = usableBaseModel(raw);
+        if (value.isEmpty()) return "";
+        String key = value.toLowerCase(java.util.Locale.ROOT).replace('_', ' ').replace('-', ' ').strip();
+        if (key.endsWith("/lora")) key = key.substring(0, key.length() - "/lora".length()).strip();
+        return switch (key) {
+            case "anima" -> "Anima";
+            case "sd15", "sd 1.5", "sd1.5", "stable diffusion v1", "stable diffusion 1.5", "sd v1" -> "SD 1.5";
+            case "sd21", "sd 2.1", "stable diffusion 2.1" -> "SD 2.1";
+            case "sdxl", "sd xl", "sdxl 1.0", "stable diffusion xl" -> "SDXL";
+            case "illustrious" -> "Illustrious";
+            case "noobai", "noobai xl" -> "NoobAI";
+            case "pony" -> "Pony";
+            case "flux", "flux.1", "flux 1" -> "Flux";
+            case "qwen", "qwen image" -> "Qwen Image";
+            default -> value;
+        };
+    }
+
+    /** 上一次读 LoRA 列表时 Forge 元数据自报的底模（名字/别名/文件名都能查；查不到返回空串）。 */
+    public String forgeLoraBaseModel(String loraName, String loraPath) {
+        Map<String, String> bases = forgeLoraBases;
+        if (bases.isEmpty()) return "";
+        for (String key : loraKeys(loraName, "", loraPath)) {
+            String value = bases.get(key);
+            if (value != null && !value.isBlank()) return value;
+        }
+        return "";
+    }
+
+    /** 一个 LoRA 的几种写法（名字/别名/文件名/文件名去扩展名），统一小写当键。 */
+    private static List<String> loraKeys(String name, String alias, String path) {
+        List<String> keys = new ArrayList<>();
+        addLoraKey(keys, name);
+        addLoraKey(keys, alias);
+        String normalized = path == null ? "" : path.replace('\\', '/');
+        String filename = normalized.isEmpty() ? "" : normalized.substring(normalized.lastIndexOf('/') + 1);
+        addLoraKey(keys, filename);
+        addLoraKey(keys, filename.replaceFirst("(?i)\\.safetensors$", ""));
+        return keys;
+    }
+
+    private static void addLoraKey(List<String> keys, String value) {
+        if (value == null) return;
+        String key = value.strip().toLowerCase(java.util.Locale.ROOT);
+        if (!key.isEmpty() && !keys.contains(key)) keys.add(key);
+    }
+
+    /**
+     * 解析一个 LoRA 的底模：Civitai 记录 → Forge 元数据 → 当前 Forge 预设栈（标注为推断）。
+     *
+     * @param civitaiBaseModel Civitai 下载记录里的 base_model（没有就空串）
+     * @param presetFallback   预设栈兜底（一次列表里只读一遍，别每个 LoRA 都问一次 Forge）；null 表示现读
+     */
+    public synchronized BaseModel resolveBaseModel(String civitaiBaseModel, String loraName, String loraPath, BaseModel presetFallback) {
+        String recorded = usableBaseModel(civitaiBaseModel);
+        if (!recorded.isEmpty()) return new BaseModel(canonicalBaseModel(recorded), CIVITAI_SOURCE);
+        String metadata = usableBaseModel(forgeLoraBaseModel(loraName, loraPath));
+        if (!metadata.isEmpty()) return new BaseModel(canonicalBaseModel(metadata), FORGE_SOURCE);
+        return presetFallback == null ? presetBaseModel() : presetFallback;
+    }
+
+    public synchronized BaseModel resolveBaseModel(String civitaiBaseModel, String loraName, String loraPath) {
+        return resolveBaseModel(civitaiBaseModel, loraName, loraPath, null);
+    }
+
+    /** 当前 Forge 预设栈的底模，作为"识别不出来"时的兜底（肯定标成推断）。没有预设就是"没有"。 */
+    public synchronized BaseModel presetBaseModel() {
+        JsonObject preset = activePresetDefaults();
+        String stack = firstNonBlank(Json.str(preset, "checkpoint", ""), Json.str(preset, "preset", "")).strip();
+        return stack.isEmpty() ? BaseModel.NONE : new BaseModel(stack, PRESET_SOURCE);
+    }
+
+    /**
+     * 当前 Forge 预设栈的推荐参数（preset/checkpoint/sampler/scheduler/steps/cfg/distilledCfg/width/height）。
+     *
+     * <p>以 {@code /sdapi/v1/options} 为准（实测这台 Forge Neo 的 options 里就有 {@code forge_preset}
+     * 与 {@code <preset>_t2i_*}），SD 离线读不到时退回它自己的 {@code config.json}。只放进**真的给了值**的键：
+     * Anima 的 {@code width/height} 是 0（意思是"用当前值"），调用方要能逐项回退到机器人当前设置。
+     */
+    public synchronized JsonObject activePresetDefaults() {
+        JsonObject options;
+        try { options = options(); } catch (Exception ignored) { options = new JsonObject(); }
+        JsonObject saved = forgeConfig();
+        String preset = firstNonBlank(Json.str(options, "forge_preset", ""), Json.str(saved, "forge_preset", "")).strip();
+        JsonObject result = new JsonObject();
+        if (preset.isEmpty()) return result;
+        result.addProperty("preset", preset);
+        addPresetValue(result, "checkpoint", options, saved, "forge_checkpoint_" + preset);
+        addPresetValue(result, "sampler", options, saved, preset + "_t2i_sampler");
+        addPresetValue(result, "scheduler", options, saved, preset + "_t2i_scheduler");
+        addPresetValue(result, "steps", options, saved, preset + "_t2i_step");
+        addPresetValue(result, "cfg", options, saved, preset + "_t2i_cfg");
+        addPresetValue(result, "distilledCfg", options, saved, preset + "_t2i_dcfg");
+        addPresetValue(result, "width", options, saved, preset + "_t2i_width");
+        addPresetValue(result, "height", options, saved, preset + "_t2i_height");
+        return result;
+    }
+
+    /** 预设里没配的键不要放进来（空串与数值 0 都算"没配"），让调用方逐项回退。 */
+    private static void addPresetValue(JsonObject target, String targetKey, JsonObject primary, JsonObject secondary, String key) {
+        JsonElement value = primary.has(key) ? primary.get(key) : secondary.get(key);
+        if (value == null || value.isJsonNull()) return;
+        if (value.isJsonPrimitive()) {
+            JsonPrimitive primitive = value.getAsJsonPrimitive();
+            if (primitive.isString() && primitive.getAsString().isBlank()) return;
+            if (primitive.isNumber() && primitive.getAsDouble() == 0) return;
+        }
+        target.add(targetKey, value.deepCopy());
+    }
+
+    /**
+     * 一份样式的模型参数快照（写进 {@code data/local-styles.json} 的 model 字段）。
+     *
+     * <p>底模用调用方识别出来的那个（Civitai 记录 → Forge 元数据）；识别不出来就按当前 Forge 预设栈推断，
+     * 来源标成 {@code preset-inferred}——**绝不编造**底模名。采样方法/调度器/步数/CFG/Shift(蒸馏 CFG)/尺寸
+     * 取当前预设栈的推荐参数，预设里没有的项再逐项回退到机器人当前设置。
+     *
+     * <p>只有和当前栈**对得上**的底模才写成 {@code checkpoint}：写别的栈的检查点，载入样式后出的是全灰废图。
+     */
+    public synchronized JsonObject styleModelParams(String baseModel, String baseModelSource) {
+        JsonObject result = new JsonObject();
+        JsonObject preset = activePresetDefaults();
+        String presetName = Json.str(preset, "preset", "");
+        String stack = Json.str(preset, "checkpoint", "");
+        String recorded = usableBaseModel(baseModel);
+        if (!recorded.isEmpty()) {
+            result.addProperty("baseModel", canonicalBaseModel(recorded));
+            result.addProperty("baseModelSource", baseModelSource == null ? "" : baseModelSource.strip());
+            if (matchesStack(recorded, presetName, stack)) result.addProperty("checkpoint", stack);
+        } else if (!stack.isEmpty() || !presetName.isEmpty()) {
+            result.addProperty("baseModel", stack.isEmpty() ? presetName : stack);
+            result.addProperty("baseModelSource", PRESET_SOURCE);
+            if (!stack.isEmpty()) result.addProperty("checkpoint", stack);
+        }
+        if (!presetName.isEmpty()) result.addProperty("forge_preset", presetName);
+        JsonObject current = modelParams();
+        for (String key : List.of("sampler", "scheduler", "steps", "cfg", "distilledCfg", "width", "height")) {
+            JsonElement value = preset.has(key) ? preset.get(key) : current.get(key);
+            if (value == null || value.isJsonNull()) continue;
+            result.add(key, value.deepCopy());
+        }
+        return result;
+    }
+
+    /**
+     * 这个底模是不是当前预设栈的那一个。Civitai 写 "Anima"、Forge 的预设名是 "anima"、
+     * 检查点文件名是 "animaCatTower_v11.safetensors"——三种写法都要能对上，对不上就不写检查点。
+     */
+    private static boolean matchesStack(String baseModel, String presetName, String checkpoint) {
+        String wanted = usableBaseModel(baseModel).toLowerCase(java.util.Locale.ROOT);
+        if (wanted.isEmpty()) return false;
+        if (!presetName.isBlank() && presetName.strip().toLowerCase(java.util.Locale.ROOT).equals(wanted)) return true;
+        if (checkpoint.isBlank()) return false;
+        String file = bareModel(checkpoint).toLowerCase(java.util.Locale.ROOT);
+        return !file.isEmpty() && (file.equals(wanted) || file.contains(wanted) || wanted.contains(file));
     }
 
     /** 磁盘上的 LoRA 文件变了（删除/重命名/下载）之后刷新 WebUI 的 LoRA 目录。 */

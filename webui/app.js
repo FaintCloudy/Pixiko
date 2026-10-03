@@ -6,7 +6,7 @@
   const state = { token: localStorage.getItem(TOKEN_KEY) || '', status: null, options: null, pollTimer: null, followTimer: null, busy: 0,
     seenImages: new Map(), seenGroups: new Map(), followUntil: 0, receiptKey: '', receiptTexts: 0, receiptImages: 0,
     receiptCount: 0, receiptBox: null, receiptToasted: '',
-    loras: null, terminalHistory: [], terminalCursor: 0 };
+    loras: null, loraGroups: null, terminalHistory: [], terminalCursor: 0 };
 
   const $ = (id) => document.getElementById(id);
   const el = (tag, cls, text) => { const node = document.createElement(tag); if (cls) node.className = cls; if (text !== undefined) node.textContent = text; return node; };
@@ -876,8 +876,12 @@
   function renderStyles(data) {
     $('style-loaded').textContent = '载入即替换，之后 prompt 由你自己改';
     $('style-pageselected').textContent = '样式库 ' + (data.library ?? (data.styles || []).length) + ' 个（只属于机器人，与 WebUI 的样式互不影响）';
+    // 底模分类：列表不按底模重排（编号是 .style load #N / 批量 #6-#9 的依据），只在上面汇总一行。
+    const groups = (data.baseModelGroups || []).map((group) => group.baseModel + ' ' + group.count);
+    if (groups.length) $('style-pageselected').textContent += '；底模：' + groups.join('、');
     const filter = $('style-filter').value.trim().toLowerCase();
-    const items = (data.styles || []).filter((item) => !filter || item.name.toLowerCase().includes(filter));
+    const items = (data.styles || []).filter((item) => !filter || item.name.toLowerCase().includes(filter)
+      || String(item.baseModel || '').toLowerCase().includes(filter));
     styleItems.clear();
     (data.styles || []).forEach((item) => styleItems.set(item.name, item));
     syncRows($('style-list'), styleRows, items, styleRow, '没有匹配的样式。');
@@ -921,6 +925,14 @@
     label.onclick = startRename;
     name.appendChild(label);
     name.appendChild(el('div', 'sub', '载入时替换你的个人提示词，之后 prompt 就是你自己的文本'));
+    // 样式保存时记下的模型参数（底模 + 采样方法/调度器/步数/CFG/Shift/尺寸）：载入时一并套用。
+    if (item.modelSummary) {
+      const model = el('div', 'sub');
+      model.appendChild(el('span', 'tag', item.baseModel || '底模未记录'));
+      model.appendChild(document.createTextNode(' ' + item.modelSummary));
+      model.title = item.modelSummary;
+      name.appendChild(model);
+    }
     li.appendChild(name);
     const acts = el('div', 'acts');
     acts.appendChild(actionButton('载入', () => {
@@ -935,7 +947,8 @@
       const current = li.dataset.name || item.name;
       const data = styleItems.get(current) || item;
       showInfo('样式原文：' + current,
-        '正向：\n' + (data.positive || '（空）') + '\n\n反向：\n' + (data.negative || '（空）'),
+        '正向：\n' + (data.positive || '（空）') + '\n\n反向：\n' + (data.negative || '（空）')
+          + (data.modelSummary ? '\n\n模型参数（载入时一并套用）：\n' + data.modelSummary : '\n\n模型参数：这条样式没记录（保存时读不到 SD 参数）。'),
         { text: '这是一份固定模板：载入会把这两段原样写进你个人的提示词。' });
     }, 'ghost'));
     acts.appendChild(actionButton('删除', async () => {
@@ -994,7 +1007,7 @@
   async function loadLoras() {
     const list = $('lora-list');
     // 先用手上这份列表渲染：切页签、刷新失败时都不会出现"空列表"的错觉。
-    if (!list.children.length && state.loras) renderLoras(state.loras);
+    if (!list.children.length && state.loras) renderLoras(state.loras, state.loraGroups);
     if (!list.children.length) list.appendChild(el('li', 'muted', '正在读取本机 LoRA…'));
     let data;
     try {
@@ -1008,6 +1021,7 @@
       return;
     }
     state.loras = data.loras || [];
+    state.loraGroups = data.groups || [];
     const count = $('lora-count');
     if (data.error) {
       // SD 没在跑：说清楚原因，别显示成"本机没有 LoRA 文件"。
@@ -1018,7 +1032,7 @@
       if (count) count.textContent = '';
       return;
     }
-    renderLoras(state.loras);
+    renderLoras(state.loras, state.loraGroups);
     $('lora-status').textContent = data.status || ('本机 ' + state.loras.length + ' 个 LoRA');
     if (count) count.textContent = '共 ' + state.loras.length + ' 个' + (data.directory ? '（' + data.directory + '）' : '');
     // 进面板时后台可能正在下载（甚至刷新过页面）：接着把进度条挂上，不然进度就"看不见了"。
@@ -1116,17 +1130,82 @@
     tick();
   }
 
-  /** 渲染本机 LoRA 列表（同样增量同步：加载/删除后不整表重画，列表不会晃）。 */
-  function renderLoras(items) {
+  /** 底模来源的中文说法（和机器人回执同一个词表）。 */
+  function baseModelSourceLabel(source) {
+    if (source === 'civitai') return 'Civitai 记录';
+    if (source === 'forge-metadata') return 'Forge 元数据';
+    if (source === 'preset-inferred') return '按当前预设推断';
+    return '';
+  }
+
+  /** 按底模分组：组头是底模名，来源写在旁边；未识别的排最后（组序由后端 groups 定）。 */
+  function loraBuckets(items, groups) {
+    const meta = new Map((groups || []).map((group) => [String(group.key == null ? '' : group.key), group]));
+    const order = new Map((groups || []).map((group, index) => [String(group.key == null ? '' : group.key), index]));
+    const buckets = new Map();
+    items.forEach((item) => {
+      const key = String(item.groupKey == null ? '' : item.groupKey);
+      if (!buckets.has(key)) {
+        const group = meta.get(key) || {};
+        buckets.set(key, {
+          key,
+          keyed: !!key,
+          title: group.baseModel || item.baseModel || '未识别底模',
+          source: baseModelSourceLabel(group.baseModelSource || item.baseModelSource),
+          items: [],
+        });
+      }
+      buckets.get(key).items.push(item);
+    });
+    return [...buckets.values()].sort((left, right) => {
+      if (left.keyed !== right.keyed) return left.keyed ? -1 : 1;         // 未识别底模的排最后
+      const leftRank = order.has(left.key) ? order.get(left.key) : order.size;
+      const rightRank = order.has(right.key) ? order.get(right.key) : order.size;
+      return leftRank - rightRank || left.title.localeCompare(right.title, 'zh');
+    });
+  }
+
+  /**
+   * 渲染本机 LoRA 列表：按底模分组（组头例如 Anima（4）· Civitai 记录），每项也带自己的底模标签。
+   * 行 DOM 仍按名字复用：加载/删除后不整表重画，列表不会晃。
+   */
+  function renderLoras(items, groups) {
     const list = $('lora-list');
     const filter = ($('lora-filter') && $('lora-filter').value || '').trim().toLowerCase();
     const matched = (items || []).filter((item) => !filter || item.name.toLowerCase().includes(filter)
-      || String(item.alias || '').toLowerCase().includes(filter));
+      || String(item.alias || '').toLowerCase().includes(filter)
+      || String(item.baseModel || '').toLowerCase().includes(filter));
     const emptyText = (items || []).length
       ? '没有匹配「' + filter + '」的 LoRA（本机共 ' + items.length + ' 个）。'
       : '本机 LoRA 目录里还没有 .safetensors 文件；用上面「Civitai 搜索」下载，或把模型放进 '
         + 'config.json 的 civitai.lora_dir。';
-    syncRows(list, loraRows, matched, loraRow, emptyText);
+    // 只摘掉真的消失的行；组容器每次重建（行节点原样搬过去，不重放动画）。
+    const wanted = new Set(matched.map((item) => item.name));
+    for (const [name, row] of [...loraRows]) if (!wanted.has(name)) { row.remove(); loraRows.delete(name); }
+    list.querySelectorAll('li.lora-group, li.muted').forEach((node) => node.remove());
+    if (!matched.length) { list.appendChild(el('li', 'muted', emptyText)); return; }
+    loraBuckets(matched, groups).forEach((bucket) => {
+      const holder = el('li', 'lora-group');
+      const head = el('div', 'group-head');
+      head.appendChild(el('span', 'group-name', bucket.title + '（' + bucket.items.length + '）'));
+      if (bucket.source) head.appendChild(el('span', 'tag', bucket.source));
+      holder.appendChild(head);
+      const rows = el('ul', 'list group-rows');
+      bucket.items.forEach((item) => {
+        let row = loraRows.get(item.name);
+        if (!row) { row = loraRow(item); loraRows.set(item.name, row); }
+        row.dataset.name = item.name;
+        row.dataset.number = String(item.number);
+        const number = row.querySelector('.num');
+        if (number) number.textContent = '#' + item.number;
+        // 底模标签可能因为 Forge 元数据/预设栈的变化而变（补展示图之后就会），每次渲染对齐一次。
+        const base = row.querySelector('.lora-base');
+        if (base) base.textContent = item.baseModelLabel || (item.baseModel ? '底模 ' + item.baseModel : '底模未识别');
+        rows.appendChild(row);
+      });
+      holder.appendChild(rows);
+      list.appendChild(holder);
+    });
   }
 
   const loraRows = new Map();
@@ -1167,6 +1246,8 @@
     label.onclick = startRename;
     name.appendChild(label);
     if (item.alias) name.appendChild(el('div', 'sub', '别名：' + item.alias));
+    // 底模标签：Civitai 记录 → Forge 元数据 → 当前预设栈（推断的会写明），识别不出来就如实写未识别。
+    name.appendChild(el('div', 'sub lora-base', item.baseModelLabel || (item.baseModel ? '底模 ' + item.baseModel : '底模未识别')));
     li.appendChild(name);
     const acts = el('div', 'acts');
     acts.appendChild(actionButton('加载', () => {
@@ -2326,7 +2407,7 @@
     });
     on('lora-status-btn', 'click', () => runCommands(['.lora status']).then(loadLoras));
     on('lora-auto-get', 'change', (event) => setOption('autoGet', event.target.checked ? 'on' : 'off'));
-    on('lora-filter', 'input', () => renderLoras(state.loras));
+    on('lora-filter', 'input', () => renderLoras(state.loras, state.loraGroups));
     on('lora-reload', 'click', loadLoras);
     // 补抓展示图：早先下载的 LoRA 没有配图，按本地 Civitai 记录去补一张（不重新下载模型文件）。
     on('lora-cover-btn', 'click', () => startLoraJob('/api/lora/cover', {}));

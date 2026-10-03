@@ -269,8 +269,8 @@ public final class WebUiTest {
         check(script.body().contains("applyGeneration(true)"), "点「开始生成」前先把面板里没提交的改动发出去");
         check(script.body().contains("function questCloud") && script.body().contains("function loadQuest")
                         && script.body().contains("function renderQuest") && script.body().contains("/api/quest")
-                        && script.body().contains("'/quest/#' + number"),
-                "任务信息云带 /quest/#N 链接，回执页实时轮询 /api/quest");
+                        && script.body().contains("'/quest#' + number"),
+                "任务信息云带 /quest#N 链接（不是 /quest/#N：那会落进 /quest/ 而 404），回执页实时轮询 /api/quest");
         check(css.body().contains(".quest-clouds") && css.body().contains(".quest-cloud")
                         && css.body().contains(".quest-step"),
                 "信息云与回执页的样式都在");
@@ -389,6 +389,20 @@ public final class WebUiTest {
                 "每项都带 preview 标志（前端据此显示缩略图或「无图」）：" + loras.getAsJsonArray("loras").get(0));
         check(!loras.getAsJsonArray("loras").get(0).getAsJsonObject().get("preview").getAsBoolean(),
                 "这个临时目录里没有 .preview.png，preview 必须是 false 而不是靠猜");
+        // 底模：这个桩既没有 Civitai 记录、Forge 元数据里也没有底模、更没有 Forge 预设栈，
+        // 所以必须如实给空值 + 空分组（前端据此归到「未识别底模」），不许编一个名字。
+        check(loras.getAsJsonArray("loras").get(0).getAsJsonObject().has("baseModel")
+                        && loras.getAsJsonArray("loras").get(0).getAsJsonObject().get("baseModel").getAsString().isEmpty(),
+                "每项都带 baseModel 字段（这里识别不出来，必须是空串）：" + loras.getAsJsonArray("loras").get(0));
+        check(loras.getAsJsonArray("loras").get(0).getAsJsonObject().has("baseModelSource")
+                        && loras.getAsJsonArray("loras").get(0).getAsJsonObject().has("groupKey"),
+                "每项都带 baseModelSource 与 groupKey：" + loras.getAsJsonArray("loras").get(0));
+        check(loras.has("groups") && loras.getAsJsonArray("groups").size() == 1,
+                "按底模分组的结果给在 groups 里（未识别的也算一组）：" + loras);
+        JsonObject onlyGroup = loras.getAsJsonArray("groups").get(0).getAsJsonObject();
+        check(onlyGroup.get("key").getAsString().isEmpty() && onlyGroup.get("count").getAsInt() == 1
+                        && onlyGroup.getAsJsonArray("names").get(0).getAsString().equals("kotori.safetensors"),
+                "未识别底模的组键是空串、成员是这个 LoRA：" + onlyGroup);
         JsonObject loraProgress = get(base, "/api/lora/progress", token);
         check(loraProgress.has("busy") && loraProgress.has("downloading") && loraProgress.has("metered")
                         && loraProgress.has("stage"),
