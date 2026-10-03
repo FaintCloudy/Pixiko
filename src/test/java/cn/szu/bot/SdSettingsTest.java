@@ -24,9 +24,52 @@ public final class SdSettingsTest {
         coherentGenerationSnapshot();
         conflictsAndFailedWrites();
         validationBeforeMutation();
+        parameterChangesAreLogged();
         offlineAndTimeout();
         System.out.println("SdSettingsTest: " + assertions + " assertions passed.");
     }
+
+    /**
+     * 每次真的改了生成参数都要在日志里留下「谁改的 + 旧值 → 新值」。
+     * 「我的参数为什么莫名其妙被改了」必须能查：网页端、指令、预设/样式载入、跟随 WebUI 页面，一个都不能静默。
+     */
+    private static void parameterChangesAreLogged() throws Exception {
+        try (Fixture f = new Fixture()) {
+            SdClient client = f.client();
+            client.settings();
+            String sampler = captureOutput(() -> client.setSampler("DPM++ 2M"));
+            check(sampler.contains("生成参数变更") && sampler.contains("采样方法") && sampler.contains("Euler a → DPM++ 2M"),
+                    "sampler change logged with old → new: " + sampler);
+            check(sampler.contains("网页端") || sampler.contains("QQ 侧"), "log names the side that changed it");
+            String size = captureOutput(() -> client.setSize(768, 512));
+            check(size.contains("尺寸 832×1152 → 768×512"), "size change logged with both dimensions: " + size);
+            String steps = captureOutput(() -> client.setParameter("steps", "33"));
+            check(steps.contains("迭代步数") && steps.contains("→ 33"), "steps change logged: " + steps);
+            String cfg = captureOutput(() -> client.setParameter("cfg", "7"));
+            check(cfg.contains("CFG") && cfg.contains("7.5 → 7"), "cfg change logged: " + cfg);
+            String model = captureOutput(() -> client.setParameter("model", "animaCatTower_v11.safetensors"));
+            check(model.contains("底模") && model.contains("跟随 WebUI 当前模型"),
+                    "checkpoint change logged from auto: " + model);
+            String unchanged = captureOutput(() -> client.setSize(768, 512));
+            check(unchanged.isBlank(), "same values leave no log line: " + unchanged);
+            // WebUI 页面把参数顶掉时同样留痕（这是"参数莫名其妙变了"最常见的一路）。
+            f.sampler = "DDIM"; f.width = 1024; f.height = 1024; f.revision++;
+            String followed = captureOutput(() -> client.settings());
+            check(followed.contains("跟随 WebUI 页面") && followed.contains("DDIM") && followed.contains("1024×1024"),
+                    "page override logged: " + followed);
+        }
+    }
+
+    /** 只为了断言日志：把这一段的标准输出收下来（Log 在测试里只写控制台）。 */
+    private static String captureOutput(ThrowingRunnable action) throws Exception {
+        PrintStream original = System.out;
+        ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+        System.setOut(new PrintStream(bytes, true, StandardCharsets.UTF_8));
+        try { action.run(); } finally { System.setOut(original); }
+        return bytes.toString(StandardCharsets.UTF_8).strip();
+    }
+
+    private interface ThrowingRunnable { void run() throws Exception; }
 
     private static void liveSettingsAndPartialEdits() throws Exception {
         try (Fixture f = new Fixture()) {
@@ -349,6 +392,8 @@ public final class SdSettingsTest {
                             : "[{\"name\":\"Euler a\",\"aliases\":[\"k_euler_a\"]},{\"name\":\"DPM++ 2M\",\"aliases\":[\"k_dpmpp_2m\"]}]");
                 } else if (path.equals("/sdapi/v1/prompt-styles")) {
                     send(exchange, catalogStatus, "[{\"name\":\"Cinematic\"},{\"name\":\"Soft, warm\"},{\"name\":\"中文 风格\"}]");
+                } else if (path.equals("/sdapi/v1/sd-models")) {
+                    send(exchange, catalogStatus, "[{\"title\":\"animaCatTower_v11.safetensors [aaaa]\",\"model_name\":\"animaCatTower_v11\"}]");
                 } else if (path.equals("/sdapi/v1/txt2img")) {
                     lastGeneration = Json.parse(new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8));
                     ByteArrayOutputStream bytes = new ByteArrayOutputStream();

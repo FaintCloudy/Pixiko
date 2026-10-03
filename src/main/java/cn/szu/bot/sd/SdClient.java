@@ -649,11 +649,13 @@ public final class SdClient {
      */
     public synchronized GenerationSettings setForgeExtras(String scheduler, double distilled) throws Exception {
         refresh(true);
+        GenerationSettings before = cachedSettings.withForge(activeScheduler, activeDistilledCfg);
         activeScheduler = scheduler == null ? "" : scheduler.strip();
         activeDistilledCfg = Double.isFinite(distilled) && distilled > 0 ? distilled : 0;
         GenerationSettings updated = cachedSettings.withForge(activeScheduler, activeDistilledCfg).withSource(LOCAL_SOURCE);
         persist(updated);
         cachedSettings = updated;
+        logSettingsChange("调度器 / Shift", before, updated);
         return updated;
     }
 
@@ -716,7 +718,19 @@ public final class SdClient {
             };
         } catch (NumberFormatException e) { throw new IOException("参数数值格式不正确。", e); }
         persistParameters(updated);
+        logParametersChange(parameterLabel(field), old, updated);
         return updated;
+    }
+
+    /** 单个参数的中文名（日志里用）。 */
+    private static String parameterLabel(String field) {
+        return switch (field) {
+            case "steps" -> "迭代步数";
+            case "cfg" -> "CFG";
+            case "seed" -> "种子";
+            case "model" -> "底模";
+            default -> field;
+        };
     }
 
     private void persistParameters(GenerationParameters updated) throws IOException {
@@ -724,17 +738,77 @@ public final class SdClient {
         generationParameters = updated;
     }
 
-    public synchronized GenerationRequest loadPreset(GenerationPreset preset) throws Exception {
+    // ---------------------------------------------------------------- 参数改动留痕
+    //
+    // 「我的生成参数为什么莫名其妙被改了」必须能查。生成参数有三个来源：
+    //   ① 采样方法/尺寸/预设样式：WebUI 页面（桥接）优先，网页端与指令改的是这一份；
+    //   ② 步数/CFG/种子/底模：只存在机器人自己的 data/sd-parameters.json；
+    //   ③ 预设与样式载入：一次改一整套。
+    // 所以每个入口在真的改了值的时候都写一行「旧值 → 新值」，并标出是网页端还是 QQ 侧。
+
+    /** 生成参数变更的一句话说明（两边一样就是空串）。只报人真正关心的四项。 */
+    public static String describeSettingsChange(GenerationSettings before, GenerationSettings after) {
+        if (before == null || after == null) return "";
+        List<String> parts = new ArrayList<>();
+        if (!Objects.equals(before.samplerName(), after.samplerName()))
+            parts.add("采样方法 " + orBlank(before.samplerName()) + " → " + orBlank(after.samplerName()));
+        if (before.width() != after.width() || before.height() != after.height())
+            parts.add("尺寸 " + before.width() + "×" + before.height() + " → " + after.width() + "×" + after.height());
+        if (!before.styles().equals(after.styles()))
+            parts.add("预设样式 " + orNone(before.styles()) + " → " + orNone(after.styles()));
+        if (!Objects.equals(before.scheduler(), after.scheduler()) || Double.compare(before.distilledCfg(), after.distilledCfg()) != 0)
+            parts.add("调度器/Shift " + forgeSummary(before) + " → " + forgeSummary(after));
+        return String.join("；", parts);
+    }
+
+    /** 步数/CFG/种子/底模的变更说明（两边一样就是空串）。 */
+    public static String describeParametersChange(GenerationParameters before, GenerationParameters after) {
+        if (before == null || after == null) return "";
+        List<String> parts = new ArrayList<>();
+        if (before.steps() != after.steps()) parts.add("迭代步数 " + before.steps() + " → " + after.steps());
+        if (Double.compare(before.cfgScale(), after.cfgScale()) != 0)
+            parts.add("CFG " + orInteger(before.cfgScale()) + " → " + orInteger(after.cfgScale()));
+        if (before.seed() != after.seed()) parts.add("种子 " + before.seed() + " → " + after.seed());
+        if (!Objects.equals(before.checkpoint(), after.checkpoint()))
+            parts.add("底模 " + orAuto(before.checkpoint()) + " → " + orAuto(after.checkpoint()));
+        return String.join("；", parts);
+    }
+
+    /** 改参数的入口名（日志里"谁改的"）：网页端 / QQ 侧。 */
+    private static String side() { return Log.webSide() ? "网页端" : "QQ 侧"; }
+
+    /** 参数变更的统一日志：值真变了才打（面板反复失焦不该刷屏）。 */
+    private static void logSettingsChange(String where, GenerationSettings before, GenerationSettings after) {
+        String diff = describeSettingsChange(before, after);
+        if (!diff.isBlank()) Log.info("生成参数变更（" + side() + "·" + where + "）：" + diff);
+    }
+    private static void logParametersChange(String where, GenerationParameters before, GenerationParameters after) {
+        String diff = describeParametersChange(before, after);
+        if (!diff.isBlank()) Log.info("生成参数变更（" + side() + "·" + where + "）：" + diff);
+    }
+    private static String orBlank(String value) { return value == null || value.isBlank() ? "（空）" : value.strip(); }
+    private static String orAuto(String value) { return value == null || value.isBlank() ? "跟随 WebUI 当前模型" : value.strip(); }
+    private static String orNone(List<String> names) { return names == null || names.isEmpty() ? "（无）" : String.join("、", names); }
+    private static String orInteger(double value) { return value == Math.rint(value) ? String.valueOf((long) value) : String.valueOf(value); }
+    private static String forgeSummary(GenerationSettings settings) {
+        String scheduler = settings.scheduler() == null || settings.scheduler().isBlank() ? "（默认）" : settings.scheduler();
+        return settings.distilledCfg() > 0 ? scheduler + " / Shift " + orInteger(settings.distilledCfg()) : scheduler;
+    }
+
+    public synchronized GenerationRequest loadPreset(String name, GenerationPreset preset) throws Exception {
+        String label = "预设 " + (name == null || name.isBlank() ? "（无名）" : name.strip());
+        GenerationParameters beforeParameters = generationParameters;
         GenerationParameters p = preset.parameters();
         String model = canonicalModel(p.checkpoint());
         if (!samplers().contains(preset.sampler())) throw new IOException("预设采样方法已不可用；请用 .sampler list 查看。");
         validateSize(preset.width(), preset.height());
-        GenerationSettings basic = changeSettings(Set.of("sampler_name", "width", "height"), current ->
+        GenerationSettings basic = changeSettings(label, Set.of("sampler_name", "width", "height"), current ->
                 new GenerationSettings(preset.sampler(), current.styles(), preset.width(), preset.height(), LOCAL_SOURCE));
         if (!basic.samplerName().equals(preset.sampler()) || basic.width() != preset.width() || basic.height() != preset.height())
             throw new IOException("WebUI 未确认预设中的尺寸或采样方法，请检查参数后重试。");
         try { persistParameters(new GenerationParameters(p.steps(), p.cfgScale(), p.seed(), model)); }
         catch (IOException e) { throw new IOException("尺寸和采样方法已更新，但其他参数保存失败；请检查磁盘并重新加载预设。", e); }
+        logParametersChange(label, beforeParameters, generationParameters);
         return new GenerationRequest(cached, basic, generationParameters);
     }
 
@@ -751,7 +825,14 @@ public final class SdClient {
             persist(value);
             if (parameters != null) persist(parameters);
             cached = value;
-            if (parameters != null) cachedSettings = parameters;
+            if (parameters != null) {
+                // WebUI 页面优先：这里覆盖掉机器人自己的记录时**必须留痕**，否则就成了"参数莫名其妙被改"。
+                GenerationSettings before = cachedSettings;
+                if (before == null) Log.info("生成参数初始化（" + parameters.source() + "）："
+                        + orBlank(parameters.samplerName()) + "，" + parameters.width() + "×" + parameters.height());
+                else if (needSettings) logSettingsChange("跟随 WebUI 页面（" + parameters.source() + "）", before, parameters);
+                cachedSettings = parameters;
+            }
             revision = state.get("revision").deepCopy();
             bridgeAvailable = true;
         } catch (BridgeUnavailable e) {
@@ -1442,7 +1523,7 @@ public final class SdClient {
             throw new IOException((matches.isEmpty() ? "未知采样方法：" : "采样方法名称有歧义：") + requested
                     + "。使用 .sampler list 查看可用名称。");
         String canonical = matches.iterator().next();
-        return changeSettings(Set.of("sampler_name"), current -> current.withSampler(canonical).withSource(LOCAL_SOURCE));
+        return changeSettings("采样方法", Set.of("sampler_name"), current -> current.withSampler(canonical).withSource(LOCAL_SOURCE));
     }
 
     public synchronized GenerationSettings setStyles(List<String> names) throws Exception {
@@ -1455,18 +1536,24 @@ public final class SdClient {
             for (String name : selected) if (!available.contains(name))
                 throw new IOException("未知预设样式：" + name + "。使用 .style list 查看可用名称（区分大小写）。");
         }
-        return changeSettings(Set.of("styles"), current -> current.withStyles(selected).withSource(LOCAL_SOURCE));
+        return changeSettings("预设样式", Set.of("styles"), current -> current.withStyles(selected).withSource(LOCAL_SOURCE));
     }
 
     public synchronized GenerationSettings setSize(int width, int height) throws Exception {
         validateSize(width, height);
-        return changeSettings(Set.of("width", "height"), current -> current.withSize(width, height).withSource(LOCAL_SOURCE));
+        return changeSettings("尺寸", Set.of("width", "height"), current -> current.withSize(width, height).withSource(LOCAL_SOURCE));
     }
 
-    private GenerationSettings changeSettings(Set<String> fields,
+    /**
+     * 改采样方法/尺寸/预设样式（这三项与 WebUI 页面同步）。
+     *
+     * @param where 入口名，只进日志——"谁改的"必须留痕
+     */
+    private GenerationSettings changeSettings(String where, Set<String> fields,
             java.util.function.UnaryOperator<GenerationSettings> change) throws Exception {
         for (int attempt = 0; attempt < 3; attempt++) {
             refresh(true);
+            GenerationSettings before = cachedSettings;
             GenerationSettings updated = change.apply(cachedSettings);
             if (bridgeAvailable && settingsBridgeAvailable) {
                 JsonObject payload = settingsJson(updated);
@@ -1487,6 +1574,7 @@ public final class SdClient {
             }
             persist(updated);
             cachedSettings = updated;
+            logSettingsChange(where, before, updated);
             return updated;
         }
         throw new IOException("WebUI 生成参数正在被其他窗口修改，请稍后重试。");

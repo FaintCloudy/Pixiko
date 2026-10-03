@@ -4153,7 +4153,7 @@ public final class Bot implements AutoCloseable {
             }
             case "show" -> reply(event, "参数预设：" + name + "\n" + store.get(name).describe());
             case "load" -> {
-                GenerationPreset selected = store.get(name); sd.loadPreset(selected);
+                GenerationPreset selected = store.get(name); sd.loadPreset(name, selected);
                 reply(event, "参数预设已加载：" + name + "\n" + selected.describe() + "\n用于后续提交的任务；当前提示词保持不变。");
             }
             case "remove" -> { store.remove(name); reply(event, "参数预设已删除：" + name); }
@@ -4653,7 +4653,11 @@ public final class Bot implements AutoCloseable {
         }
         JsonObject result = webStatus();
         result.add("changed", Json.GSON.toJsonTree(changed));
-        result.addProperty("message", changed.isEmpty() ? "生成参数没有变化。" : "已生效：" + String.join("，", changed));
+        // 回执里连"这份参数现在归谁"一起说清楚：采样方法/尺寸跟 WebUI 页面走，步数/CFG/种子/底模是机器人自己的记录。
+        String source = result.has("generation") && result.get("generation").isJsonObject()
+                ? Json.str(result.getAsJsonObject("generation"), "source", "") : "";
+        result.addProperty("message", (changed.isEmpty() ? "生成参数没有变化。" : "已生效：" + String.join("，", changed))
+                + (source.isBlank() ? "" : "\n参数来源：" + source));
         return result;
     }
 

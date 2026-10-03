@@ -5,7 +5,7 @@ Pixiko 是一个自用的 QQ 机器人：接 **NapCat** 收消息，接 **Stable
 领图；机器人自己把生成好的图片发回对话。
 
 - **作者**：loriko（deloriko@outlook.com）
-- **版本**：v1.0.14（发行说明见 [`RELEASE.md`](RELEASE.md)）
+- **版本**：v1.0.15（发行说明见 [`RELEASE.md`](RELEASE.md)）
 - **当前实现**：**Java 版**（`src/`）——这是线上一直在跑的那一份
 - **网页控制台**：`webui/`（纯静态 HTML/CSS/JS，随机器人一起由内嵌 Spring Boot 提供）
 - **SD WebUI 桥接扩展**：`webui-extension/pixiko-bridge/`（把文生图页正在编辑的提示词同步给机器人）
@@ -309,6 +309,25 @@ run.bat --set-map yh "路径"       # 命令行设置地图（需先停止机器
 （只要提示词就加 `noparams`）；网页「样式」页上方按底模汇总（例如「底模：Anima 12、NoobAI 5」），
 每条样式也标着自己的底模与**归属栈**。
 
+### 生成参数归谁：三个来源 + 每次改动都留痕（v1.0.15）
+
+生成参数不是一个整体，它有**三个来源**，所以"我设的值怎么变了"要分开看：
+
+1. **采样方法 / 尺寸 / 预设样式**：跟着 **WebUI（Forge）的 txt2img 页面**走——页面报了什么就用什么
+   （`.settings` 里的「来源」会写「WebUI 当前页面（实时同步）」或「WebUI 桥接状态（页面未实时连接）」）。
+   网页控制台与指令改这三项时，机器人会把新值**推回页面**（桥接 `PUT`），两边因此保持一致；
+2. **步数 / CFG / 种子 / 底模**：只存在机器人自己的 `data/sd-parameters.json`，页面不管这几项；
+   所以页面和机器人各改一半时，会出现「页面上的采样方法与尺寸 + 机器人里的步数与 CFG」这种组合；
+3. **`.preset load` / `.model preset` / `.style load`**：一次改一整套（预设＝尺寸+采样+步数+CFG+底模，
+   样式＝它自己记着的那套）。
+
+每次**真的改了值**都会留一行日志：`生成参数变更（网页端·尺寸）：832×1216 → 768×512`。
+来源标成 `网页端` / `QQ 侧`，入口名写明是尺寸、采样方法、预设样式、迭代步数、CFG、种子、底模、
+调度器 / Shift，还是某个预设名（`预设 default`）；WebUI 页面把机器人记录顶掉时同样留痕
+（`生成参数变更（网页端·跟随 WebUI 页面（…））：…`）。**值没变就不留痕**——网页端面板反复失焦不该刷屏。
+网页控制台改完参数，提示信息云会回一句「已生效：…」并附「参数来源：…」。
+历史在 `logs/bot-YYYYMMDD.log`（或网页「日志」页）。
+
 ### 样式分类：一个 LoRA 一个分类，其余按归属栈
 
 样式库里每条样式都可以有分类（`data/local-styles.json` 的 `category` 字段）。**手动设过的分类优先**；
@@ -481,7 +500,7 @@ Civitai 下载记录里的 `base_model` → Forge 的 LoRA 元数据（`/sdapi/v
 ```
 pixiko\
 ├─ README.md                       本文件
-├─ RELEASE.md                      v1.0.14 发行说明（含版权声明与已知限制）
+├─ RELEASE.md                      v1.0.15 发行说明（含版权声明与已知限制）
 ├─ THIRD-PARTY-LICENSES.md         随二进制包分发的第三方组件与许可
 ├─ config.example.json             脱敏配置模板（复制成 config.json 再改）
 ├─ .gitignore                      config.json / data / logs / lib jar 等一律不入库
