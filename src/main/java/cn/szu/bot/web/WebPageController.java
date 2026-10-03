@@ -122,6 +122,9 @@ public class WebPageController {
     public ResponseEntity<?> fallback(HttpServletRequest request) {
         String path = request.getRequestURI();
         if (path.equals("/index.html")) return renderPage("/");
+        // 尾部斜杠当成同一个页面：老的 /quest/ 链接（以及用户手敲的 /gen/ 之类）不该 404。
+        if (path.length() > 1 && path.endsWith("/") && PAGES.containsKey(path.substring(0, path.length() - 1)))
+            return renderPage(path.substring(0, path.length() - 1));
         return WebJson.of(HttpStatus.NOT_FOUND, WebJson.error("未找到 " + path));
     }
 
