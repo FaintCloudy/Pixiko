@@ -1347,11 +1347,26 @@
    * 尺寸 / 步数 / CFG / Shift 一起采纳成机器人设置——参数是随请求发的，不换就会拿旧栈参数跑新模型。
    */
   async function loadForgePresets() {
+    const select = $('forge-preset');
+    // 先把下拉置成"读取中"，读取失败也要给出可点的提示——空下拉会让人以为功能没做。
+    if (select && !select.options.length) {
+      select.innerHTML = '';
+      const loading = el('option', null, '（正在读取 Forge 预设…）');
+      loading.value = '';
+      select.appendChild(loading);
+    }
     try {
       renderForgePresets(await api('/api/sd/presets'));
     } catch (error) {
       const note = $('forge-note');
-      if (note && String(error.message) !== 'unauthorized') { note.textContent = '读取预设失败：' + error.message; note.className = 'bad'; }
+      if (String(error.message) === 'unauthorized') return;
+      if (select) {
+        select.innerHTML = '';
+        const failed = el('option', null, '读取失败：' + error.message + '（点「刷新列表」重试）');
+        failed.value = '';
+        select.appendChild(failed);
+      }
+      if (note) { note.textContent = '读取预设失败：' + error.message; note.className = 'bad'; }
     }
   }
 
