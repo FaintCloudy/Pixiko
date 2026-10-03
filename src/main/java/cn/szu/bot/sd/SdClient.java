@@ -288,6 +288,22 @@ public final class SdClient {
 
     private static String firstNonBlank(String preferred, String fallback) { return preferred.isBlank() ? fallback : preferred; }
 
+    /**
+     * 切完之后回读一次：当前加载的底模是不是这个预设指定的那一个。
+     * 预设没指定底模时返回 true（只认 forge_preset 的结果）；读不到就当作没换成功，让调用方走显式换底模那条路。
+     */
+    private boolean checkpointApplied(JsonObject defaults) {
+        String wanted = Json.str(defaults, "checkpoint", "");
+        if (wanted.isBlank()) return true;
+        try {
+            String current = Json.str(options(), "sd_model_checkpoint", "");
+            if (current.isBlank()) return false;
+            String base = wanted.replaceAll("(?i)\\.safetensors$", "").strip();
+            return current.equalsIgnoreCase(wanted) || current.startsWith(wanted) || current.startsWith(base)
+                    || current.toLowerCase(java.util.Locale.ROOT).startsWith(base.toLowerCase(java.util.Locale.ROOT));
+        } catch (Exception error) { return false; }
+    }
+
     private static long pickNumber(JsonObject options, JsonObject saved, String key) {
         if (options.has(key)) return Json.num(options, key, 0);
         return Json.num(saved, key, 0);
@@ -321,7 +337,9 @@ public final class SdClient {
         direct.addProperty("forge_preset", preset);
         try {
             HttpResponse<String> response = request("/sdapi/v1/options", "POST", direct, false, false);
-            switched = response.statusCode() >= 200 && response.statusCode() < 300;
+            // 有的构建会**接受** forge_preset（HTTP 200）却要等下一次加载才真正换栈，
+            // 所以不能只看状态码：切完必须回读当前底模，确认这一栈真的上去了。
+            switched = response.statusCode() >= 200 && response.statusCode() < 300 && checkpointApplied(defaults);
             if (switched) applied.add("forge_preset=" + preset);
         } catch (Exception ignored) { /* 这一版不接受 forge_preset，走下面的检查点路线 */ }
         if (!switched) {
