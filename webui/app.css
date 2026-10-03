@@ -394,12 +394,13 @@ body.console-full .terminal {
 .login form { display: flex; flex-direction: column; gap: 10px; }
 .error { color: var(--danger); min-height: 20px; margin: 0; font-size: 13px; }
 .toast {
-  position: fixed; left: 50%; bottom: 26px; transform: translateX(-50%) translateY(10px);
+  /* 与任务回执同一个角落：右下角滑入。 */
+  position: fixed; right: 18px; bottom: 18px; left: auto; transform: translateX(18px);
   background: linear-gradient(135deg, rgba(31, 44, 66, .96), rgba(23, 33, 51, .96));
   border: 1px solid var(--line); border-radius: 12px; padding: 11px 18px; z-index: 60; max-width: 90vw;
   box-shadow: var(--shadow); opacity: 0; transition: opacity .24s var(--ease), transform .24s var(--ease);
 }
-.toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
+.toast.show { opacity: 1; transform: none; }
 .spin { display: inline-block; width: 12px; height: 12px; border: 2px solid rgba(120, 160, 220, .3); border-top-color: var(--accent); border-radius: 50%; animation: spin .8s linear infinite; }
 @keyframes spin { to { transform: rotate(360deg); } }
 .skeleton { height: 44px; border-radius: 12px; background: linear-gradient(90deg, rgba(120,160,220,.08), rgba(120,160,220,.2), rgba(120,160,220,.08)); background-size: 200% 100%; animation: shimmer 1.4s linear infinite; }
@@ -588,12 +589,13 @@ a.image-link img:hover { border-color: rgba(120, 160, 220, .55); }
 /* ---------------------------------------------------------------- 任务信息云（下方弹出）
    每次下达任务都从屏幕下方冒一条，带跳去 /quest/#N 的链接；出图完成后再冒一条。 */
 .quest-clouds {
-  position: fixed; left: 50%; bottom: 18px; transform: translateX(-50%);
-  z-index: 60; display: flex; flex-direction: column-reverse; gap: 8px; align-items: center;
-  pointer-events: none; max-width: min(92vw, 560px);
+  /* 任务回执从**右下角**弹出：固定右下、从右侧滑入、新的一条贴着角（column-reverse）。 */
+  position: fixed; right: 18px; bottom: 18px; left: auto; transform: none;
+  z-index: 60; display: flex; flex-direction: column-reverse; gap: 8px; align-items: flex-end;
+  pointer-events: none; max-width: min(92vw, 420px);
 }
 .quest-cloud {
-  pointer-events: auto; opacity: 0; transform: translateY(14px);
+  pointer-events: auto; opacity: 0; transform: translateX(18px);
   transition: opacity .24s var(--ease), transform .24s var(--ease);
   background: linear-gradient(135deg, rgba(31, 44, 66, .97), rgba(23, 33, 51, .97));
   border: 1px solid rgba(120, 160, 220, .32); border-radius: 14px;
