@@ -104,6 +104,8 @@ public class WebPageController {
     }
 
     private ResponseEntity<byte[]> renderPage(String path) {
+        // 容忍尾部斜杠：/quest/ 与 /quest 是同一个页面（任务回执链接以前写成 /quest/#N，落地成 /quest/ 就 404）。
+        while (path.length() > 1 && path.endsWith("/")) path = path.substring(0, path.length() - 1);
         String panel = PAGES.getOrDefault(path, "chat");
         try {
             String html = WebPages.render(webRoot, panel);

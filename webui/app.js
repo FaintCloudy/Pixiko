@@ -249,7 +249,7 @@
     const cloud = el('div', 'quest-cloud' + (options && options.done ? ' done' : ''));
     cloud.appendChild(el('div', 'quest-cloud-text', text));
     const link = el('a', 'quest-cloud-link', '查看回执 #' + number + ' →');
-    link.href = '/quest/#' + number;
+    link.href = '/quest#' + number;   // 不要写成 /quest/#N：那会变成 /quest/ 路径，服务端没有这条路由
     cloud.appendChild(link);
     box.appendChild(cloud);
     requestAnimationFrame(() => cloud.classList.add('show'));
