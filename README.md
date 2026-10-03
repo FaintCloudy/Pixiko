@@ -5,7 +5,7 @@ Pixiko 是一个自用的 QQ 机器人：接 **NapCat** 收消息，接 **Stable
 领图；机器人自己把生成好的图片发回对话。
 
 - **作者**：loriko（deloriko@outlook.com）
-- **版本**：v1.0.8（发行说明见 [`RELEASE.md`](RELEASE.md)）
+- **版本**：v1.0.9（发行说明见 [`RELEASE.md`](RELEASE.md)）
 - **当前实现**：**Java 版**（`src/`）——这是线上一直在跑的那一份
 - **网页控制台**：`webui/`（纯静态 HTML/CSS/JS，随机器人一起由内嵌 Spring Boot 提供）
 - **SD WebUI 桥接扩展**：`webui-extension/pixiko-bridge/`（把文生图页正在编辑的提示词同步给机器人）
@@ -348,7 +348,7 @@ run.bat --set-map yh "路径"       # 命令行设置地图（需先停止机器
 ```
 pixiko\
 ├─ README.md                       本文件
-├─ RELEASE.md                      v1.0.8 发行说明（含版权声明与已知限制）
+├─ RELEASE.md                      v1.0.9 发行说明（含版权声明与已知限制）
 ├─ THIRD-PARTY-LICENSES.md         随二进制包分发的第三方组件与许可
 ├─ config.example.json             脱敏配置模板（复制成 config.json 再改）
 ├─ .gitignore                      config.json / data / logs / lib jar 等一律不入库

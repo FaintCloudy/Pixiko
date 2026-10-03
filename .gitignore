@@ -43,6 +43,8 @@ config.json
 !/data/prompt-meanings.json
 #    上一次拉起 NapCat 的时间戳
 !/data/napcat-last-start.txt
+#    聊天提示词（每次聊天自动导出：实际发给 DeepSeek 的那份请求）
+!/data/chat-prompt.txt
 #    步数 / CFG / 种子 / 底模
 !/data/sd-parameters.json
 #    参数预设
@@ -69,6 +71,7 @@ config.json
 /data/sd-functions.json
 /data/affinity.json
 /data/mood.json
+/data/chat-prompt-full.txt
 /data/deepseek-api-key.txt
 /data/deepseek-chat-api-key.txt
 /data/*-api-key.txt

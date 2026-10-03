@@ -1,13 +1,24 @@
-# Pixiko v1.0.8 发行说明
+# Pixiko v1.0.9 发行说明
 
-- **版本**：v1.0.8
+- **版本**：v1.0.9
 - **日期**：2026-10-03
 - **作者**：loriko（deloriko@outlook.com）
 - **当前实现**：Java 版（`src/`）。另有一次**未完成的** Next.js 重构，见 `nextjs-wip/`，**不可运行**。
 
 ---
 
-## 〇、本版新增（v1.0.8）
+## 〇、本版新增（v1.0.9）
+
+**聊天提示词自动落盘**：每次聊天都把**实际发给 DeepSeek 的那份请求**导出成可读文本
+`data/chat-prompt.txt`——`## system` 段就是系统提示词（硬规则 + 可用指令表 + 基础性格），
+`## user` 段是本轮交给模型的输入（本轮消息、说话人、列表上下文、原文锚点、要求输出的 JSON 形状）。
+原样导出，不做任何遮蔽，方便对照「机器人到底被交代了什么」以及跟着仓库同步。
+默认**不含对话历史**（历史是逐轮累积的对话正文，不是提示词的一部分）；要连历史一起导出，
+把 `config.json` 里 `chat.export_history` 设为 `true`；整个开关是 `chat.export_prompt`（默认开）。
+导出失败只记日志，不影响聊天本身。
+
+<details>
+<summary>上一版（v1.0.8）</summary>
 
 **适配 Forge／Forge Neo 的预设体系（尤其是 Anima）**。Forge Neo 把「底模 + VAE + 文本编码器」按**预设**
 分成一栈一栈（`sd` / `xl` / `flux` / `qwen` / `anima` …），而机器人以前只知道 A1111 的 `sd_model_checkpoint`，
@@ -29,6 +40,8 @@
 但代码并不读它——实际生效的一直是 `config.json` 里那份被 gitignore 掉的短卡片，换台机器同步不过去。
 现在：优先读这个文件（按 mtime 缓存，改完立刻生效），`config.json` 的 `chat.personality` 只是文件不存在时的退路；
 `.chat personality`／`.chat infix` 与网页「聊天」页的修改都**写回文件**（同目录原子替换），人设才会跟着仓库走。
+
+</details>
 
 <details>
 <summary>上一版（v1.0.7）</summary>
@@ -219,7 +232,7 @@ Danbooru 词条（↑↓ 选择、Esc 关闭；空词条上按 **Ctrl+Space** �
 
 ## 三、安装与启动（三步）
 
-### 开箱即用包 `pixiko-v1.0.8-runnable.zip`
+### 开箱即用包 `pixiko-v1.0.9-runnable.zip`
 
 1. 装好 **JDK 17+**。
 2. **双击 `start.bat`**。第一次运行会自动生成 `config.json`（照 `config.example.json` 起一份），
@@ -229,7 +242,7 @@ Danbooru 词条（↑↓ 选择、Esc 关闭；空词条上按 **Ctrl+Space** �
 
 > `start.bat` 跑的是包内已编译好的 `build/pixiko.jar`；只有需要改代码时才用 `build.ps1` + `run.bat`。
 
-### 源码包 `pixiko-v1.0.8.zip`
+### 源码包 `pixiko-v1.0.9.zip`
 
 1. 装好 **JDK 17+**。
 2. 在项目根目录准备好依赖 jar：`lib/gson-2.13.1.jar` 由 `build.ps1` **自动下载并校验**，
@@ -294,8 +307,8 @@ copy config.example.json config.json
 
 ## 六、在 GitHub Releases 里发布这个 zip
 
-1. 打开仓库 → 右侧 **Releases** → **Draft a new release**，Tag 填 `v1.0.8`（新建 tag），标题填 `Pixiko v1.0.8`。
-2. 把 `pixiko-v1.0.8.zip` 与 `pixiko-v1.0.8-runnable.zip`（以及各自的 `.sha256`）拖进附件区，
+1. 打开仓库 → 右侧 **Releases** → **Draft a new release**，Tag 填 `v1.0.9`（新建 tag），标题填 `Pixiko v1.0.9`。
+2. 把 `pixiko-v1.0.9.zip` 与 `pixiko-v1.0.9-runnable.zip`（以及各自的 `.sha256`）拖进附件区，
    正文粘贴本文件内容后点 **Publish release**。
 
 > 建仓库时 License 请选 **None**（本项目保留所有权利，不使用开源许可证）。

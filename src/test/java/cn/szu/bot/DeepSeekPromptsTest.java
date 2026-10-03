@@ -50,6 +50,37 @@ public final class DeepSeekPromptsTest {
                 return response("stop", "{\"positive\":\"red bicycle, rainy night\",\"negative\":\"blur\"}");
             });
             assert client.generate("雨夜的自行车").positive().equals("red bicycle, rainy night");
+            // 聊天提示词导出：把**实际发出去的那份请求**写成可读文本，给人看与进版本库留档。
+            var exportedClient = new DeepSeekPrompts(f.root, new JsonObject(), (body, key, timeout) -> {
+                assert body.getAsJsonArray("messages").get(0).getAsJsonObject().get("role").getAsString().equals("system");
+                return response("stop", "好呀，去海边吧");
+            });
+            JsonArray turns = new JsonArray();
+            JsonObject oldTurn = new JsonObject();
+            oldTurn.addProperty("role", "user"); oldTurn.addProperty("content", "上一轮说的话");
+            turns.add(oldTurn);
+            exportedClient.chat("人设文本在这里", turns, "今天天气不错");
+            Path exported = f.root.resolve("data/chat-prompt.txt");
+            assert Files.exists(exported) : "聊天请求要导出到 data/chat-prompt.txt";
+            String dump = Files.readString(exported, java.nio.charset.StandardCharsets.UTF_8);
+            assert dump.contains("## system") && dump.contains("## user") : "导出分 system/user 两段：" + dump.substring(0, 80);
+            assert dump.contains("人设文本在这里") && dump.contains("今天天气不错") : "导出要含系统提示词（人设）与本轮输入";
+            assert !dump.contains("上一轮说的话") : "默认不导出对话历史";
+            // 打开开关后连历史一起导出（同一份文件，覆盖写）。
+            JsonObject withHistory = new JsonObject(); withHistory.addProperty("export_history", true);
+            var historyClient = new DeepSeekPrompts(f.root, withHistory, (body, key, timeout) -> response("stop", "嗯"));
+            JsonArray turns2 = new JsonArray();
+            JsonObject previous = new JsonObject();
+            previous.addProperty("role", "user"); previous.addProperty("content", "上一轮说的话");
+            turns2.add(previous);
+            historyClient.chat("人设文本在这里", turns2, "今天天气不错");
+            assert Files.readString(f.root.resolve("data/chat-prompt.txt"), java.nio.charset.StandardCharsets.UTF_8)
+                    .contains("上一轮说的话") : "export_history=true 时连历史一起导出";
+            // 关掉导出功能就不写文件。
+            JsonObject off = new JsonObject(); off.addProperty("export_prompt", false);
+            Files.deleteIfExists(f.root.resolve("data/chat-prompt.txt"));
+            new DeepSeekPrompts(f.root, off, (body, key, timeout) -> response("stop", "嗯")).chat("人设", new JsonArray(), "喂");
+            assert !Files.exists(f.root.resolve("data/chat-prompt.txt")) : "export_prompt=false 时不写文件";
             // Personality editing returns the whole setup prompt and is applied with a compare-and-set guard.
             f.command("private",".chat personality 温柔简洁");
             var personaCalls=new java.util.concurrent.atomic.AtomicInteger();

@@ -474,6 +474,46 @@ public final class DeepSeekPrompts {
         if (!"stop".equals(Json.str(choice, "finish_reason", ""))) throw new IOException("DeepSeek 输出未完整结束，请重试。");
         return Json.parse(text(choice.getAsJsonObject("message"), "content"));
     }
+    /**
+     * 把**实际发出去的聊天请求**导出成可读文本：{@code data/chat-prompt.txt}。
+     *
+     * <p>system 段就是系统提示词（硬规则 + 可用指令 + 基础性格），user 段是本轮交给模型的输入
+     * （含列表上下文、原文锚点、要求输出的 JSON 形状）。给人看、进版本库留档，机器人的行为一概不变。
+     *
+     * <p>默认**不导出对话历史**（{@code chat.export_history=true} 才一起导出）：这个文件要提交进仓库，
+     * 而历史是逐轮累积的对话正文，与"提示词"本身无关。其余字段一律原样导出——包括 selections 里
+     * 个人的提示词正文，仓库所有者要求的就是"实际发出去的那份"。导出失败只记日志，不影响聊天。
+     */
+    private void exportChatPrompt(JsonObject body, String note) {
+        if (!Json.bool(config, "export_prompt", true)) return;
+        try {
+            boolean withHistory = Json.bool(config, "export_history", false);
+            JsonArray messages = body.has("messages") && body.get("messages").isJsonArray()
+                    ? body.getAsJsonArray("messages") : new JsonArray();
+            StringBuilder text = new StringBuilder();
+            text.append("# Pixiko 聊天提示词（自动导出：最近一次实际发给 DeepSeek 的请求）\n");
+            text.append("# 时间：").append(java.time.LocalDateTime.now().truncatedTo(java.time.temporal.ChronoUnit.SECONDS)).append("\n");
+            text.append("# 模型：").append(Json.str(config, "model", "")).append("　用途：").append(note).append("\n");
+            if (!withHistory) text.append("# 对话历史未导出（要一起导出就把 config.json 里 chat.export_history 设为 true）\n");
+            int index = 0;
+            for (JsonElement item : messages) {
+                if (!item.isJsonObject()) { index++; continue; }
+                JsonObject message = item.getAsJsonObject();
+                String role = Json.str(message, "role", "?");
+                // 最后一条 user 才是"本轮输入"，前面的是历史。
+                boolean history = role.equals("assistant") || (role.equals("user") && index < messages.size() - 1);
+                if (history && !withHistory) { index++; continue; }
+                text.append("\n## ").append(role).append(history ? "（对话历史）" : "").append("\n");
+                text.append(Json.str(message, "content", "")).append("\n");
+                index++;
+            }
+            // 原样导出：连 selections 里的个人提示词正文也不遮（仓库所有者要的就是"实际发出去的那份"）。
+            Json.atomicWriteText(root.resolve("data/chat-prompt.txt"), text.toString());
+        } catch (Exception error) {
+            Log.warn("导出聊天提示词失败：" + error);
+        }
+    }
+
     private Response exchange(JsonObject body) throws Exception {
         if (!Files.isRegularFile(keyFile)) throw new IOException("未配置 DeepSeek API 密钥，请检查 " + keyFileName + "。");
         String key = Files.readString(keyFile).strip();
@@ -550,6 +590,7 @@ public final class DeepSeekPrompts {
                 + "不得虚构今天做过的事、见过的景象或凭空的心情，不知道就照实说。"
                 + "以下是基础性格设定：\n" + personality + extra));
         messages.addAll(history.deepCopy()); messages.add(chatMessage("user", message)); body.add("messages", messages);
+        exportChatPrompt(body, "普通聊天回复");
         Response response = exchange(body);
         try {
             JsonObject choice = Json.parse(response.body()).getAsJsonArray("choices").get(0).getAsJsonObject();
@@ -1706,6 +1747,7 @@ public final class DeepSeekPrompts {
                     + "不要主动引入用户没提到的高剧透内容（结局、她在其他线路的死、最重的那段独白），露骨台词只在话题确实相关时使用。");
         }
         messages.add(chatMessage("user", user.toString())); body.add("messages", messages);
+        exportChatPrompt(body, "聊天规划（把用户要求转成指令）");
         IOException last=null; String lastResponse="";
         for(int attempt=1;attempt<=4;attempt++) {
             Response response = exchange(body);

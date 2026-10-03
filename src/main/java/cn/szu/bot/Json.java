@@ -22,6 +22,28 @@ public final class Json {
     public static boolean bool(JsonObject o, String key, boolean fallback) { return o.has(key) ? o.get(key).getAsBoolean() : fallback; }
     /** One lock per target file: concurrent conversations otherwise collide on the atomic rename. */
     private static final java.util.concurrent.ConcurrentHashMap<String, Object> LOCKS = new java.util.concurrent.ConcurrentHashMap<>();
+    /** 文本版原子写：和 {@link #atomicWrite(Path, Object)} 同一套临时文件 + 替换重试，用于非 JSON 的导出文件。 */
+    public static void atomicWriteText(Path path, String text) throws IOException {
+        Path absolute = path.toAbsolutePath().normalize();
+        Object lock = LOCKS.computeIfAbsent(absolute.toString(), key -> new Object());
+        synchronized (lock) {
+            Files.createDirectories(absolute.getParent());
+            Path temp = Files.createTempFile(absolute.getParent(), absolute.getFileName().toString(), ".tmp");
+            try {
+                Files.writeString(temp, text, StandardCharsets.UTF_8);
+                IOException last = null;
+                for (int attempt = 1; attempt <= 5; attempt++) {
+                    try {
+                        try { Files.move(temp, absolute, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE); }
+                        catch (AtomicMoveNotSupportedException e) { Files.move(temp, absolute, StandardCopyOption.REPLACE_EXISTING); }
+                        return;
+                    } catch (IOException error) { last = error; try { Thread.sleep(50L * attempt); } catch (InterruptedException interrupted) { Thread.currentThread().interrupt(); break; } }
+                }
+                throw last == null ? new IOException("无法写入文件：" + absolute) : last;
+            } finally { Files.deleteIfExists(temp); }
+        }
+    }
+
     public static void atomicWrite(Path path, Object value) throws IOException {
         Path absolute = path.toAbsolutePath().normalize();
         Object lock = LOCKS.computeIfAbsent(absolute.toString(), key -> new Object());
