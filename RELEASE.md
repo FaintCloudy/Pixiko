@@ -1,11 +1,46 @@
-# Pixiko v1.5.2 发行说明
+# Pixiko v1.5.3 发行说明
 
-- **版本**：v1.5.2
+- **版本**：v1.5.3
 - **日期**：2026-10-04
 - **作者**：loriko（deloriko@outlook.com）
 - **当前实现**：Java 版（`src/`）。另有一次**未完成的** Next.js 重构，见 `nextjs-wip/`，**不可运行**。
 
 ---
+
+## 〇、本版新增（v1.5.3）
+
+**一件事：手机端对话里「执行指令：…」这类系统行原来是居中的，现在改成跟机器人回复一样靠左。**
+用户原话是问句「**手机端的对话，消息为什么会居中**」——量完给他解释后，他选了
+「**改成跟机器人回复一样靠左**」。改动只有一处 CSS，**只影响手机端 `/m`**。
+
+- **实测的"为什么居中"**：改前 `.bubble.sys` 是 `align-self: center` + `text-align: center`，
+  所以 390×844 下逐条量 200 条气泡时，**`sys` 28 条全部居中（左边距均值 69.1 / 右边距 73.1）**，
+  而这 28 条**全部**是「执行指令：…」（按前缀分组核对过）；对照 `user` **29 条靠右**
+  （左边距均值 227.2 / 右边距 16）、`bot` **126 条 + 图集 17 条靠左**（左边距 12）。
+- **改法（`webui/m/app.css` 的 `.bubble.sys`）**：`align-self: center → flex-start`、
+  `text-align: center → left`、`background: #101a2c → transparent`、
+  `border-style: dashed → border-color: transparent` 并加**左侧 2px `var(--line)` 细线**、
+  内边距改成 `2px 2px 2px 6px`；`color: var(--muted)` 与字号 **13px**（`var(--m-fs-sm)`）、
+  行高 **1.45**（`var(--m-lh-sm)`）不变。也就是：**与机器人回复同侧（靠左）**，
+  但**长得像一行日志**——没有气泡底、没有虚线框、灰字小一号、左侧一条细线、上下留白更小。
+- **改后实测**：`sys` 变成 **左边距 12**、左对齐；`user` 仍靠右（右边距 12–16）、
+  `bot` 仍靠左（左边距 12）**不变**；长指令照样完整折行（`white-space: pre-wrap` +
+  `overflow-wrap: anywhere` 保留）。
+- **桌面控制台没有跟着改**：`webui/app.css` 的 `.msg.sys { align-self: center; … }` **原样没动**
+  ——用户只报了手机端。所以这一条**不要**理解成"两端都改了"。
+- **验证**：探针里那条旧断言（`probe-m1.mjs`，原文案"气泡分角色：user 右、bot 左、sys 居中"）
+  已改成**真的量几何**：`user 靠右、bot 与 sys 都靠左`，并打印三者的
+  `gapLeft` / `gapRight` / `alignSelf` / `textAlign`。`probe-m1` **99 条契约 / 0 失败 → PASS**、
+  `probe-m5` **58 条契约 / 0 失败 → PASS**。`probe-m1` 会真发 4 条写请求并把线上「迭代步数」+3，
+  跑完已恢复成 **20**（复查：steps=20 / CFG 5.2 / 1664×1216 / 种子 -1）。
+- **没有 Java 改动**；**`?v=` 仍是 `1.5.2`**（手机端资源是 `no-store`、不带版本参数，这轮也只改了
+  `webui/m/app.css`）；**APK 不受影响**；**仍然没有真机 / 模拟器验证**（headless Chrome + CDP）。
+
+**前端**：本版只改了手机端 `webui/m/app.css`，桌面控制台 `webui/index.html` 的 `?v=` **仍是 `?v=1.5.2`**
+（手机端 `/m` 的资源是 `no-store`、不带版本参数，所以这版没有 `?v=` 可升）。
+
+<details>
+<summary>上一版（v1.5.2）</summary>
 
 ## 〇、本版新增（v1.5.2）
 
@@ -66,6 +101,8 @@
 
 **前端**：`webui/index.html` 的 `?v=` **由 `1.5.0` 升到 `1.5.2`**（本版改了 `webui/app.js` 与
 `webui/m/`；`webui/index.html` 里两处已同步成 `/app.css?v=1.5.2` 与 `/app.js?v=1.5.2`）。
+
+</details>
 
 <details>
 <summary>上一版（v1.5.1）</summary>
@@ -1155,7 +1192,7 @@ Danbooru 词条（↑↓ 选择、Esc 关闭；空词条上按 **Ctrl+Space** �
 
 ## 三、安装与启动（三步）
 
-### 开箱即用包 `pixiko-v1.5.2-runnable.zip`
+### 开箱即用包 `pixiko-v1.5.3-runnable.zip`
 
 1. 装好 **JDK 17+**。
 2. **双击 `start.bat`**。第一次运行会自动生成 `config.json`（照 `config.example.json` 起一份），
@@ -1165,7 +1202,7 @@ Danbooru 词条（↑↓ 选择、Esc 关闭；空词条上按 **Ctrl+Space** �
 
 > `start.bat` 跑的是包内已编译好的 `build/pixiko.jar`；只有需要改代码时才用 `build.ps1` + `run.bat`。
 
-### 源码包 `pixiko-v1.5.2.zip`
+### 源码包 `pixiko-v1.5.3.zip`
 
 1. 装好 **JDK 17+**。
 2. 在项目根目录准备好依赖 jar：`lib/gson-2.13.1.jar` 由 `build.ps1` **自动下载并校验**，
@@ -1189,7 +1226,7 @@ copy config.example.json config.json
 4. 不想先装 APK？直接在电脑浏览器打开 `http://<电脑地址>:8787/android` 看**网页预览**（v1.4.1 起）。
 
 > 这是**用 Android SDK 现构建出来的 debug 签名包**（`cn.szu.bot.app` / **1.5.0**，`compileSdk 34`、`minSdk 26`，
-> **v1.5.1 / v1.5.2 都没有重新出包**，客户端仍是 **1.5.0**——这两版改的网页不在 APK 里），
+> **v1.5.1 / v1.5.2 / v1.5.3 都没有重新出包**，客户端仍是 **1.5.0**——这三版改的网页不在 APK 里），
 > **不是官方签名的正式包**；想自己构建就用 `android/build-apk.ps1`（要 **JDK 21 + Android SDK**，
 > 跑 `assembleDebug` 并把 APK 复制到 `F:\Bot\android\dist\`）。安装时 Android 会要求允许
 > 「**安装未知来源应用**」。用法、构建步骤与安全提醒见 [`android/README.md`](android/README.md)。
@@ -1246,12 +1283,12 @@ copy config.example.json config.json
 
 ## 六、在 GitHub Releases 里发布这个 zip
 
-1. 打开仓库 → 右侧 **Releases** → **Draft a new release**，Tag 填 `v1.5.2`（新建 tag），标题填 `Pixiko v1.5.2`。
-2. 把 `pixiko-v1.5.2.zip` 与 `pixiko-v1.5.2-runnable.zip`（以及各自的 `.sha256`），
+1. 打开仓库 → 右侧 **Releases** → **Draft a new release**，Tag 填 `v1.5.3`（新建 tag），标题填 `Pixiko v1.5.3`。
+2. 把 `pixiko-v1.5.3.zip` 与 `pixiko-v1.5.3-runnable.zip`（以及各自的 `.sha256`），
    外加 Android 客户端 `pixiko-android-1.5.0-debug.apk`（**debug 签名**，由 `android/build-apk.ps1` 跑
    `assembleDebug` 产出、复制到 `F:\Bot\android\dist\`；脚本给的原名是 `pixiko-1.5.0-debug.apk`，
-   内容是同一个文件；**v1.5.1 / v1.5.2 都没有重新出包**，客户端自身版本仍是 **1.5.0**——APK 只是外壳，
-   网页（含这两版改的 `/m` 与图集缩略图）不在里面），一共三个附件拖进附件区，
+   内容是同一个文件；**v1.5.1 / v1.5.2 / v1.5.3 都没有重新出包**，客户端自身版本仍是 **1.5.0**——
+   APK 只是外壳，网页（含这三版改的 `/m` 排版、图集缩略图与系统行对齐）不在里面），一共三个附件拖进附件区，
    正文粘贴本文件内容后点 **Publish release**。
 
 > 建仓库时 License 请选 **None**（本项目保留所有权利，不使用开源许可证）。

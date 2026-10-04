@@ -492,9 +492,19 @@ input[type="range"]::-webkit-slider-thumb {
 }
 .bubble.user { align-self: flex-end; background: #1b3358; border-color: #29456f; }
 .bubble.bot { align-self: flex-start; }
+/**
+ * 系统行（「执行指令：…」这种机器人自己贴的执行回显）。
+ *
+ * <p>**和机器人回复同侧（靠左）**，但长得像一行日志而不是一条消息：没有气泡底、没有边框、
+ * 灰字、小一号、上下留白也小。原来的写法是 `align-self: center` + 虚线框 + 居中文字，
+ * 用户看到的是"每条指令都有一条居中的消息"，反馈后改成现在这样（2026-10-05）。
+ * 保留 `word-break` 与 `pre-wrap` 是为了让长指令照样完整折行。
+ */
 .bubble.sys {
-  align-self: center; max-width: 92%; text-align: center;
-  background: #101a2c; border-style: dashed; color: var(--muted); font-size: var(--m-fs-sm);
+  align-self: flex-start; max-width: 92%; text-align: left;
+  background: transparent; border-color: transparent; padding: 2px 2px 2px 6px;
+  border-left: 2px solid var(--line);
+  color: var(--muted); font-size: var(--m-fs-sm); line-height: var(--m-lh-sm);
 }
 .bubble.imgs { padding: 6px; }
 .bubble .bubble-imgs { display: grid; grid-template-columns: repeat(2, 1fr); gap: 6px; margin-top: 6px; }
