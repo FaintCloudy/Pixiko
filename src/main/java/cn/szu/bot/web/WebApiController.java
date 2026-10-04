@@ -390,7 +390,12 @@ public class WebApiController {
         try {
             String stamp = java.time.LocalDate.now().toString().replace("-", "");
             Path file = settings.root.toAbsolutePath().normalize().resolve("logs/" + prefix + stamp + ".log");
-            if (!Files.isRegularFile(file)) return result;
+            if (!Files.isRegularFile(file)) {
+                // 今天的文件还没出现（例如机器人在零点前启动、当天还一条都没写）时回退到最近一份，
+                // 免得「全部日志」在那个窗口里是空白。命名与挑选规则都在 Log 里（同一处口径）。
+                file = Log.newestDailyFile(settings.root.toAbsolutePath().normalize().resolve("logs"), prefix, file);
+                if (file == null) return result;
+            }
             List<String> all = Files.readAllLines(file, StandardCharsets.UTF_8);
             int from = Math.max(0, all.size() - wanted);
             for (int index = from; index < all.size(); index++) result.add(all.get(index));

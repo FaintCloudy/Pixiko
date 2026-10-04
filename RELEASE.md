@@ -1,11 +1,96 @@
-# Pixiko v1.5.0 发行说明
+# Pixiko v1.5.1 发行说明
 
-- **版本**：v1.5.0
+- **版本**：v1.5.1
 - **日期**：2026-10-04
 - **作者**：loriko（deloriko@outlook.com）
 - **当前实现**：Java 版（`src/`）。另有一次**未完成的** Next.js 重构，见 `nextjs-wip/`，**不可运行**。
 
 ---
+
+## 〇、本版新增（v1.5.1）
+
+**一件事：把手机端界面 `/m` 的排版重新量了一遍。** 用户原话是「**调整手机端各控件、字体大小使其看起来
+舒适并且可以完整看到所有参数（而不是因为框太小或字太大被掩盖一部分）**」，所以这一版定了一套**全站排版
+规格**、**去掉全站的省略号与裁切**（参数一律完整折行）、把宽视口「机身框」的缩放提到看得清的档位，
+另外修了**外壳与 Java 侧各两个真缺陷**。
+
+- **`/m` 的全站排版规格（`webui/m/app.css` 的 `:root` 新增一组 CSS 令牌）**：
+  - 正文 / 参数值 **15px**（`line-height 1.5`）、卡片标题 **15px / 600**、参数名与说明行 **13px**、
+    标签 / 胶囊 **12px**（这是**全局下限**，原来有 **11.5px**）；数字一律 **`tabular-nums`**。
+  - 单行输入 / 下拉 / 按钮 **`min-height 44px`**；**输入框字号 16px**（低于 16px 时 iOS 聚焦会缩放页面）；
+    图标按钮 **44×44**；**开关与复选框的可点区域 ≥44×44**（视觉轨道 / 方框仍是 22–26px）。
+  - 卡片内边距 **14px**、圆角 **14px**、卡片间距 **12px**、卡片内行距 **10px**、label 与输入之间 6px。
+  - 令牌名：`--m-fs-body` / `--m-fs-title` / `--m-fs-sm` / `--m-fs-xs` / `--m-fs-tag`（别名）/
+    `--m-lh-body` / `--m-lh-sm` / `--m-gap` / `--m-pad` / `--m-radius` / `--m-row-gap` /
+    `--m-label-gap` / `--m-tap` / `--m-input-h` / `--m-input-fs` / `--m-area-h` / `--m-icon`。
+- **「所有参数都要完整看到」：全站去掉省略号与裁切**：删掉所有
+  `white-space:nowrap` + `text-overflow:ellipsis` + `-webkit-line-clamp` + 写死高度 的组合
+  （**只保留 app bar 标题与底部 tab 文案的单行省略**），改成**完整折行**
+  （`white-space:normal; overflow:visible; text-overflow:clip; overflow-wrap:anywhere`）。涉及：
+  - **回执**的**命令原文**（原来最狠被剪 **977px**）与**摘要**（原来被切 18–35px）；回执每行因此
+    变高约 **1.5–2 倍**、一屏约 **4 条**。
+  - **样式名**（最长 **63 字**，原来被剪 **234px**）、**分类名**（**61 字**，被剪 **181px**）、标签、
+    **底模说明**（后端最多 **145 字**）——底模说明原来在 JS 里被 `truncate(…, 60)` **硬截到 60 字**，
+    纯 CSS 改不动，所以**这段 JS 截断也一并删了**。
+  - **提示词词条**（最长 **49 字**，原来被剪 **143px**；现在**词条与释义分两行**）。
+  - **LoRA 文件名 / 别名**、**参数预设摘要**（模型名 + 12 位 hash 原来被 ellipsis 吃掉）。
+  - **帮助正文**、**日志行**（原来单行省略 / 横向滚动，现在「**时间 / 级别一行 + 正文整行折行**」，
+    外层仍可滚）。
+  - **原生 `<select>`**（出图屏与系统屏）：关闭态永远单行截断，这是浏览器行为、CSS 改不了，
+    所以**下拉下方补一行「完整值行」**（可换行、`overflow-wrap:anywhere`）。实测最长模型名
+    `【noob】hans-bulldozer26.02.23.safetensors [4c0f7b7e43]` 与当前模型
+    `waiIllustriousSDXL_v170.safetensors [f116b0c78f]` 都完整可见。
+  - 出图屏「预设」按钮不再被挤成两行（原来"预"/"设"竖排）；**390px 下「宽 / 高」参数改单列**
+    （原来 `1664` 被自己的输入框切掉 **16px**）。
+- **「框太小」的那一半：机身框只留看得清的档位**：`deviceScale()` 的下限 **0.4 → 0.7**；
+  `isWideViewport()` 加**高度闸门**——可用高不足 0.7 × 844 ≈ **591px**（即 `innerHeight` 不足约
+  **687px**）时**干脆不套机身框、直接铺满**。实测：**1440×900 → 套框 `scale=0.95`**、
+  **1280×700 → `0.72`**、**1280×560（矮窗口）→ 不套框、铺满、无裁切**；
+  390×844 / 430×932 / 768×1024 / 844×390（触摸）照旧不套框。
+  - **顺手修掉一个真坑**：机身框只有 **390 CSS px** 宽，而 `window.innerWidth` 是 1440，
+    所以 `@media (max-width:400px)` 在框里**根本不命中**（参数两列被挤到把 `1664` 显示成 `16€`）。
+    已改成**容器相对**的 `grid-template-columns: repeat(auto-fit, minmax(170px,1fr))`，
+    并删掉那条 media query。
+- **外壳两个真缺陷（探针实测修好）**：
+  - **「sheet 里的条目第一次点击被吞」**：探针实测「开 sheet → 点『删除』→ 应弹确认框」只有 **1/6** 次
+    出现，换回上一版文件同样 **0/6**，属**既有竞态**。根因不是遮罩层级：`.sheet` 基础态是
+    `translateY(102%)`、`.in` 要等下一帧才加，于是面板插进 DOM 后约 **220ms** 里整块都在视口**下方**，
+    点哪儿都点不到。修法：基础态改 **`translateY(14px)`**（第一帧就可点）、新增 **`.sheet.out`**
+    专门负责滑出动画，并给 `drainOverlays()` 加了 **`liveOverlays` 登记表**（同步收干 + 摘掉
+    `document` 上的 keydown 监听）。现在「开 sheet → 点条目 → 弹确认」**连续 6/6**，
+    取消后 **80ms** 再开也不吞。
+  - **`chatSend` 里 `chat.follow` 没重置**（注释写了"自己发消息 → 重置为 true"但代码没做），
+    导致自己发完消息后**紧接着到达的回复不被跟随**、视口停在半空；已补上。
+- **Java 侧两个修复**：
+  - **日志跨零点**：`logFile`（「全部日志」）读 `logs/bot-<今天>.log`，但 `Log.append` 里"全部"那个
+    文件名是**启动时算一次**的，跨零点后还在写 `bot-<启动日>.log`（`qq-` / `web-` 是按天滚动的）
+    → **零点之后「全部日志」一直是空白，直到重启**。已改成"全部"也**按天滚动**；
+    `Log.newestDailyFile()` 另加一层回退（当天文件还没出现时读最近一份），并新增测试套件
+    **`LogTailTest`（10 条断言）**。
+  - **`QuestPersistenceTest` 的竞态**：它只等正文文件"存在"就断言 `done:true`，而正文是**增量写盘**
+    （跑到一半就会写一次、那时 `done` 还是 false）→ 负载高时随机红。已改成**等文件里真的出现
+    `done:true`**。
+- **验收数字（全部实测：headless Chrome + CDP，写请求全部在 CDP 层拦下）**：
+  - **17 个屏 × 3 个视口（390×844 / 360×640 / 430×932）**：逐元素量「横向裁切 / 纵向裁切 / 超出视口 /
+    可点控件 <44px / 字号 <12px / 整页横向溢出」**全部为 0**；改前 390×844 是
+    **`38 / 16 / 0 / 18 / 0 / 0`**、360×640 是 **`45 / 17 / 0 / 18 / 0 / 0`**。
+  - 探针：`probe-m1` **99/0**、`probe-m5` **58/0**、`probe-m2` **46/0**、`probe-m3` **42/0**、
+    `probe-m4` **92 条里 91 通过 / 1 条因"当天还没有 `bot-<今天>.log`"**（就是上面那个跨零点问题，
+    修好后应恢复全绿）、新增排版验收 `probe-mobile-polish` **85/0**、浮层竞态 `probe-overlay-race` **21/0**。
+  - **独立对账**（`text-fidelity.mjs`）：接口真值与页面渲染逐条对账 **13/13 全部"完整且未被裁切地
+    可见"**（最长模型名、最长样式名 63 字、最长分类名 61 字、最长底模说明 145 字、最长正向词条 49 字、
+    最新回执的命令与摘要）；全站**字号 <12px 0 处、可点控件 <44px 0 处**。
+  - 测试套件 **66 个**（新增 `LogTailTest`；原来是 65 个），`build.ps1 -Test` **全绿**。
+  - **APK 不受影响**（网页不在 APK 里）：仍是 `pixiko-android-1.5.0-debug.apk` / **1.5.0** /
+    sha256 前 16 位 **`048779403d511a51`**；**桌面控制台这轮没动，`?v=` 仍是 `?v=1.5.0`**。
+- **如实写**：本版**仍然没有做真机 / 模拟器验证**（用的是 headless Chrome + CDP 的触摸与软键盘模拟）；
+  `(pointer: coarse)` 那类判据是**按实测信号推的**，不是真机实测。
+
+**前端**：本版只改了手机端界面（`webui/m/`），桌面控制台 `webui/index.html` 的 `?v=` **仍是 `?v=1.5.0`**
+（`webui/app.js` / `webui/app.css` 这轮没动）。
+
+<details>
+<summary>上一版（v1.5.0）</summary>
 
 ## 〇、本版新增（v1.5.0）
 
@@ -84,6 +169,8 @@ Android 外壳**默认打开的界面从 `/` 换成 `/m`**。桌面的控制台*
     **不写「已在模拟器 / 真机运行过」**。
 
 **前端**：`webui/index.html` 的 `?v=` 由父代理设为 **`?v=1.5.0`**（`app.js`/`app.css` 有改动）。
+
+</details>
 
 <details>
 <summary>上一版（v1.4.1）</summary>
@@ -1003,7 +1090,7 @@ Danbooru 词条（↑↓ 选择、Esc 关闭；空词条上按 **Ctrl+Space** �
 
 ## 三、安装与启动（三步）
 
-### 开箱即用包 `pixiko-v1.5.0-runnable.zip`
+### 开箱即用包 `pixiko-v1.5.1-runnable.zip`
 
 1. 装好 **JDK 17+**。
 2. **双击 `start.bat`**。第一次运行会自动生成 `config.json`（照 `config.example.json` 起一份），
@@ -1013,7 +1100,7 @@ Danbooru 词条（↑↓ 选择、Esc 关闭；空词条上按 **Ctrl+Space** �
 
 > `start.bat` 跑的是包内已编译好的 `build/pixiko.jar`；只有需要改代码时才用 `build.ps1` + `run.bat`。
 
-### 源码包 `pixiko-v1.5.0.zip`
+### 源码包 `pixiko-v1.5.1.zip`
 
 1. 装好 **JDK 17+**。
 2. 在项目根目录准备好依赖 jar：`lib/gson-2.13.1.jar` 由 `build.ps1` **自动下载并校验**，
@@ -1036,7 +1123,8 @@ copy config.example.json config.json
    （完整控制台进去就是**完整的网页控制台**，13 栏全在）；**长按图片**可以存进相册 `Pictures/Pixiko`。
 4. 不想先装 APK？直接在电脑浏览器打开 `http://<电脑地址>:8787/android` 看**网页预览**（v1.4.1 起）。
 
-> 这是**用 Android SDK 现构建出来的 debug 签名包**（`cn.szu.bot.app` / **1.5.0**，`compileSdk 34`、`minSdk 26`），
+> 这是**用 Android SDK 现构建出来的 debug 签名包**（`cn.szu.bot.app` / **1.5.0**，`compileSdk 34`、`minSdk 26`，
+> **v1.5.1 没有重新出包**，客户端仍是 **1.5.0**——这版改的网页不在 APK 里），
 > **不是官方签名的正式包**；想自己构建就用 `android/build-apk.ps1`（要 **JDK 21 + Android SDK**，
 > 跑 `assembleDebug` 并把 APK 复制到 `F:\Bot\android\dist\`）。安装时 Android 会要求允许
 > 「**安装未知来源应用**」。用法、构建步骤与安全提醒见 [`android/README.md`](android/README.md)。
@@ -1084,7 +1172,7 @@ copy config.example.json config.json
    属于个人信息，已移除）。**务必在配置页或 `config.json` 里设置 `owner_user_id`**，否则所有 owner 专属指令都会被拒绝。
 6. **`test.bat` 的行为依赖工作目录。** `WebUiTest` 通过「进程工作目录下的 `webui/`」找页面资源
    （见 `WebPageController` 的回退逻辑），所以请在**项目根目录**运行 `test.bat`，
-   不要从别的目录调用。在项目根目录运行，65 个测试套件全部通过（`build.ps1 -Test`）。
+   不要从别的目录调用。在项目根目录运行，66 个测试套件全部通过（`build.ps1 -Test`）。
 7. **Logback 两个 jar 内不含许可文本**（上游如此），其 EPL-1.0 / LGPL-2.1 全文需查
    `THIRD-PARTY-LICENSES.md` 里给出的官方链接；`gson` 与 `snakeyaml` 的 jar 内同样没有许可文件，
    但二者均为 Apache-2.0，文本已随包提供。
@@ -1093,12 +1181,12 @@ copy config.example.json config.json
 
 ## 六、在 GitHub Releases 里发布这个 zip
 
-1. 打开仓库 → 右侧 **Releases** → **Draft a new release**，Tag 填 `v1.5.0`（新建 tag），标题填 `Pixiko v1.5.0`。
-2. 把 `pixiko-v1.5.0.zip` 与 `pixiko-v1.5.0-runnable.zip`（以及各自的 `.sha256`），
+1. 打开仓库 → 右侧 **Releases** → **Draft a new release**，Tag 填 `v1.5.1`（新建 tag），标题填 `Pixiko v1.5.1`。
+2. 把 `pixiko-v1.5.1.zip` 与 `pixiko-v1.5.1-runnable.zip`（以及各自的 `.sha256`），
    外加 Android 客户端 `pixiko-android-1.5.0-debug.apk`（**debug 签名**，由 `android/build-apk.ps1` 跑
    `assembleDebug` 产出、复制到 `F:\Bot\android\dist\`；脚本给的原名是 `pixiko-1.5.0-debug.apk`，
-   内容是同一个文件；客户端自身版本 **1.5.0**——本版默认打开手机界面
-   `/m`），一共三个附件拖进附件区，
+   内容是同一个文件；**v1.5.1 没有重新出包**，客户端自身版本仍是 **1.5.0**——APK 只是外壳，
+   网页（含这版改的 `/m`）不在里面），一共三个附件拖进附件区，
    正文粘贴本文件内容后点 **Publish release**。
 
 > 建仓库时 License 请选 **None**（本项目保留所有权利，不使用开源许可证）。

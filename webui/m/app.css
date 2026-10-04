@@ -31,10 +31,48 @@
   --ok: #4fd196;
   --warn: #ffc266;
   --radius: 14px;
-  --gap: 10px;
+  --gap: 10px;                /* @deprecated 行距的旧名，保留是为了别处引用不炸；请用 --m-row-gap */
   --bar-h: 52px;
   --tabs-h: 56px;
   --kb: 0px;
+
+  /* ── 排版令牌（本轮"排版舒适度"的统一规格，字母序按语义分组） ──────────────
+   * 这一组是**全站唯一真相来源**：屏 B/C/D 的 *.js 里已经写下了
+   *   var(--m-fs-body,15px) / var(--m-fs-title,15px) / var(--m-fs-sm,13px) / var(--m-fs-xs,12px)
+   *   var(--m-lh-body,1.5)  / var(--m-lh-sm,1.45)
+   *   var(--m-gap,12px)     / var(--m-pad,14px)       / var(--m-radius,14px)
+   * 这些名字与回退值**都不能改**（改名会让别人的规则掉回回退值、两套数字打架）。
+   * 下面 --m-fs-base 是 --m-fs-body 的别名（父代理的建议名），两个都给出，谁用哪个都行。
+   *
+   * 规格（基线 390px 宽）：
+   *   正文 / 参数值 / 数值      15px  行高 1.5
+   *   卡片标题                  15px / 600
+   *   参数名(label) / 说明行     13px  muted  行高 1.45
+   *   标签 / 胶囊 / 角标         12px          ← 全站不允许出现小于 12px 的文字
+   *   单行输入 / select / 按钮   高 ≥44px，输入框字号 16px（防 iOS 聚焦自动缩放）
+   *   多行 textarea             高 ≥88px
+   *   图标按钮 / 开关 / 复选框    可点区域 ≥44×44（视觉轨道可以更小）
+   *   卡片                      内边距 14px / 圆角 14px / 卡片间距 12px / 行距 10px
+   *   label 与输入之间           6px
+   * ------------------------------------------------------------------------ */
+  --m-fs-body: 15px;         /* 正文、参数值、数值读数 */
+  --m-fs-base: 15px;         /* = --m-fs-body（别名） */
+  --m-fs-title: 15px;        /* 卡片标题 */
+  --m-fs-sm: 13px;           /* 参数名 label、说明行 sub */
+  --m-fs-xs: 12px;           /* 标签 / 胶囊 / 角标 —— 全局字号下限 */
+  --m-fs-tag: 12px;          /* = --m-fs-xs（兼容别名；screen-styles.js / screen-quest.js 里写的是这个名） */
+  --m-lh-body: 1.5;
+  --m-lh-sm: 1.45;
+  --m-tap: 44px;             /* 最小可点区域（宽与高都要 ≥ 它） */
+  --m-icon: 44px;            /* 图标按钮 */
+  --m-input-h: 44px;         /* 单行输入 / select / 按钮最小高 */
+  --m-input-fs: 16px;        /* 输入框字号（16px 以下 iOS 聚焦会缩放页面） */
+  --m-area-h: 88px;          /* 多行 textarea 最小高 */
+  --m-gap: 12px;             /* 卡片与卡片之间 */
+  --m-row-gap: 10px;         /* 同一张卡片里的行间距 */
+  --m-pad: 14px;             /* 卡片内边距 */
+  --m-radius: 14px;          /* 卡片圆角（= --radius） */
+  --m-label-gap: 6px;        /* label 与输入之间 */
   --sat: env(safe-area-inset-top, 0px);
   --sab: env(safe-area-inset-bottom, 0px);
   --sal: env(safe-area-inset-left, 0px);
@@ -141,7 +179,7 @@ svg { width: 24px; height: 24px; fill: none; stroke: currentColor; stroke-width:
 }
 /* 对话屏可见时，滚动交给 .chat-log：可滚动祖先越少越不会出现双滚动条/联动 */
 .main:has(.screen.chat.active) { overflow: hidden; }
-.screen { display: none; padding: var(--gap) 12px 18px; }
+.screen { display: none; padding: var(--m-gap) 12px 18px; }
 .screen.active { display: block; }
 .screen.pad-x0 { padding-left: 0; padding-right: 0; }
 
@@ -152,7 +190,7 @@ svg { width: 24px; height: 24px; fill: none; stroke: currentColor; stroke-width:
   display: grid;
   place-items: center;
   color: var(--muted);
-  font-size: 12px;
+  font-size: var(--m-fs-xs);
   transition: height .18s ease;
 }
 .ptr.on { height: 40px; }
@@ -165,33 +203,50 @@ svg { width: 24px; height: 24px; fill: none; stroke: currentColor; stroke-width:
 @keyframes spin { to { transform: rotate(360deg); } }
 
 /* ── 4. 通用块：卡片 / 列表 / 行 / 按钮 ───────────────────────────────── */
+/* 卡片：内边距 14px、圆角 14px、卡片间距 12px（--m-* 令牌） */
 .card {
   background: var(--card);
   border: 1px solid var(--line);
-  border-radius: var(--radius);
-  padding: 12px;
-  margin-bottom: var(--gap);
+  border-radius: var(--m-radius);
+  padding: var(--m-pad);
+  margin-bottom: var(--m-gap);
 }
 .card.flush { padding: 0; overflow: hidden; }
-.card-title { font-size: 13px; color: var(--muted); margin: 0 0 8px; font-weight: 600; letter-spacing: .3px; }
-.card-head { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
-.card-head .card-title { margin: 0; flex: 1 1 auto; }
-.hint { color: var(--muted); font-size: 12.5px; margin: 6px 0 0; }
+/* 卡片标题 15px/600；原来是 13px muted，比正文还小，手机上看标题比内容弱 */
+.card-title {
+  font-size: var(--m-fs-title); color: var(--text); margin: 0 0 var(--m-row-gap);
+  font-weight: 600; line-height: var(--m-lh-body); overflow-wrap: anywhere;
+}
+.card-head { display: flex; align-items: center; gap: 8px; margin-bottom: var(--m-row-gap); }
+.card-head .card-title { margin: 0; flex: 1 1 auto; min-width: 0; }
+.hint {
+  color: var(--muted); font-size: var(--m-fs-sm); margin: 6px 0 0;
+  line-height: var(--m-lh-sm); white-space: normal; overflow-wrap: anywhere;
+}
 .muted { color: var(--muted); }
 .danger-text { color: var(--danger); }
 .ok-text { color: var(--ok); }
 .warn-text { color: var(--warn); }
-.mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12.5px; }
-.row-gap { display: flex; flex-direction: column; gap: 8px; }
+.mono {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: var(--m-fs-sm); font-variant-numeric: tabular-nums;
+  overflow-wrap: anywhere;
+}
+.row-gap { display: flex; flex-direction: column; gap: var(--m-row-gap); }
 .inline { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
-.spread { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.spread { display: flex; align-items: center; justify-content: space-between; gap: var(--m-row-gap); }
 .grow { flex: 1 1 auto; min-width: 0; }
-.nowrap { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+/* 单行省略是"例外"，只留给 app bar 标题与底部 tab 文案（见 .bar-title / .tab-text）。
+   其余地方的文本必须完整显示：正常换行 + anywhere 断词，不许 ellipsis。
+   .nowrap 只禁换行、不再 overflow:hidden —— 长了就自然撑开，绝不切字。
+   .truncate 才是"允许单行省略"的那一个（只有上面两处用它）。 */
+.nowrap { white-space: nowrap; overflow: visible; text-overflow: clip; }
+.truncate { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
 .center { text-align: center; }
 .hidden { display: none !important; }
 
 .list { display: flex; flex-direction: column; }
-.list.gap > * + * { margin-top: 8px; }
+.list.gap > * + * { margin-top: var(--m-row-gap); }
 .row {
   display: flex;
   align-items: center;
@@ -207,11 +262,14 @@ svg { width: 24px; height: 24px; fill: none; stroke: currentColor; stroke-width:
 .row:last-child { border-bottom: 0; }
 .row:active { background: var(--card-2); }
 .row-main { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
-.row-title { font-size: 15px; line-height: 1.35; overflow-wrap: anywhere; }
-.row-sub { font-size: 12.5px; color: var(--muted); overflow-wrap: anywhere; }
+.row-title { font-size: var(--m-fs-body); line-height: var(--m-lh-sm); overflow-wrap: anywhere; }
+.row-sub { font-size: var(--m-fs-sm); line-height: var(--m-lh-sm); color: var(--muted); overflow-wrap: anywhere; }
 .row-chevron { flex: 0 0 auto; color: #4d6187; }
 .row-chevron svg { width: 18px; height: 18px; }
-.row-tail { flex: 0 0 auto; color: var(--muted); font-size: 12.5px; }
+.row-tail {
+  flex: 0 0 auto; color: var(--muted); font-size: var(--m-fs-sm);
+  overflow-wrap: anywhere; font-variant-numeric: tabular-nums;
+}
 .row.pressed-flash { background: #24334f; }
 
 .btn {
@@ -219,13 +277,15 @@ svg { width: 24px; height: 24px; fill: none; stroke: currentColor; stroke-width:
   align-items: center;
   justify-content: center;
   gap: 8px;
-  min-height: 44px;
+  min-height: var(--m-input-h);
   padding: 0 16px;
   border-radius: 12px;
   background: #1d2a42;
   color: var(--text);
-  font-size: 15px;
+  font-size: var(--m-fs-body);
   font-weight: 600;
+  /* flex:0 0 auto —— 按钮不许被同行控件挤窄（挤窄了「预设」这种两字按钮就会折成"预/设"两行） */
+  flex: 0 0 auto;
   transition: transform .08s, background .12s, opacity .12s;
 }
 .btn:active { transform: scale(.975); background: #24334f; }
@@ -233,32 +293,49 @@ svg { width: 24px; height: 24px; fill: none; stroke: currentColor; stroke-width:
 .btn.primary:active { background: #4b90ea; }
 .btn.danger { background: rgba(255, 107, 107, .16); color: var(--danger); }
 .btn.ghost { background: transparent; border: 1px solid var(--line); }
-.btn.block { width: 100%; }
+.btn.block { width: 100%; flex: 1 1 auto; }
 .btn.big { min-height: 52px; font-size: 16px; }
 .btn[disabled], .btn.is-disabled { opacity: .45; pointer-events: none; }
-.btn-icon { width: 44px; height: 44px; padding: 0; }
+.btn-icon { width: var(--m-icon); height: var(--m-icon); padding: 0; }
+/* 胶囊/标签：字号 12px 是**下限**，可点胶囊用 13px 更好按也更好读 */
 .chip {
   display: inline-flex; align-items: center; gap: 6px;
-  min-height: 44px; padding: 0 14px; border-radius: 999px;
-  background: #1b2740; border: 1px solid var(--line); color: var(--text); font-size: 13px;
+  min-height: var(--m-tap); padding: 0 14px; border-radius: 999px;
+  background: #1b2740; border: 1px solid var(--line); color: var(--text);
+  font-size: var(--m-fs-sm); flex: 0 0 auto;
 }
 .chip.on { background: rgba(90, 162, 255, .18); border-color: var(--primary-dim); color: #cfe2ff; }
 .chip:active { background: #24334f; }
 .badge {
   display: inline-grid; place-items: center;
-  min-width: 20px; height: 20px; padding: 0 6px; border-radius: 999px;
-  background: var(--danger); color: #fff; font-size: 11.5px; font-weight: 700;
+  min-width: 22px; height: 22px; padding: 0 6px; border-radius: 999px;
+  background: var(--danger); color: #fff; font-size: var(--m-fs-xs); font-weight: 700;
+  font-variant-numeric: tabular-nums;
 }
 .badge.soft { background: #24334f; color: var(--muted); }
 
 /* ── 5. 表单控件（输入框一律 16px，防 iOS 自动缩放） ───────────────────── */
-.field { display: flex; flex-direction: column; gap: 6px; margin-bottom: var(--gap); }
-.field-label { font-size: 13px; color: var(--muted); font-weight: 600; }
+.field {
+  display: flex; flex-direction: column;
+  gap: var(--m-label-gap);            /* label 与输入之间 6px */
+  margin-bottom: var(--m-row-gap);    /* 行间距 10px */
+  min-width: 0;
+}
+.field-label {
+  font-size: var(--m-fs-sm); color: var(--muted); font-weight: 600;
+  line-height: var(--m-lh-sm); overflow-wrap: anywhere;
+}
+/* 长值完整显示行（原生 <select> 天生单行截断，配一行可换行的完整值，见 genSelect） */
+.field-value {
+  font-size: var(--m-fs-body); font-weight: 600; line-height: var(--m-lh-sm);
+  color: var(--text); font-variant-numeric: tabular-nums;
+  white-space: normal; overflow: visible; text-overflow: clip; overflow-wrap: anywhere;
+}
 .input, textarea.input, select.input {
   width: 100%;
-  min-height: 44px;
+  min-height: var(--m-input-h);
   padding: 10px 12px;
-  font-size: 16px;
+  font-size: var(--m-input-fs);
   font-family: inherit;
   color: var(--text);
   background: #0e1727;
@@ -267,16 +344,17 @@ svg { width: 24px; height: 24px; fill: none; stroke: currentColor; stroke-width:
   outline: none;
 }
 .input:focus { border-color: var(--primary-dim); }
-textarea.input { resize: none; line-height: 1.45; }
+textarea.input { resize: none; line-height: var(--m-lh-sm); min-height: var(--m-area-h); }
+/* select 的箭头按 44px 高的框居中（原来写死 20px，是从 44px 时代的旧值） */
 select.input { appearance: none; -webkit-appearance: none; padding-right: 34px;
   background-image: linear-gradient(45deg, transparent 50%, var(--muted) 50%), linear-gradient(135deg, var(--muted) 50%, transparent 50%);
-  background-position: calc(100% - 18px) 20px, calc(100% - 13px) 20px;
+  background-position: calc(100% - 18px) calc(50% - 2px), calc(100% - 13px) calc(50% - 2px);
   background-size: 5px 5px, 5px 5px;
   background-repeat: no-repeat;
 }
 input[type="range"] {
   -webkit-appearance: none; appearance: none;
-  width: 100%; height: 44px; background: transparent; margin: 0;
+  width: 100%; height: var(--m-tap); background: transparent; margin: 0;
 }
 input[type="range"]::-webkit-slider-runnable-track { height: 6px; border-radius: 6px; background: #24334f; }
 input[type="range"]::-webkit-slider-thumb {
@@ -284,16 +362,16 @@ input[type="range"]::-webkit-slider-thumb {
   width: 26px; height: 26px; margin-top: -10px; border-radius: 50%;
   background: var(--primary); border: 3px solid #0b1220;
 }
-.stepper { display: flex; align-items: center; gap: 8px; }
-.stepper .input { text-align: center; min-width: 0; }
+.stepper { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.stepper .input { text-align: center; min-width: 0; flex: 1 1 auto; font-variant-numeric: tabular-nums; }
 .stepper-btn {
-  flex: 0 0 auto; width: 44px; height: 44px; border-radius: 12px;
+  flex: 0 0 auto; width: var(--m-tap); height: var(--m-tap); border-radius: 12px;
   background: #1d2a42; display: grid; place-items: center; font-size: 22px; font-weight: 600;
 }
 .stepper-btn:active { background: #24334f; }
 .switch {
   position: relative; flex: 0 0 auto;
-  width: 48px; height: 44px;              /* 触摸目标 ≥44px；轨道靠 ::before 画 */
+  width: 48px; height: var(--m-tap);       /* 可点区域 ≥44×44；轨道靠 ::before 画 */
   background: none; border: 0;
 }
 .switch::before {
@@ -307,13 +385,13 @@ input[type="range"]::-webkit-slider-thumb {
 }
 .switch.on::before { background: var(--primary-dim); }
 .switch.on::after { transform: translateX(20px); background: var(--primary); }
-.switch-row { display: flex; align-items: center; gap: 10px; min-height: 44px; }
+.switch-row { display: flex; align-items: center; gap: 10px; min-height: var(--m-tap); }
 .switch-row .row-main { flex: 1 1 auto; }
-/* 输入条里的开关小一号，但同样保持 44px 的可点高度 */
-.composer-meta .switch { width: 44px; height: 40px; }
-.composer-meta .switch::before { height: 24px; margin-top: -12px; }
-.composer-meta .switch::after { width: 18px; height: 18px; margin-top: -9px; }
-.composer-meta .switch.on::after { transform: translateX(20px); }
+/* 输入条里的开关窄一号（轨道 44×26），但**可点区域仍然 44×44** —— 少这 4px 就是"手指按不准"。 */
+.composer-meta .switch { width: var(--m-tap); height: var(--m-tap); }
+.composer-meta .switch::before { height: 26px; margin-top: -13px; }
+.composer-meta .switch::after { width: 20px; height: 20px; margin-top: -10px; }
+.composer-meta .switch.on::after { transform: translateX(18px); }
 
 /* ── 6. 底部 tab ───────────────────────────────────────────────────────── */
 .tabs {
@@ -337,7 +415,7 @@ input[type="range"]::-webkit-slider-thumb {
   justify-content: center;
   gap: 3px;
   color: var(--muted);
-  font-size: 11px;
+  font-size: var(--m-fs-xs);            /* 原来是 11px —— 12px 是全站字号下限 */
   transition: color .12s, background .12s;
 }
 .tab:active { background: #16203a; }
@@ -347,17 +425,20 @@ input[type="range"]::-webkit-slider-thumb {
 .tab-text { line-height: 1; }
 .tab-badge {
   position: absolute; top: 6px; left: 50%; margin-left: 4px;
-  min-width: 16px; height: 16px; padding: 0 4px; border-radius: 999px;
-  background: var(--danger); color: #fff; font-size: 10px; font-weight: 700;
-  display: grid; place-items: center;
+  min-width: 20px; height: 18px; padding: 0 5px; border-radius: 999px;
+  background: var(--danger); color: #fff; font-size: var(--m-fs-xs); font-weight: 700;
+  display: grid; place-items: center; font-variant-numeric: tabular-nums;
 }
 .tab-badge[hidden] { display: none; }
 
 /* ── 7. 三态：骨架 / 空 / 错误 ─────────────────────────────────────────── */
 .state { padding: 40px 16px; text-align: center; color: var(--muted); }
 .state-icon { width: 40px; height: 40px; margin: 0 auto 10px; color: #3d4f70; }
-.state-title { font-size: 15px; color: var(--text); margin: 0 0 4px; }
-.state-text { font-size: 13px; margin: 0 0 14px; overflow-wrap: anywhere; }
+.state-title { font-size: var(--m-fs-title); color: var(--text); margin: 0 0 4px; line-height: var(--m-lh-sm); }
+.state-text {
+  font-size: var(--m-fs-sm); line-height: var(--m-lh-sm);
+  margin: 0 0 14px; overflow-wrap: anywhere; white-space: normal;
+}
 .state-error .state-icon { color: #7a3a44; }
 .state-error .state-title { color: var(--danger); }
 .sk { background: linear-gradient(90deg, #16203a 25%, #1d2a42 37%, #16203a 63%); background-size: 400% 100%; animation: sk 1.3s ease infinite; border-radius: 8px; }
@@ -389,10 +470,10 @@ input[type="range"]::-webkit-slider-thumb {
   min-height: 0;
   overflow-y: auto;
   overflow-x: hidden;
-  padding: var(--gap) 12px 12px;
+  padding: var(--m-gap) 12px 12px;
   display: flex;
   flex-direction: column;
-  gap: var(--gap);
+  gap: var(--m-row-gap);
   -webkit-overflow-scrolling: touch;
   overscroll-behavior-y: contain;
 }
@@ -402,8 +483,8 @@ input[type="range"]::-webkit-slider-thumb {
   border-radius: var(--radius);
   background: var(--card);
   border: 1px solid var(--line);
-  font-size: 15px;
-  line-height: 1.5;
+  font-size: var(--m-fs-body);
+  line-height: var(--m-lh-body);
   white-space: pre-wrap;
   overflow-wrap: anywhere;
   user-select: text;
@@ -413,7 +494,7 @@ input[type="range"]::-webkit-slider-thumb {
 .bubble.bot { align-self: flex-start; }
 .bubble.sys {
   align-self: center; max-width: 92%; text-align: center;
-  background: #101a2c; border-style: dashed; color: var(--muted); font-size: 12.5px;
+  background: #101a2c; border-style: dashed; color: var(--muted); font-size: var(--m-fs-sm);
 }
 .bubble.imgs { padding: 6px; }
 .bubble .bubble-imgs { display: grid; grid-template-columns: repeat(2, 1fr); gap: 6px; margin-top: 6px; }
@@ -435,10 +516,10 @@ input[type="range"]::-webkit-slider-thumb {
 .composer-row { display: flex; align-items: flex-end; gap: 8px; }
 .composer textarea {
   flex: 1 1 auto;
-  min-height: 44px;
+  min-height: var(--m-input-h);
   max-height: 40vh;
   padding: 11px 12px;
-  font-size: 16px;
+  font-size: var(--m-input-fs);
   line-height: 1.4;
   color: var(--text);
   background: #0e1727;
@@ -451,42 +532,59 @@ input[type="range"]::-webkit-slider-thumb {
 .composer textarea:focus { border-color: var(--primary-dim); }
 .composer .send {
   flex: 0 0 auto;
-  width: 44px; height: 44px; border-radius: 12px;
+  width: var(--m-icon); height: var(--m-icon); border-radius: 12px;
   background: var(--primary); color: #05101f; display: grid; place-items: center;
 }
 .composer .send:active { background: #4b90ea; }
 .composer .send[disabled] { opacity: .4; }
 .composer-meta {
   display: flex; align-items: center; gap: 10px;
-  padding: 6px 2px 0; font-size: 12.5px; color: var(--muted);
+  padding: 6px 2px 0; font-size: var(--m-fs-sm); color: var(--muted);
+  min-height: var(--m-tap);              /* 整条 meta 行也是 44px 高，和里面的开关对齐 */
 }
-/* 触摸目标的尺寸统一由第 5 段的 .switch/.composer-meta .switch 规则负责（44×40） */
+/* 触摸目标的尺寸统一由第 5 段的 .switch/.composer-meta .switch 规则负责（都是 44×44） */
 .composer-spacer { height: 0; }
 
 /* 生成中：气泡下方的“正在出图”提示 */
-.typing { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); font-size: 12.5px; }
+.typing { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); font-size: var(--m-fs-sm); }
 .typing i { width: 6px; height: 6px; border-radius: 50%; background: var(--muted); animation: blink 1.2s infinite; }
 .typing i:nth-child(2) { animation-delay: .2s; }
 .typing i:nth-child(3) { animation-delay: .4s; }
 @keyframes blink { 0%, 60%, 100% { opacity: .25; } 30% { opacity: 1; } }
 
 /* ── 9. 出图屏 ─────────────────────────────────────────────────────────── */
-.progress-card { display: flex; flex-direction: column; gap: 8px; }
+.progress-card { display: flex; flex-direction: column; gap: var(--m-row-gap); }
 .progress-top { display: flex; align-items: baseline; gap: 8px; }
 .progress-pct { font-size: 26px; font-weight: 700; font-variant-numeric: tabular-nums; }
 .bar-track { height: 8px; border-radius: 8px; background: #1d2a42; overflow: hidden; }
 .bar-fill { height: 100%; width: 0; background: linear-gradient(90deg, var(--primary-dim), var(--primary)); transition: width .35s ease; }
 .bar-fill.indet { width: 40% !important; animation: indet 1.2s ease-in-out infinite; }
 @keyframes indet { 0% { margin-left: -40%; } 100% { margin-left: 100%; } }
-.queue-row { display: flex; align-items: center; gap: 8px; min-height: 44px; }
-.queue-row .stepper-btn { width: 44px; height: 44px; font-size: 16px; }
+.queue-row { display: flex; align-items: center; gap: 8px; min-height: var(--m-tap); }
+.queue-row .stepper-btn { width: var(--m-tap); height: var(--m-tap); font-size: 16px; }
 
+/*
+ * 图集网格：每格 = 一个正方形缩略图（.thumb，带边框/圆角/裁切） + 底下一行文件名（.cap）。
+ *
+ * 为什么把 .cap 从"压在图上的一行省略号"改成"图底下的可换行整行"：
+ *   原来 .cap 是 position:absolute + nowrap + ellipsis，30 个字符的文件名只看得见前 8 个，
+ *   用户要的就是"完整看到"。文件名现在完整换行显示；缩略图本身仍然 1:1 铺满格子。
+ *   （.thumb 是后加的一层：.cell 自己不再画边框和裁切，否则 .cap 会被 overflow:hidden 吃掉。）
+ */
 .grid-imgs {
   display: grid;
   grid-template-columns: repeat(3, 1fr);
-  gap: 6px;
+  gap: 8px;
+  align-items: start;
 }
 .grid-imgs .cell {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+.grid-imgs .cell .thumb {
   position: relative;
   aspect-ratio: 1 / 1;
   border-radius: 10px;
@@ -496,32 +594,42 @@ input[type="range"]::-webkit-slider-thumb {
   display: grid;
   place-items: center;
 }
-.grid-imgs .cell img { width: 100%; height: 100%; object-fit: cover; display: block; }
-.grid-imgs .cell.tap:active { transform: scale(.97); }
+.grid-imgs .cell .thumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.grid-imgs .cell.tap .thumb:active { transform: scale(.97); }
+.grid-imgs .cell.tap:active { transform: none; }
 .grid-imgs .cell .ring { width: 34px; height: 34px; }
 .grid-imgs .cell .ring circle { fill: none; stroke-width: 3; }
 .grid-imgs .cell .ring .bg { stroke: #22304a; }
 .grid-imgs .cell .ring .fg { stroke: var(--primary); stroke-linecap: round; transition: stroke-dashoffset .3s; }
 .grid-imgs .cell .pct {
-  position: absolute; font-size: 11px; font-weight: 700; font-variant-numeric: tabular-nums; color: #cfe2ff;
+  position: absolute; font-size: var(--m-fs-xs); font-weight: 700;
+  font-variant-numeric: tabular-nums; color: #cfe2ff;
 }
-.grid-imgs .cell.pending { color: var(--muted); font-size: 11px; }
+.grid-imgs .cell.pending { color: var(--muted); font-size: var(--m-fs-xs); }
 .grid-imgs .cell.pending .dot { width: 8px; height: 8px; border-radius: 50%; background: #2b3a56; }
-.grid-imgs .cell.failed { border-color: #5a2b33; background: #1b1119; }
+.grid-imgs .cell.failed .thumb { border-color: #5a2b33; background: #1b1119; }
 .grid-imgs .cell.failed .x { color: var(--danger); font-size: 18px; font-weight: 700; }
-.grid-imgs .cell.done { border-color: #2b3a56; }
-.grid-imgs .cell.held::after {
-  content: "挂起"; position: absolute; left: 4px; bottom: 4px;
-  font-size: 10px; padding: 1px 5px; border-radius: 6px; background: rgba(0,0,0,.6); color: var(--warn);
+.grid-imgs .cell.done .thumb { border-color: #2b3a56; }
+.grid-imgs .cell .thumb .held-tag {
+  position: absolute; left: 4px; bottom: 4px;
+  font-size: var(--m-fs-xs); padding: 1px 5px; border-radius: 6px;
+  background: rgba(0, 0, 0, .6); color: var(--warn);
 }
+/* 文件名：完整显示、允许换行 —— 不再 nowrap / ellipsis / 压在图上看不见后半截 */
 .grid-imgs .cell .cap {
-  position: absolute; left: 0; right: 0; bottom: 0;
-  font-size: 10px; padding: 3px 5px; color: #dbe6fb;
-  background: linear-gradient(transparent, rgba(0, 0, 0, .72));
-  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  font-size: var(--m-fs-xs); line-height: 1.35; color: var(--muted);
+  padding: 0 1px;
+  white-space: normal; overflow: visible; text-overflow: clip; overflow-wrap: anywhere;
 }
-.param-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+/* 宽/高这一对：两列时列宽只有 ~184px，−／＋ 各 44px 之后中间只剩 60–80px，
+   4 位数在 16px 字号下约 38px —— 左右内边距收窄到 6px，并且**用容器宽度自己决定列数**。
+   为什么不写 `@media (max-width:400px)`：桌面预览的机身框是固定 390 CSS px 宽，而媒体查询读的是
+   **窗口**宽度（1440）—— 用媒体查询的话框里永远是两列，"1664" 会被自己的输入框切成 "16€"。
+   `auto-fit + minmax(170px,1fr)` 量的是**卡片自己的宽度**：390 及以下 1 列、430 两列，
+   机身框里也一样，跟窗口多大无关。 */
+.param-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: var(--m-row-gap); }
 .param-grid .field { margin-bottom: 0; }
+.param-grid .stepper .input { padding-left: 6px; padding-right: 6px; }
 
 /* ── 10. 浮层：sheet / 对话框 / 查看器 / toast ─────────────────────────── */
 .overlay-root { position: relative; z-index: 40; }
@@ -532,32 +640,49 @@ input[type="range"]::-webkit-slider-thumb {
 }
 .scrim.in { opacity: 1; }
 
+/*
+ * 进入动画**不再把面板整块挪到视口外**（原来是 translateY(102%) → 0）。
+ *
+ * 为什么改：`.in` 是 nextFrame（+16ms）才加上的，而 220ms 的滑入过程里面板一直在视口下方 ——
+ * 这 200 多毫秒内**任何落在 sheet 上的点击都打在视口外面**（或打在遮罩上直接把面板关掉），
+ * 表现就是用户/自动化说的"第一次点击被吞"：明明元素和坐标都对，点下去就是没反应。
+ * 安卓 WebView 上动画更慢，这个窗口更长。
+ *
+ * 现在起始位置只低 14px：从第一帧起面板就在视口内、条目中心就在原地，
+ * 点得早就一定点得中；14px 的微升 + 缓动仍然保留"从底部升上来"的手感。
+ * 关闭时才真的滑下去（`.out` → translateY(102%)），所以"甩下去"的观感没丢。
+ */
 .sheet {
   position: fixed; left: 0; right: 0; bottom: 0; z-index: 31;
   background: #16203a;
   border-top-left-radius: 18px; border-top-right-radius: 18px;
   border-top: 1px solid var(--line);
   padding-bottom: var(--sab);
-  transform: translateY(102%);
+  transform: translateY(14px);
   transition: transform .22s cubic-bezier(.22, .8, .3, 1);
   max-height: 82vh;
   display: flex; flex-direction: column;
 }
 .sheet.in { transform: translateY(0); }
+.sheet.out { transform: translateY(102%); }   /* 只在 close() 里加，专管"关"的滑出 */
 .sheet-grip { width: 40px; height: 4px; border-radius: 4px; background: #33456a; margin: 8px auto 4px; }
-.sheet-title { padding: 6px 16px 8px; font-size: 14px; font-weight: 650; }
+.sheet-title {
+  padding: 6px 16px 8px; font-size: var(--m-fs-title); font-weight: 600;
+  line-height: var(--m-lh-body); overflow-wrap: anywhere;
+}
 .sheet-list { overflow-y: auto; padding-bottom: 8px; }
 .sheet-item {
   display: flex; align-items: center; gap: 10px;
   width: 100%; min-height: 52px; padding: 10px 16px;
-  font-size: 16px; text-align: left; border-top: 1px solid var(--line);
+  font-size: var(--m-fs-body); text-align: left; border-top: 1px solid var(--line);
+  overflow-wrap: anywhere;
 }
 .sheet-item:active { background: #1d2a42; }
 .sheet-item.danger { color: var(--danger); }
-.sheet-item .sheet-sub { font-size: 12.5px; color: var(--muted); }
+.sheet-item .sheet-sub { font-size: var(--m-fs-sm); line-height: var(--m-lh-sm); color: var(--muted); overflow-wrap: anywhere; }
 .sheet-cancel {
   margin: 8px 12px 12px; min-height: 48px; border-radius: 12px;
-  background: #1d2a42; display: grid; place-items: center; font-size: 16px; font-weight: 600;
+  background: #1d2a42; display: grid; place-items: center; font-size: var(--m-input-fs); font-weight: 600;
 }
 .sheet-cancel:active { background: #24334f; }
 
@@ -571,9 +696,12 @@ input[type="range"]::-webkit-slider-thumb {
   transition: transform .18s ease, opacity .18s ease;
 }
 .dialog.in { opacity: 1; transform: translate(-50%, -50%) scale(1); }
-.dialog-title { font-size: 16px; font-weight: 650; margin: 0 0 6px; }
-.dialog-text { font-size: 14px; color: var(--muted); margin: 0 0 12px; overflow-wrap: anywhere; }
-.dialog-input { width: 100%; min-height: 44px; padding: 10px 12px; font-size: 16px; color: var(--text);
+.dialog-title { font-size: 16px; font-weight: 650; margin: 0 0 6px; overflow-wrap: anywhere; }
+.dialog-text {
+  font-size: var(--m-fs-body); line-height: var(--m-lh-body); color: var(--muted);
+  margin: 0 0 12px; overflow-wrap: anywhere; white-space: normal;
+}
+.dialog-input { width: 100%; min-height: var(--m-input-h); padding: 10px 12px; font-size: var(--m-input-fs); color: var(--text);
   background: #0e1727; border: 1px solid var(--line); border-radius: 12px; outline: none; margin-bottom: 12px; }
 .dialog-actions { display: flex; gap: 8px; }
 .dialog-actions .btn { flex: 1 1 0; }
@@ -588,7 +716,7 @@ input[type="range"]::-webkit-slider-thumb {
   max-width: 92vw;
   padding: 9px 14px; border-radius: 12px;
   background: rgba(24, 35, 56, .97); border: 1px solid var(--line);
-  color: var(--text); font-size: 13.5px; text-align: center;
+  color: var(--text); font-size: var(--m-fs-body); line-height: var(--m-lh-sm); text-align: center;
   box-shadow: 0 6px 22px rgba(0, 0, 0, .4);
   opacity: 0; transform: translateY(8px);
   transition: opacity .18s, transform .18s;
@@ -607,7 +735,7 @@ input[type="range"]::-webkit-slider-thumb {
 .viewer-top {
   display: flex; align-items: center; gap: 8px;
   padding: calc(var(--sat) + 6px) 8px 6px;
-  color: var(--muted); font-size: 13px;
+  color: var(--muted); font-size: var(--m-fs-sm);
 }
 .viewer-count { flex: 1 1 auto; padding-left: 6px; font-variant-numeric: tabular-nums; }
 .viewer-stage {
@@ -625,7 +753,7 @@ input[type="range"]::-webkit-slider-thumb {
 .viewer-stage img.snap { transition: none; }
 .viewer-nav {
   position: absolute; top: 50%; transform: translateY(-50%);
-  width: 44px; height: 44px; border-radius: 50%;
+  width: var(--m-tap); height: var(--m-tap); border-radius: 50%;
   background: rgba(19, 28, 46, .8); display: grid; place-items: center; color: var(--text);
 }
 .viewer-nav.prev { left: 8px; }
@@ -633,17 +761,19 @@ input[type="range"]::-webkit-slider-thumb {
 .viewer-nav[disabled] { opacity: .28; }
 .viewer-bottom {
   padding: 10px 16px calc(14px + var(--sab));
-  color: var(--muted); font-size: 13px; text-align: center;
+  color: var(--muted); font-size: var(--m-fs-sm); line-height: var(--m-lh-sm); text-align: center;
   white-space: pre-wrap; overflow-wrap: anywhere;
-  min-height: 44px;
+  min-height: var(--m-tap);
 }
 
 /* ── 11. 占位屏（screen-*.js 还没加载出来时） ──────────────────────────── */
 .missing { padding: 48px 16px; text-align: center; }
 .missing h2 { font-size: 16px; margin: 0 0 6px; }
-.missing p { color: var(--muted); font-size: 13px; margin: 0; }
+.missing p { color: var(--muted); font-size: var(--m-fs-sm); margin: 0; line-height: var(--m-lh-sm); }
 
 /* ── 12. 窄屏微调（360×640 一类的机器） ────────────────────────────────── */
+/* 注意：这里不要再用 `@media (max-width:400px)` 去管 .param-grid —— 桌面预览的机身框是固定
+   390 CSS px 宽而窗口宽 1440，媒体查询在框里根本不命中（见第 9 段 .param-grid 的注释）。 */
 @media (max-width: 380px) {
   .grid-imgs { grid-template-columns: repeat(2, 1fr); }
   .bubble { max-width: 92%; }
@@ -667,6 +797,10 @@ input[type="range"]::-webkit-slider-thumb {
  * **包含块**（CSS Transforms 规范），底部 tab / 底部 sheet / 查看器 / toast 于是全部相对这个框
  * 定位、并跟着一起缩放 —— 这正是"模拟安卓尺寸"要的效果。框的高度用 --device-scale 反算，
  * 保证缩放后正好落在视口里（最大 100%，不会超出）。
+ *
+ * 缩放有**可读性下限 0.7**：0.7 × 15px ≈ 10.5px 已经是"手机上还能读"的底线。窗口高度不够时
+ * app.js 的 isWideViewport() 直接返回 false（不套框、走铺满那条路），所以这里永远不会出现
+ * 0.5 那种"整屏糊掉"的框 —— 见 app.js 的 MIN_DEVICE_SCALE / 那一条高度判据。
  */
 html[data-wide="1"] {
   /* clip 而不是 hidden：不产生滚动条，页面宽度就是视口宽度（框才能真正居中） */
@@ -722,8 +856,10 @@ html[data-wide="1"] {
     display: block;
     margin: 0;
     color: var(--muted);
-    font-size: 12.5px;
+    font-size: var(--m-fs-sm);
+    line-height: var(--m-lh-sm);
     text-align: center;
     letter-spacing: .2px;
+    white-space: normal; overflow: visible; text-overflow: clip; overflow-wrap: anywhere;
   }
 }

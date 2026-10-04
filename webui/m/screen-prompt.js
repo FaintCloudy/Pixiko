@@ -24,25 +24,31 @@
 
   /* ───────────────────────── 样式（一次性注入，全部 .pr- 前缀） ───────────────────────── */
 
+  /* 排版尺度（与 app.css 的移动端令牌同值，令牌缺失时用兜底值，见任务书「统一排版规格」）：
+       正文/参数值 15px · 说明 13px · 标签/胶囊 12px（下限） · 行高 1.5 / 1.45
+       单行控件 ≥44px · 卡片内边距 14px · 圆角 14px · 卡片间距 12px · 行距 10px
+     本轮重点（提示词屏）：**词条必须完整可读** —— 词条、LoRA 标签一律允许换行、绝不 ellipsis
+     单行剪裁（`.pr-term` 原先 `max-width:38vw` + `nowrap` + `ellipsis`，49 字的 danbooru 长 tag
+     会被剪掉 143px，等于看不到自己写了什么）。 */
   var CSS = [
     '.pr-wrap{display:flex;flex-direction:column;gap:12px;padding:0 0 96px;}',
-    '.pr-note{font-size:12px;line-height:1.5;color:#93a4c4;padding:0 4px;}',
+    '.pr-note{font-size:13px;line-height:1.45;color:var(--muted,#93a4c4);padding:0 4px;}',
     '.pr-block{background:#131c2e;border-radius:14px;overflow:hidden;border:1px solid #1d2942;}',
-    '.pr-head{display:flex;align-items:center;gap:8px;width:100%;min-height:48px;padding:10px 14px;',
-    'background:none;border:0;color:#e8eefc;font-size:16px;font-weight:600;text-align:left;cursor:pointer;}',
+    '.pr-head{display:flex;align-items:center;gap:8px;width:100%;min-height:44px;padding:10px 14px;',
+    'background:none;border:0;color:#e8eefc;font-size:15px;font-weight:600;line-height:1.5;text-align:left;cursor:pointer;font-family:inherit;}',
     '.pr-head:active{background:#1a2540;}',
     '.pr-head .pr-chev{margin-left:auto;flex:none;color:#93a4c4;transition:transform .18s ease;}',
     '.pr-block.pr-collapsed .pr-chev{transform:rotate(-90deg);}',
     '.pr-block.pr-collapsed .pr-panel{display:none;}',
-    '.pr-count{font-size:12px;font-weight:400;color:#93a4c4;white-space:nowrap;}',
-    '.pr-panel{display:flex;flex-direction:column;gap:10px;padding:0 12px 12px;}',
+    '.pr-count{font-size:12px;font-weight:400;color:#93a4c4;white-space:nowrap;font-variant-numeric:tabular-nums;}',
+    '.pr-panel{display:flex;flex-direction:column;gap:10px;padding:0 14px 14px;}',
     '.pr-input{width:100%;box-sizing:border-box;min-height:76px;max-height:40vh;padding:10px 12px;',
     'background:#0b1220;color:#e8eefc;border:1px solid #26324c;border-radius:10px;font-size:16px;',
     'line-height:1.5;font-family:inherit;resize:none;overflow-y:auto;}',
     '.pr-input:focus{outline:none;border-color:#5aa2ff;}',
     '.pr-actions{display:flex;flex-wrap:wrap;gap:8px;}',
     '.pr-btn{min-height:44px;min-width:44px;padding:0 14px;border-radius:10px;border:1px solid transparent;',
-    'background:#5aa2ff;color:#08111f;font-size:14px;font-weight:600;font-family:inherit;cursor:pointer;',
+    'background:#5aa2ff;color:#08111f;font-size:15px;font-weight:600;font-family:inherit;cursor:pointer;',
     'display:inline-flex;align-items:center;justify-content:center;}',
     '.pr-btn:active{opacity:.72;}',
     '.pr-btn[disabled]{opacity:.45;}',
@@ -54,34 +60,45 @@
     'color:#e8eefc;border:1px solid #26324c;border-radius:10px;font-size:16px;font-family:inherit;}',
     '.pr-add-input:focus{outline:none;border-color:#5aa2ff;}',
     '.pr-sug{display:flex;flex-direction:column;background:#0b1220;border:1px solid #26324c;border-radius:10px;overflow:hidden;}',
-    '.pr-sug-item{display:flex;align-items:center;gap:8px;min-height:44px;padding:6px 12px;background:none;',
-    'border:0;border-top:1px solid #1a2338;color:#e8eefc;font-size:15px;font-family:inherit;text-align:left;cursor:pointer;}',
+    '.pr-sug-item{display:flex;align-items:center;flex-wrap:wrap;gap:2px 8px;min-height:44px;padding:6px 12px;background:none;',
+    'border:0;border-top:1px solid #1a2338;color:#e8eefc;font-size:15px;line-height:1.5;font-family:inherit;text-align:left;cursor:pointer;}',
     '.pr-sug-item:first-child{border-top:0;}',
     '.pr-sug-item:active{background:#1a2540;}',
-    '.pr-sug-item .pr-sug-tag{font-weight:600;}',
-    '.pr-sug-item .pr-sug-zh{color:#93a4c4;font-size:13px;}',
-    '.pr-sug-item .pr-sug-rank{margin-left:auto;color:#5aa2ff;font-size:12px;}',
+    '.pr-sug-item .pr-sug-tag{font-weight:600;min-width:0;overflow-wrap:anywhere;word-break:break-word;}',
+    '.pr-sug-item .pr-sug-zh{color:#93a4c4;font-size:13px;line-height:1.45;min-width:0;overflow-wrap:anywhere;word-break:break-word;}',
+    '.pr-sug-item .pr-sug-rank{margin-left:auto;color:#5aa2ff;font-size:12px;font-variant-numeric:tabular-nums;}',
     '.pr-meanbox{background:#0b1220;border:1px solid #26324c;border-radius:10px;padding:8px 12px;}',
-    '.pr-meanbox .pr-mean-head{display:flex;align-items:center;gap:8px;color:#93a4c4;font-size:12px;margin-bottom:6px;}',
-    '.pr-meanbox .pr-mean-row{display:flex;gap:8px;font-size:14px;line-height:1.7;color:#e8eefc;}',
-    '.pr-meanbox .pr-mean-row .pr-mean-term{color:#cfe0ff;flex:none;max-width:52%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}',
-    '.pr-meanbox .pr-mean-row .pr-mean-zh{color:#93a4c4;}',
+    '.pr-meanbox .pr-mean-head{display:flex;align-items:center;gap:8px;color:#93a4c4;font-size:13px;line-height:1.45;margin-bottom:6px;}',
+    '.pr-meanbox .pr-mean-row{display:flex;flex-wrap:wrap;gap:2px 8px;font-size:15px;line-height:1.5;color:#e8eefc;}',
+    '.pr-meanbox .pr-mean-row .pr-mean-term{color:#cfe0ff;font-weight:600;min-width:0;max-width:100%;',
+    'overflow-wrap:anywhere;word-break:break-word;}',
+    '.pr-meanbox .pr-mean-row .pr-mean-zh{color:#93a4c4;font-size:13px;line-height:1.45;min-width:0;',
+    'overflow-wrap:anywhere;word-break:break-word;}',
     '.pr-chips{display:flex;flex-wrap:wrap;gap:6px;}',
-    '.pr-chip{display:inline-flex;align-items:center;gap:4px;max-width:100%;background:#1b2540;border:1px solid #2a3a5c;',
-    'border-radius:10px;padding-left:10px;overflow:hidden;}',
-    '.pr-chip .pr-num{color:#5aa2ff;font-size:12px;flex:none;}',
-    '.pr-chip .pr-term{color:#e8eefc;font-size:14px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:38vw;}',
-    '.pr-chip .pr-mean{color:#93a4c4;font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:28vw;}',
+    /* 词条胶囊 = 2×2 网格：行1 = 序号 + 词条，行2 = 中文释义（占满第一列）。
+       这样词条折几行都不会把释义挤到中间，释义永远在词条下面自成一行（原先是 inline-flex +
+       `max-width:38vw` + `nowrap` + `ellipsis`，49 字的 danbooru 长 tag 会被剪掉 143px）。 */
+    '.pr-chip{display:grid;grid-template-columns:auto minmax(0,1fr) auto;grid-template-areas:"num term x" ". mean x";',
+    'align-items:center;column-gap:6px;row-gap:1px;max-width:100%;box-sizing:border-box;background:#1b2540;',
+    'border:1px solid #2a3a5c;border-radius:10px;padding:5px 0 5px 10px;overflow:visible;}',
+    '.pr-chip .pr-num{grid-area:num;color:#5aa2ff;font-size:12px;font-variant-numeric:tabular-nums;align-self:start;}',
+    '.pr-chip .pr-term{grid-area:term;color:#e8eefc;font-size:15px;line-height:1.5;min-width:0;white-space:normal;',
+    'overflow:visible;text-overflow:clip;overflow-wrap:anywhere;word-break:break-word;}',
+    '.pr-chip .pr-mean{grid-area:mean;color:#93a4c4;font-size:13px;line-height:1.45;min-width:2ch;white-space:normal;',
+    'overflow:visible;text-overflow:clip;overflow-wrap:anywhere;word-break:break-word;}',
     '.pr-chip .pr-mean.pr-pending{opacity:.45;}',
-    '.pr-x{flex:none;width:44px;height:44px;display:inline-flex;align-items:center;justify-content:center;',
+    '/* 释义还在路上时：空元素 + 2ch 最小宽（不塞 "…" 文本 —— 那个占位在窄屏会被压到 7px 宽，',
+    '   自己变成一处横向裁切；也不画任何字符，免得词条下面留一行看得见的空点）。 */',
+    '.pr-chip .pr-mean.pr-pending:empty{min-width:2ch;}',
+    '.pr-x{grid-area:x;flex:none;width:44px;height:44px;display:inline-flex;align-items:center;justify-content:center;',
     'background:none;border:0;color:#93a4c4;font-size:20px;line-height:1;font-family:inherit;cursor:pointer;}',
     '.pr-x:active{background:#3a1c22;color:#ff6b6b;}',
-    '.pr-empty{color:#93a4c4;font-size:14px;padding:8px 2px;}',
-    '.pr-err{color:#ff6b6b;font-size:14px;padding:10px 2px;line-height:1.6;}',
-    '.pr-loading{color:#93a4c4;font-size:14px;padding:16px 4px;text-align:center;}',
+    '.pr-empty{color:#93a4c4;font-size:15px;line-height:1.5;padding:8px 2px;}',
+    '.pr-err{color:#ff6b6b;font-size:15px;line-height:1.5;padding:10px 2px;overflow-wrap:anywhere;word-break:break-word;}',
+    '.pr-loading{color:#93a4c4;font-size:15px;line-height:1.5;padding:16px 4px;text-align:center;}',
     '.pr-pre{margin:0;padding:10px 12px;background:#0b1220;border:1px solid #26324c;border-radius:10px;',
-    'color:#cfe0ff;font-size:13px;line-height:1.6;white-space:pre-wrap;word-break:break-word;max-height:44vh;overflow:auto;}',
-    '.pr-hint{color:#93a4c4;font-size:12px;line-height:1.5;padding:0 2px;}',
+    'color:#cfe0ff;font-size:13px;line-height:1.5;white-space:pre-wrap;word-break:break-word;max-height:44vh;overflow:auto;}',
+    '.pr-hint{color:#93a4c4;font-size:13px;line-height:1.45;padding:0 2px;}',
     '/* 外壳把 body 设成 user-select:none；输入框必须能选中文本，否则没法改提示词。 */',
     '.pr-input,.pr-add-input{user-select:text;-webkit-user-select:text;}'
   ].join('');
@@ -436,7 +453,10 @@
         chip.appendChild(el('span', 'pr-num', '#' + item.number));
         chip.appendChild(el('span', 'pr-term', item.term));
         var meaning = item.meaning || stored[item.term] || '';
-        var zh = el('span', 'pr-mean' + (meaning ? '' : ' pr-pending'), meaning || '…');
+        // 释义没到之前**不塞 "…" 文本**：那个占位在窄屏会被 flex 压到 7px 宽、自己变成一处
+        // 横向裁切（scrollW 10 / clientW 7）。改成空元素 + CSS :empty::before 画一个不参与
+        // 布局测量的占位点，标签宽度就由 min-width 稳住。
+        var zh = el('span', 'pr-mean' + (meaning ? '' : ' pr-pending'), meaning);
         zh.setAttribute('data-meaning', meaning || '');
         chip.appendChild(zh);
         var x = el('button', 'pr-x', '×');

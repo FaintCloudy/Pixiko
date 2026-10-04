@@ -104,14 +104,45 @@ public final class Log {
         append(stamp + body);
     }
 
+    /**
+     * logs 目录里 {@code prefix} 开头的最新一份按天日志（按文件名倒序取第一个）；一份都没有就给 {@code fallback}。
+     *
+     * <p>用途：网页的「全部日志」读的是 {@code bot-<今天>.log}，而机器人在零点前启动、当天又还没写过一行时
+     * 这个文件并不存在 —— 那种窗口里回退到最近一份，省得日志面板是空白。挑选规则与 {@link #append} 的
+     * 命名规则放在同一个类里，避免两处口径漂移。
+     */
+    public static Path newestDailyFile(Path dir, String prefix, Path fallback) {
+        if (dir == null || !Files.isDirectory(dir)) return fallback;
+        try (java.util.stream.Stream<Path> files = Files.list(dir)) {
+            return files
+                    .filter(Files::isRegularFile)
+                    .filter(path -> {
+                        String name = path.getFileName().toString().toLowerCase(java.util.Locale.ROOT);
+                        return name.startsWith(prefix) && name.endsWith(".log")
+                                && !name.contains(".stdout") && !name.contains(".stderr");
+                    })
+                    .max(java.util.Comparator.comparing(path -> path.getFileName().toString()))
+                    .orElse(fallback);
+        } catch (Exception error) {
+            warn("日志目录读取失败（不影响日志本身）：" + Bot.error(error));
+            return fallback;
+        }
+    }
+
     /** 同时写"全部"与当前侧（qq/web）两个文件；磁盘问题绝不能影响消息处理。 */
     private static void append(String line) {
         Path base = directory;
         if (base == null) return;
         String day = LocalDateTime.now().format(DAY);
         Path side = base.resolve((webSide() ? "web-" : "qq-") + day + ".log");
+        // 「全部」也必须按天滚动：allFile 是 init() 时按**启动那天**算好的，跨零点后原来继续写昨天那份，
+        // 而网页面板的「全部日志」读的是 bot-<今天>.log —— 不滚动就会在零点之后读到空白（实测过：
+        // 00:00 之后 bot-20261004.log 还在长，bot-20261005.log 直到重启才出现）。这样三者口径一致：
+        // 每个自然日在 logs/ 下都有一份 bot-/qq-/web- 的当天文件。
+        Path all = base.resolve("bot-" + day + ".log");
+        allFile = all;
         synchronized (LOCK) {
-            writeFile(allFile, line);
+            writeFile(all, line);
             writeFile(side, line);
         }
     }

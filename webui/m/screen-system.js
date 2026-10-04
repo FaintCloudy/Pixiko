@@ -46,41 +46,58 @@
     var style = document.createElement('style');
     style.id = STYLE_ID;
     style.textContent = [
-      '.sy-wrap{display:flex;flex-direction:column;gap:14px;padding:12px 12px 28px;box-sizing:border-box}',
-      '.sy-card{background:#131c2e;border-radius:14px;padding:14px}',
-      '.sy-head{display:flex;align-items:center;gap:10px;margin-bottom:10px}',
-      '.sy-head b{font-size:15px;color:#e8eefc;font-weight:600}',
-      '.sy-head .sy-hint{font-size:12.5px;color:#93a4c4;margin-left:auto;text-align:right;max-width:52%}',
-      '.sy-kv{display:flex;gap:10px;font-size:14px;padding:7px 0;border-top:1px solid rgba(147,164,196,.11);line-height:1.5}',
+      /* 字号 / 间距 / 圆角一律走 app.css 第 1 段的 --m-* 令牌（回退值写成本轮规格的同一个
+         数字，令牌没加载出来时也不会跟别的屏打架）。规格见 app.css 的"排版令牌"注释：
+         正文 15/1.5 · 标题 15/600 · 参数名与说明 13/1.45 · 标签 12（下限）·
+         卡片 内边距14/圆角14/间距12 · 行距10 · label 与输入 6。 */
+      '.sy-wrap{display:flex;flex-direction:column;gap:var(--m-gap,12px);padding:12px 12px 28px;box-sizing:border-box}',
+      '.sy-card{background:#131c2e;border-radius:var(--m-radius,14px);padding:var(--m-pad,14px)}',
+      '.sy-head{display:flex;align-items:flex-start;gap:10px;margin-bottom:var(--m-row-gap,10px)}',
+      '.sy-head b{font-size:var(--m-fs-title,15px);color:#e8eefc;font-weight:600;line-height:var(--m-lh-body,1.5);overflow-wrap:anywhere}',
+      '.sy-head .sy-hint{font-size:var(--m-fs-xs,12px);color:#93a4c4;margin-left:auto;text-align:right;max-width:52%;',
+      'line-height:var(--m-lh-sm,1.45);white-space:normal;overflow-wrap:anywhere}',
+      '.sy-kv{display:flex;gap:10px;font-size:var(--m-fs-body,15px);padding:7px 0;border-top:1px solid rgba(147,164,196,.11);line-height:var(--m-lh-body,1.5)}',
       '.sy-kv:first-child{border-top:0}',
-      '.sy-kv-key{flex:0 0 96px;color:#93a4c4}',
-      '.sy-kv-val{flex:1 1 auto;color:#e8eefc;word-break:break-all}',
+      '.sy-kv-key{flex:0 0 96px;color:#93a4c4;font-size:var(--m-fs-sm,13px);line-height:var(--m-lh-sm,1.45);overflow-wrap:anywhere}',
+      '.sy-kv-val{flex:1 1 auto;min-width:0;color:#e8eefc;overflow-wrap:anywhere;word-break:break-word;font-variant-numeric:tabular-nums}',
       '.sy-kv-val.ok{color:#4ad991}.sy-kv-val.bad{color:#ff6b6b}.sy-kv-val.dim{color:#93a4c4}',
-      '.sy-field{display:flex;flex-direction:column;gap:6px;margin-bottom:10px}',
-      '.sy-field>span{font-size:12.5px;color:#93a4c4}',
-      '.sy-input,.sy-select,.sy-area{width:100%;box-sizing:border-box;min-height:44px;padding:10px 12px;border-radius:12px;',
-      'border:1px solid rgba(147,164,196,.24);background:#0e1626;color:#e8eefc;font-size:16px;font-family:inherit}',
+      '.sy-field{display:flex;flex-direction:column;gap:var(--m-label-gap,6px);margin-bottom:var(--m-row-gap,10px);min-width:0}',
+      '.sy-field>span{font-size:var(--m-fs-sm,13px);color:#93a4c4;line-height:var(--m-lh-sm,1.45);overflow-wrap:anywhere}',
+      /* 原生 <select> 的**关闭态永远单行**、超长自动截断（UA 行为，CSS 改不了）；
+         「基础模型（检查点）」「Forge 预设栈」这类值动辄 40+ 字符，390px 宽下只能看见前半截。
+         .sy-value 是紧跟在 select 后面的**完整值行**：允许换行、绝不 ellipsis（见 attachValueLine）。 */
+      '.sy-value{font-size:var(--m-fs-body,15px);font-weight:600;line-height:var(--m-lh-sm,1.45);color:#e8eefc;',
+      'margin-top:var(--m-label-gap,6px);white-space:normal;overflow:visible;text-overflow:clip;overflow-wrap:anywhere;',
+      'font-variant-numeric:tabular-nums}',
+      /* 输入 / select / textarea：高 44、字号 16（<16px 时 iOS 聚焦会把整页放大） */
+      '.sy-input,.sy-select,.sy-area{width:100%;box-sizing:border-box;min-height:var(--m-input-h,44px);padding:10px 12px;border-radius:12px;',
+      'border:1px solid rgba(147,164,196,.24);background:#0e1626;color:#e8eefc;font-size:var(--m-input-fs,16px);font-family:inherit}',
       '.sy-input:focus,.sy-select:focus,.sy-area:focus{outline:none;border-color:#5aa2ff}',
-      '.sy-area{min-height:132px;resize:vertical;line-height:1.5}',
-      '.sy-grid2{display:flex;gap:10px;flex-wrap:wrap}',
+      /* 多行：最小高 ≥88px（规格），这里给 132px 便于写长文本 */
+      '.sy-area{min-height:132px;resize:vertical;line-height:var(--m-lh-body,1.5)}',
+      '.sy-grid2{display:flex;gap:var(--m-row-gap,10px);flex-wrap:wrap}',
       '.sy-grid2>*{flex:1 1 140px;min-width:0}',
-      '.sy-check{display:flex;align-items:center;gap:10px;min-height:48px;font-size:15px;color:#e8eefc;',
-      'border-top:1px solid rgba(147,164,196,.11);padding:4px 0}',
+      /* 开关整行：cursor:pointer 不是装饰 —— <label> 包着 <input>，点整行都会切换，
+         所以**真正的可点区域是这一整行**（高 48px、宽吃满卡片），不是里面那个 24px 的方框。
+         写明 cursor:pointer 就是把这件事实说出来，读屏/鼠标/自动化量命中区时才不会误判成 24×24。 */
+      '.sy-check{display:flex;align-items:center;gap:10px;min-height:48px;font-size:var(--m-fs-body,15px);color:#e8eefc;',
+      'border-top:1px solid rgba(147,164,196,.11);padding:4px 0;cursor:pointer}',
       '.sy-check:first-of-type{border-top:0}',
-      '.sy-check input{width:24px;height:24px;accent-color:#5aa2ff;flex:0 0 24px}',
-      '.sy-check .sy-check-text{flex:1 1 auto;min-width:0}',
-      '.sy-check .sy-check-sub{font-size:12.5px;color:#93a4c4;margin-top:2px;line-height:1.4}',
-      '.sy-btn{min-height:44px;padding:0 16px;border-radius:12px;border:0;background:#5aa2ff;color:#08101f;',
-      'font-size:15px;font-weight:600;font-family:inherit;-webkit-tap-highlight-color:transparent}',
+      '.sy-check input{width:24px;height:24px;accent-color:#5aa2ff;flex:0 0 24px;margin:0}',
+      '.sy-check .sy-check-text{flex:1 1 auto;min-width:0;line-height:var(--m-lh-sm,1.45)}',
+      '.sy-check .sy-check-sub{font-size:var(--m-fs-sm,13px);color:#93a4c4;margin-top:2px;line-height:var(--m-lh-sm,1.45);overflow-wrap:anywhere}',
+      '.sy-btn{min-height:var(--m-tap,44px);padding:0 16px;border-radius:12px;border:0;background:#5aa2ff;color:#08101f;',
+      'font-size:var(--m-fs-body,15px);font-weight:600;font-family:inherit;-webkit-tap-highlight-color:transparent}',
       '.sy-btn:active{opacity:.78}',
       '.sy-btn.ghost{background:rgba(90,162,255,.14);color:#5aa2ff}',
       '.sy-btn.danger{background:rgba(255,107,107,.16);color:#ff6b6b}',
       '.sy-btn[disabled]{opacity:.5}',
-      '.sy-actions{display:flex;gap:10px;flex-wrap:wrap;margin-top:12px}',
-      '.sy-note{font-size:12.5px;color:#93a4c4;line-height:1.6;margin-top:10px;white-space:pre-wrap;word-break:break-word}',
+      '.sy-actions{display:flex;gap:var(--m-row-gap,10px);flex-wrap:wrap;margin-top:12px}',
+      '.sy-note{font-size:var(--m-fs-sm,13px);color:#93a4c4;line-height:var(--m-lh-sm,1.45);margin-top:10px;white-space:pre-wrap;overflow-wrap:anywhere}',
       '.sy-note.bad{color:#ff6b6b}.sy-note.ok{color:#4ad991}',
-      '.sy-mono{font-family:Consolas,Menlo,monospace;font-size:12.5px}',
-      '.sy-link{display:flex;align-items:center;min-height:48px;padding:0 2px;color:#5aa2ff;font-size:15px;text-decoration:none}',
+      '.sy-mono{font-family:Consolas,Menlo,monospace;font-size:var(--m-fs-sm,13px);font-variant-numeric:tabular-nums}',
+      '.sy-link{display:flex;align-items:center;min-height:48px;padding:0 2px;color:#5aa2ff;font-size:var(--m-fs-body,15px);',
+      'text-decoration:none;white-space:normal;overflow-wrap:anywhere}',
       '.sy-link:active{opacity:.7}'
     ].join('');
     document.head.appendChild(style);
@@ -159,6 +176,74 @@
     box.appendChild(make('span', null, label));
     box.appendChild(input);
     return box;
+  }
+
+  /** 文本框 + 它的"溢出才出现"的完整值行，一起塞进一个 .sy-field。 */
+  function textField(label, input) {
+    var box = field(label, input);
+    if (input.type !== 'password') box.appendChild(attachOverflowValueLine(input));
+    return box;
+  }
+
+  /**
+   * 给一个原生 <select> 补一条**完整值行**（`.sy-value`），返回那一行。
+   *
+   * 为什么需要：原生 `<select>` 关闭态是单行、超出就由 UA 截断，CSS 无解。
+   * 「基础模型（检查点）」（`xl · waiIllustriousSDXL_v170.safetensors [f116b0c78f]`）、
+   * 「Forge 预设栈」这类值在 390px 宽下只看得到前半截 —— 用户原话里的"被掩盖一部分"。
+   * 这一行完整显示当前值、允许换行；下拉本身照旧保留（原生选择体验 + id 契约不变）。
+   *
+   * 同步时机：① 用户 change；② 选项被异步填进来（MutationObserver）；
+   * ③ 代码里 setSelectValue()/fillForge() 改了 value —— 它们会调 `select.__syncValueLine()`。
+   */
+  function attachValueLine(selectNode, placeholder) {
+    var line = make('div', 'sy-value selectable');
+    if (selectNode.id) line.setAttribute('data-value-for', selectNode.id);
+    function sync() {
+      var text = String(selectNode.value || '');
+      if (!text) {
+        var option = selectNode.options && selectNode.selectedIndex >= 0 ? selectNode.options[selectNode.selectedIndex] : null;
+        text = option ? String(option.textContent || '') : '';
+      }
+      line.textContent = text || placeholder || '';
+    }
+    selectNode.addEventListener('change', sync);
+    selectNode.__syncValueLine = sync;
+    if (typeof MutationObserver === 'function' && selectNode.id) {
+      new MutationObserver(sync).observe(selectNode, { childList: true, subtree: true });
+    }
+    sync();
+    return line;
+  }
+
+  /**
+   * 普通文本框（不是 select）的完整值行：**只在当前值真的超出输入框可见宽度时**才显示。
+   * 短值（deepseek-flash、http://127.0.0.1:7861）不打扰界面；长值（自建 base URL、长模型名）
+   * 在下面补一行完整可换行的文本 —— 单行 `<input>` 同样是"看不全"的重灾区。
+   * 宽度用 canvas 按计算字体量（`<input>` 没有文本节点，scrollWidth 量不出来）。
+   */
+  function attachOverflowValueLine(input) {
+    var line = make('div', 'sy-value selectable');
+    if (input.id) line.setAttribute('data-value-for', input.id);
+    line.hidden = true;
+    var ctx = document.createElement('canvas').getContext('2d');
+    function sync() {
+      var cs = window.getComputedStyle(input);
+      if (!cs) return;
+      ctx.font = cs.fontStyle + ' ' + cs.fontWeight + ' ' + cs.fontSize + ' ' + cs.fontFamily;
+      var text = String(input.value || '');
+      var need = ctx.measureText(text).width;
+      var avail = input.clientWidth - parseFloat(cs.paddingLeft) - parseFloat(cs.paddingRight);
+      line.hidden = !(avail > 0 && text && need > avail + 0.5);
+      line.textContent = text;
+    }
+    input.addEventListener('input', sync);
+    input.addEventListener('change', sync);
+    input.addEventListener('blur', sync);
+    input.__syncValueLine = sync;
+    // 挂进 DOM 之后 clientWidth 才有值：下一帧再量一次（renderSetup 是"先建后 append"，同步的）
+    if (typeof requestAnimationFrame === 'function') requestAnimationFrame(sync);
+    return line;
   }
 
   function textInput(id, placeholder, value, type) {
@@ -361,10 +446,14 @@
 
     var sampler = select('sy-gen-sampler', [], '');
     gen.sampler = sampler;
-    node.appendChild(field('采样方法', sampler));
+    var samplerField = field('采样方法', sampler);
+    samplerField.appendChild(attachValueLine(sampler, '（SD 没在跑，列不出来）'));
+    node.appendChild(samplerField);
     var model = select('sy-gen-model', [], '');
     gen.model = model;
-    node.appendChild(field('基础模型（检查点）', model));
+    var modelField = field('基础模型（检查点）', model);
+    modelField.appendChild(attachValueLine(model, '（SD 没在跑，列不出来）'));
+    node.appendChild(modelField);
 
     var note = make('div', 'sy-note', '正在读取当前参数…');
     note.id = 'sy-gen-note';
@@ -417,7 +506,10 @@
     body.appendChild(stateLine('正在读取…'));
     node.appendChild(body);
 
-    node.appendChild(field('Forge 预设栈（底模 + VAE + 文本编码器）', select('sy-forge-preset', [], '')));
+    var forgeSelect = select('sy-forge-preset', [], '');
+    var forgeField = field('Forge 预设栈（底模 + VAE + 文本编码器）', forgeSelect);
+    forgeField.appendChild(attachValueLine(forgeSelect, '（还没读到预设）'));
+    node.appendChild(forgeField);
     var forgeNote = make('div', 'sy-note', '正在读取 Forge 预设…');
     forgeNote.id = 'sy-forge-note';
     node.appendChild(forgeNote);
@@ -580,6 +672,7 @@
       selectNode.appendChild(option);
     }
     selectNode.value = value;
+    if (typeof selectNode.__syncValueLine === 'function') selectNode.__syncValueLine();
   }
 
   function loadOptions() {
@@ -688,6 +781,7 @@
         ? ('当前预设：' + ((data && data.active) || '（未选）') + '；切换会连着该栈的采样方法/尺寸/步数/CFG 一起采纳。')
         : '当前 WebUI 不是 Forge / Forge Neo：没有预设栈可切，直接用上面的基础模型下拉。';
     }
+    if (typeof selectNode.__syncValueLine === 'function') selectNode.__syncValueLine();
   }
 
   function fillSwitchBody(status) {
@@ -776,7 +870,7 @@
 
   function chatModelCard() {
     var node = card('模型与思考', '聊天 / 生图两条通道各自独立');
-    node.appendChild(field('聊天模型', textInput('sy-cc-model', '例如 deepseek-flash', '')));
+    node.appendChild(textField('聊天模型', textInput('sy-cc-model', '例如 deepseek-flash', '')));
     var actions = make('div', 'sy-actions');
     var apply = button('sy-btn', '应用聊天模型', 'sy-cc-apply-model');
     apply.addEventListener('click', function () {
@@ -899,7 +993,10 @@
     }
 
     var model = byId('sy-cc-model');
-    if (model && document.activeElement !== model && (status.chatChannel || {}).model) model.value = String(status.chatChannel.model);
+    if (model && document.activeElement !== model && (status.chatChannel || {}).model) {
+      model.value = String(status.chatChannel.model);
+      if (typeof model.__syncValueLine === 'function') model.__syncValueLine();
+    }
     var frequency = byId('sy-cc-frequency');
     if (frequency && document.activeElement !== frequency && chat.frequency !== undefined) frequency.value = String(chat.frequency);
     var area = byId('sy-cc-personality');
@@ -945,11 +1042,11 @@
 
   function setupFieldCard() {
     var node = card('基本信息', '改完点保存');
-    node.appendChild(field('机器人名字', textInput('sy-su-botname', '例如 神户小鸟', '')));
-    node.appendChild(field('owner QQ（1–20 位数字，可留空）', textInput('sy-su-owner', '例如 2070435720', '', 'text')));
-    node.appendChild(field('Stable Diffusion 地址（重启后生效）', textInput('sy-su-sd', '例如 http://127.0.0.1:7861', '')));
-    node.appendChild(field('Stable Diffusion 目录（重启后生效）', textInput('sy-su-sdroot', '例如 F:/sd/sd-webui-forge-neo', '')));
-    node.appendChild(field('NapCat 地址（ws:// 或 wss://，重启后生效）', textInput('sy-su-qqws', '例如 ws://127.0.0.1:3001', '')));
+    node.appendChild(textField('机器人名字', textInput('sy-su-botname', '例如 神户小鸟', '')));
+    node.appendChild(textField('owner QQ（1–20 位数字，可留空）', textInput('sy-su-owner', '例如 2070435720', '', 'text')));
+    node.appendChild(textField('Stable Diffusion 地址（重启后生效）', textInput('sy-su-sd', '例如 http://127.0.0.1:7861', '')));
+    node.appendChild(textField('Stable Diffusion 目录（重启后生效）', textInput('sy-su-sdroot', '例如 F:/sd/sd-webui-forge-neo', '')));
+    node.appendChild(textField('NapCat 地址（ws:// 或 wss://，重启后生效）', textInput('sy-su-qqws', '例如 ws://127.0.0.1:3001', '')));
     node.appendChild(field('NapCat 令牌（留空 = 不改）', textInput('sy-su-qqtoken', '留空表示不修改', '', 'password')));
     node.appendChild(field('网页访问令牌（留空 = 不改，至少 8 位）', textInput('sy-su-webtoken', '留空表示不修改', '', 'password')));
     return node;
@@ -958,9 +1055,9 @@
   function setupChannelCard() {
     var node = card('DeepSeek 通道', '密钥留空 = 不改');
     node.appendChild(make('div', 'sy-note', '地址留空 = 用官方地址；密钥只写进机器人本机的密钥文件，网页不回显明文。'));
-    node.appendChild(field('生图通道地址', textInput('sy-su-imagebase', '', '')));
+    node.appendChild(textField('生图通道地址', textInput('sy-su-imagebase', '', '')));
     node.appendChild(field('生图通道密钥（留空 = 不改）', textInput('sy-su-imagekey', '留空表示不修改', '', 'password')));
-    node.appendChild(field('聊天通道地址', textInput('sy-su-chatbase', '', '')));
+    node.appendChild(textField('聊天通道地址', textInput('sy-su-chatbase', '', '')));
     node.appendChild(field('聊天通道密钥（留空 = 不改）', textInput('sy-su-chatkey', '留空表示不修改', '', 'password')));
     var info = make('div', 'sy-note', '');
     info.id = 'sy-su-channels';
@@ -1112,6 +1209,8 @@
     var node = byId(id);
     if (!node) return;
     node.value = value === undefined || value === null ? '' : String(value);
+    // 值是被代码写进去的（不是用户敲的），input/change 不会触发 —— 手动刷新那条"溢出才出现"的完整值行
+    if (typeof node.__syncValueLine === 'function') node.__syncValueLine();
   }
 
   /* ================================================================ 服务器信息 */

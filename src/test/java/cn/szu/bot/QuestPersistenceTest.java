@@ -98,7 +98,8 @@ public final class QuestPersistenceTest {
                 first = command(base, ".help");
                 waitEntry(base, first);
                 Path body = root.resolve("data/quests/" + first + ".json");
-                check(awaitFile(body), "回执 #" + first + " 的正文落在 data/quests/" + first + ".json");
+                check(awaitFileDone(body),
+                        "回执 #" + first + " 的正文落在 data/quests/" + first + ".json 且已写完（done:true）");
                 byte[] bytes = Files.readAllBytes(body);
                 check(!(bytes.length >= 3 && (bytes[0] & 0xFF) == 0xEF && (bytes[1] & 0xFF) == 0xBB
                                 && (bytes[2] & 0xFF) == 0xBF), "正文文件是 UTF-8 无 BOM");
@@ -413,6 +414,30 @@ public final class QuestPersistenceTest {
             Thread.sleep(50);
         }
         return Files.isRegularFile(file);
+    }
+
+    /**
+     * 等正文文件出现**并且**写成 {@code done:true}。
+     *
+     * <p>为什么要多等一步：{@code Bot.saveQuestBody} 是**增量**写盘 —— 回执跑到一半、正文一有变化就写一次，
+     * 写进去的 {@code done} 就是当时的 {@code capture.done()}。所以"文件已存在"并不等于"已经写完"。
+     * 机器负载高时（例如同时在跑别的测试套件、并发探针）只等文件存在就会读到那份 {@code done:false}
+     * 的半成品快照，断言 {@code done} 随机失败（实测：一次全量门里 QuestPersistenceTest 就死在这一条）。
+     */
+    private static boolean awaitFileDone(Path file) throws InterruptedException {
+        long deadline = System.currentTimeMillis() + 10000;
+        while (System.currentTimeMillis() < deadline) {
+            try {
+                if (Files.isRegularFile(file)) {
+                    JsonObject stored = Json.parse(Files.readString(file, StandardCharsets.UTF_8));
+                    if (stored.has("done") && stored.get("done").getAsBoolean()) return true;
+                }
+            } catch (Exception ignored) {
+                // 文件正在被原子替换 / 还没写完：下一轮再读。
+            }
+            Thread.sleep(50);
+        }
+        return false;
     }
 
     /** messages（分组数组）里有没有这一条文字/图片引用。 */

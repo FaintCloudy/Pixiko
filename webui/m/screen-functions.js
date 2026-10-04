@@ -23,49 +23,67 @@
 
   var STYLE_ID = 'fn-style';
 
+  /**
+   * 复选框的**视觉**用 22px 的 SVG 画（不依赖浏览器原生外观），
+   * 元素本身留成 44×44 的可点区 —— 规格要求「开关/复选框可点区 ≥44×44」。
+   * 样式令牌都带兜底值，另一份 app.css 里定义了同名令牌时会自动接管。
+   */
+  var CHECK_OFF = "url(\"data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Crect x='2' y='2' width='20' height='20' rx='6' fill='%230e1626' stroke='%2393a4c4' stroke-opacity='0.55' stroke-width='2'/%3E%3C/svg%3E\")";
+  var CHECK_ON = "url(\"data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Crect x='2' y='2' width='20' height='20' rx='6' fill='%235aa2ff'/%3E%3Cpath d='M7 12.4l3.3 3.3L17 8.6' fill='none' stroke='%2308101f' stroke-width='2.6' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E\")";
+
   function injectStyle() {
     if (document.getElementById(STYLE_ID)) return;
     var style = document.createElement('style');
     style.id = STYLE_ID;
     style.textContent = [
-      '.fn-wrap{display:flex;flex-direction:column;gap:14px;padding:12px 12px 28px;box-sizing:border-box}',
-      '.fn-card{background:#131c2e;border-radius:14px;padding:14px}',
+      '.fn-wrap{display:flex;flex-direction:column;gap:var(--m-gap,12px);padding:12px 12px 28px;box-sizing:border-box}',
+      '.fn-card{background:#131c2e;border-radius:var(--m-radius,14px);padding:var(--m-pad,14px)}',
       '.fn-head{display:flex;align-items:center;gap:10px;margin-bottom:10px}',
-      '.fn-head b{font-size:15px;color:#e8eefc;font-weight:600}',
-      '.fn-head .fn-hint{font-size:12.5px;color:#93a4c4;margin-left:auto;text-align:right}',
+      // 标题不折行（360px 下「参数预设」曾被挤成「参数预 / 设」两行）；让右侧提示行去折。
+      '.fn-head b{font-size:var(--m-fs-title,15px);color:#e8eefc;font-weight:600;flex:0 0 auto;white-space:nowrap}',
+      '.fn-head .fn-hint{font-size:var(--m-fs-sm,13px);color:#93a4c4;margin-left:auto;text-align:right;',
+      'flex:1 1 auto;min-width:0;line-height:var(--m-lh-sm,1.45)}',
       '.fn-field{display:flex;flex-direction:column;gap:6px;margin-bottom:10px}',
-      '.fn-field>span{font-size:12.5px;color:#93a4c4}',
+      '.fn-field>span{font-size:var(--m-fs-sm,13px);color:#93a4c4;line-height:var(--m-lh-sm,1.45)}',
       '.fn-input,.fn-select,.fn-area{width:100%;box-sizing:border-box;min-height:44px;padding:10px 12px;border-radius:12px;',
       'border:1px solid rgba(147,164,196,.24);background:#0e1626;color:#e8eefc;font-size:16px;font-family:inherit}',
       '.fn-input:focus,.fn-select:focus,.fn-area:focus{outline:none;border-color:#5aa2ff}',
-      '.fn-area{min-height:88px;resize:vertical;line-height:1.5}',
-      '.fn-check{display:flex;align-items:center;gap:9px;min-height:44px;font-size:14.5px;color:#e8eefc}',
-      '.fn-check input{width:24px;height:24px;accent-color:#5aa2ff}',
+      '.fn-area{min-height:88px;resize:vertical;line-height:var(--m-lh-body,1.5)}',
+      '.fn-check{display:flex;align-items:center;gap:9px;min-height:44px;font-size:var(--m-fs-body,15px);color:#e8eefc;cursor:pointer}',
+      '.fn-check input{-webkit-appearance:none;appearance:none;flex:0 0 44px;width:44px;height:44px;margin:0;padding:0;border:0;',
+      'background-color:transparent;background-repeat:no-repeat;background-position:center;background-size:22px 22px;',
+      'background-image:' + CHECK_OFF + ';cursor:pointer}',
+      '.fn-check input:checked{background-image:' + CHECK_ON + '}',
+      '.fn-check input:focus-visible{outline:2px solid #5aa2ff;outline-offset:2px;border-radius:12px}',
       '.fn-row{display:flex;gap:10px;flex-wrap:wrap}',
       '.fn-row>.fn-input{flex:1 1 150px}',
       '.fn-btn{min-height:44px;padding:0 16px;border-radius:12px;border:0;background:#5aa2ff;color:#08101f;',
-      'font-size:15px;font-weight:600;font-family:inherit;-webkit-tap-highlight-color:transparent}',
+      'font-size:var(--m-fs-body,15px);font-weight:600;font-family:inherit;-webkit-tap-highlight-color:transparent}',
       '.fn-btn:active{opacity:.78}',
       '.fn-btn.ghost{background:rgba(90,162,255,.14);color:#5aa2ff}',
       '.fn-btn.danger{background:rgba(255,107,107,.16);color:#ff6b6b}',
       '.fn-btn[disabled]{opacity:.5}',
       '.fn-list{display:flex;flex-direction:column}',
       '.fn-item{display:flex;align-items:center;gap:12px;width:100%;box-sizing:border-box;min-height:56px;padding:11px 2px;',
-      'background:transparent;border:0;border-top:1px solid rgba(147,164,196,.13);color:#e8eefc;font-size:16px;',
-      'text-align:left;font-family:inherit;-webkit-tap-highlight-color:transparent}',
+      'background:transparent;border:0;border-top:1px solid rgba(147,164,196,.13);color:#e8eefc;',
+      'font-size:var(--m-fs-body,15px);text-align:left;font-family:inherit;-webkit-tap-highlight-color:transparent}',
       '.fn-item:first-child{border-top:0}',
       '.fn-item:active{background:rgba(90,162,255,.12)}',
       '.fn-item-main{flex:1 1 auto;min-width:0}',
-      '.fn-item-name{display:flex;align-items:center;gap:6px}',
-      '.fn-item-sub{font-size:12.5px;color:#93a4c4;margin-top:3px;line-height:1.45;overflow:hidden;text-overflow:ellipsis;',
-      'display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;word-break:break-all}',
-      '.fn-star{color:#5aa2ff;font-size:13px;flex:0 0 auto}',
+      '.fn-item-name{display:flex;align-items:center;gap:6px;font-size:var(--m-fs-body,15px);font-weight:600;line-height:1.45;',
+      'overflow-wrap:anywhere}',
+      // 预设摘要（尺寸/采样/步数/CFG/种子/模型名+hash）不再用 -webkit-line-clamp + ellipsis：
+      // 一律完整折行显示，长 token（模型名、hash）用 overflow-wrap:anywhere 断行。
+      '.fn-item-sub{font-size:var(--m-fs-sm,13px);color:#93a4c4;margin-top:3px;line-height:var(--m-lh-sm,1.45);',
+      'white-space:normal;overflow:visible;text-overflow:clip;overflow-wrap:anywhere;word-break:normal}',
+      '.fn-star{color:#5aa2ff;font-size:var(--m-fs-xs,12px);flex:0 0 auto}',
       '.fn-chev{flex:0 0 18px;width:18px;height:18px;stroke:#93a4c4;fill:none;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}',
-      '.fn-state{font-size:13.5px;color:#93a4c4;padding:12px 2px;line-height:1.6}',
+      '.fn-state{font-size:14px;color:#93a4c4;padding:12px 2px;line-height:var(--m-lh-body,1.5);overflow-wrap:anywhere}',
       '.fn-state.bad{color:#ff6b6b}',
-      '.fn-note{font-size:12.5px;color:#93a4c4;margin-top:10px;line-height:1.55}',
-      '.fn-applied{font-size:13px;color:#93a4c4;line-height:1.6;word-break:break-all}',
-      '.fn-applied b{color:#e8eefc;font-weight:500}'
+      '.fn-note{font-size:var(--m-fs-sm,13px);color:#93a4c4;margin-top:10px;line-height:var(--m-lh-sm,1.45);overflow-wrap:anywhere}',
+      '.fn-applied{font-size:var(--m-fs-body,15px);color:#dfe8fa;line-height:1.55;font-variant-numeric:tabular-nums;',
+      'white-space:normal;overflow:visible;text-overflow:clip;overflow-wrap:anywhere;word-break:normal}',
+      '.fn-applied b{color:#e8eefc;font-weight:600}'
     ].join('');
     document.head.appendChild(style);
   }

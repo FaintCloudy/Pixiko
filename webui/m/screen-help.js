@@ -18,63 +18,83 @@
 
   var STYLE_ID = 'hp-style';
 
+  /** 复选框视觉（与 screen-functions.js 同一套）：22px 的方框画在 44×44 的可点区里。 */
+  var CHECK_OFF = "url(\"data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Crect x='2' y='2' width='20' height='20' rx='6' fill='%230e1626' stroke='%2393a4c4' stroke-opacity='0.55' stroke-width='2'/%3E%3C/svg%3E\")";
+  var CHECK_ON = "url(\"data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Crect x='2' y='2' width='20' height='20' rx='6' fill='%235aa2ff'/%3E%3Cpath d='M7 12.4l3.3 3.3L17 8.6' fill='none' stroke='%2308101f' stroke-width='2.6' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E\")";
+
   function injectStyle() {
     if (document.getElementById(STYLE_ID)) return;
     var style = document.createElement('style');
     style.id = STYLE_ID;
     style.textContent = [
-      '.hp-wrap{display:flex;flex-direction:column;gap:14px;padding:12px 12px 28px;box-sizing:border-box}',
-      '.hp-card{background:#131c2e;border-radius:14px;padding:14px}',
+      '.hp-wrap{display:flex;flex-direction:column;gap:var(--m-gap,12px);padding:12px 12px 28px;box-sizing:border-box}',
+      '.hp-card{background:#131c2e;border-radius:var(--m-radius,14px);padding:var(--m-pad,14px)}',
       '.hp-head{display:flex;align-items:center;gap:10px;margin-bottom:10px}',
-      '.hp-head b{font-size:15px;color:#e8eefc;font-weight:600}',
-      '.hp-head .hp-hint{font-size:12.5px;color:#93a4c4;margin-left:auto;text-align:right;max-width:52%}',
+      // 同 screen-functions.js：标题固定单行，右侧提示行负责折行。
+      '.hp-head b{font-size:var(--m-fs-title,15px);color:#e8eefc;font-weight:600;flex:0 0 auto;white-space:nowrap}',
+      '.hp-head .hp-hint{font-size:var(--m-fs-sm,13px);color:#93a4c4;margin-left:auto;text-align:right;max-width:52%;',
+      'line-height:var(--m-lh-sm,1.45)}',
       '.hp-input{width:100%;box-sizing:border-box;min-height:44px;padding:10px 12px;border-radius:12px;',
       'border:1px solid rgba(147,164,196,.24);background:#0e1626;color:#e8eefc;font-size:16px;font-family:inherit}',
       '.hp-input:focus{outline:none;border-color:#5aa2ff}',
       '.hp-btn{min-height:44px;padding:0 14px;border-radius:12px;border:0;background:#5aa2ff;color:#08101f;',
-      'font-size:15px;font-weight:600;font-family:inherit;-webkit-tap-highlight-color:transparent}',
+      'font-size:var(--m-fs-body,15px);font-weight:600;font-family:inherit;-webkit-tap-highlight-color:transparent}',
       '.hp-btn:active{opacity:.78}',
       '.hp-btn.ghost{background:rgba(90,162,255,.14);color:#5aa2ff}',
       '.hp-btn.on{background:#5aa2ff;color:#08101f}',
       '.hp-btn[disabled]{opacity:.5}',
       '.hp-actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px}',
       '.hp-chips{display:flex;gap:8px;flex-wrap:wrap}',
-      '.hp-note{font-size:12.5px;color:#93a4c4;line-height:1.6;margin-top:10px;white-space:pre-wrap;word-break:break-word}',
+      '.hp-note{font-size:var(--m-fs-sm,13px);color:#93a4c4;line-height:var(--m-lh-sm,1.45);margin-top:10px;',
+      'white-space:pre-wrap;overflow-wrap:anywhere}',
       '.hp-note.bad{color:#ff6b6b}',
+      // 「自动刷新」那一行的 label：整行 ≥44 高、可点（checkbox 本体另给 44×44 命中区）。
+      '.hp-auto{display:flex;align-items:center;gap:8px;min-height:44px;margin-top:0;cursor:pointer}',
+      '.hp-check{-webkit-appearance:none;appearance:none;flex:0 0 44px;width:44px;height:44px;margin:0;padding:0;border:0;',
+      'background-color:transparent;background-repeat:no-repeat;background-position:center;background-size:22px 22px;',
+      'background-image:' + CHECK_OFF + ';cursor:pointer}',
+      '.hp-check:checked{background-image:' + CHECK_ON + '}',
+      '.hp-check:focus-visible{outline:2px solid #5aa2ff;outline-offset:2px;border-radius:12px}',
       '.hp-sec{border-top:1px solid rgba(147,164,196,.13)}',
       '.hp-sec:first-child{border-top:0}',
       '.hp-sec-head{display:flex;align-items:center;gap:10px;width:100%;box-sizing:border-box;min-height:48px;',
-      'padding:10px 2px;background:transparent;border:0;color:#e8eefc;font-size:15.5px;text-align:left;font-family:inherit}',
+      'padding:10px 2px;background:transparent;border:0;color:#e8eefc;font-size:var(--m-fs-title,15px);text-align:left;font-family:inherit}',
       '.hp-sec-head:active{background:rgba(90,162,255,.12)}',
-      '.hp-sec-title{flex:1 1 auto;min-width:0;font-weight:600;word-break:break-word}',
-      '.hp-sec-count{font-size:12px;color:#93a4c4;flex:0 0 auto}',
+      '.hp-sec-title{flex:1 1 auto;min-width:0;font-weight:600;white-space:normal;overflow-wrap:anywhere}',
+      '.hp-sec-count{font-size:var(--m-fs-xs,12px);color:#93a4c4;flex:0 0 auto}',
       '.hp-caret{flex:0 0 16px;width:16px;height:16px;stroke:#93a4c4;fill:none;stroke-width:2;stroke-linecap:round;stroke-linejoin:round;transition:transform .15s}',
       '.hp-sec.open .hp-caret{transform:rotate(90deg)}',
-      '.hp-sec-body{display:none;padding:0 2px 12px;font-size:14px;line-height:1.65;color:#dfe8fa;',
-      'font-family:Consolas,Menlo,monospace;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere}',
+      // 帮助正文：长指令行一律折行显示完整（pre-wrap 保留原来的换行与缩进，anywhere 断长 token）。
+      '.hp-sec-body{display:none;padding:0 2px 12px;font-size:var(--m-fs-body,15px);line-height:1.6;color:#dfe8fa;',
+      'font-family:Consolas,Menlo,monospace;white-space:pre-wrap;overflow-wrap:anywhere;word-break:normal}',
       '.hp-sec.open .hp-sec-body{display:block}',
       '.hp-sec-body mark{background:rgba(90,162,255,.32);color:#e8eefc;border-radius:3px}',
-      '.hp-state{font-size:13.5px;color:#93a4c4;padding:12px 2px;line-height:1.6}',
+      '.hp-state{font-size:14px;color:#93a4c4;padding:12px 2px;line-height:var(--m-lh-body,1.5);overflow-wrap:anywhere}',
       '.hp-state.bad{color:#ff6b6b}',
       '.hp-logbar{display:flex;flex-direction:column;gap:10px}',
       '.hp-logscroll{max-height:58vh;overflow:auto;-webkit-overflow-scrolling:touch;border-radius:10px;background:#0e1626;',
-      'padding:8px 6px;margin-top:10px}',
-      '.hp-log-line{display:flex;gap:8px;align-items:baseline;white-space:nowrap;overflow-x:auto;',
-      'font-family:Consolas,Menlo,monospace;font-size:12.5px;line-height:1.75;padding:1px 2px;border-radius:6px}',
+      'padding:8px;margin-top:10px}',
+      // 日志行：原来 white-space:nowrap + 每行横向滚动（长正文要左右拖）；改成
+      // 「时间/级别一行 + 正文整行宽度折行」——正文不再被挤成窄列，也不用横向拖。
+      // 时间/级别本来也是 nowrap，这里对整行说明不使用 ellipsis（内容一个字都不遮）。
+      '.hp-log-line{display:flex;flex-wrap:wrap;gap:0 8px;align-items:baseline;white-space:normal;overflow:visible;',
+      'overflow-wrap:anywhere;font-family:Consolas,Menlo,monospace;font-size:13px;line-height:1.55;padding:3px 2px;border-radius:6px}',
       '.hp-log-time{color:#93a4c4;flex:0 0 auto}',
-      '.hp-log-level{flex:0 0 auto;font-weight:700;padding:0 6px;border-radius:6px;background:rgba(147,164,196,.16);color:#93a4c4;font-size:11.5px}',
+      '.hp-log-level{flex:0 0 auto;font-weight:700;padding:0 6px;border-radius:6px;background:rgba(147,164,196,.16);color:#93a4c4;',
+      'font-size:var(--m-fs-xs,12px)}',
       '.hp-log-level.lv-INFO{color:#6fb3ff;background:rgba(90,162,255,.16)}',
       '.hp-log-level.lv-WARN{color:#ffcc66;background:rgba(255,204,102,.16)}',
       '.hp-log-level.lv-ERROR{color:#ff6b6b;background:rgba(255,107,107,.18)}',
       '.hp-log-level.lv-THINK{color:#b98cff;background:rgba(185,140,255,.16)}',
-      '.hp-log-text{flex:0 0 auto;color:#dfe8fa}',
+      '.hp-log-text{flex:1 1 100%;min-width:0;color:#dfe8fa;white-space:pre-wrap;overflow-wrap:anywhere}',
       '.hp-log-line.cont .hp-log-text{color:#b9c6e0}',
-      '.hp-link{display:flex;align-items:center;min-height:48px;color:#5aa2ff;font-size:15px;text-decoration:none}',
+      '.hp-link{display:flex;align-items:center;min-height:48px;color:#5aa2ff;font-size:var(--m-fs-body,15px);text-decoration:none}',
       '.hp-link:active{opacity:.7}',
-      '.hp-kv{display:flex;gap:10px;font-size:14px;padding:7px 0;border-top:1px solid rgba(147,164,196,.11);line-height:1.5}',
+      '.hp-kv{display:flex;gap:10px;align-items:baseline;font-size:var(--m-fs-body,15px);padding:7px 0;',
+      'border-top:1px solid rgba(147,164,196,.11);line-height:var(--m-lh-body,1.5)}',
       '.hp-kv:first-child{border-top:0}',
-      '.hp-kv-key{flex:0 0 84px;color:#93a4c4}',
-      '.hp-kv-val{flex:1 1 auto;color:#e8eefc;word-break:break-all}'
+      '.hp-kv-key{flex:0 0 84px;color:#93a4c4;font-size:var(--m-fs-sm,13px)}',
+      '.hp-kv-val{flex:1 1 auto;color:#e8eefc;overflow-wrap:anywhere;word-break:normal}'
     ].join('');
     document.head.appendChild(style);
   }
@@ -440,19 +460,12 @@
     source.addEventListener('change', function () { lgSource = String(source.value || 'all'); lgSignature = ''; loadLogs(); });
     row.appendChild(source);
 
-    var auto = make('label', 'hp-note');
-    auto.style.display = 'flex';
-    auto.style.alignItems = 'center';
-    auto.style.gap = '8px';
-    auto.style.minHeight = '44px';
-    auto.style.marginTop = '0';
-    var box = make('input');
+    // 整行 label 可点（.hp-auto ≥44 高），checkbox 本体也是 44×44 的命中区（视觉仍是 22px 方框）。
+    var auto = make('label', 'hp-note hp-auto');
+    var box = make('input', 'hp-check');
     box.type = 'checkbox';
     box.id = 'hp-log-auto';
     box.checked = lgAuto;
-    box.style.width = '20px';
-    box.style.height = '20px';
-    box.style.accentColor = '#5aa2ff';
     box.addEventListener('change', function () {
       lgAuto = !!box.checked;
       if (lgAuto) { startLogPoll(); toast('自动刷新已开启（2 秒）'); }

@@ -309,23 +309,42 @@
   function nextFrame(fn) { setTimeout(fn, 16); }
 
   /**
+   * 当前"活着"的浮层（按打开顺序）。为什么要登记：{@link drainOverlays} 光删 DOM 是不够的 ——
+   * 每个浮层都在 `document` 上挂了 keydown 监听，只删节点的话监听会一直泄漏，
+   * 而且旧浮层的 `onDismiss` 以后还可能被一次 Escape 意外触发。
+   */
+  var liveOverlays = [];
+
+  /**
    * 开新浮层之前把旧浮层收干。
    *
    * <p>为什么必须做：{@link overlay} 的关闭是"先褪色、240ms 后再 remove"。如果用户（或探针）
    * 在这 240ms 内又点开另一个浮层，旧的 `.scrim` 还在 DOM 里，它会盖在新面板上面 —— 表现就是
    * **"点了没反应"**（命中点被 `DIV.scrim` 抢走）。这里在每次开新浮层时同步扫掉残留。
+   *
+   * <p>两条路径都要走：① 登记的浮层逐个 `close(true)`（同步摘掉节点 + 摘掉 keydown 监听，
+   * 不留定时器）；② 再兜底扫一遍 DOM —— `screen-*.js` 里如果有自己 append 到 `#m-overlay`
+   * 的面板（不是通过 overlay() 建的），只能靠这一步收掉。
    */
   function drainOverlays() {
+    var pending = liveOverlays.slice();
+    liveOverlays.length = 0;
+    for (var i = 0; i < pending.length; i++) {
+      try { pending[i].close(true); } catch (error) { /* 收不干净也不能把新浮层带崩 */ }
+    }
     var root = $('m-overlay');
     if (!root) return;
     var stale = root.querySelectorAll('.scrim, .sheet, .dialog, .viewer');
-    for (var i = 0; i < stale.length; i++) {
-      var node = stale[i];
+    for (var j = 0; j < stale.length; j++) {
+      var node = stale[j];
       if (node.parentNode) node.parentNode.removeChild(node);
     }
   }
 
-  /** 浮层公共件：遮罩 + 关闭。返回 {scrim, close}。 */
+  /**
+   * 浮层公共件：遮罩 + 关闭。返回 {scrim, close, panel}。
+   * @param {boolean} [immediate] close(true)：同步摘节点（drainOverlays 用），不走 240ms 过渡。
+   */
   function overlay(panel, onDismiss) {
     drainOverlays();
     var root = $('m-overlay') || document.body;
@@ -334,21 +353,39 @@
     root.appendChild(panel);
     nextFrame(function () { scrim.classList.add('in'); if (panel.classList) panel.classList.add('in'); });
     var closed = false;
-    function close() {
+    /**
+     * @param {boolean} [immediate] 只认**严格的 true**（drainOverlays 用）。
+     *   注意不能写成 `if (immediate)`：`addEventListener('click', handle.close)` 会把 MouseEvent
+     *   当第一个实参传进来，事件对象是真值 —— 那样"取消"按钮会跳过 240ms 的滑出动画、面板瞬间消失。
+     */
+    function close(immediate) {
       if (closed) return;
       closed = true;
+      var at = liveOverlays.indexOf(handle);
+      if (at >= 0) liveOverlays.splice(at, 1);
       scrim.classList.remove('in');
-      if (panel.classList) panel.classList.remove('in');
-      setTimeout(function () {
+      if (panel.classList) { panel.classList.remove('in'); panel.classList.add('out'); }
+      document.removeEventListener('keydown', onKey);
+      // 兜底扫残留的定时器：即使这次是 immediate，也别留一个 240ms 后再动的回调
+      if (closeTimer) { clearTimeout(closeTimer); closeTimer = null; }
+      if (immediate === true) {
+        if (scrim.parentNode) scrim.parentNode.removeChild(scrim);
+        if (panel.parentNode) panel.parentNode.removeChild(panel);
+        return;
+      }
+      closeTimer = setTimeout(function () {
+        closeTimer = null;
         if (scrim.parentNode) scrim.parentNode.removeChild(scrim);
         if (panel.parentNode) panel.parentNode.removeChild(panel);
       }, 240);
-      document.removeEventListener('keydown', onKey);
     }
+    var closeTimer = null;
     function onKey(event) { if (event.key === 'Escape') { close(); if (onDismiss) onDismiss(); } }
     scrim.addEventListener('click', function () { close(); if (onDismiss) onDismiss(); });
     document.addEventListener('keydown', onKey);
-    return { scrim: scrim, close: close, panel: panel };
+    var handle = { scrim: scrim, close: close, panel: panel };
+    liveOverlays.push(handle);
+    return handle;
   }
 
   /**
@@ -1042,9 +1079,17 @@
   var DEVICE = { width: 390, height: 844 };
   /** 框外上下留给"说明小字 + 内边距"的高度。 */
   var FRAME_CHROME = 96;
+  /**
+   * 缩放的**可读性下限**。0.7 时 15px 正文渲染成 10.5px，已经是"手机上还能读"的底线；
+   * 再小（旧值 0.4 → 6px）就是用户抱怨的"框太小，参数整片糊掉、看不见"。
+   * 窗口高度不够撑到 0.7 时**干脆不套框**（见 isWideViewport 的高度判据），走铺满那条路。
+   */
+  var MIN_DEVICE_SCALE = 0.7;
+  /** 套框所需的最小"可用高度"：0.7 × 844 ≈ 591px，即 innerHeight 至少约 687px。 */
+  var MIN_FRAME_AVAILABLE = MIN_DEVICE_SCALE * DEVICE.height;
 
   /**
-   * "窄视口 / 宽视口"的判据，三个条件都要满足才画机身框：
+   * "窄视口 / 宽视口"的判据，四个条件都要满足才画机身框：
    *   1. **顶层文档**（window.self === window.top）—— 被 /android 预览页嵌成同源 iframe 时，
    *      innerWidth 是 iframe 的宽度而不是电脑窗口的宽度，预览页已经有一个机身框了；
    *   2. **宽度够**（innerWidth > 560）—— 真机竖屏 390 / 430 不套框；
@@ -1052,6 +1097,10 @@
    *      顶层文档且 setUseWideViewPort(true)，手机上"横屏 844×390""平板竖屏 768×1024"都满足 1+2，
    *      只看宽度的话用户把手机一横过来就会缩成中间一条 156px 的窄条。
    *      不用 navigator.maxTouchPoints：带触摸屏的电脑上桌面 Chrome 也报非 0（实测本机报 10）。
+   *   4. **高度够撑到可读性下限**（可用高 = innerHeight - FRAME_CHROME ≥ 0.7 × 844 ≈ 591px，
+   *      即 innerHeight ≥ 约 687px）。窗口又矮又宽时（比如 1280×560，可用高只有 464px）套一个
+   *      0.55 的框只会让 15px 正文变成 8px、参数全糊；这一屏本来就是响应式的，**铺满反而每个
+   *      参数都看得清**，所以宁可放弃机身框。
    *
    * <p>为什么必须带 `window.self === window.top`：这一页也会被装进 Android 外壳的**网页预览页**
    * （`/android` 是个同源 iframe）。iframe 里 `innerWidth` 是**iframe 的宽度**，不是电脑窗口的宽度；
@@ -1065,15 +1114,20 @@
     try { topLevel = window.self === window.top; } catch (error) { topLevel = false; }
     if (!topLevel) return false;
     if (window.innerWidth <= 560) return false;
+    // 高度不够就别套框：套了也只有 MIN_DEVICE_SCALE 以下的可读性，还不如铺满
+    if (window.innerHeight - FRAME_CHROME < MIN_FRAME_AVAILABLE) return false;
     var coarse = false;
     try { coarse = window.matchMedia('(pointer: coarse)').matches; } catch (error) { coarse = false; }
     return !coarse;
   }
 
-  /** 缩放档位：只按可用高度等比缩，最大 1（不放大），保留两位小数。 */
+  /**
+   * 缩放档位：只按可用高度等比缩，最大 1（不放大），保留两位小数。
+   * 下限是 MIN_DEVICE_SCALE（0.7）—— isWideViewport 已经保证可用高够到它，这里的 max 是双保险。
+   */
   function deviceScale() {
     var available = window.innerHeight - FRAME_CHROME;
-    return Math.max(0.4, Math.min(1, Math.round((available / DEVICE.height) * 100) / 100));
+    return Math.max(MIN_DEVICE_SCALE, Math.min(1, Math.round((available / DEVICE.height) * 100) / 100));
   }
 
   /**
@@ -1361,6 +1415,12 @@
     typing.innerHTML = '<i></i><i></i><i></i><span>正在想…</span>';
     if (chat.host) chat.host.appendChild(typing);
     chatScrollToEnd(false);             // 自己发消息：无条件贴底（设计意图，见 chatSend 的注释）
+    // 而且要把 follow 一起置回 true —— 这正是上面 chatFollow 注释里写的"自己发消息 → 重置为 true"。
+    // 不置的话：用户上滑看历史（follow=false）时发消息，chatScrollToEnd 只把视口挪到底、follow 仍是 false，
+    // 于是紧接着到达的**回复不会被跟随**，视口停在半空（差一个气泡的高度）。
+    // 原来这里只靠 scroll 事件异步把 follow 改回来，网速快/接口被本地伪造时事件还没派发、回复就已经插进 DOM 了 —— 那是个竞态。
+    // 之后用户再上滑，scroll 监听照样会把 follow 打回 false（C2 那条断言依赖它）。
+    chat.follow = true;
     try {
       // 接口：POST /api/chat {message, execute, history?, scope} → {reply, commands[], captureId?, quest?, interest?}
       var data = await PixikoM.api('/api/chat', {
@@ -1749,7 +1809,15 @@
     }
   }
 
-  /** 一行下拉。 */
+  /**
+   * 一行下拉。
+   *
+   * 原生 `<select>` 的**关闭态永远是单行、超长就自动截断**（这是 UA 行为，CSS 改不了），
+   * 基础模型名（`waiIllustriousSDXL_v170.safetensors [f116b0c78f]`）在 390px 宽下只看得到
+   * 前半截 —— 用户抱怨的就是这个。所以下拉下面再补一条**完整值行**（`.field-value`，
+   * 允许换行、overflow-wrap:anywhere），保证完整字符串在页面上真的看得见。
+   * 下拉本身照旧保留（`data-gen-field` 契约、原生选择器体验、改完立刻 POST /api/generation）。
+   */
   function genSelect(label, key, value, values, placeholder) {
     var field = el('div', 'field');
     field.appendChild(el('div', 'field-label', label));
@@ -1765,10 +1833,16 @@
       if (item === value) option.selected = true;
       select.appendChild(option);
     });
+    // 完整值行：显示 select 当前值的**全文**（可换行）
+    var readout = el('div', 'field-value selectable');
+    readout.setAttribute('data-gen-value-for', key);
+    readout.textContent = select.value || (value || '') || placeholder;
     select.addEventListener('change', function () {
+      readout.textContent = select.value || placeholder;
       var fields = {}; fields[key] = select.value; genApply(fields);
     });
     field.appendChild(select);
+    field.appendChild(readout);
     return field;
   }
 
@@ -1922,11 +1996,13 @@
       var cell = el('div', 'cell done tap');
       cell.setAttribute('data-cell', 'done');
       if (item) {
+        var thumb = el('div', 'thumb');       // 缩略图盒（1:1、圆角、裁切）；文件名在它下面完整换行
         var img = el('img');
         img.src = PixikoM.imageUrl(item.path);
         img.alt = item.name || ('生成图 ' + (i + 1));
         img.loading = 'lazy';
-        cell.appendChild(img);
+        thumb.appendChild(img);
+        cell.appendChild(thumb);
         var cap = el('div', 'cap', item.name || '');
         cell.appendChild(cap);
         (function (entry, index, node, source) {
@@ -1945,7 +2021,9 @@
           node.addEventListener('contextmenu', function (event) { event.preventDefault(); genImageMenu(entry, index); });
         })(item, i, cell, item.path);
       } else {
-        cell.appendChild(el('div', 'muted', '—'));
+        var emptyThumb = el('div', 'thumb');
+        emptyThumb.appendChild(el('div', 'muted', '—'));
+        cell.appendChild(emptyThumb);
       }
       grid.appendChild(cell);
       shown++;
@@ -1956,17 +2034,21 @@
       var percent = Math.max(0, Math.min(100, imagePercent));
       var radius = 15, circumference = 2 * Math.PI * radius;
       var offset = circumference * (1 - percent / 100);
-      ringCell.innerHTML = '<svg class="ring" viewBox="0 0 34 34"><circle class="bg" cx="17" cy="17" r="' + radius + '"></circle>' +
+      var ringThumb = el('div', 'thumb');
+      ringThumb.innerHTML = '<svg class="ring" viewBox="0 0 34 34"><circle class="bg" cx="17" cy="17" r="' + radius + '"></circle>' +
         '<circle class="fg" cx="17" cy="17" r="' + radius + '" stroke-dasharray="' + circumference.toFixed(1) + '" stroke-dashoffset="' + offset.toFixed(1) + '" transform="rotate(-90 17 17)"></circle></svg>' +
         '<div class="pct">' + Math.round(percent) + '%</div>';
-      if (task && task.suspended) ringCell.classList.add('held');
+      if (task && task.suspended) ringThumb.appendChild(el('div', 'held-tag', '挂起'));
+      ringCell.appendChild(ringThumb);
       grid.appendChild(ringCell);
       shown++;
     }
     for (var k = 0; k < pending; k++) {
       var wait = el('div', 'cell pending');
       wait.setAttribute('data-cell', 'pending');
-      wait.appendChild(el('div', 'muted', '等待'));
+      var waitThumb = el('div', 'thumb');
+      waitThumb.appendChild(el('div', 'muted', '等待'));
+      wait.appendChild(waitThumb);
       grid.appendChild(wait);
       shown++;
     }
@@ -1994,11 +2076,13 @@
         gen.images.forEach(function (item, index) {
           var cell = el('div', 'cell done tap');
           cell.setAttribute('data-gallery-cell', String(index));
+          var thumb = el('div', 'thumb');     // 与上面同一套：缩略图 + 完整文件名在下面换行
           var img = el('img');
           img.src = PixikoM.imageUrl(item.path);
           img.alt = item.name || '';
           img.loading = 'lazy';
-          cell.appendChild(img);
+          thumb.appendChild(img);
+          cell.appendChild(thumb);
           if (item.pending) cell.appendChild(el('div', 'cap', '待领取'));
           cell.addEventListener('click', function () { PixikoM.openViewer(list, index); });
           var timer = null;
@@ -2135,6 +2219,9 @@
     presetBtn.type = 'button';
     presetBtn.setAttribute('data-gen-presets', '1');
     presetBtn.textContent = '预设';
+    // 明确"别挤我"：.btn 已经是 flex:0 0 auto，这里再补 nowrap —— 上一版「预设」被挤成
+    // 竖排的"预/设"两行，就是因为它在 .spread 行里被 stepper 抢走了宽度。
+    presetBtn.style.whiteSpace = 'nowrap';
     presetBtn.addEventListener('click', genPresetsMenu);
     countRow.appendChild(presetBtn);
     start.appendChild(countRow);

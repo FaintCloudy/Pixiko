@@ -48,40 +48,44 @@
       '.st-body>*{max-width:100%}',
       /* 下拉刷新提示（手势由本屏接管） */
       '.st-ptr{height:0;overflow:hidden;display:flex;align-items:center;justify-content:center;gap:8px;',
-      '  color:#93a4c4;font-size:12.5px;transition:height .18s}',
+      '  color:#93a4c4;font-size:var(--m-fs-sm,13px);line-height:1.45;transition:height .18s}',
       '.st-ptr.st-on{height:40px}',
       '.st-ptr .st-spin-dot{width:14px;height:14px;border-radius:50%;border:2px solid rgba(90,162,255,.35);',
       '  border-top-color:#5aa2ff;animation:st-spin .9s linear infinite}',
       /* 顶部摘要 + 搜索 + 选项 */
-      '.st-summary{display:flex;flex-wrap:wrap;gap:6px;align-items:center;padding:10px 12px;border:1px solid #1e2a44;',
-      '  border-radius:14px;background:#131c2e;color:#93a4c4;font-size:13px;line-height:1.4}',
+      '.st-summary{display:flex;flex-wrap:wrap;gap:6px;align-items:center;padding:12px 14px;border:1px solid #1e2a44;',
+      '  border-radius:14px;background:#131c2e;color:#93a4c4;font-size:var(--m-fs-sm,13px);line-height:1.45}',
+      '.st-summary>*{overflow-wrap:anywhere}',
       '.st-search{display:flex;align-items:center;gap:8px;min-height:44px;margin-top:8px;padding:0 12px;',
       '  border:1px solid #1e2a44;border-radius:14px;background:#131c2e}',
-      '.st-search input{flex:1 1 auto;min-width:0;height:42px;border:0;background:transparent;color:#e9efff;',
+      '.st-search input{flex:1 1 auto;min-width:0;height:44px;border:0;background:transparent;color:#e9efff;',
       '  font:inherit;font-size:16px;outline:none}',
-      '.st-search .st-clear{flex:0 0 auto;width:32px;height:32px;border:0;border-radius:50%;background:#1b2740;',
-      '  color:#93a4c4;font-size:16px;line-height:1;cursor:pointer}',
+      '.st-search .st-clear{flex:0 0 auto;width:44px;height:44px;margin-right:-8px;border:0;border-radius:50%;',
+      '  background:transparent;color:#93a4c4;font-size:16px;line-height:1;cursor:pointer}',
       '.st-toggle{display:flex;align-items:center;gap:10px;min-height:44px;margin-top:8px;padding:0 12px;border-radius:14px;',
-      '  background:#101a2b;border:1px solid #1e2a44;color:#c9d6ee;font-size:13.5px}',
+      '  background:#101a2b;border:1px solid #1e2a44;color:#c9d6ee;font-size:var(--m-fs-sm,13px);line-height:1.45}',
       '.st-toggle .st-switch{flex:0 0 auto;width:44px;height:26px;border-radius:13px;background:#26314c;position:relative;',
       '  transition:background .15s}',
       '.st-toggle .st-switch:after{content:"";position:absolute;top:3px;left:3px;width:20px;height:20px;border-radius:50%;',
       '  background:#93a4c4;transition:transform .15s,background .15s}',
       '.st-toggle.st-on .st-switch{background:rgba(90,162,255,.35)}',
       '.st-toggle.st-on .st-switch:after{transform:translateX(18px);background:#5aa2ff}',
-      '.st-toggle .st-toggle-text{flex:1 1 auto;min-width:0}',
+      '.st-toggle .st-toggle-text{flex:1 1 auto;min-width:0;overflow-wrap:anywhere}',
       /* 分类组 */
-      '.st-group{margin-top:14px}',
-      '.st-group-head{display:flex;align-items:center;gap:8px;min-height:44px;padding:0 4px;background:transparent;',
-      '  border:0;color:#93a4c4;font:inherit;font-size:13px;font-weight:600;cursor:pointer;width:100%;text-align:left}',
+      '.st-group{margin-top:12px}',
+      '.st-group-head{display:flex;align-items:flex-start;gap:8px;min-height:44px;padding:4px;background:transparent;',
+      '  border:0;color:#93a4c4;font:inherit;font-size:var(--m-fs-sm,13px);font-weight:600;line-height:1.45;',
+      '  cursor:pointer;width:100%;text-align:left}',
       '.st-group-head:active{color:#5aa2ff}',
-      '.st-arrow{display:inline-block;width:14px;color:#5d6f92;transition:transform .15s}',
+      '.st-arrow{display:inline-block;flex:0 0 auto;width:14px;color:#5d6f92;transition:transform .15s}',
       '.st-group.st-fold .st-arrow{transform:rotate(-90deg)}',
       '.st-group.st-fold .st-group-rows{display:none}',
-      '.st-group-name{flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}',
-      '.st-count{padding:1px 8px;border-radius:999px;background:#1b2740;border:1px solid #24314e;font-size:11.5px;color:#93a4c4}',
+      '.st-group-name{flex:1 1 auto;min-width:0;white-space:normal;overflow:visible;text-overflow:clip;',
+      '  overflow-wrap:anywhere;word-break:break-word}',
+      '.st-count{flex:0 0 auto;padding:1px 8px;border-radius:999px;background:#1b2740;border:1px solid #24314e;',
+      '  font-size:var(--m-fs-tag,12px);line-height:1.45;color:#93a4c4;font-variant-numeric:tabular-nums}',
       /* 样式行 */
-      '.st-row{display:flex;align-items:center;gap:10px;width:100%;min-height:64px;padding:10px;margin:0 0 8px;',
+      '.st-row{display:flex;align-items:flex-start;gap:10px;width:100%;min-height:64px;padding:14px;margin:0 0 12px;',
       '  border:1px solid #1e2a44;border-radius:14px;background:#131c2e;color:inherit;font:inherit;text-align:left;',
       '  cursor:pointer;touch-action:manipulation;transition:transform .1s,background .12s}',
       '.st-row:active{background:#18233a;transform:scale(.985)}',
@@ -89,21 +93,22 @@
       '  border:1px solid #24314e;display:flex;align-items:center;justify-content:center;color:#5d6f92;font-size:18px}',
       '.st-thumb img{width:100%;height:100%;object-fit:cover;display:block}',
       '.st-row-main{flex:1 1 auto;min-width:0}',
-      '.st-row-top{display:flex;align-items:center;gap:6px;min-width:0}',
-      '.st-no{flex:0 0 auto;color:#5aa2ff;font-size:12.5px;font-weight:700}',
-      '.st-name{flex:1 1 auto;min-width:0;font-size:15px;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}',
-      '.st-meta{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin-top:5px}',
-      '.st-tag{display:inline-flex;align-items:center;gap:4px;padding:2px 8px;border-radius:999px;background:#1b2740;',
-      '  border:1px solid #24314e;color:#93a4c4;font-size:11.5px;line-height:1.5;white-space:nowrap;max-width:100%;',
-      '  overflow:hidden;text-overflow:ellipsis}',
+      '.st-row-top{display:flex;align-items:baseline;gap:6px;min-width:0}',
+      '.st-no{flex:0 0 auto;color:#5aa2ff;font-size:12.5px;font-weight:700;font-variant-numeric:tabular-nums}',
+      '.st-name{display:block;min-width:0;font-size:var(--m-fs-body,15px);font-weight:600;line-height:1.5;',
+      '  white-space:normal;overflow:visible;text-overflow:clip;overflow-wrap:anywhere;word-break:break-word}',
+      '.st-meta{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin-top:6px}',
+      '.st-tag{display:inline-flex;align-items:center;gap:4px;padding:3px 8px;border-radius:999px;background:#1b2740;',
+      '  border:1px solid #24314e;color:#93a4c4;font-size:var(--m-fs-tag,12px);line-height:1.5;max-width:100%;',
+      '  white-space:normal;overflow:visible;text-overflow:clip;overflow-wrap:anywhere}',
       '.st-tag.st-on{background:rgba(90,162,255,.16);border-color:rgba(90,162,255,.45);color:#9cc7ff}',
       '.st-tag.st-auto{border-style:dashed}',
-      '.st-sub{margin-top:4px;color:#93a4c4;font-size:12px;line-height:1.35;overflow:hidden;text-overflow:ellipsis;',
-      '  display:-webkit-box;-webkit-line-clamp:1;-webkit-box-orient:vertical}',
-      '.st-chev{flex:0 0 auto;color:#5d6f92;font-size:20px;line-height:1}',
+      '.st-sub{margin-top:6px;color:#93a4c4;font-size:var(--m-fs-sm,13px);line-height:1.45;',
+      '  white-space:normal;overflow:visible;text-overflow:clip;overflow-wrap:anywhere;word-break:break-word}',
+      '.st-chev{flex:0 0 auto;color:#5d6f92;font-size:20px;line-height:1;align-self:center}',
       /* 三态 */
       '.st-state{margin:8px 0;padding:14px;border:1px dashed #24314e;border-radius:14px;background:#101a2b;',
-      '  color:#93a4c4;font-size:13.5px;line-height:1.5;word-break:break-word}',
+      '  color:#93a4c4;font-size:var(--m-fs-sm,13px);line-height:1.5;overflow-wrap:anywhere;word-break:break-word}',
       '.st-state.st-err{border-style:solid;border-color:rgba(255,107,107,.45);background:rgba(255,107,107,.08);color:#ffc9c9}',
       '.st-empty{padding:46px 18px;text-align:center;color:#93a4c4}',
       '.st-empty .st-empty-icon{font-size:40px;opacity:.5}',
@@ -130,10 +135,11 @@
       '  border-bottom:1px solid #1e2a44}',
       '.st-panel-title{flex:1 1 auto;min-width:0;font-size:16px;font-weight:700;overflow:hidden;text-overflow:ellipsis;',
       '  white-space:nowrap}',
-      '.st-panel-body{flex:1 1 auto;min-height:0;overflow-y:auto;padding:12px;font-size:14.5px;line-height:1.55;color:#dde7fb}',
-      '.st-panel-body .st-pre{white-space:pre-wrap;word-break:break-word;padding:10px;border-radius:12px;background:#0f1728;',
-      '  border:1px solid #1e2a44;margin-bottom:10px}',
-      '.st-panel-foot{flex:0 0 auto;display:flex;gap:8px;padding:10px 12px 4px;border-top:1px solid #1e2a44}',
+      '.st-panel-body{flex:1 1 auto;min-height:0;overflow-y:auto;padding:14px;font-size:var(--m-fs-body,15px);',
+      '  line-height:1.5;color:#dde7fb}',
+      '.st-panel-body .st-pre{white-space:pre-wrap;overflow-wrap:anywhere;word-break:break-word;padding:12px;',
+      '  border-radius:12px;background:#0f1728;border:1px solid #1e2a44;margin-bottom:12px}',
+      '.st-panel-foot{flex:0 0 auto;display:flex;gap:8px;padding:10px 14px 4px;border-top:1px solid #1e2a44}',
       '.st-btn{flex:1 1 0;display:inline-flex;align-items:center;justify-content:center;min-height:44px;padding:0 14px;',
       '  border:1px solid #24314e;border-radius:12px;background:#1b2740;color:#e9efff;font:inherit;font-size:15px;',
       '  cursor:pointer;touch-action:manipulation}',
@@ -143,20 +149,20 @@
       '.st-btn[disabled]{opacity:.5}',
       /* 表单 */
       '.st-field{margin-bottom:12px}',
-      '.st-field label{display:block;margin-bottom:6px;color:#93a4c4;font-size:12.5px}',
+      '.st-field label{display:block;margin-bottom:6px;color:#93a4c4;font-size:var(--m-fs-sm,13px);line-height:1.45}',
       '.st-field input[type=text]{width:100%;height:46px;padding:0 12px;border:1px solid #24314e;border-radius:12px;',
       '  background:#0f1728;color:#e9efff;font-size:16px;outline:none;box-sizing:border-box}',
       '.st-field input[type=text]:focus{border-color:#5aa2ff}',
       '.st-cover-row{display:flex;align-items:center;gap:10px}',
       '.st-cover-prev{flex:0 0 auto;width:56px;height:56px;border-radius:12px;border:1px solid #24314e;background:#0f1728;',
-      '  overflow:hidden;display:flex;align-items:center;justify-content:center;color:#5d6f92;font-size:11px}',
+      '  overflow:hidden;display:flex;align-items:center;justify-content:center;color:#5d6f92;font-size:12px}',
       '.st-cover-prev img{width:100%;height:100%;object-fit:cover;display:block}',
-      '.st-cover-value{flex:1 1 auto;min-width:0;color:#c9d6ee;font-size:13px;overflow:hidden;text-overflow:ellipsis;',
-      '  white-space:nowrap}',
+      '.st-cover-value{flex:1 1 auto;min-width:0;color:#c9d6ee;font-size:var(--m-fs-sm,13px);line-height:1.45;',
+      '  overflow-wrap:anywhere;word-break:break-word}',
       '.st-cover-btn{flex:0 0 auto;min-height:44px;padding:0 14px;border-radius:12px;border:1px solid rgba(90,162,255,.5);',
-      '  background:rgba(90,162,255,.14);color:#9cc7ff;font:inherit;font-size:14px;cursor:pointer}',
+      '  background:rgba(90,162,255,.14);color:#9cc7ff;font:inherit;font-size:14.5px;cursor:pointer}',
       '.st-check{display:flex;align-items:center;gap:10px;min-height:44px;padding:0 12px;border:1px solid #24314e;',
-      '  border-radius:12px;background:#0f1728;color:#c9d6ee;font-size:13.5px;cursor:pointer}',
+      '  border-radius:12px;background:#0f1728;color:#c9d6ee;font-size:var(--m-fs-sm,13px);line-height:1.45;cursor:pointer}',
       '.st-check input{width:20px;height:20px;accent-color:#5aa2ff;margin:0}'
     ].join('');
     document.head.appendChild(style);
@@ -182,10 +188,8 @@
     return Number.isFinite(n) ? n : (fallback === undefined ? 0 : fallback);
   }
   function shortName(file) { return text(file).replace(/^.*[\\/]/, '').split('?')[0]; }
-  function truncate(value, max) {
-    var s = text(value);
-    return s.length > max ? s.slice(0, max) + '…' : s;
-  }
+  /* 这里原来有一个 truncate(value,max)：它只给底模说明用过一次，而用户要求「不许默认省略」，
+     现在那一处改成完整显示，这个函数就没有调用方了，一并删掉（免得以后又被拿去截别的东西）。 */
   function coverUrlFor(name) {
     return '/api/style/preview?token=' + encodeURIComponent(text(P.token && P.token())) + '&name=' + encodeURIComponent(text(name));
   }
@@ -428,7 +432,8 @@
     var height = num(item && item.height, 0);
     if (width > 0 && height > 0) meta.appendChild(el('span', 'st-tag', width + '×' + height));
     main.appendChild(meta);
-    if (item && item.modelSummary) main.appendChild(el('div', 'st-sub', truncate(item.modelSummary, 60)));
+    /* 底模说明完整显示：不截断（后端最长 145 字），由 CSS 的 overflow-wrap 负责折行。 */
+    if (item && item.modelSummary) main.appendChild(el('div', 'st-sub', text(item.modelSummary)));
     row.appendChild(main);
     row.appendChild(el('span', 'st-chev', '›'));
     row.addEventListener('click', function () { rowSheet(item); });
