@@ -18,8 +18,11 @@ import java.util.List;
 
 /**
  * 网页任务回执的**索引**：只记元信息（任务号、指令、开始时间、文字/图片条数、第一段文字压成的摘要、
- * 已读标记），**不存正文**——正文只活在内存里的 {@link Bot.WebCapture}，回执过期或重启之后，
- * 列表照样能说清楚"有过这么一条任务"，只是内容标记为已过期。
+ * 已读标记），**不存正文**——正文按任务号落在 {@code data/quests/&lt;number&gt;.json}
+ * （见 {@link Bot} 的回执正文落盘），这里只负责列表与未读状态。
+ *
+ * <p>回执内容不再有"过期"概念：{@code expired} 永远为 false，列表与单条都以磁盘正文为准。
+ * 只有被上限裁掉的**最旧**那批，才会连正文文件一起删。
  *
  * <p>索引落盘在 {@code data/quests.json}（{@link Json#atomicWrite}，UTF-8 无 BOM），
  * 最多留最新 {@value #MAX_ENTRIES} 条，超出的丢最旧的。
@@ -30,8 +33,8 @@ import java.util.List;
  */
 public final class QuestIndex {
 
-    /** 索引最多保留的条数：再多就把最旧的任务号挤掉。 */
-    public static final int MAX_ENTRIES = 200;
+    /** 索引最多保留的条数：再多就把最旧的任务号（连同 data/quests/&lt;n&gt;.json 正文）挤掉。 */
+    public static final int MAX_ENTRIES = 2000;
     /** 摘要最多取的字符数（第一段文字压成单行后）。 */
     public static final int SUMMARY_CHARS = 120;
     /** 落盘时间戳：UTC ISO-8601，固定毫秒 + Z（JS 的 new Date(...) 直接能解析）。 */
@@ -51,7 +54,7 @@ public final class QuestIndex {
         boolean unread;
         /** 被打开过（/api/quest 取到，或 /api/quests/read）：之后不会再变回未读。 */
         boolean read;
-        /** 这一轮刷新时内容还在内存里（false = 重启后或超过保留时间的旧条目）。 */
+        /** 这一轮刷新时内容还在内存里（false = 重启后或已从内存淘汰；只影响 busy，不影响可见性）。 */
         boolean alive;
 
         Entry(int number) { this.number = number; }
@@ -59,6 +62,8 @@ public final class QuestIndex {
 
     /** 任务号 → 条目，按登记顺序（新号在后面）。 */
     private final LinkedHashMap<Integer, Entry> entries = new LinkedHashMap<>();
+    /** 被上限裁掉、等着连正文文件一起删的任务号（{@link Bot} 用 {@link #drainTrimmed()} 取走）。 */
+    private final List<Integer> trimmed = new ArrayList<>();
     /** 每次**实际变化**自增：写盘节流据此判断"内容真变了没有"。 */
     private long revision;
 
@@ -82,13 +87,13 @@ public final class QuestIndex {
         return latest;
     }
 
-    /** 开始一轮刷新：先全部当成"内容已不在内存"，再由 {@link #observe} 把活着的重新点亮。 */
+    /** 开始一轮刷新：先全部当成"内容已不在内存"，再由 {@link #observe} 把活着的重新点亮（只影响 busy）。 */
     public synchronized void begin() {
         for (Entry entry : entries.values()) entry.alive = false;
     }
 
     /**
-     * 用一条**还活着**的回执刷新它的索引项：任务号、指令、开始时间、条数、摘要、是否跑完。
+     * 用一条**还活着**（还在内存里）的回执刷新它的索引项：任务号、指令、开始时间、条数、摘要、是否跑完。
      *
      * <p>未读的判定只在这里发生：第一次出现文字（texts 非空）且这条从没被打开过，才记为未读；
      * 已读一旦确定就再也不会变回未读。
@@ -155,10 +160,10 @@ public final class QuestIndex {
     }
 
     /**
-     * 列表接口的返回：最新的在前，最多 {@code limit} 条（1..200），**不带任何正文数组**。
+     * 列表接口的返回：最新的在前，最多 {@code limit} 条（1..{@value #MAX_ENTRIES}），**不带任何正文数组**。
      *
      * @param limit          最多返回多少条（越界会被钳到 1..{@value #MAX_ENTRIES}）
-     * @param retainedMinutes 回执在内存里保留多少分钟（顶层原样回报给网页）
+     * @param retainedMinutes 回执正文保留多少分钟（顶层原样回报给网页；0 = 不过期）
      */
     public synchronized JsonObject json(int limit, int retainedMinutes) {
         int wanted = Math.max(1, Math.min(MAX_ENTRIES, limit));
@@ -178,8 +183,8 @@ public final class QuestIndex {
     /**
      * 单条索引项（字段与列表里的一致）。
      *
-     * <p>{@code /api/quest} 在正文已经回收（重启或超过保留时间）时用它回一份"只剩摘要"的结果，
-     * 这样 /quest#N 这种直接打开的链接也能看到摘要而不是一句冷冰冰的报错；找不到返回 null。
+     * <p>{@code /api/quest} 在磁盘上也找不到正文时用它兜底，这样 /quest#N 这种直接打开的链接
+     * 至少还能看到摘要而不是一句冷冰冰的报错；找不到返回 null。
      */
     public synchronized JsonObject item(int number) {
         Entry entry = entries.get(number);
@@ -191,12 +196,13 @@ public final class QuestIndex {
         JsonObject item = new JsonObject();
         item.addProperty("number", entry.number);
         item.addProperty("command", entry.command);
-        item.addProperty("startedAt", STAMP.format(Instant.ofEpochMilli(entry.startedMillis)));
+        item.addProperty("startedAt", stamp(entry.startedMillis));
         item.addProperty("ageMillis", Math.max(0, System.currentTimeMillis() - entry.startedMillis));
         item.addProperty("done", entry.done);
         item.addProperty("busy", entry.alive && !entry.done);
         item.addProperty("unread", entry.unread);
-        item.addProperty("expired", !entry.alive);
+        // 回执内容不再过期：正文落在 data/quests/<n>.json，任何时候都能读回来。
+        item.addProperty("expired", false);
         item.addProperty("texts", entry.texts);
         item.addProperty("images", entry.images);
         item.addProperty("summary", entry.summary);
@@ -250,7 +256,7 @@ public final class QuestIndex {
                 JsonObject node = new JsonObject();
                 node.addProperty("number", entry.number);
                 node.addProperty("command", entry.command);
-                node.addProperty("startedAt", STAMP.format(Instant.ofEpochMilli(entry.startedMillis)));
+                node.addProperty("startedAt", stamp(entry.startedMillis));
                 node.addProperty("summary", entry.summary);
                 node.addProperty("texts", entry.texts);
                 node.addProperty("images", entry.images);
@@ -268,14 +274,33 @@ public final class QuestIndex {
         }
     }
 
-    /** 超出上限就丢最旧的（按任务号最小者，任务号复用也能正确收尾）。 */
+    /**
+     * 超出上限就丢最旧的（按任务号最小者，任务号复用也能正确收尾）。
+     * 被丢掉的任务号记在 {@link #trimmed} 里，由 {@link Bot} 取走后删掉对应的正文文件。
+     */
     private void trim() {
         while (entries.size() > MAX_ENTRIES) {
             int oldest = Integer.MAX_VALUE;
             for (int number : entries.keySet()) oldest = Math.min(oldest, number);
-            entries.remove(oldest);
+            if (entries.remove(oldest) != null) trimmed.add(oldest);
         }
     }
+
+    /**
+     * 取走（并清空）最近被上限裁掉的任务号。
+     *
+     * <p>{@link Bot} 每次 {@code observe}/{@code load} 之后调它，把 {@code data/quests/<n>.json}
+     * 一起删掉——索引都不留的号，正文文件也不该留成孤儿。
+     */
+    public synchronized List<Integer> drainTrimmed() {
+        if (trimmed.isEmpty()) return List.of();
+        List<Integer> drained = new ArrayList<>(trimmed);
+        trimmed.clear();
+        return drained;
+    }
+
+    /** 落盘时间戳：UTC ISO-8601，固定毫秒 + Z（JS 的 new Date(...) 直接能解析）。索引与回执正文共用。 */
+    static String stamp(long millis) { return STAMP.format(Instant.ofEpochMilli(millis)); }
 
     /** 第一段文字压成单行后的前 {@value #SUMMARY_CHARS} 个字符；没有文字就是空串。 */
     static String summary(String text) {
@@ -284,7 +309,8 @@ public final class QuestIndex {
         return one.length() > SUMMARY_CHARS ? one.substring(0, SUMMARY_CHARS) : one;
     }
 
-    private static long parseStamp(String value) {
+    /** 解析 {@link #stamp(long)} 写出的时间戳（读不出来返回 0）。 */
+    static long parseStamp(String value) {
         if (value == null || value.isBlank()) return 0;
         try { return Instant.parse(value.strip()).toEpochMilli(); }
         catch (Exception error) { return 0; }

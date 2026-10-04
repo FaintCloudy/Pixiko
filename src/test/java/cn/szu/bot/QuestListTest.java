@@ -26,7 +26,10 @@ import cn.szu.bot.web.WebUiServer;
 /**
  * 网页「任务回执列表」：摘要索引（{@code GET /api/quests}）、未读标记（{@code POST /api/quests/read}）、
  * 用 {@code /api/quest} 打开一条就变已读、{@code /api/status} 里的 {@code quests} 小块，
- * 以及索引落盘（data/quests.json）后重启还在与 200 条上限。
+ * 以及索引落盘（data/quests.json）后重启还在与 2000 条上限。
+ *
+ * <p>回执正文不再过期：索引里 {@code expired} 恒为 false、{@code retainedMinutes} 恒为 0；
+ * 重启后正文从 {@code data/quests/<n>.json} 读回来（见 {@link QuestPersistenceTest}）。
  *
  * <p>全程只连回环地址（SD 是本机桩），不碰 QQ、不碰真实 SD，更不碰线上运行目录：
  * 所有读写都在 {@code Files.createTempDirectory} 出来的临时根目录里。
@@ -56,7 +59,8 @@ public final class QuestListTest {
         }
         System.out.println("QuestListTest: " + checks + " assertions passed：列表降序与 limit 钳制、摘要单行截 120 字、"
                 + "有内容才算未读且已读不回退、markRead/markAllRead//api/quest 打开即已读、落盘重载后未读还在、"
-                + "200 条上限丢最旧、/api/quests 契约字段、/api/status 的 quests");
+                + "2000 条上限丢最旧、expired 恒为 false、retainedMinutes 恒为 0、/api/quests 契约字段、"
+                + "/api/status 的 quests");
     }
 
     // ------------------------------------------------------------------ 索引本身（不跑指令，纯语义）
@@ -69,11 +73,11 @@ public final class QuestListTest {
         // ① 还没有内容的回执也进索引，但不算未读
         Bot.WebCapture first = new Bot.WebCapture("capture-a", ".style list", root.resolve("data/generated"));
         index.observe(first);
-        JsonObject list = index.json(50, 30);
+        JsonObject list = index.json(50, 0);
         check(list.getAsJsonArray("quests").size() == 1, "没有内容的回执也进索引");
         check(list.get("unread").getAsInt() == 0 && list.get("latest").getAsInt() == first.number()
-                        && list.get("total").getAsInt() == 1 && list.get("retainedMinutes").getAsInt() == 30,
-                "顶层 unread/latest/total/retainedMinutes 如实回报：" + list);
+                        && list.get("total").getAsInt() == 1 && list.get("retainedMinutes").getAsInt() == 0,
+                "顶层 unread/latest/total/retainedMinutes 如实回报（0 = 不过期）：" + list);
         JsonObject item = entry(list, 0);
         check(!item.get("unread").getAsBoolean(), "还没有文字就不算未读");
         check(item.get("texts").getAsInt() == 0 && item.get("images").getAsInt() == 0
@@ -85,7 +89,7 @@ public final class QuestListTest {
         first.capture(image("data/generated/sample.png"));
         first.finish();
         index.observe(first);
-        list = index.json(50, 30);
+        list = index.json(50, 0);
         item = entry(list, 0);
         String summary = item.get("summary").getAsString();
         check(list.get("unread").getAsInt() == 1 && item.get("unread").getAsBoolean(), "第一次有文字就记为未读");
@@ -110,7 +114,7 @@ public final class QuestListTest {
         check(index.markRead(java.util.List.of(first.number() + 777)) == 0, "索引里没有的号忽略");
         first.capture(Maps.text("第二段文字"));
         index.observe(first);
-        item = entry(index.json(50, 30), 0);
+        item = entry(index.json(50, 0), 0);
         check(item.get("texts").getAsInt() == 2 && item.get("summary").getAsString().equals(summary),
                 "摘要永远取第一段文字：" + item.get("summary"));
         check(!item.get("unread").getAsBoolean(), "已读之后再来文字也不会变回未读");
@@ -119,19 +123,19 @@ public final class QuestListTest {
         Bot.WebCapture second = new Bot.WebCapture("capture-b", ".rg 1girl", root.resolve("data/generated"));
         second.capture(Maps.text("出图任务已提交"));
         index.observe(second);
-        list = index.json(50, 30);
+        list = index.json(50, 0);
         check(list.getAsJsonArray("quests").size() == 2
                         && entry(list, 0).get("number").getAsInt() == second.number()
                         && entry(list, 1).get("number").getAsInt() == first.number(),
                 "最新的一条排在最前面（number 降序）：" + list);
         check(list.get("unread").getAsInt() == 1, "只有新的那条未读：" + list.get("unread"));
         for (int limit : new int[]{0, -9, 1}) {
-            JsonObject clamped = index.json(limit, 30);
+            JsonObject clamped = index.json(limit, 0);
             check(clamped.getAsJsonArray("quests").size() == 1,
                     "limit=" + limit + " 钳到 1 条（实际 " + clamped.getAsJsonArray("quests").size() + "）");
             check(entry(clamped, 0).get("number").getAsInt() == second.number(), "limit 小的时候留的是最新的");
         }
-        check(index.json(1000, 30).getAsJsonArray("quests").size() == 2, "超大 limit 也把现有的给全");
+        check(index.json(1000, 0).getAsJsonArray("quests").size() == 2, "超大 limit 也把现有的给全");
         check(index.markAllRead() == 1 && index.unread() == 0, "markAllRead 只数真正从没读变已读的那一条");
 
         // ⑤ 落盘 → 重载（未读状态、摘要、已读都不丢），文件是 UTF-8 无 BOM
@@ -146,7 +150,7 @@ public final class QuestListTest {
                 "落盘文件是 UTF-8 无 BOM");
         QuestIndex reloaded = new QuestIndex();
         reloaded.load(file);
-        JsonObject after = reloaded.json(50, 30);
+        JsonObject after = reloaded.json(50, 0);
         check(after.get("total").getAsInt() == 3 && after.get("latest").getAsInt() == third.number(),
                 "重载后条数与最大号都还在：" + after);
         check(after.get("unread").getAsInt() == 1 && entry(after, 0).get("unread").getAsBoolean(),
@@ -155,34 +159,40 @@ public final class QuestListTest {
                 "已读的那几条重载后不会变回未读");
         check(entry(after, 0).get("summary").getAsString().equals("帮助：.style list")
                         && entry(after, 0).get("done").getAsBoolean(), "摘要与 done 也一起持久化：" + entry(after, 0));
-        boolean allExpired = true, anyBusy = false;
+        boolean anyExpired = false, anyBusy = false;
         for (JsonElement node : after.getAsJsonArray("quests")) {
-            allExpired &= node.getAsJsonObject().get("expired").getAsBoolean();
+            anyExpired |= node.getAsJsonObject().get("expired").getAsBoolean();
             anyBusy |= node.getAsJsonObject().get("busy").getAsBoolean();
         }
-        check(allExpired && !anyBusy, "磁盘读回来的条目内容都不在内存里：expired=true、busy=false");
+        check(!anyExpired && !anyBusy,
+                "索引里的条目不再有“内容已不在内存”的过期语义：expired 恒为 false、busy=false");
 
-        // ⑥ 超过 200 条丢最旧的
+        // ⑥ 超过 2000 条丢最旧的
         QuestIndex many = new QuestIndex();
         java.util.List<Bot.WebCapture> captures = new java.util.ArrayList<>();
-        for (int i = 0; i < 250; i++) {
+        for (int i = 0; i < 2100; i++) {
             Bot.WebCapture capture = new Bot.WebCapture("bulk-" + i, ".help #" + i, root.resolve("data/generated"));
             capture.capture(Maps.text("第 " + i + " 条回执"));
             capture.finish();
             captures.add(capture);
             many.observe(capture);
         }
-        JsonObject capped = many.json(500, 30);
-        check(capped.getAsJsonArray("quests").size() == 200 && capped.get("total").getAsInt() == 200,
-                "索引最多留 200 条：" + capped.get("total"));
-        check(entry(capped, 0).get("number").getAsInt() == captures.get(249).number()
-                        && entry(capped, 199).get("number").getAsInt() == captures.get(50).number(),
-                "超出上限时丢的是最旧的 50 条");
+        JsonObject capped = many.json(5000, 0);
+        check(capped.getAsJsonArray("quests").size() == 2000 && capped.get("total").getAsInt() == 2000,
+                "索引最多留 2000 条：" + capped.get("total"));
+        check(entry(capped, 0).get("number").getAsInt() == captures.get(2099).number()
+                        && entry(capped, 1999).get("number").getAsInt() == captures.get(100).number(),
+                "超出上限时丢的是最旧的 100 条");
+        java.util.List<Integer> trimmed = many.drainTrimmed();
+        check(trimmed.size() == 100 && trimmed.contains(captures.get(0).number())
+                        && trimmed.contains(captures.get(99).number()) && !trimmed.contains(captures.get(100).number()),
+                "被裁掉的最旧 100 条任务号交给 Bot 去删正文文件：" + trimmed.size());
+        check(many.drainTrimmed().isEmpty(), "任务号取过一次就不重复给");
         Path bulkFile = root.resolve("data/bulk-quests.json");
         many.save(bulkFile);
         QuestIndex bulkReloaded = new QuestIndex();
         bulkReloaded.load(bulkFile);
-        check(bulkReloaded.json(500, 30).get("total").getAsInt() == 200, "重载后仍然是 200 条");
+        check(bulkReloaded.json(5000, 0).get("total").getAsInt() == 2000, "重载后仍然是 2000 条");
 
         // ⑦ 读坏了当空索引，绝不抛异常
         Path broken = root.resolve("data/broken-quests.json");
@@ -190,7 +200,7 @@ public final class QuestListTest {
         Files.writeString(broken, "{这不是 JSON", StandardCharsets.UTF_8);
         QuestIndex brokenIndex = new QuestIndex();
         brokenIndex.load(broken);
-        check(brokenIndex.json(50, 30).get("total").getAsInt() == 0, "索引读坏了就当空索引（只写日志）");
+        check(brokenIndex.json(50, 0).get("total").getAsInt() == 0, "索引读坏了就当空索引（只写日志）");
     }
 
     // ------------------------------------------------------------------ 真实 Bot + 网页接口
@@ -237,7 +247,7 @@ public final class QuestListTest {
                 check(empty.getAsJsonArray("quests").isEmpty() && empty.get("unread").getAsInt() == 0
                                 && empty.get("latest").getAsInt() == 0 && empty.get("total").getAsInt() == 0,
                         "还没有任务时列表是空的、计数都是 0：" + empty);
-                check(empty.get("retainedMinutes").getAsInt() == 30, "retainedMinutes = 30");
+                check(empty.get("retainedMinutes").getAsInt() == 0, "retainedMinutes = 0（回执不过期）");
 
                 // ① 一条真指令：有内容才未读
                 int first = command(base, ".help");
@@ -291,10 +301,11 @@ public final class QuestListTest {
                 check(marked.get("marked").getAsInt() == 1 && marked.get("unread").getAsInt() == 0,
                         "all=true 把剩下的未读全标掉：" + marked);
 
-                // ⑤ 降序与 limit 钳制（1..200）
+                // ⑤ 降序与 limit 钳制（1..2000）
                 list = get(base, "/api/quests");
                 check(list.get("total").getAsInt() == 3 && list.getAsJsonArray("quests").size() == 3,
                         "三条回执都在列表里：" + list.get("total"));
+                check(list.get("retainedMinutes").getAsInt() == 0, "retainedMinutes = 0（不过期）");
                 int previous = Integer.MAX_VALUE;
                 for (JsonElement node : list.getAsJsonArray("quests")) {
                     int number = node.getAsJsonObject().get("number").getAsInt();
@@ -320,25 +331,27 @@ public final class QuestListTest {
             check(list.get("total").getAsInt() == 4 && list.get("latest").getAsInt() == fourth,
                     "重启后索引里的 4 条都还在，latest 还在：" + list);
             check(list.get("unread").getAsInt() == 1, "重启后未读状态还在：" + list.get("unread"));
-            boolean allExpired = true;
+            boolean anyExpired = false;
             for (JsonElement node : list.getAsJsonArray("quests")) {
                 JsonObject entry = node.getAsJsonObject();
-                allExpired &= entry.get("expired").getAsBoolean();
+                anyExpired |= entry.get("expired").getAsBoolean();
                 check(!entry.get("busy").getAsBoolean(), "重启后没有内容在内存里，busy=false");
             }
-            check(allExpired, "重启后每条都标成内容已过期：expired=true");
+            check(!anyExpired, "重启后索引里每一条 expired 都是 false（回执不再过期）");
+            check(list.get("retainedMinutes").getAsInt() == 0, "重启后 retainedMinutes 仍是 0：不过期");
             JsonObject counts = second.webStatus().getAsJsonObject("quests");
             check(counts.get("unread").getAsInt() == 1 && counts.get("latest").getAsInt() == fourth,
                     "重启后 /api/status 的 quests 也从索引来：" + counts);
             JsonObject marked = second.webMarkQuestsRead(null, true);
             check(marked.get("marked").getAsInt() == 1 && marked.get("unread").getAsInt() == 0,
                     "重启后也能把剩下的标为已读：" + marked);
-            // 正文过期之后直接打开（/quest#N）：照样给摘要 + 一句"已过期"，而不是冷冰冰一句报错。
-            JsonObject stale = second.webQuest(fourth);
-            check(stale.get("expired").getAsBoolean() && !stale.get("summary").getAsString().isBlank()
-                            && String.valueOf(stale.get("error")).contains("过期")
-                            && stale.get("unread").getAsBoolean() == false,
-                    "过期回执按摘要返回（expired=true + summary + 已过期说明）：" + stale);
+            // 重启后直接打开（/quest#N）：正文从 data/quests/<n>.json 读回来，和进程内看的一样完整。
+            JsonObject reopened = second.webQuest(fourth);
+            check(!reopened.get("expired").getAsBoolean() && !reopened.get("busy").getAsBoolean()
+                            && reopened.get("fromDisk").getAsBoolean() && reopened.has("texts")
+                            && !reopened.get("texts").getAsJsonArray().isEmpty()
+                            && !reopened.get("messages").getAsJsonArray().isEmpty(),
+                    "重启后按任务号仍能拿到完整正文（fromDisk=true、expired=false、busy=false）：" + reopened);
             JsonObject unknown = second.webQuest(fourth + 5000);
             check(!unknown.has("summary") && String.valueOf(unknown.get("error")).contains("不在了"),
                     "索引里没有的号仍然如实说'不在了'：" + unknown);

@@ -671,19 +671,24 @@ a.image-link img:hover { border-color: rgba(120, 160, 220, .55); }
 /* ---------------------------------------------------------------- 回执列表（左列表 / 右详情）
    未查看（unread）的行：左边一条色条 + 圆点 + 加粗 + 高亮底色 + 「未读」徽标，四种标记一起上。 */
 .quest-split { display: grid; grid-template-columns: minmax(250px, 340px) minmax(0, 1fr); gap: 12px; align-items: start; }
-.quest-list-card { min-width: 0; }
+/* 列表卡：竖直排列「卡片头 / 状态行 / 列表」，列表吃掉剩余高度并可内部滚动 */
+.quest-list-card { min-width: 0; display: flex; flex-direction: column; }
 .quest-list {
-  display: flex; flex-direction: column; gap: 6px;
-  max-height: min(56vh, 560px); overflow-y: auto; padding-right: 2px;
+  display: flex; flex-direction: column; gap: 8px;
+  /* 整体加高：可视高度明显提升，内部仍可滚动 */
+  max-height: min(76vh, 760px); overflow-y: auto; padding-right: 2px;
   border-radius: 10px;
+  flex: 1 1 auto; min-height: 0;
 }
 .quest-list::-webkit-scrollbar { width: 8px; }
 .quest-list::-webkit-scrollbar-thumb { background: rgba(120, 160, 220, .3); border-radius: 8px; }
 .quest-row {
-  display: flex; align-items: flex-start; gap: 6px; width: 100%; text-align: left;
+  display: flex; align-items: flex-start; gap: 8px; width: 100%; text-align: left;
   background: rgba(120, 160, 220, .06); color: var(--text);
   border: 1px solid var(--line); border-left: 3px solid transparent; border-radius: 12px;
-  padding: 8px 10px; font-weight: 450; cursor: pointer;
+  /* 每条回执不被压扁：给足最小高度与内边距（不设 height / max-height，内容多就自己撑开） */
+  min-height: 68px; padding: 10px 12px; box-sizing: border-box;
+  font-weight: 450; cursor: pointer;
   transition: background .2s var(--ease), border-color .2s var(--ease), transform .15s var(--ease);
 }
 .quest-row:hover { background: rgba(120, 160, 220, .14); transform: translateY(-1px); }
@@ -700,7 +705,7 @@ a.image-link img:hover { border-color: rgba(120, 160, 220, .55); }
   background: transparent;
 }
 .quest-row.unread .quest-dot { background: var(--accent); box-shadow: 0 0 8px rgba(90, 162, 255, .8); }
-.quest-row-main { display: flex; flex-direction: column; gap: 2px; min-width: 0; flex: 1 1 auto; }
+.quest-row-main { display: flex; flex-direction: column; gap: 4px; min-width: 0; flex: 1 1 auto; }
 .quest-row-line { display: flex; align-items: baseline; gap: 6px; min-width: 0; }
 .quest-row-num { flex: 0 0 auto; color: var(--muted); font-variant-numeric: tabular-nums; font-size: 12.5px; }
 .quest-row-cmd { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13.5px; }
@@ -711,9 +716,24 @@ a.image-link img:hover { border-color: rgba(120, 160, 220, .55); }
 }
 .quest-row-spin { flex: 0 0 auto; align-self: center; }
 .quest-row-summary {
-  color: var(--muted); font-size: 12px;
-  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  color: var(--muted); font-size: 12px; line-height: 1.45;
+  /* 摘要最多 2 行：不用 height / max-height 裁剪，超长才省略 */
+  display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2;
+  overflow: hidden; overflow-wrap: anywhere; word-break: break-word;
 }
+
+/* 回执列表行里的未读条数徽标（数字 pill）：与页签上的 .tab-badge 同风格、自带底色。
+   窄屏不换行、不参与收缩，保证指令文字不被它挤掉。 */
+.quest-unread-count {
+  flex: 0 0 auto; align-self: center;
+  display: inline-flex; align-items: center; justify-content: center;
+  min-width: 20px; height: 18px; padding: 0 6px; margin-left: 2px;
+  border: 1px solid var(--line); border-radius: 999px;
+  background: var(--accent); color: #04101f;
+  font-size: 11.5px; font-weight: 700; line-height: 1;
+  font-variant-numeric: tabular-nums; white-space: nowrap;
+}
+.quest-row.expired .quest-unread-count { background: var(--muted); }
 
 /* 「回执」页签上的未读数徽标：文字在 active 态是深色、平时是 muted，所以徽标用自带底色 + 亮字。 */
 .tab-badge {
@@ -725,9 +745,9 @@ a.image-link img:hover { border-color: rgba(120, 160, 220, .55); }
 .tab.active .tab-badge { background: #04101f; color: #dce9ff; }
 
 @media (max-width: 860px) {
-  /* 窄屏：列表与详情改成上下堆叠 */
+  /* 窄屏：列表与详情改成上下堆叠；列表同步加高，但仍留在视口内 */
   .quest-split { grid-template-columns: minmax(0, 1fr); }
-  .quest-list { max-height: 40vh; }
+  .quest-list { max-height: min(64vh, 620px); }
   /* 窄屏：翻页按钮贴边收窄一点，别压住画面 */
   .viewer-nav { width: 38px; height: 62px; min-height: 62px; font-size: 22px; }
   #viewer-prev { left: 6px; }

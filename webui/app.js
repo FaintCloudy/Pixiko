@@ -349,10 +349,19 @@
 
   // ---------------------------------------------------------------- 回执
 
-  const RECEIPT_BOXES = ['chat-receipts', 'gen-receipts', 'prompt-receipts', 'style-receipts',
+  // 对话页底部的回执栏已经取消：聊天里只留对话本身，回执统一去「回执」页看。
+  // 每个 box 都可能不存在（页面不同/HTML 又删了一处），下面一律先判空再判 active。
+  const RECEIPT_BOXES = ['gen-receipts', 'prompt-receipts', 'style-receipts',
     'lora-receipts', 'function-receipts', 'chatcfg-receipts', 'system-receipts'];
 
-  function activeReceiptBoxes() { return RECEIPT_BOXES.filter((id) => $(id) && $(id).closest('.panel').classList.contains('active')); }
+  /** 面板底部那些回执栏里，此刻真正可见（所在 .panel 是 active）的几个；缺的、不在面板里的都跳过。 */
+  function activeReceiptBoxes() {
+    return RECEIPT_BOXES.filter((id) => {
+      const box = $(id);
+      const panel = box && box.closest ? box.closest('.panel') : null;
+      return !!panel && panel.classList.contains('active');
+    });
+  }
 
   // ---------------------------------------------------------------- 任务回执（/quest/#N）
 
@@ -379,19 +388,51 @@
 
   const questWatch = { timer: null, number: 0 };
 
+  /** 会话里记住「当前打开的回执号」与各处的滚动位置：切页面/切会话回来时接着看。 */
+  const QUEST_CURRENT_KEY = 'pixiko-quest-current';
+  const QUEST_SCROLL_PREFIX = 'pixiko-quest-scroll:';
+  const CHAT_SCROLL_PREFIX = 'pixiko-chat-scroll:';
+  const PAGE_SCROLL_PREFIX = 'pixiko-scroll:';
+  /** 生成期间实时视图（进度卡 + 图集预览）的轮询间隔；与 questWatch.timer（900ms 回执轮询）各走各的表。 */
+  const QUEST_LIVE_INTERVAL = 1500;
+  /** 距底小于这么多像素就算「在底部」（切换回来仍然贴底跟随）。 */
+  const STICK_BOTTOM_PX = 40;
+
+  /** 会话存储读写：隐私模式/被禁用时一律吞掉异常，退化成「不记忆」，不能让整页崩掉。 */
+  function storeGet(key) { try { return sessionStorage.getItem(key); } catch { return null; } }
+  function storeSet(key, value) { try { sessionStorage.setItem(key, String(value)); } catch { /* 没有会话存储：不记忆 */ } }
+  function storeJson(key) {
+    const raw = storeGet(key);
+    if (!raw) return null;
+    try { const parsed = JSON.parse(raw); return parsed && typeof parsed === 'object' ? parsed : null; } catch { return null; }
+  }
+
   /** 当前地址里的任务号（/quest/#22 → 22）；没有就是 0（表示"最新一条"）。 */
   function questNumberFromLocation() {
     const value = Number(String(location.hash || '').replace(/^#/, '').trim());
     return Number.isFinite(value) && value > 0 ? Math.floor(value) : 0;
   }
 
+  /** 会话里记住的回执号（上次在回执页看的那条）。 */
+  function questStoredNumber() {
+    const value = Math.floor(Number(storeGet(QUEST_CURRENT_KEY)) || 0);
+    return value > 0 ? value : 0;
+  }
+
+  function questStoreNumber(number) {
+    const value = Math.floor(Number(number) || 0);
+    if (value > 0) storeSet(QUEST_CURRENT_KEY, value);
+  }
+
   /**
    * 回执页：跟着一条回执实时刷新（指令结果 + 生成图片都在里面）。
    * 跑完就停表；换任务号（点另一条云）会重新开始跟。
+   * 没带 hash 时恢复会话里记住的那条（切页面回来不会掉回「最新一条」）。
    */
   async function loadQuest(number) {
     clearInterval(questWatch.timer);
-    questWatch.number = number || questNumberFromLocation() || 0;
+    questWatch.number = Number(number) || questNumberFromLocation() || questStoredNumber() || 0;
+    if (questWatch.number > 0) questStoreNumber(questWatch.number);
     const tick = async () => {
       let data;
       try { data = await api('/api/quest', { body: { id: questWatch.number } }); }
@@ -416,62 +457,452 @@
     if (!body) return;
     const number = data.quest || questWatch.number;
     const running = !data.error && !(data.done && !data.busy);
+    if (number > 0) questStoreNumber(number);          // 记住当前这条：下次回到 /quest 还是它
+    // 换了一条回执（或压根没有回执号）：上一张的进度卡、图集、去重集合全部作废（提前重置，下面才好重建）。
+    if (questLive.number !== number) questLiveReset(number);
     setText('quest-state', data.error ? data.error : '#' + number + (running ? '（进行中…）' : '（已完成）'));
     setText('quest-command', data.command ? '指令：' + data.command : '');
     setText('quest-progress', data.latest ? '最新一条是 #' + data.latest : '');
+    // 重画前后把滚动位置接回来：本次就是按现在 DOM 里的位置，换页回来按会话里记的那份（之前在底部就保持贴底）。
+    const here = { top: Number(body.scrollTop) || 0, atBottom: nodeAtBottom(body, STICK_BOTTOM_PX) };
+    const restore = Number(body.scrollHeight) > 0 ? here : (questScrollRead(number) || here);
     body.innerHTML = '';
     if (data.error) {
-      // 旧回执：正文过期（重启后/超过保留时间）时只留摘要 —— 不能白屏，也不能像报错一样吓人。
+      // 正文读不到（被清理/重启后）：旧后端会把「过期」当错误说，这里统一成人话；索引里还有摘要就一并给出。
       const listed = Array.isArray(state.questList) ? state.questList.find((item) => item && item.number === number) : null;
-      const expired = data.expired === true || (listed && listed.expired)
-        || /过期|expired|不存在|没有这条/i.test(String(data.error));
-      if (expired) {
-        const notice = el('div', 'quest-step');
-        notice.appendChild(el('div', 'head', '正文已过期（只保留摘要）'));
-        notice.appendChild(el('div', 'quest-text', data.summary || (listed && listed.summary)
-          || '这条回执的正文已经过期，摘要也没有留下。指令与时间仍能在左边列表里看到。'));
-        body.appendChild(notice);
-        return;
+      const summary = String(data.summary || (listed && listed.summary) || '').trim();
+      const notice = el('div', 'quest-step');
+      notice.appendChild(el('div', 'head', '正文读不到'));
+      notice.appendChild(el('div', 'quest-text', '这条回执的正文读不到了（磁盘上也没有）。'
+        + (summary ? '\n摘要：' + summary : '')));
+      body.appendChild(notice);
+    } else {
+      const groups = Array.isArray(data.messages) && data.messages.length ? data.messages : null;
+      const steps = groups || (data.texts || []).map((text) => [{ type: 'text', text }]);
+      // 同一条回执里的图片属于**一个图集**：不管分在 messages 的哪一步，都收进同一张图集卡（不重复渲染）。
+      const files = [];
+      steps.forEach((pieces) => (pieces || []).forEach((piece) => { if (piece.type === 'image' && piece.file) files.push(piece.file); }));
+      if (!groups) (data.images || []).forEach((image) => { if (image && image.file) files.push(image.file); });
+      // 生成期间提前预览到的新图（本页 1.5 秒轮询到的）也并进同一张图集：按 path 去重，重画不丢。
+      const seenFiles = new Set(files.map(questFileKey));
+      if (questLive.number === number) {
+        questLive.extras.forEach((file) => {
+          const fileKey = questFileKey(file);
+          if (seenFiles.has(fileKey)) return;
+          seenFiles.add(fileKey);
+          files.push(file);
+        });
       }
-      body.appendChild(el('div', 'quest-empty', data.error));
+      if (!steps.length && !files.length) {
+        body.appendChild(el('div', 'quest-empty', '这条任务还没有输出。'));
+      }
+      questLive.base = '任务 #' + number + ' 的图';
+      questLive.startedAt = questStartedMillis(number, data);
+      questLive.files = seenFiles;
+      let picture = null;
+      const picturesOnce = () => { if (!picture) picture = questPictureArea(files, questLive.base); return picture; };
+      let placed = false;
+      steps.forEach((pieces, index) => {
+        const text = (pieces || []).filter((piece) => piece.type !== 'image' && piece.text).map((piece) => piece.text).join('\n');
+        const hasPicture = !!groups && (pieces || []).some((piece) => piece.type === 'image' && piece.file);
+        const galleryHere = hasPicture && !placed && files.length > 0;   // 图集放在第一处出现图片的位置
+        if (!text && hasPicture && !galleryHere) return;                 // 图片已经被图集收走：这一步不再单独出一张空卡
+        const step = el('div', 'quest-step');
+        step.appendChild(el('div', 'head', groups ? '第 ' + (index + 1) + ' 步' : '输出'));
+        if (text) {
+          if (/(^|\n)[^\n]{0,16}(失败|错误|不正确|无效|超时|拒绝|找不到)[:：]/.test(text)) step.classList.add('err');
+          step.appendChild(el('div', 'quest-text', text));
+        }
+        if (galleryHere) { placed = true; const area = picturesOnce(); if (area) step.appendChild(area); }
+        body.appendChild(step);
+      });
+      if (!placed && files.length) { const area = picturesOnce(); if (area) body.appendChild(area); }
+      if (running) body.appendChild(el('div', 'quest-empty', '（还在跑，实时刷新中…）'));
+    }
+    // 进度卡与生成期间的图集预览：起表/停表都在这里收口，卡片与图集都是就地更新，不重建 #quest-body。
+    questLiveSync(number, running);
+    questGalleryHead();
+    questMountCard();
+    scrollApply(body, restore);
+  }
+
+  // ---------------------------------------------------------------- 回执实时视图（进度卡 + 生成期间图集预览）
+
+  /**
+   * 当前回执的实时视图：`#quest-body` 顶部那张进度卡，以及生成期间提前到达的图片。
+   * 只问 /api/progress（单张图内部的采样）、/api/tasks（图片级 done/total）、/api/images（一完成就出现的图），
+   * 与 questWatch.timer 的 900ms 回执轮询完全独立：空闲就停表，绝不留悬挂的定时器。
+   */
+  const questLive = {
+    number: 0, timer: null, ticked: false, openAt: 0,
+    questRunning: false, tasksRunning: false,
+    card: null, head: null, fill: null, note: null,
+    gallery: null, single: null, singleFile: '', base: '',
+    files: new Set(), extras: [], baseline: null, startedAt: 0,
+  };
+
+  /** 图片去重键：正反斜杠、绝对/相对都归一，回执正文里的 file 与 /api/images 的 path 能对上。 */
+  function questFileKey(file) {
+    return String(file == null ? '' : file).replace(/\\/g, '/').replace(/^.*?(data\/generated\/)/, '$1');
+  }
+
+  function questCount(value) {
+    const number = Number(value);
+    return Number.isFinite(number) && number > 0 ? Math.floor(number) : 0;
+  }
+
+  /** 这条回执是什么时候开始的：列表项的 startedAt 优先，退化到 ageMillis；都拿不到返回 0。 */
+  function questStartedMillis(number, data) {
+    const listed = Array.isArray(state.questList) ? state.questList.find((item) => item && Number(item.number) === Number(number)) : null;
+    const raw = (listed && listed.startedAt) || (data && data.startedAt);
+    if (raw !== undefined && raw !== null && raw !== '') {
+      const parsed = typeof raw === 'number' ? raw : Date.parse(String(raw));
+      if (Number.isFinite(parsed) && parsed > 0) return parsed;
+    }
+    const age = Number(data && data.ageMillis !== undefined ? data.ageMillis : (listed && listed.ageMillis));
+    if (Number.isFinite(age) && age >= 0) return Date.now() - age;
+    return 0;
+  }
+
+  /** 队列里该盯哪一条：优先当前这条回执（在跑，或队列里只有它），否则队列里正在跑的那条。 */
+  function questTaskOf(tasks, number) {
+    const list = Array.isArray(tasks) ? tasks.filter(Boolean) : (tasks && tasks.number !== undefined ? [tasks] : []);
+    if (!list.length) return null;
+    const mine = list.find((task) => Number(task.number) === Number(number));
+    if (mine && (mine.running || list.length === 1)) return mine;
+    return list.find((task) => task.running) || mine || (list.length === 1 ? list[0] : null);
+  }
+
+  /** 进度卡：一条回执只建一次，之后就地改文字与宽度（不重建 #quest-body，不打断正在播的图集）。 */
+  function questBuildCard() {
+    const card = el('div', 'quest-progress-card');
+    const head = el('div', 'head');
+    const track = el('div', 'quest-progress-bar');
+    const fill = el('div', 'quest-progress-fill');
+    const note = el('div', 'quest-progress-note');
+    track.appendChild(fill);
+    card.appendChild(head);
+    card.appendChild(track);
+    card.appendChild(note);
+    note.hidden = true;
+    // 这一类名 CSS 里还没有规则：卡片与进度条给最小内联样式，免得条高 0 看不见（后面有 CSS 也能盖外观）。
+    card.style.border = '1px solid var(--line, rgba(120, 160, 220, .28))';
+    card.style.borderRadius = '12px';
+    card.style.padding = '10px 12px';
+    card.style.background = 'linear-gradient(135deg, rgba(31, 44, 66, .5), rgba(23, 33, 51, .42))';
+    card.style.display = 'flex';
+    card.style.flexDirection = 'column';
+    card.style.gap = '8px';
+    head.style.fontSize = '12.5px';
+    track.style.height = '6px';
+    track.style.borderRadius = '999px';
+    track.style.background = 'rgba(120, 160, 220, .22)';
+    track.style.overflow = 'hidden';
+    fill.style.height = '100%';
+    fill.style.width = '0%';
+    fill.style.borderRadius = '999px';
+    fill.style.background = 'var(--accent, #5aa2ff)';
+    fill.style.transition = 'width .3s ease';
+    note.style.fontSize = '12px';
+    note.style.color = 'var(--muted, #8fa4bf)';
+    questLive.card = card; questLive.head = head; questLive.fill = fill; questLive.note = note;
+    return card;
+  }
+
+  /** 进度卡文案与宽度：主条看图片级 done/total/percent，副标题看单张图内部的采样进度。 */
+  function questPaintCard(task, progress) {
+    const card = questLive.card, head = questLive.head, fill = questLive.fill, note = questLive.note;
+    if (!card || !head || !fill || !note) return;
+    const number = questLive.number;
+    const running = questLive.questRunning || questLive.tasksRunning;
+    const done = task ? questCount(task.done) : 0;
+    const total = task ? questCount(task.total) : 0;
+    let percent = task && Number.isFinite(Number(task.percent)) ? Number(task.percent) : (total ? Math.round(100 * done / total) : 0);
+    percent = Math.max(0, Math.min(100, Math.round(percent)));
+    let text = task
+      ? '任务 #' + (Number(task.number) || number) + ' · 已生成 ' + done + '/' + total + ' 张 · ' + percent + '%'
+      : '任务 #' + number + (running ? ' · 生成中…' : '');
+    if (!running) {
+      if (!task || (total > 0 && done >= total)) percent = 100;   // 真跑满了才把条推满（被取消的不假装 100%）
+      text += ' · 已完成';
+    }
+    head.textContent = text;
+    fill.style.width = percent + '%';
+    card.classList.toggle('done', !running);
+    // 副标题只放「单张图内部」的采样进度；SD 读不到（reachable=false）就不显示，免得拿它冒充任务进度。
+    const steps = progress ? questCount(progress.steps) : 0;
+    if (running && progress && progress.reachable !== false && steps > 0) {
+      let sub = '采样中 ' + questCount(progress.step) + '/' + steps + '（' + Math.round(Number(progress.percent) || 0) + '%）';
+      const eta = Math.round(Number(progress.etaSeconds) || 0);
+      if (eta > 0) sub += ' · 预计 ' + eta + ' 秒';
+      note.textContent = sub;
+      note.hidden = false;
+    } else {
+      note.textContent = '';
+      note.hidden = true;
+    }
+  }
+
+  /** 图集表头：生成期间「已生成 N 张（生成中…）」，跑完回到「共 N 张」。 */
+  function questGalleryHead() {
+    const gallery = questLive.gallery;
+    if (!gallery || !gallery.head) return;
+    const count = gallery.items.length;
+    gallery.head.textContent = (questLive.questRunning || questLive.tasksRunning)
+      ? '图集 · 已生成 ' + count + ' 张（生成中…）'
+      : '图集 · 共 ' + count + ' 张';
+  }
+
+  /** 把进度卡插到 #quest-body 顶部（已经在里面就不动它）。 */
+  function questMountCard() {
+    const body = $('quest-body'), card = questLive.card;
+    if (!body || !card || card.parentNode === body) return;
+    body.insertBefore(card, body.firstChild || null);
+  }
+
+  /** 生成期间新到的图：卡片就地追加，绝不重建 #quest-body（进度卡后面是它们的位置）。 */
+  function questMountGallery(node) {
+    const body = $('quest-body');
+    if (!body || !node) return;
+    const card = questLive.card && questLive.card.parentNode === body ? questLive.card : null;
+    if (card) body.insertBefore(node, card.nextSibling || null);
+    else body.insertBefore(node, body.firstChild || null);
+  }
+
+  /** 这张新图属于当前这条回执吗：modified 晚于回执开始时间；拿不到开始时间就退化成「本次打开后新出现的」。 */
+  function questImageFresh(image, startedAt, baseline) {
+    const path = String((image && image.path) || '');
+    if (!path) return false;
+    if (startedAt > 0) {
+      const modified = Date.parse(String((image && image.modified) || ''));
+      return Number.isFinite(modified) ? modified >= startedAt : true;
+    }
+    return baseline ? !baseline.has(path) : true;
+  }
+
+  /** 一张新图就地追加进这条回执的图集（单张卡会被就地升级成图集，已经加载好的图不重新加载）。 */
+  function questAddImage(file) {
+    const fileKey = questFileKey(file);
+    if (questLive.files.has(fileKey)) return;
+    questLive.files.add(fileKey);
+    if (questLive.gallery) {
+      questLive.gallery.add(file);
+      questGalleryHead();
       return;
     }
-
-    const groups = Array.isArray(data.messages) && data.messages.length ? data.messages : null;
-    const steps = groups || (data.texts || []).map((text) => [{ type: 'text', text }]);
-    // 同一条回执里的图片属于**一个图集**：不管分在 messages 的哪一步，都收进同一张图集卡（不重复渲染）。
-    const files = [];
-    steps.forEach((pieces) => (pieces || []).forEach((piece) => { if (piece.type === 'image' && piece.file) files.push(piece.file); }));
-    if (!groups) (data.images || []).forEach((image) => { if (image && image.file) files.push(image.file); });
-    if (!steps.length && !files.length) {
-      body.appendChild(el('div', 'quest-empty', '这条任务还没有输出。'));
+    if (questLive.single && questLive.single.parentNode) {
+      const gallery = createGallery({ base: questLive.base, cardClass: 'quest-step gallery-step',
+        gridClass: 'gallery-grid', reuse: questLive.single, firstFile: questLive.singleFile || file });
+      questLive.gallery = gallery;
+      questLive.single = null;
+      questLive.singleFile = '';
+      gallery.add(file);
+      questGalleryHead();
+      return;
     }
-    const base = '任务 #' + number + ' 的图';
-    let picture = null;
-    const picturesOnce = () => {
-      if (!picture) {
-        picture = pictureArea(files, base, { singleClass: 'quest-images', imageClass: 'quest-image',
-          cardClass: 'quest-step gallery-step', gridClass: 'gallery-grid' });
-      }
-      return picture;
-    };
-    let placed = false;
-    steps.forEach((pieces, index) => {
-      const text = (pieces || []).filter((piece) => piece.type !== 'image' && piece.text).map((piece) => piece.text).join('\n');
-      const hasPicture = !!groups && (pieces || []).some((piece) => piece.type === 'image' && piece.file);
-      const galleryHere = hasPicture && !placed && files.length > 0;   // 图集放在第一处出现图片的位置
-      if (!text && hasPicture && !galleryHere) return;                 // 图片已经被图集收走：这一步不再单独出一张空卡
-      const step = el('div', 'quest-step');
-      step.appendChild(el('div', 'head', groups ? '第 ' + (index + 1) + ' 步' : '输出'));
-      if (text) {
-        if (/(^|\n)[^\n]{0,16}(失败|错误|不正确|无效|超时|拒绝|找不到)[:：]/.test(text)) step.classList.add('err');
-        step.appendChild(el('div', 'quest-text', text));
-      }
-      if (galleryHere) { placed = true; const area = picturesOnce(); if (area) step.appendChild(area); }
-      body.appendChild(step);
+    const gallery = createGallery({ base: questLive.base, cardClass: 'quest-step gallery-step',
+      gridClass: 'gallery-grid', firstFile: file });
+    questLive.gallery = gallery;
+    questMountGallery(gallery.card);
+    questGalleryHead();
+  }
+
+  /** /api/images 里属于这条回执、还没画过的图 → 增量追加（按 path 去重，绝不出现重复项）。 */
+  function questAppendImages(payload) {
+    const list = payload && Array.isArray(payload.images) ? payload.images : null;
+    if (!list) return;
+    if (!questLive.baseline) questLive.baseline = new Set(list.map((image) => String((image && image.path) || '')));
+    const fresh = [];
+    list.forEach((image) => {
+      const path = String((image && image.path) || '');
+      if (!path) return;
+      const fileKey = questFileKey(path);
+      if (questLive.files.has(fileKey)) return;                              // 回执正文里已经有这张
+      if (fresh.some((item) => questFileKey(item) === fileKey)) return;      // 这一批里重复的
+      if (!questImageFresh(image, questLive.startedAt, questLive.baseline)) return;
+      fresh.push(path);
     });
-    if (!groups && files.length) { const area = picturesOnce(); if (area) body.appendChild(area); }
-    if (running) body.appendChild(el('div', 'quest-empty', '（还在跑，实时刷新中…）'));
+    fresh.reverse();                                                         // 接口是最新在前：反过来才是生成顺序
+    fresh.forEach((path) => { questLive.extras.push(path); questAddImage(path); });
+  }
+
+  /** 生成期间的一轮：进度（/api/progress + /api/tasks）与提前预览（/api/images）。 */
+  async function questLiveTick() {
+    const number = questLive.number;
+    if (!number) { questLiveStop(); return; }
+    const [progress, tasks, images] = await Promise.all([
+      api('/api/progress').catch(() => null),
+      api('/api/tasks').catch(() => null),
+      api('/api/images?limit=40').catch(() => null),
+    ]);
+    if (questLive.number !== number) return;                                 // 期间切到别的回执：这一轮作废
+    const list = Array.isArray(tasks) ? tasks : (tasks && tasks.number !== undefined ? [tasks] : []);
+    questLive.tasksRunning = list.some((task) => task && task.running);
+    if ((questLive.questRunning || questLive.tasksRunning) && !questLive.card) { questBuildCard(); questMountCard(); }
+    questPaintCard(questTaskOf(list, number), progress);
+    questAppendImages(images);
+    questGalleryHead();
+    if (!questLive.questRunning && !questLive.tasksRunning) questLiveStop();  // 空闲：卡片留在原地标「已完成」，表停掉
+  }
+
+  function questLiveStart() {
+    questLive.ticked = true;
+    if (questLive.timer === null) questLive.timer = setInterval(questLiveTick, QUEST_LIVE_INTERVAL);
+    questLiveTick();
+  }
+
+  /** 只清这一个定时器；questWatch.timer（900ms 回执轮询）不归它管。 */
+  function questLiveStop() {
+    if (questLive.timer !== null) { clearInterval(questLive.timer); questLive.timer = null; }
+  }
+
+  /** 换了一条回执：上一张的进度、图集、去重集合全部作废重来。 */
+  function questLiveReset(number) {
+    questLiveStop();
+    questLive.number = number;
+    questLive.ticked = false;
+    questLive.openAt = Date.now();
+    questLive.questRunning = false;
+    questLive.tasksRunning = false;
+    questLive.card = null; questLive.head = null; questLive.fill = null; questLive.note = null;
+    questLive.gallery = null; questLive.single = null; questLive.singleFile = '';
+    questLive.files = new Set();
+    questLive.extras = [];
+    questLive.baseline = null;
+    questLive.startedAt = 0;
+  }
+
+  /**
+   * 每次重画回执后同步一次：换了回执就整个重来；这条在跑（或这一条还没问过一轮）就把表起上，
+   * 空闲就让这一轮自己收尾。`ticked` 保证「跑完停表」之后不会每 900ms 又白问一轮。
+   */
+  function questLiveSync(number, questRunning) {
+    if (!number) { questLiveStop(); return; }
+    if (questLive.number !== number) questLiveReset(number);
+    questLive.questRunning = !!questRunning;
+    if (questLive.timer !== null) return;
+    if (questRunning || !questLive.ticked) questLiveStart();
+  }
+
+  /** 节点是不是贴底（距底小于 slack 像素）。 */
+  function nodeAtBottom(node, slack) {
+    if (!node) return true;
+    const height = Number(node.scrollHeight) || 0;
+    if (height <= 0) return true;
+    return height - (Number(node.scrollTop) || 0) - (Number(node.clientHeight) || 0) < (slack || 0);
+  }
+
+  /** 把记下的偏移贴回节点：之前在底部就保持贴底。 */
+  function scrollApply(node, saved) {
+    if (!node || !saved) return;
+    const height = Number(node.scrollHeight) || 0;
+    const top = Math.max(0, Number(saved.top) || 0);
+    node.scrollTop = saved.atBottom ? height : (height > 0 ? Math.min(top, height) : top);
+  }
+
+  /** 回执正文的滚动偏移（按回执号记）。 */
+  function questScrollRead(number) {
+    const saved = storeJson(QUEST_SCROLL_PREFIX + number);
+    if (!saved) return null;
+    return { top: Math.max(0, Number(saved.top) || 0), atBottom: saved.atBottom !== false };
+  }
+
+  let questScrollSaved = { number: 0, top: 0, atBottom: true };
+
+  function questScrollPersist() {
+    const body = $('quest-body');
+    const number = questWatch.number || questLive.number;
+    if (!body || !number) return;
+    const top = Math.max(0, Number(body.scrollTop) || 0);
+    const atBottom = nodeAtBottom(body, STICK_BOTTOM_PX);
+    if (questScrollSaved.number === number && questScrollSaved.top === top && questScrollSaved.atBottom === atBottom) return;
+    questScrollSaved = { number, top, atBottom };
+    storeSet(QUEST_SCROLL_PREFIX + number, JSON.stringify({ top, atBottom }));
+  }
+
+  /** 对话滚动偏移（按会话 scope 记，切会话互不污染）。 */
+  function chatScrollRead() {
+    const saved = storeJson(CHAT_SCROLL_PREFIX + (scope() || 'default'));
+    if (!saved) return null;
+    return { top: Math.max(0, Number(saved.top) || 0), atBottom: saved.atBottom !== false };
+  }
+
+  let chatScrollSaved = { scope: '', top: -1, atBottom: false };
+
+  function chatScrollPersist() {
+    const log = $('chat-log');
+    if (!log) return;
+    const current = { scope: scope() || 'default', top: Math.max(0, Number(log.scrollTop) || 0), atBottom: nodeAtBottom(log, STICK_BOTTOM_PX) };
+    if (chatScrollSaved.scope === current.scope && chatScrollSaved.top === current.top && chatScrollSaved.atBottom === current.atBottom) return;
+    chatScrollSaved = current;
+    storeSet(CHAT_SCROLL_PREFIX + current.scope, JSON.stringify({ top: current.top, atBottom: current.atBottom }));
+  }
+
+  /**
+   * 给对话里已经渲染出来的图片各挂一次性贴底校准（load/error 各一次，不是死循环）：
+   * <img> 是异步撑高的，加载完再把滚动条压回底部，视图才不会被顶走。
+   */
+  function chatStickImages(log) {
+    if (!log || !log.querySelectorAll) return;
+    log.querySelectorAll('img').forEach((img) => {
+      if (!img || img.__chatStick) return;
+      img.__chatStick = true;
+      const stick = () => { img.__chatStick = false; log.scrollTop = Number(log.scrollHeight) || 0; };
+      img.addEventListener('load', stick, { once: true });
+      img.addEventListener('error', stick, { once: true });
+    });
+  }
+
+  /**
+   * 恢复对话滚动：之前在底部就贴底，并给异步加载的图片挂一次性校准；
+   * 不在底部就原样恢复偏移，不打扰用户正在看的地方。
+   */
+  function chatScrollRestore(log, saved) {
+    if (!log) return;
+    const atBottom = !saved || saved.atBottom !== false;
+    scrollApply(log, saved || { top: 0, atBottom: true });
+    if (atBottom) chatStickImages(log);
+  }
+
+  /** 其它页面的窗口滚动：按 location.pathname 各记一份（最小实现；值没变就不重复写）。 */
+  let pageScrollSaved = -1;
+
+  function pageScrollPersist() {
+    const top = Math.round(Number(window.scrollY) || 0);
+    if (top === pageScrollSaved) return;
+    pageScrollSaved = top;
+    storeSet(PAGE_SCROLL_PREFIX + (location.pathname || '/'), top);
+  }
+
+  function pageScrollRestore() {
+    const raw = storeGet(PAGE_SCROLL_PREFIX + (location.pathname || '/'));
+    if (raw === null || raw === undefined || raw === '') return;
+    const top = Number(raw);
+    if (!Number.isFinite(top) || top <= 0) return;
+    if (typeof window.scrollTo === 'function') window.scrollTo(0, top);
+  }
+
+  /**
+   * 一条回执的图片区：1 张还是那张单张图片卡，2 张以上合成一张图集卡。
+   * 与 {@link pictureArea} 的样子一致，另外把图集对象记进 questLive，生成期间的新图才能就地追加上去。
+   */
+  function questPictureArea(files, base) {
+    const list = (files || []).filter(Boolean);
+    if (!list.length) return null;
+    if (list.length === 1) {
+      const box = el('div', 'quest-images');
+      box.appendChild(imageNode(imageUrl(list[0]), base, 'quest-image'));
+      questLive.gallery = null;
+      questLive.single = box;
+      questLive.singleFile = list[0];
+      return box;
+    }
+    const gallery = createGallery({ base, cardClass: 'quest-step gallery-step', gridClass: 'gallery-grid', firstFile: list[0] });
+    list.slice(1).forEach((file) => gallery.add(file));
+    questLive.gallery = gallery;
+    questLive.single = null;
+    questLive.singleFile = '';
+    return gallery.card;
   }
 
   // ---------------------------------------------------------------- 回执列表（/quest 左栏）与未读标记
@@ -643,29 +1074,33 @@
       if (!item) return;
       const number = Number(item.number);
       const running = !item.done || item.busy;
+      // 「过期」不再是一个界面分支：后端马上会取消过期（正文落盘、expired 永远 false），
+      // 就算旧后端仍给 expired:true，这里也按普通行渲染，不再显示「已过期」。
       const row = el('button', 'quest-row' + (item.unread ? ' unread' : '') + (running ? ' running' : '')
-        + (item.expired ? ' expired' : '') + (number === current ? ' current' : ''));
+        + (number === current ? ' current' : ''));
       row.type = 'button';
       row.setAttribute('role', 'listitem');
       row.setAttribute('data-number', String(number));
       row.setAttribute('aria-label', '回执 #' + number + '：' + (item.command || '（无指令）')
-        + '，' + (running ? '进行中' : relativeTime(item.ageMillis))
-        + (item.expired ? '，正文已过期，只保留摘要' : '') + (item.unread ? '，未读' : ''));
+        + '，' + (running ? '进行中' : relativeTime(item.ageMillis)) + (item.unread ? '，未读' : ''));
       if (number === current) row.setAttribute('aria-current', 'true');
       row.appendChild(el('span', 'quest-dot', item.unread ? '' : null));   // 未读圆点（已读时保持占位，行高不跳）
       const main = el('div', 'quest-row-main');
       const line = el('div', 'quest-row-line');
       line.appendChild(el('span', 'quest-row-num', '#' + number));
       line.appendChild(el('span', 'quest-row-cmd', item.command || '（无指令）'));
-      if (item.unread) line.appendChild(el('span', 'quest-row-badge', '未读'));
-      line.appendChild(el('span', 'quest-row-state',
-        item.expired ? '已过期' : (running ? '进行中…' : relativeTime(item.ageMillis))));
-      if (running && !item.expired) line.appendChild(el('span', 'spin quest-row-spin'));
+      // 未读条目的消息条数（文字 + 图片）以数字呈现；0 条就不占位（后端只有 texts>0 才算未读）。
+      const unreadMessages = Math.max(0, (Number(item.texts) || 0) + (Number(item.images) || 0));
+      if (item.unread && unreadMessages > 0) {
+        const pill = el('span', 'quest-unread-count', String(unreadMessages));
+        pill.title = '未读 ' + unreadMessages + ' 条消息';
+        pill.setAttribute('aria-label', '未读 ' + unreadMessages + ' 条消息');
+        line.appendChild(pill);
+      }
+      line.appendChild(el('span', 'quest-row-state', running ? '进行中…' : relativeTime(item.ageMillis)));
+      if (running) line.appendChild(el('span', 'spin quest-row-spin'));
       main.appendChild(line);
-      const summary = item.expired
-        ? '已过期（只保留摘要）' + (item.summary ? '：' + item.summary : '')
-        : (item.summary || (running ? '（还在跑，暂无摘要）' : '（没有摘要）'));
-      main.appendChild(el('div', 'quest-row-summary', summary));
+      main.appendChild(el('div', 'quest-row-summary', item.summary || (running ? '（还在跑，暂无摘要）' : '（没有摘要）')));
       row.appendChild(main);
       row.addEventListener('click', () => openQuest(number));
       box.appendChild(row);
@@ -717,15 +1152,17 @@
   function renderCapture(capture) {
     const key = String(capture.id || capture.command || '');
     const texts = capture.texts || [], images = capture.images || [];
+    // 图片卡的标题（面板回执栏与对话页共用同一句）。
+    const pictureBase = capture.command ? '指令 · ' + capture.command + ' 的图' : '生成结果图';
     if (state.receiptKey !== key) {
       state.receiptKey = key; state.receiptTexts = 0; state.receiptImages = 0; state.receiptCount = 0; state.receiptBox = null;
       state.receiptGallery = null; state.receiptSingle = null; state.receiptSingleFile = '';
     }
     for (const id of RECEIPT_BOXES) {
       const box = $(id);
-      if (!box) continue;
-      const visible = box.closest('.panel').classList.contains('active');
-      if (!visible) continue;
+      if (!box || !box.closest) continue;                          // 这一栏没有回执栏（HTML 里已经删了）：跳过
+      const panel = box.closest('.panel');
+      if (!panel || !panel.classList.contains('active')) continue;
       if (state.receiptBox !== box) {
         box.innerHTML = '';
         state.receiptTexts = 0; state.receiptImages = 0; state.receiptCount = 0;
@@ -748,7 +1185,6 @@
       // 增量（图片是陆续到的）：第一张先按单张出；第二张到达时**复用同一张卡**就地改成图集
       // （卡里那张已经加载好的 <a>/<img> 直接挪进网格，图不重新加载、位置不跳），之后每来一张
       // 只往网格里 append 一个缩略图并改表头张数：卡片节点从头到尾是同一个，滚动与其它卡片都不受影响。
-      const pictureBase = capture.command ? '指令 · ' + capture.command + ' 的图' : '生成结果图';
       for (let index = state.receiptImages; index < images.length; index++) {
         const file = images[index].file;
         if (images.length < 2) {
@@ -789,6 +1225,19 @@
         state.receiptToasted = key;
         toast(texts[texts.length - 1].split('\n')[0]);
       }
+    }
+    // 对话页：图片还必须落进 #chat-log —— 对话页底部的回执栏已经取消（HTML 里没有 #chat-receipts），
+    // 这里再不管，图片在对话页就没有任何落点了。文字配图的那条消息由 appendMessage 画进消息里
+    // （并已记进快照），这里靠快照去重，同一张图不会画两回：只补「聊天那边还没画过」的图。
+    // **只动对话页**：其它面板底部的 receipts 行为一个字没改（见上面的循环）。
+    if (PAGE === 'chat' && images.length) {
+      const seen = chatSnapshotImages();
+      const missing = [];
+      images.forEach((image) => {
+        const file = image && image.file ? String(image.file) : '';
+        if (file && !seen.has(file) && missing.indexOf(file) < 0) missing.push(file);
+      });
+      if (missing.length) chatEntryAdd({ role: 'bot', text: pictureBase, images: missing });
     }
   }
 
@@ -906,9 +1355,11 @@
     clearTimeout(state.pollTimer);
     try {
       const capture = await api('/api/capture', { body: { id } });
-      renderCapture(capture);
       // 机器人发的每条消息都直接回到对话里：一条消息 = 一条聊天记录（文字配着自己的图）。
       // 后端给了 messages 就按它分条；旧格式（只有扁平 texts/images）仍走「图片好了」那条老路。
+      // 先把消息画进对话、再 renderCapture：对话页的图片补漏（renderCapture 末尾那段）靠快照去重，
+      // 顺序反了会先补一张图、再画一条带同样图的消息 —— 同一张图就画两回了。
+      // 这一步只写 #chat-log（别的栏目没有它，等于空转），面板 receipts 的行为一个字没变。
       const groups = Array.isArray(capture.messages) && capture.messages.length ? capture.messages : null;
       if (groups) {
         const seenGroups = state.seenGroups.get(id) || 0;
@@ -926,6 +1377,7 @@
           loadImages().catch(() => {});
         }
       }
+      renderCapture(capture);
       // 出图成功再冒一条信息云（第一次看到新图片时）：任务回执里已经附了图，这里只负责提醒。
       const imageCount = (capture.images || []).length;
       const seenImages = questCloudSeen.get(id) || 0;
@@ -973,19 +1425,164 @@
 
   // ---------------------------------------------------------------- 对话
 
-  /** 往对话页加一条消息；不在对话页面（别的栏目）时静默跳过。 */
-  function appendMessage(kind, text, images) {
+  /** 对话页渲染结果快照的存储键、上限与写盘节流。 */
+  const CHAT_LOG_PREFIX = 'pixiko-chat-log:';       // 按会话 scope 各存一份（和 pixiko-chat-scroll: 一个路子）
+  const CHAT_LOG_LIMIT = 200;                       // 条目只留最近 200 条
+  const CHAT_LOG_BYTES = 512 * 1024;                // 序列化超过约 512KB 就从最旧的开始丢
+  const CHAT_LOG_THROTTLE = 400;                    // 写盘节流：最多每 400ms 一次
+
+  /**
+   * 对话页的渲染结果快照：`{scope, entries, server, timer, dirty}`。
+   *
+   * <p>存的是**结构化条目**（`{role,text}` 或 `{role:'bot',text,images:[file]}`），不是整段 HTML ——
+   * 体积小，也不会把存下来的标签当代码跑。切栏目是真的一次页面加载（每个栏目一份 HTML），
+   * DOM 一没就只剩这份快照可用：服务端历史（`/api/chat/history`）里只有对话文字，
+   * 指令回执的文字与图片都不在里面，光按它渲染就是「切一下回来回执和图片全消失」的原因。
+   *
+   * <p>`server` 是「上次铺完时服务端历史有多少条」，重新加载时用它算出只该补哪一段。
+   */
+  const chatSnapshot = { scope: '', entries: [], server: 0, timer: null, dirty: false };
+
+  /** 快照的存储键（按会话 scope）。 */
+  function chatLogKey(scopeName) { return CHAT_LOG_PREFIX + (scopeName || 'default'); }
+
+  /** 当前该写哪个 scope 的键：以铺回时记下的为准，没记过就用当前会话 scope（loadChatHistory 没跑到也不会写错地方）。 */
+  function chatScopeName() { return chatSnapshot.scope || scope() || 'default'; }
+
+  /** 把一条任意来源的条目洗成能存能渲染的形状；坏数据返回 null（不抛、也不渲染半条）。 */
+  function chatEntryClean(raw) {
+    if (!raw || typeof raw !== 'object') return null;
+    const role = raw.role === 'user' || raw.role === 'sys' ? raw.role : 'bot';
+    const text = typeof raw.text === 'string' ? raw.text : '';
+    const images = Array.isArray(raw.images)
+      ? raw.images.filter((file) => typeof file === 'string' && file).map(String).slice(0, 60) : [];
+    if (!text && !images.length) return null;
+    return images.length ? { role, text, images } : { role, text };
+  }
+
+  /** 体积保护：只留最近 200 条；序列化超过约 512KB 就从最旧的开始丢（至少留一条，别把一条超长消息也丢了）。 */
+  function chatSnapshotTrim(entries) {
+    let list = entries.slice(-CHAT_LOG_LIMIT);
+    while (list.length > 1 && JSON.stringify(list).length > CHAT_LOG_BYTES) list = list.slice(1);
+    return list;
+  }
+
+  /** 读一份快照；坏 JSON / 没有会话存储（隐私模式）都当成「没有」——聊天照常，只是不记忆。 */
+  function chatSnapshotRead(scopeName) {
+    const saved = storeJson(chatLogKey(scopeName));
+    if (!saved) return { entries: [], server: 0, dropped: false };
+    const raw = (Array.isArray(saved.entries) ? saved.entries : []).map(chatEntryClean).filter(Boolean);
+    const entries = chatSnapshotTrim(raw);
+    return { entries, server: Math.max(0, Math.floor(Number(saved.server) || 0)), dropped: entries.length !== raw.length };
+  }
+
+  /** 落盘一次：写失败（超配额、存储被禁、坏存储）只警告，绝不影响聊天与其它面板。 */
+  function chatSnapshotWrite() {
+    chatSnapshot.scope = chatScopeName();
+    chatSnapshot.entries = chatSnapshotTrim(chatSnapshot.entries);
+    try {
+      sessionStorage.setItem(chatLogKey(chatSnapshot.scope),
+        JSON.stringify({ entries: chatSnapshot.entries, server: chatSnapshot.server || 0 }));
+    } catch (error) {
+      console.warn('对话快照未保存（不影响聊天）：' + (error && error.message ? error.message : error));
+    }
+  }
+
+  /** 追加消息/图片后调它：节流最多每 400ms 写一次；页面隐藏或卸载时用 {@link chatSnapshotFlush} 补一次。 */
+  function chatSnapshotSchedule() {
+    chatSnapshot.dirty = true;
+    if (chatSnapshot.timer) return;
+    chatSnapshot.timer = setTimeout(() => {
+      chatSnapshot.timer = null;
+      chatSnapshotWrite();
+      chatSnapshot.dirty = false;
+    }, CHAT_LOG_THROTTLE);
+  }
+
+  /** 把节流窗口里还没写完的那次立刻写掉（pagehide / 页面隐藏时调）。 */
+  function chatSnapshotFlush() {
+    if (chatSnapshot.timer) { clearTimeout(chatSnapshot.timer); chatSnapshot.timer = null; }
+    if (!chatSnapshot.dirty) return;
+    chatSnapshot.dirty = false;
+    chatSnapshotWrite();
+  }
+
+  /** 清空对话：DOM、内存快照、会话存储一起删（不然清空后又「复活」）。 */
+  function chatSnapshotClear() {
+    if (chatSnapshot.timer) { clearTimeout(chatSnapshot.timer); chatSnapshot.timer = null; }
+    chatSnapshot.scope = chatScopeName();
+    chatSnapshot.entries = [];
+    chatSnapshot.server = 0;
+    chatSnapshot.dirty = false;
+    try { sessionStorage.removeItem(chatLogKey(chatSnapshot.scope)); }
+    catch (error) { console.warn('对话快照未删除（不影响聊天）：' + (error && error.message ? error.message : error)); }
+  }
+
+  /**
+   * 一条对话条目 → 一条消息卡。文字在上、图片在下同属一条；带图的机器人消息多挂一个
+   * `chat-receipt-images` 类（对话页底部的回执栏已经取消，`#chat-log` 就是图片的落点）。
+   *
+   * <p>**2 张以上**用图集网格（内部还是 imageUrl + imageNode），点任意一张都用查看器打开
+   * **这条消息的整组图**并能在其中前后翻页；**1 张**仍是原来那张 `.msg-image`。
+   */
+  function chatEntryNode(entry) {
+    const images = entry.images || [];
+    const node = el('div', 'msg ' + entry.role + (images.length ? ' chat-receipt-images' : ''));
+    if (entry.text || !images.length) node.appendChild(el('div', null, entry.text || ''));
+    if (images.length === 1) {
+      // 点图打开查看器放大（不再跳到新标签页）。
+      node.appendChild(imageNode(imageUrl(images[0]), shortName(images[0]), 'msg-image'));
+    } else if (images.length > 1) {
+      // createGallery 内部就是 imageUrl() + imageNode()，并把「活的」图集数组交给查看器 —— 翻页天然可用。
+      const gallery = createGallery({ cardClass: 'chat-gallery', gridClass: 'gallery-grid', firstFile: images[0] });
+      images.slice(1).forEach((file) => gallery.add(file));
+      node.appendChild(gallery.grid);
+    }
+    return node;
+  }
+
+  /** 只渲染（不记快照）：铺回上次的对话用。 */
+  function chatEntryAppend(entry) {
     const log = $('chat-log');
     if (!log) return null;
-    const node = el('div', 'msg ' + kind);
-    node.appendChild(el('div', null, text));
-    (images || []).forEach((image) => {
-      // 点图打开查看器放大（不再跳到新标签页）。
-      node.appendChild(imageNode(imageUrl(image.file), String(image.file).replace(/^.*[\\/]/, ''), 'msg-image'));
-    });
+    const node = chatEntryNode(entry);
     log.appendChild(node);
     log.scrollTop = log.scrollHeight;
+    chatStickImages(log);                 // 图片是异步加载的：加载完再贴一次底，别让图把视图顶上去
     return node;
+  }
+
+  /** 只把条目记进快照（不渲染）：DOM 上已经由别处显示过的内容（例如「正在思考…」那条被就地改成回复）。 */
+  function chatSnapshotRemember(entry) {
+    const clean = chatEntryClean(entry);
+    if (!clean) return null;
+    chatSnapshot.entries.push(clean);
+    if (chatSnapshot.entries.length > CHAT_LOG_LIMIT) chatSnapshot.entries = chatSnapshot.entries.slice(-CHAT_LOG_LIMIT);
+    chatSnapshotSchedule();
+    return clean;
+  }
+
+  /** 追加一条对话条目：先记进快照（切页面回来要恢复），再渲染进 #chat-log。 */
+  function chatEntryAdd(entry) {
+    const clean = chatSnapshotRemember(entry);
+    return clean ? chatEntryAppend(clean) : null;
+  }
+
+  /** 快照里已经画过的图片：renderCapture 的补漏靠它去重，同一张图不会画两回。 */
+  function chatSnapshotImages() {
+    const files = new Set();
+    chatSnapshot.entries.forEach((entry) => (entry.images || []).forEach((file) => files.add(file)));
+    return files;
+  }
+
+  /** 往对话页加一条消息（同时记进快照）；不在对话页面（别的栏目）时静默跳过。 */
+  function appendMessage(kind, text, images) {
+    const log = $('chat-log');
+    if (!log) return null;                     // 每个栏目一份 HTML：别的栏目根本没有 #chat-log
+    const files = (images || []).map((image) => (image && image.file) || image).filter(Boolean).map(String);
+    const entry = { role: kind, text: String(text === undefined || text === null ? '' : text) };
+    if (files.length) entry.images = files;
+    return chatEntryAdd(entry);
   }
 
   async function sendChat(event) {
@@ -1004,7 +1601,10 @@
     $('chat-send').disabled = true;
     try {
       const result = await api('/api/chat', { body: { message, execute: $('chat-execute').checked, scope: scope() } });
-      pending.textContent = result.reply || '(空回复)';
+      const reply = result.reply || '(空回复)';
+      pending.textContent = reply;
+      // 就地改成回复的那条也要进快照：切页面回来位置才对，也能和服务端历史里的同一条对上（不重复画）。
+      chatSnapshotRemember({ role: 'bot', text: reply });
       $('chat-interest').textContent = result.interest != null ? '相关度 ' + result.interest : '';
       if (result.commands && result.commands.length) {
         appendMessage('sys', '执行指令：' + result.commands.join('  '));
@@ -1022,14 +1622,58 @@
     }
   }
 
+  /**
+   * 打开对话页：先把**上次渲染过的内容**（指令回执的文字与图片都在里面）从会话存储里铺回来，
+   * 再拉服务端历史，只补「比本地基准多出来的那一段」。
+   *
+   * <p>服务端历史里只有文字，图片与指令回执都不在里面 —— 只按它渲染，
+   * 切一下栏目回来回执文字与图片就全没了（这就是这个函数以前的样子）。
+   */
   async function loadChatHistory() {
     const log = $('chat-log');
     if (!log) return;                           // 只有对话页面有消息区
+    // 切换会话回来时接回原来的滚动位置（按 scope 各记一份，互不污染）。
+    const saved = chatScrollRead();
+    // 1) 先铺上次的快照：文字、指令回执、图片都在，顺序也照旧。
+    const scopeName = scope() || 'default';
+    const snapshot = chatSnapshotRead(scopeName);
+    chatSnapshot.scope = scopeName;
+    chatSnapshot.entries = snapshot.entries;
+    chatSnapshot.server = snapshot.server;
+    chatSnapshot.dirty = false;
+    // 读回来被裁过（超 200 条 / 超 512KB）：把裁过的版本写回去，存储里不留超限的旧账。
+    if (snapshot.dropped) chatSnapshotSchedule();
+    log.innerHTML = '';
+    chatSnapshot.entries.forEach((entry) => chatEntryAppend(entry));
+    // 2) 再拉服务端历史，只追加比基准多出来的那部分。
     try {
       const history = await api('/api/chat/history', { body: { scope: scope() } });
-      log.innerHTML = '';
-      (Array.isArray(history) ? history : []).forEach((entry) => appendMessage(entry.role === 'user' ? 'user' : 'bot', entry.content || ''));
+      const list = Array.isArray(history) ? history : [];
+      // 基准 = 保存时服务端历史有多少条。服务端被清空/变短（列表比基准还短）时一段都不补，
+      // 本地内容也原样留着（不会重复渲染，也不会把本地清掉）。
+      const base = Math.min(chatSnapshot.server || 0, list.length);
+      // 本地已经有的 role+文本记一份：本地刚发出去的那条也在历史里，靠它认出来别画两回。
+      const known = new Map();
+      chatSnapshot.entries.forEach((entry) => {
+        const key = entry.role + '\n' + (entry.text || '');
+        known.set(key, (known.get(key) || 0) + 1);
+      });
+      let added = 0;
+      for (let index = base; index < list.length; index++) {
+        const raw = list[index] || {};
+        const clean = chatEntryClean({ role: raw.role === 'user' ? 'user' : 'bot', text: raw.content || '' });
+        if (!clean) continue;
+        const key = clean.role + '\n' + (clean.text || '');
+        if (known.get(key)) { known.set(key, known.get(key) - 1); continue; }
+        chatEntryAdd(clean);
+        added++;
+      }
+      const next = Math.max(chatSnapshot.server || 0, list.length);
+      const moved = next !== (chatSnapshot.server || 0);
+      chatSnapshot.server = next;
+      if (added || moved) chatSnapshotSchedule();
     } catch { /* 历史读不到不影响使用 */ }
+    chatScrollRestore(log, saved);              // 之前在底部就贴底（图片异步加载完再校准一次）
   }
 
   // ---------------------------------------------------------------- 状态与设置
@@ -3145,6 +3789,16 @@
     document.querySelectorAll('[data-tag-complete]').forEach(attachTagComplete);
     window.addEventListener('resize', () => closeTagSuggest());
     window.addEventListener('scroll', () => closeTagSuggest(), true);
+    // 滚动位置记忆：回执正文 / 对话各自按号/按会话记，窗口滚动按 location.pathname 记（切页面回来不丢）。
+    const questBody = $('quest-body');
+    if (questBody) questBody.addEventListener('scroll', () => questScrollPersist(), { passive: true });
+    const chatLog = $('chat-log');
+    if (chatLog) chatLog.addEventListener('scroll', () => chatScrollPersist(), { passive: true });
+    // 对话快照：节流窗口（最多 400ms 一次）里还没写完的那次，在页面隐藏/卸载时补一次 ——
+    // 切栏目回来要原样恢复，就靠它别漏掉最后几条。
+    document.addEventListener('visibilitychange', () => { if (document.hidden) chatSnapshotFlush(); });
+    window.addEventListener('pagehide', () => chatSnapshotFlush());
+    window.addEventListener('scroll', () => pageScrollPersist(), { passive: true });
     on('login-form', 'submit', async (event) => {
       event.preventDefault();
       const token = $('token').value.trim();
@@ -3160,7 +3814,12 @@
     on('refresh', 'click', () => boot().catch((error) => banner('刷新失败：' + error.message)));
     on('chat-form', 'submit', sendChat);
     on('chat-input', 'keydown', (event) => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); sendChat(event); } });
-    on('chat-reset', 'click', async () => { await api('/api/chat/reset', { body: { scope: scope() } }); $('chat-log').innerHTML = ''; toast('对话已清空'); });
+    on('chat-reset', 'click', async () => {
+      await api('/api/chat/reset', { body: { scope: scope() } });
+      $('chat-log').innerHTML = '';
+      chatSnapshotClear();               // 会话存储里的那份也一起删：清空之后切回来不能又"复活"
+      toast('对话已清空');
+    });
 
     // 出图
     // 生成参数没有「应用」按钮：失焦/回车/下拉选择都会触发 change，等它发完再生图。
@@ -3487,6 +4146,7 @@
         fillModelSelect('set-model', state.options, state.status?.generation?.model || '');
       }
       banner('');
+      pageScrollRestore();                     // 其它页面的窗口滚动位置：本栏目上次看到哪就回到哪
     } catch (error) {
       if (String(error.message) !== 'unauthorized') banner('「' + PAGE + '」面板加载失败：' + error.message);
     }

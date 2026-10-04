@@ -1216,14 +1216,18 @@ public final class Bot implements AutoCloseable {
     public Bot(Settings settings, SdClient sd, Sender sender, LoraDownloader loraDownloader) {        this.settings = settings; this.sd = sd; this.sender = muteAware(webAware(sender)); this.loraDownloader = Objects.requireNonNull(loraDownloader);
         // 传输层是否真的实现了合并转发（要在包装之前问原始传输层：包装器自己会转发 sendRecord）。
         this.forwardRecords = sender.supportsRecord();
+        // 回执正文落盘目录（data/quests/<number>.json）：回执不再过期，正文随时读得回来。
+        this.questBodyDir = settings.root.resolve("data/quests");
         // 回执索引：只存摘要与已读标记，列表在重启后也还在（读失败就是空索引，不影响回执）。
         this.questFile = settings.root.resolve("data/quests.json");
         this.questIndex = new QuestIndex();
         this.questIndex.load(questFile);
+        // 索引读进来时可能已经裁掉了最旧的几条：连它们的正文文件一起删，别留孤儿。
+        sweepTrimmedQuests();
         // 刚读进来的索引就是"已保存"的样子：之后真的要写盘才算变化（空索引不会凭空建文件）。
         this.questSavedRevision = this.questIndex.revision();
-        // 任务号在进程内自增；重启后从索引里的最大号接着发，新回执不会和旧摘要撞号。
-        WEB_QUEST_SEQ.accumulateAndGet(questIndex.latest(), Math::max);
+        // 任务号在进程内自增；重启后从索引与磁盘正文文件里的最大号接着发，新回执不会和旧的撞号。
+        WEB_QUEST_SEQ.accumulateAndGet(Math.max(questIndex.latest(), latestQuestBodyNumber()), Math::max);
         this.sdLauncher = new cn.szu.bot.sd.SdLauncher(cn.szu.bot.sd.SdLauncher.root(Json.obj(settings.snapshot(), "sd")),
                 () -> Json.obj(settings.snapshot(), "sd"), sd::reachable);
         // SD 的启动输出写进机器人自己的 logs 目录，和别的日志放在一起看。
@@ -3199,7 +3203,7 @@ public final class Bot implements AutoCloseable {
                 if (context != null) reply(context, result.text());
                 // 控制台触发的任务没有 QQ 回执通道：把最终结论写进 loraStatus，进度条收起时显示的就是它。
                 else loraStatus = result.text();
-                if (receipt != null) { receipt.capture(Maps.text(result.text())); receipt.finish(); }
+                if (receipt != null) { receipt.capture(Maps.text(result.text())); receipt.finish(); observeQuest(receipt); }
                 completeChatWorkflowStep(context, result.success());
             });
         } catch (RejectedExecutionException e) {
@@ -3207,7 +3211,7 @@ public final class Bot implements AutoCloseable {
             loraDownloading = false;
             loraReceipt = null;
             if (downloading) loraStatus = "操作未启动；机器人正在关闭，请稍后重试。";
-            if (receipt != null) { receipt.capture(Maps.text("操作失败：机器人正在关闭，请稍后重试。")); receipt.finish(); }
+            if (receipt != null) { receipt.capture(Maps.text("操作失败：机器人正在关闭，请稍后重试。")); receipt.finish(); observeQuest(receipt); }
             completeChatWorkflowStep(context, false);
             throw new IllegalStateException("机器人正在关闭，请稍后重试。");
         }
@@ -5004,6 +5008,13 @@ public final class Bot implements AutoCloseable {
         /** 每条出站消息一组（组内是有序的 text / image 片段）：LoRA 搜索就是一条一项，回执也照这个渲染。 */
         private final List<JsonArray> messages = new CopyOnWriteArrayList<>();
         private final long startedNanos = System.nanoTime();
+        /** 开始时刻的墙钟（回执正文落盘时的 startedAt）：与 startedNanos 一起记，进程内相对时间照旧。 */
+        private final long startedMillis = System.currentTimeMillis();
+        /**
+         * 正文有变化（来了文字/图片、指令跑完）还没写进 data/quests/&lt;number&gt;.json。
+         * 落盘成功后清掉；写失败就留着，下次再试——这样磁盘上的正文总是最新的一份。
+         */
+        private volatile boolean bodyDirty;
         private volatile long lastActivityNanos = System.nanoTime();
         private volatile boolean closed;
         /** 这条指令的执行体已经跑完（回执可能还在陆续到达，见 quiet()）。 */
@@ -5054,7 +5065,7 @@ public final class Bot implements AutoCloseable {
                         for (JsonElement node : data.getAsJsonArray("messages")) if (node.isJsonObject()) capture(node.getAsJsonObject().getAsJsonArray("content"));
                 }
             }
-            if (!group.isEmpty()) messages.add(group);
+            if (!group.isEmpty()) { messages.add(group); bodyDirty = true; }
             lastActivityNanos = System.nanoTime();
         }
         public boolean closed() { return closed; }
@@ -5100,8 +5111,14 @@ public final class Bot implements AutoCloseable {
             } catch (Exception ignored) { /* 目录读不到不影响本次落盘 */ }
         }
         void close() { closed = true; }
-        void finish() { done = true; }
+        /** 指令执行体跑完：正文也算变了，落盘一次（之后异步补的图片还会再写）。 */
+        void finish() { done = true; bodyDirty = true; }
         public boolean done() { return done; }
+        /** 回执开始的墙钟毫秒（落盘用；相对时间仍看 {@link #ageMillis()}）。 */
+        public long startedMillis() { return startedMillis; }
+        /** 正文有变化还没落盘（{@link Bot#saveQuestBody} 写完会清掉）。 */
+        boolean bodyDirty() { return bodyDirty; }
+        void bodySaved() { bodyDirty = false; }
         public long ageMillis() { return millis(startedNanos); }
         public boolean quiet() { return System.nanoTime() - lastActivityNanos > TimeUnit.MILLISECONDS.toNanos(1200); }
         void read() { readNanos = System.nanoTime(); }
@@ -5130,15 +5147,24 @@ public final class Bot implements AutoCloseable {
             return result;
         }
     }
+    /** 内存里的回执收集器：正文另有磁盘副本（data/quests/&lt;number&gt;.json），淘汰了也能读回来。 */
     private final Map<String, WebCapture> webCaptures = new ConcurrentHashMap<>();
     /** 每个网页会话最新的一条指令：异步后续消息（生成完成、下载进度）落到它上面。 */
     private final Map<String, WebCapture> webCurrent = new ConcurrentHashMap<>();
-    /** 回执索引：只存摘要与已读标记（正文只在 webCaptures 里），重启后列表还能看到。 */
+    /**
+     * 内存里最多保留多少条回执（按任务号淘汰最旧的）。
+     * 淘汰**前**一定先把正文写进磁盘，所以 /api/quest 照样给得出完整内容。
+     * 包级非 final：测试可以直接设小值来跑淘汰路径。
+     */
+    int webCaptureLimit = DEFAULT_WEB_CAPTURE_LIMIT;
+    /** 内存里保留回执条数的默认上限。 */
+    static final int DEFAULT_WEB_CAPTURE_LIMIT = 200;
+    /** 回执索引：只存摘要与已读标记（正文在 data/quests/&lt;n&gt;.json），重启后列表还能看到。 */
     private final QuestIndex questIndex;
     /** 索引落盘文件（data/quests.json）。 */
     private final Path questFile;
-    /** 回执在内存里保留的分钟数（索引过期标记与网页提示都以它为准）。 */
-    public static final int QUEST_RETAINED_MINUTES = 30;
+    /** 回执正文落盘目录（data/quests/&lt;number&gt;.json）：回执不再过期，正文随时可读。 */
+    private final Path questBodyDir;
     /** 索引写盘节流：距上次写盘不足 2 秒、且内容没变，就不写——900ms 一次的轮询不能把磁盘写爆。 */
     private static final long QUEST_SAVE_INTERVAL_MILLIS = 2000;
     private volatile long questSavedMillis;
@@ -5378,40 +5404,43 @@ public final class Bot implements AutoCloseable {
     /**
      * 按**任务号**取一条回执（网页 /quest/#22）。
      *
-     * <p>number ≤ 0 表示"最新一条"。回执只在内存里留 30 分钟（见 {@link #pruneWebCaptures()}），
-     * 过期就如实说过期，不假装还在跑。
+     * <p>number ≤ 0 表示"最新一条"。回执正文不再有过期一说：还在内存就直接给，
+     * 已经重启/被淘汰就从 {@code data/quests/&lt;number&gt;.json} 读回来（多一个 {@code fromDisk:true}），
+     * 只有磁盘上也没有才如实说"不在了"。
      */
     public JsonObject webQuest(int number) {
         pruneWebCaptures();
+        int wanted = number > 0 ? number : latestQuest();
         WebCapture capture = null;
-        for (WebCapture item : webCaptures.values()) {
-            if (number <= 0 ? (capture == null || item.number > capture.number) : item.number == number) {
-                capture = item;
-                if (number > 0) break;
-            }
+        if (wanted > 0) {
+            for (WebCapture item : webCaptures.values()) if (item.number == wanted) { capture = item; break; }
         }
         if (capture == null) {
             // 内容不在了也照样算"打开过"：索引里那一条（如果还在）标为已读，列表里不再算未读。
-            markQuestRead(number);
+            markQuestRead(wanted);
+            JsonObject stored = wanted > 0 ? questFromDisk(wanted) : null;
+            if (stored != null) {
+                stored.addProperty("latest", latestQuest());
+                return stored;
+            }
             JsonObject missing = new JsonObject();
             missing.addProperty("quest", number);
             missing.addProperty("latest", latestQuest());
-            // 索引里还有摘要（重启后或超过保留时间的回执）就把摘要一起给出去：
-            // /quest#N 这种直接打开的链接也能看到"有过这么一条任务"，不用只吃一句报错。
-            JsonObject stale = questIndex.item(number);
+            // 正文文件也没了（被索引上限裁掉或被手工删掉）时，索引里还有摘要就把摘要一起给出去：
+            // /quest#N 这种直接打开的链接至少能看到"有过这么一条任务"，不用只吃一句报错。
+            JsonObject stale = wanted > 0 ? questIndex.item(wanted) : null;
             if (stale != null) {
                 stale.addProperty("quest", number);
                 stale.addProperty("latest", latestQuest());
-                stale.addProperty("error", "回执 #" + number + " 的正文已过期：正文只在内存里保留 "
-                        + QUEST_RETAINED_MINUTES + " 分钟，下面是摘要。");
+                stale.addProperty("error", "回执 #" + number + " 不在了：磁盘上没有正文文件（data/quests/"
+                        + number + ".json），下面是索引里的摘要。");
                 return stale;
             }
-            missing.addProperty("error", number <= 0 ? "还没有任何任务回执。" : "回执 #" + number + " 不在了（回执只保留 "
-                    + QUEST_RETAINED_MINUTES + " 分钟）。");
+            missing.addProperty("error", number <= 0 ? "还没有任何任务回执。" : "回执 #" + number + " 不在了。");
             return missing;
         }
         capture.read();
-        // 打开过就标为已读（已读不会再变回未读），并把最新状态刷进索引。
+        // 打开过就标为已读（已读不会再变回未读），并把最新状态刷进索引（顺带落一次正文快照）。
         markQuestRead(capture.number());
         observeQuest(capture);
         // "还在跑"必须把出图队列算进去：生成一张图要几十秒，只报 busy（DeepSeek/LoRA）
@@ -5424,22 +5453,24 @@ public final class Bot implements AutoCloseable {
     public boolean generationQueued() {
         synchronized (generationLock) { return !generationJobs.isEmpty(); }
     }
-    /** 最近一条回执的任务号（没有就是 0）。 */
+    /** 最近一条回执的任务号（没有就是 0）：内存里没有就退回索引里的最大号（重启后照样有效）。 */
     public int latestQuest() {
         pruneWebCaptures();
         int latest = 0;
         for (WebCapture item : webCaptures.values()) latest = Math.max(latest, item.number);
+        QuestIndex index = questIndex;
+        if (index != null) latest = Math.max(latest, index.latest());
         return latest;
     }
     /**
-     * 网页「任务回执列表」：索引里的摘要（最新在前，最多 limit 条，钳到 1..200）。
+     * 网页「任务回执列表」：索引里的摘要（最新在前，最多 limit 条，钳到 1..{@link QuestIndex#MAX_ENTRIES}）。
      *
-     * <p>只回元信息与摘要，**不回任何正文数组**；正文还在内存里的条目 expired=false，
-     * 重启后或超过保留时间的旧条目只给摘要，网页据此提示"内容已过期"。
+     * <p>只回元信息与摘要，**不回任何正文数组**；正文一律在 {@code data/quests/&lt;n&gt;.json}，
+     * 所以 {@code expired} 永远是 false、{@code retainedMinutes} 恒为 0（表示不过期）。
      */
     public JsonObject webQuests(int limit) {
         observeQuests();
-        return questIndex.json(limit, QUEST_RETAINED_MINUTES);
+        return questIndex.json(limit, 0);
     }
     /**
      * 批量标记已读：numbers 里的任务号（索引里没有的忽略），或者 all=true 全部。
@@ -5455,23 +5486,130 @@ public final class Bot implements AutoCloseable {
         return result;
     }
     /**
-     * 刷新索引里还活着的回执（列表与状态接口都先走这一步），再按节流落盘。
-     * 先 prune：超过保留时间的回执已经从内存里清掉，索引里那一条自然标成 expired。
+     * 刷新索引里还活着的回执（列表与状态接口都先走这一步），把正文写进磁盘，再按节流落盘索引。
+     * 先 prune：内存超上限时淘汰最旧的几条（正文早已落盘，列表里那一条只是 busy 变 false）。
      */
     private void observeQuests() {
         pruneWebCaptures();
         QuestIndex index = questIndex;
         if (index == null) return;
         index.begin();
-        for (WebCapture capture : webCaptures.values()) index.observe(capture);
+        for (WebCapture capture : webCaptures.values()) {
+            index.observe(capture);
+            saveQuestBody(capture);
+        }
+        sweepTrimmedQuests();
         persistQuests(false);
     }
-    /** 一条回执变了（来了文字/图片、指令跑完）：立刻刷新索引，落盘按节流。 */
+    /** 一条回执变了（来了文字/图片、指令跑完）：立刻刷新索引与磁盘正文，落盘节流只管索引。 */
     private void observeQuest(WebCapture capture) {
         QuestIndex index = questIndex;
         if (index == null || capture == null) return;
         index.observe(capture);
+        saveQuestBody(capture);
+        sweepTrimmedQuests();
         persistQuests(false);
+    }
+    /**
+     * 一条回执的正文落盘：{@code data/quests/&lt;number&gt;.json}（{@link Json#atomicWrite}，UTF-8 无 BOM）。
+     *
+     * <p>写的是**引用**不是图片字节：{@code images}/{@code messages} 里的 {@code file} 就是网页
+     * {@code /api/image} 能读到的那个相对路径，和 {@link WebCapture#json(boolean)} 里一样。
+     * 正文没变化（{@link WebCapture#bodyDirty()} 为 false）就完全不写。
+     *
+     * <p>只写正文不写摘要：摘要在 {@code data/quests.json} 索引里，两者互相独立，谁坏了都不连累对方。
+     */
+    void saveQuestBody(WebCapture capture) {
+        if (capture == null || questBodyDir == null || !capture.bodyDirty()) return;
+        try {
+            JsonObject body = new JsonObject();
+            body.addProperty("version", 1);
+            body.addProperty("number", capture.number);
+            body.addProperty("command", capture.command());
+            body.addProperty("startedAt", QuestIndex.stamp(capture.startedMillis()));
+            body.addProperty("done", capture.done());
+            body.add("texts", Json.GSON.toJsonTree(new ArrayList<>(capture.texts)));
+            body.add("images", Json.GSON.toJsonTree(new ArrayList<>(capture.images)));
+            body.add("messages", Json.GSON.toJsonTree(new ArrayList<>(capture.messages)));
+            Json.atomicWrite(questBodyFile(capture.number), body);
+            capture.bodySaved();
+        } catch (Exception error) {
+            // 写失败只写日志：回执本身照旧在内存里、照旧能看，下次有变化再试。
+            Log.warn("网页回执正文写入失败（回执本身不受影响）：" + error(error));
+        }
+    }
+    /**
+     * 从 {@code data/quests/&lt;number&gt;.json} 读回一条回执的**完整正文**（字段名与
+     * {@link WebCapture#json(boolean)} 一致，另加 {@code fromDisk:true} 便于排查）。
+     *
+     * <p>没有这个文件、或者文件坏了都返回 null（坏文件只写日志，当作"没有正文"）。
+     */
+    private JsonObject questFromDisk(int number) {
+        Path file = questBodyFile(number);
+        if (file == null || !Files.isRegularFile(file)) return null;
+        try {
+            JsonObject stored = Json.parse(Files.readString(file, StandardCharsets.UTF_8));
+            JsonObject result = new JsonObject();
+            // 磁盘上的回执没有活着的收集器 id：给一个稳定可读的标识，字段本身照旧保留。
+            result.addProperty("id", "quest-" + number);
+            result.addProperty("quest", number);
+            result.addProperty("command", Json.str(stored, "command", ""));
+            result.add("texts", jsonArray(stored, "texts"));
+            result.add("images", jsonArray(stored, "images"));
+            result.add("messages", jsonArray(stored, "messages"));
+            result.addProperty("busy", false);
+            result.addProperty("done", Json.bool(stored, "done", true));
+            // 磁盘上没有"网页正在接收它的消息"这回事：收集器等同于已关闭。
+            result.addProperty("closed", true);
+            long started = QuestIndex.parseStamp(Json.str(stored, "startedAt", ""));
+            result.addProperty("ageMillis", started <= 0 ? 0 : Math.max(0, System.currentTimeMillis() - started));
+            // 回执不再过期：磁盘上读回来的正文同样是"还活着的内容"。
+            result.addProperty("expired", false);
+            result.addProperty("fromDisk", true);
+            return result;
+        } catch (Exception error) {
+            Log.warn("网页回执正文读取失败（当作没有正文）：" + error(error));
+            return null;
+        }
+    }
+    /** 磁盘正文里的数组字段：缺失或类型不对就给空数组（半截文件也不至于抛异常）。 */
+    private static JsonArray jsonArray(JsonObject stored, String key) {
+        return stored.has(key) && stored.get(key).isJsonArray() ? stored.getAsJsonArray(key) : new JsonArray();
+    }
+    /** 一条回执的正文文件（data/quests/&lt;number&gt;.json）。 */
+    private Path questBodyFile(int number) {
+        return questBodyDir == null || number <= 0 ? null : questBodyDir.resolve(number + ".json");
+    }
+    /**
+     * 索引裁掉的最旧那批：连 {@code data/quests/&lt;n&gt;.json} 一起删。
+     * 索引都不留的号，正文文件留着只会变成没人引用的孤儿。
+     */
+    private void sweepTrimmedQuests() {
+        QuestIndex index = questIndex;
+        if (index == null) return;
+        for (int number : index.drainTrimmed()) {
+            Path file = questBodyFile(number);
+            if (file == null) continue;
+            try { Files.deleteIfExists(file); }
+            catch (Exception error) { Log.warn("旧回执正文删除失败（留着不影响使用）：" + error(error)); }
+        }
+    }
+    /**
+     * 磁盘上回执正文文件里的最大任务号（quests.json 丢了也不会在重启后撞号）。
+     * 包级可见：启动路径用它抬发号器，测试也直接验证这一句。
+     */
+    int latestQuestBodyNumber() {
+        if (questBodyDir == null) return 0;
+        int latest = 0;
+        try (var files = Files.list(questBodyDir)) {
+            for (Path path : files.toList()) {
+                String name = path.getFileName().toString();
+                if (!name.endsWith(".json")) continue;
+                try { latest = Math.max(latest, Integer.parseInt(name.substring(0, name.length() - ".json".length()))); }
+                catch (NumberFormatException ignored) { /* 不是任务号的文件忽略 */ }
+            }
+        } catch (Exception ignored) { /* 目录不存在或读不到：就当没有磁盘正文 */ }
+        return latest;
     }
     /**
      * 索引落盘（节流）：内容没变就完全不写，变了也最多每 2 秒写一次——
@@ -5521,18 +5659,30 @@ public final class Bot implements AutoCloseable {
         }
         return capture;
     }
-    /** 收完的回执保留半小时：网页可能已经关掉，不能让收集器无限堆积。 */
+    /**
+     * 内存回收：回执**不再按时间过期**（正文已经写进 {@code data/quests/&lt;number&gt;.json}），
+     * 这里只把内存里的收集器限在最近 {@link #webCaptureLimit} 条——按任务号淘汰最旧的，
+     * 淘汰**前**先 {@link #saveQuestBody}，所以淘汰之后 {@code /api/quest} 照样给得出完整正文。
+     */
     private void pruneWebCaptures() {
-        long deadline = System.nanoTime() - TimeUnit.MINUTES.toNanos(QUEST_RETAINED_MINUTES);
-        webCaptures.values().removeIf(capture -> capture.startedNanos < deadline);
+        int limit = Math.max(1, webCaptureLimit);
+        while (webCaptures.size() > limit) {
+            WebCapture oldest = null;
+            for (WebCapture capture : webCaptures.values()) {
+                if (oldest == null || capture.number < oldest.number) oldest = capture;
+            }
+            if (oldest == null) break;
+            saveQuestBody(oldest);
+            webCaptures.remove(oldest.id());
+        }
         webCurrent.values().removeIf(capture -> !webCaptures.containsKey(capture.id()));
     }
     /**
      * 关闭收集器：之后这个会话的消息重新发往 QQ（网页不再接收）。
      *
      * <p>回执本身**留着**——它现在是 /quest/#N 这种可分享的链接，关掉收集不该让链接失效；
-     * 真正过期由 {@link #pruneWebCaptures()} 统一回收。{@code closed} 标记已经足够让
-     * {@link #webCaptureFor} 与 {@link #webActive} 不再把它当成活动回执。
+     * 内存回收只按条数上限走（见 {@link #pruneWebCaptures()}），正文另有磁盘副本。
+     * {@code closed} 标记已经足够让 {@link #webCaptureFor} 与 {@link #webActive} 不再把它当成活动回执。
      */
     public void webClose(String id) {
         WebCapture capture = webCapture(id);

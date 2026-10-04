@@ -1,11 +1,48 @@
-# Pixiko v1.0.18 发行说明
+# Pixiko v1.1.1 发行说明
 
-- **版本**：v1.0.18
+- **版本**：v1.1.1
 - **日期**：2026-10-04
 - **作者**：loriko（deloriko@outlook.com）
 - **当前实现**：Java 版（`src/`）。另有一次**未完成的** Next.js 重构，见 `nextjs-wip/`，**不可运行**。
 
 ---
+
+## 〇、本版新增（v1.1.1）
+
+**回执不再过期——正文落盘永久保留；生成期间回执显示进度条、图集提前预览；列表上的未读数变成数字徽标。**
+
+- **回执正文永久保留**：以前正文只在内存里留 30 分钟，超时后点开只能看到摘要（「内容已过期，只保留摘要」）。
+  现在每条回执的正文（文字 + 图片**引用**）都会落到 `data/quests/<任务号>.json`（UTF-8 无 BOM、原子写、
+  **只写引用不写图片字节**）；内存里最多保留最近 **200** 条、按任务号淘汰最旧的（**淘汰前先落盘**）；
+  索引 `data/quests.json` 的上限从 200 条提到 **2000** 条（被裁掉的最旧条目会连 `data/quests/<号>.json`
+  一起删）。因此：
+  - `/api/quest` 现在**任何旧回执都能打开看完整正文**（从磁盘读回来，附 `fromDisk:true`；
+    `busy=false`、`expired=false`）；
+  - `/api/quests` 里每条 `expired` **恒为 false**，顶层 `retainedMinutes` **恒为 0**（＝不过期）；
+  - **只有磁盘上确实没有正文文件**时才会说打不开，页面文案是「这条回执的正文读不到了（磁盘上也没有）」。
+- **带生成指令的回执在生成期间显示进度条**（回执页）：主条来自任务队列的图片级进度
+  （`任务 #4 · 已生成 9/20 张 · 45%`，数据 `GET /api/tasks`），副标题来自 SD 单张图内部的采样进度与
+  预计时间（`采样中 8/20（41%）· 预计 14 秒`，数据 `GET /api/progress`）；每 **1.5 秒**刷新一次，
+  空闲后标「已完成」并停止轮询。**多图任务会显示「已生成 N/总数 张」**。
+- **图集能在生成过程中提前预览**：生成期间前端轮询 `GET /api/images`，把这条回执开始时间之后新产出的
+  图片**增量**追加进该回执的图集（标题显示「图集 · 已生成 N 张（生成中…）」，完成后变
+  「图集 · 共 N 张」），按图片路径去重、**不重建回执、不打断滚动**。
+- **回执列表**：每条未读回执在条目上用**数字徽标**显示未读消息条数（＝文字条数 + 图片条数，
+  `span.quest-unread-count`，`title` 为「未读 N 条消息」），不再用「未读」文字徽标；页签徽标仍是
+  未读**回执**条数。列表整体高度上限从 `min(56vh,560px)` 提到 `min(76vh,760px)`（窄屏
+  `min(64vh,620px)`）；**每条回执不再被压扁**（`min-height:68px`、摘要最多两行，不做高度裁剪）。
+- **对话页底部那个与回执页重复的图片回执区（`id="chat-receipts"`）已删除**；对话页里带图片的出站消息
+  改为**内联进对话流**（点击仍可放大、可在同一条消息的图片间翻页）。
+- **切页面不丢东西**：控制台每切换一个栏目都是一次真实的页面加载，现在用 `sessionStorage` 记住
+  回执页当前打开的任务号（回到 `/quest` 自动恢复那条）与 `#quest-body` 的滚动位置、对话页的渲染内容
+  （文本 + 图片引用）与按会话 scope 记住的滚动位置（之前贴在底部就继续贴底，图片异步加载后也保持贴底）、
+  以及其它栏目的窗口滚动位置。切换回来不再需要手动滚到最新消息，也不再出现「回执消息与图片全没了」。
+- **前端**：`webui/index.html` 资源版本升到 **`?v=1.1.1`**。
+- **测试**：新增 `QuestPersistenceTest`（53 条断言）、`QuestListTest` 更新到 82 条断言；
+  `build.ps1 -Test` **60 套全绿**。
+
+<details>
+<summary>上一版（v1.0.18）</summary>
 
 ## 〇、本版新增（v1.0.18）
 
@@ -20,6 +57,8 @@
   与**当前打开的那条回执**。
 - **`/quest#N` 仍可直接打开**：列表点一行就是跳到这个地址，所以链接照旧可分享，打开照旧标记已读。
 - **前端**：`webui/index.html` 资源版本 `?v=1.0.22`。
+
+</details>
 
 <details>
 <summary>上一版（v1.0.17）</summary>
@@ -509,7 +548,7 @@ Danbooru 词条（↑↓ 选择、Esc 关闭；空词条上按 **Ctrl+Space** �
 
 ## 三、安装与启动（三步）
 
-### 开箱即用包 `pixiko-v1.0.14-runnable.zip`
+### 开箱即用包 `pixiko-v1.1.1-runnable.zip`
 
 1. 装好 **JDK 17+**。
 2. **双击 `start.bat`**。第一次运行会自动生成 `config.json`（照 `config.example.json` 起一份），
@@ -519,7 +558,7 @@ Danbooru 词条（↑↓ 选择、Esc 关闭；空词条上按 **Ctrl+Space** �
 
 > `start.bat` 跑的是包内已编译好的 `build/pixiko.jar`；只有需要改代码时才用 `build.ps1` + `run.bat`。
 
-### 源码包 `pixiko-v1.0.14.zip`
+### 源码包 `pixiko-v1.1.1.zip`
 
 1. 装好 **JDK 17+**。
 2. 在项目根目录准备好依赖 jar：`lib/gson-2.13.1.jar` 由 `build.ps1` **自动下载并校验**，
@@ -575,7 +614,7 @@ copy config.example.json config.json
    属于个人信息，已移除）。**务必在配置页或 `config.json` 里设置 `owner_user_id`**，否则所有 owner 专属指令都会被拒绝。
 6. **`test.bat` 的行为依赖工作目录。** `WebUiTest` 通过「进程工作目录下的 `webui/`」找页面资源
    （见 `WebPageController` 的回退逻辑），所以请在**项目根目录**运行 `test.bat`，
-   不要从别的目录调用。在项目根目录运行，48 个测试全部通过（含 CivitaiLinkTest、TagSuggestTest）。
+   不要从别的目录调用。在项目根目录运行，60 个测试套件全部通过（`build.ps1 -Test`）。
 7. **Logback 两个 jar 内不含许可文本**（上游如此），其 EPL-1.0 / LGPL-2.1 全文需查
    `THIRD-PARTY-LICENSES.md` 里给出的官方链接；`gson` 与 `snakeyaml` 的 jar 内同样没有许可文件，
    但二者均为 Apache-2.0，文本已随包提供。
@@ -584,8 +623,8 @@ copy config.example.json config.json
 
 ## 六、在 GitHub Releases 里发布这个 zip
 
-1. 打开仓库 → 右侧 **Releases** → **Draft a new release**，Tag 填 `v1.0.14`（新建 tag），标题填 `Pixiko v1.0.14`。
-2. 把 `pixiko-v1.0.14.zip` 与 `pixiko-v1.0.14-runnable.zip`（以及各自的 `.sha256`）拖进附件区，
+1. 打开仓库 → 右侧 **Releases** → **Draft a new release**，Tag 填 `v1.1.1`（新建 tag），标题填 `Pixiko v1.1.1`。
+2. 把 `pixiko-v1.1.1.zip` 与 `pixiko-v1.1.1-runnable.zip`（以及各自的 `.sha256`）拖进附件区，
    正文粘贴本文件内容后点 **Publish release**。
 
 > 建仓库时 License 请选 **None**（本项目保留所有权利，不使用开源许可证）。
