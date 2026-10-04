@@ -397,7 +397,7 @@
       try { data = await api('/api/quest', { body: { id: questWatch.number } }); }
       catch (error) {
         clearInterval(questWatch.timer);
-        if (String(error.message) !== 'unauthorized' && $('quest-state')) $('quest-state').textContent = '读取失败：' + error.message;
+        if (String(error.message) !== 'unauthorized') setText('quest-state', '读取失败：' + error.message);
         return;
       }
       renderQuest(data);
@@ -415,12 +415,10 @@
     const body = $('quest-body');
     if (!body) return;
     const number = data.quest || questWatch.number;
-    const field = $('quest-number');
-    if (field && document.activeElement !== field) field.value = number || '';
     const running = !data.error && !(data.done && !data.busy);
-    $('quest-state').textContent = data.error ? data.error : '#' + number + (running ? '（进行中…）' : '（已完成）');
-    $('quest-command').textContent = data.command ? '指令：' + data.command : '';
-    $('quest-progress').textContent = data.latest ? '最新一条是 #' + data.latest : '';
+    setText('quest-state', data.error ? data.error : '#' + number + (running ? '（进行中…）' : '（已完成）'));
+    setText('quest-command', data.command ? '指令：' + data.command : '');
+    setText('quest-progress', data.latest ? '最新一条是 #' + data.latest : '');
     body.innerHTML = '';
     if (data.error) {
       // 旧回执：正文过期（重启后/超过保留时间）时只留摘要 —— 不能白屏，也不能像报错一样吓人。
@@ -688,6 +686,11 @@
   /** 列表卡头部的两个按钮。 */
   function bindQuestListActions() {
     on('quest-list-refresh', 'click', () => {
+      // 「刷新」一次刷两样：左栏列表 + 右栏当前打开的那条回执。
+      // 还没打开过任何一条（questWatch.number 是 0）就只刷列表，不空跳也不报错。
+      const current = Number(questWatch.number) || 0;
+      if (current > 0) loadQuest(current).catch(() => {});   // loadQuest 自己会先清掉旧 timer，不会留下两条轮询
+      else clearInterval(questWatch.timer);                  // 没跟任何一条：只把可能残留的 timer 收干净
       loadQuestList()
         .then((data) => toast('回执列表已刷新，共 ' + data.quests.length + ' 条。'))
         .catch((error) => { questListFailed(error); toast('刷新失败：' + error.message); });
@@ -3417,23 +3420,7 @@
     on('terminal-clear', 'click', clearTerminal);
     bindTerminalTail();
     on('terminal-fullscreen', 'click', () => applyConsoleFullscreen(!consoleFullscreen()));
-    // 任务回执页：地址里的 #N 就是任务号；点信息云里的链接会直接进来。
-    on('quest-open', 'click', () => {
-      const value = Number($('quest-number').value.trim().replace(/^#/, ''));
-      if (!Number.isFinite(value) || value <= 0) { toast('请填任务号，例如 22。'); return; }
-      location.hash = '#' + Math.floor(value);
-      loadQuest(Math.floor(value));
-    });
-    on('quest-latest-btn', 'click', async () => {
-      const data = await api('/api/quest', { body: { id: 0 } });
-      if (data.quest) { location.hash = '#' + data.quest; loadQuest(data.quest); }
-      else toast(data.error || '还没有任何任务回执。');
-    });
-    on('quest-reload', 'click', () => {
-      loadQuest(questNumberFromLocation());
-      if (PAGE === 'quest') loadQuestList().catch((error) => questListFailed(error));
-    });
-    if ($('quest-number')) on('quest-number', 'keydown', (event) => { if (event.key === 'Enter') { event.preventDefault(); $('quest-open').click(); } });
+    // 任务回执页：地址里的 #N 就是任务号（/quest#22）；点信息云里的链接、点左栏列表里的一行都会走到这里。
     window.addEventListener('hashchange', () => { if (PAGE === 'quest') loadQuest(questNumberFromLocation()); });
     bindQuestListActions();
     // 列表里的「进行中」条目不靠高频轮询：页面重新可见时刷一次就够了。

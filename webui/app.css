@@ -651,6 +651,11 @@ a.image-link img:hover { border-color: rgba(120, 160, 220, .55); }
 
 /* ---------------------------------------------------------------- 任务回执页 */
 .quest-body { display: flex; flex-direction: column; gap: 10px; }
+/* 右栏「执行结果」：状态与进度并排在卡片头部（.card-head 本来就是 flex + wrap），指令另起一行小字。
+   两者都允许收缩与断行，窄屏下不会把卡片头部挤爆；没有指令时整行不占位。 */
+#quest-state, #quest-progress { min-width: 0; overflow-wrap: anywhere; }
+#quest-command { line-height: 1.5; overflow-wrap: anywhere; }
+#quest-command:empty { display: none; }
 .quest-step {
   border: 1px solid var(--line); border-radius: 12px; padding: 10px 12px;
   background: linear-gradient(135deg, rgba(31, 44, 66, .5), rgba(23, 33, 51, .42));

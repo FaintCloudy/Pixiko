@@ -10,7 +10,7 @@
 <link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <title>Pixiko · 控制台</title>
-<link rel="stylesheet" href="/app.css?v=1.0.21">
+<link rel="stylesheet" href="/app.css?v=1.0.22">
 </head>
 <body>
 <div class="aurora" aria-hidden="true"></div>
@@ -530,16 +530,6 @@
   <!--#panel:quest-->
   <!-- ============================ 任务回执 ============================ -->
   <section class="panel" id="panel-quest">
-    <div class="card">
-      <div class="card-head"><b>任务回执</b><span class="muted" id="quest-state"></span></div>
-      <div class="row wrap">
-        <input id="quest-number" placeholder="任务号，例如 22" inputmode="numeric">
-        <button type="button" id="quest-open">打开回执</button>
-        <button class="ghost" type="button" id="quest-latest-btn">最新一条</button>
-        <button class="ghost" type="button" id="quest-reload">刷新</button>
-      </div>
-      <div class="muted" id="quest-command"></div>
-    </div>
     <div class="quest-split">
       <div class="card quest-list-card">
         <div class="card-head">
@@ -553,7 +543,8 @@
         <div class="quest-list" id="quest-list" role="list" aria-label="回执列表"></div>
       </div>
       <div class="card">
-        <div class="card-head"><b>执行结果</b><span class="muted" id="quest-progress"></span></div>
+        <div class="card-head"><b>执行结果</b><span class="muted" id="quest-state"></span><span class="muted" id="quest-progress"></span></div>
+        <div class="muted" id="quest-command"></div>
         <div id="quest-body" class="quest-body" aria-live="polite"></div>
       </div>
     </div>
@@ -620,6 +611,6 @@
 <div id="toast" class="toast" hidden></div>
 <!-- 任务信息云：从下方弹出，带跳去 /quest/#N 的链接 -->
 <div id="quest-clouds" class="quest-clouds" aria-live="polite"></div>
-<script src="/app.js?v=1.0.21"></script>
+<script src="/app.js?v=1.0.22"></script>
 </body>
 </html>
