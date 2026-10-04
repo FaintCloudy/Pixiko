@@ -100,7 +100,14 @@ public final class GenerationPresetTest {
             image = Base64.getEncoder().encodeToString(bytes.toByteArray());
             server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0); server.createContext("/", this::handle); server.start();
             config.addProperty("base_url", "http://127.0.0.1:" + server.getAddress().getPort());
-            JsonObject settings = new JsonObject(); settings.add("sd", config); settings.addProperty("owner_user_id", "2"); Json.atomicWrite(root.resolve("config.json"), settings);
+            JsonObject settings = new JsonObject(); settings.add("sd", config); settings.addProperty("owner_user_id", "2");
+            // 生图频道（.infix/.progen 的 DeepSeek 网关）也指到本桩服务上：这些用例要的是"改写失败/成功
+            // 之后链路怎么走"，不该真的去打 api.deepseek.com——无网或机器有负载时那是一次会拖很久、
+            // 结果还不确定的真实网络调用（ChatActionsTest 的"失败步骤必须停住后续指令"就因此偶发超时）。
+            JsonObject progen = new JsonObject();
+            progen.addProperty("api_base", "http://127.0.0.1:" + server.getAddress().getPort());
+            settings.add("progen", progen);
+            Json.atomicWrite(root.resolve("config.json"), settings);
             sd = new SdClient(root, config);
             bot = new Bot(new Settings(root), sd, (event, segments) -> { replies.add(Bot.messageText(segments)); return CompletableFuture.completedFuture(null); });
         }
@@ -152,8 +159,15 @@ public final class GenerationPresetTest {
             }
         }
         public void close() throws IOException {
+            // 先等机器人把排队的工作跑完（生成 → 自动领取），close() 只是 shutdownNow，不等线程退出。
+            long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+            while (System.nanoTime() < deadline && (bot.generationQueued() || bot.webBusy())) {
+                try { Thread.sleep(20); } catch (InterruptedException interrupted) { Thread.currentThread().interrupt(); break; }
+            }
             bot.close(); server.stop(0);
-            try (var paths = Files.walk(root)) { for (Path path : paths.sorted(Comparator.reverseOrder()).toList()) Files.deleteIfExists(path); }
+            // 出图/领取线程可能还在落盘，直接删目录就会撞上 DirectoryNotEmptyException（见 TestCleanup）。
+            TestCleanup.awaitQuiet(root, 5000);
+            TestCleanup.deleteQuietly(root);
         }
     }
 }

@@ -134,12 +134,15 @@ public final class ChatActionsTest {
             assert f.sd.settings().width()==640 : "successful async step must release the next workflow step";
             f.replies.clear();
             f.bot.executeChatCommands(e,List.of(".infix 改成夜景",".size set 704 512"),new JsonObject());
+            // .infix 是异步步骤（改写在后台线程里跑，失败也发生在后台）：等这条多步链路真的执行完
+            // （activeChatWorkflows 归零，回执已在此之前入队）再断言，而不是拿固定 3 秒去赌后台线程
+            // 跑得快——负载下那 3 秒本身就是 flake。
+            long chainDeadline=System.nanoTime()+TimeUnit.SECONDS.toNanos(30);
+            while(f.bot.activeChatWorkflows()>0 && System.nanoTime()<chainDeadline) Thread.sleep(10);
             String workflowReply="";
-            workflowDeadline=System.nanoTime()+TimeUnit.SECONDS.toNanos(3);
-            while(System.nanoTime()<workflowDeadline && !workflowReply.contains("多步骤指令已停止")) {
-                String part=f.replies.poll(100,TimeUnit.MILLISECONDS);if(part!=null)workflowReply+=part;
-            }
-            assert workflowReply.contains("多步骤指令已停止") && f.sd.settings().width()==640 : "failed async step must stop all remaining commands";
+            for(String part=f.replies.poll(); part!=null; part=f.replies.poll()) workflowReply+=part+"\n";
+            assert workflowReply.contains("多步骤指令已停止") && f.sd.settings().width()==640
+                    : "failed async step must stop all remaining commands: " + workflowReply;
         }
         listContext();
         selectionNumbers();

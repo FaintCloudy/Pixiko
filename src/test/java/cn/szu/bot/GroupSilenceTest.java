@@ -261,9 +261,9 @@ public final class GroupSilenceTest {
         public void close() throws Exception {
             bot.close();
             server.stop(0);
-            try (var walk = Files.walk(root)) {
-                for (Path path : walk.sorted(Comparator.reverseOrder()).toList()) Files.deleteIfExists(path);
-            }
+            // 聊天/改写都是后台线程；先等目录树安静，再带重试删除（见 TestCleanup）。
+            TestCleanup.awaitQuiet(root, 5000);
+            TestCleanup.deleteQuietly(root);
         }
     }
 

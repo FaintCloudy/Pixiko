@@ -457,11 +457,15 @@ public final class AlbumDeliveryTest {
                     && nodes.get(0).get(0).isJsonObject()
                     && "image".equals(Json.str(nodes.get(0).get(0).getAsJsonObject(), "type", ""));
             Dispatch dispatch = new Dispatch(kind, event.deepCopy(), nodes, new CompletableFuture<>());
+            if (image) {
+                // 计数必须先于入队：awaitImage() 一取到 dispatch，测试线程马上就会读这几个计数，
+                // 先入队再计数会让"这条是 sendMap"与 mapped==0 同时成立（负载下实测偶发失败）。
+                if ("send".equals(kind)) plains.incrementAndGet();
+                else if ("sendMap".equals(kind)) mapped.incrementAndGet();
+                else records.incrementAndGet();
+            }
             dispatches.add(dispatch);
             if (!image) { texts.add(Bot.messageText(nodes.get(0))); return CompletableFuture.completedFuture(null); }   // 文本回执照常立即送达
-            if ("send".equals(kind)) plains.incrementAndGet();
-            else if ("sendMap".equals(kind)) mapped.incrementAndGet();
-            else records.incrementAndGet();
             if (failRecords && "sendRecord".equals(kind))
                 return CompletableFuture.failedFuture(new IOException("模拟合并转发失败（send_group_forward_msg），retcode=1200"));
             if (failPlains && "send".equals(kind))
@@ -647,10 +651,9 @@ public final class AlbumDeliveryTest {
 
         public void close() throws IOException {
             bot.close();
-            // 只删自己这个 case- 临时目录（Files.walk 不跟随符号链接）。
-            try (var walk = Files.walk(root)) {
-                for (Path path : walk.sorted(Comparator.reverseOrder()).toList()) Files.deleteIfExists(path);
-            }
+            // 只删自己这个 case- 临时目录；领取/ACK 是后台线程在写盘，所以等目录安静下来再带重试删除（见 TestCleanup）。
+            TestCleanup.awaitQuiet(root, 5000);
+            TestCleanup.deleteQuietly(root);
         }
     }
 
