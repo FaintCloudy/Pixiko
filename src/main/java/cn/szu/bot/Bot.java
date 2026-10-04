@@ -1013,6 +1013,8 @@ public final class Bot implements AutoCloseable {
             return "多步执行完成：" + succeeded + "/" + total + " 条（全部成功）";
         }
         boolean empty() { return blocks.isEmpty() && lines.isEmpty(); }
+        /** 每一步都跑到底了吗（有一步被跳过/提前返回就不算）。 */
+        boolean complete(int total) { return blocks.size() >= total; }
         String text(int total) { return summary(total) + "\n" + String.join("\n", blocks); }
     }
     private final Map<String, ChainRecord> chainRecords = new ConcurrentHashMap<>();
@@ -1021,6 +1023,16 @@ public final class Bot implements AutoCloseable {
         if (record == null) return;
         chainRecords.remove(key);
         if (record.empty()) return;
+        // 常规档只留"肯定"与图片：多步执行的"过程"（总结 + 每一步的命令与回执块，例如
+        // 「多步执行完成：2/2 条（全部成功）」「【1】.prompt add …」）在全部成功时不再发。
+        // 只要有任何一步失败（failure != null）或没跑完（blocks 少于 total，原因写在收尾里），
+        // 就走下面原有的完整形态——错误、失败原因与"需要用户决定"的说明绝不吞。
+        // 全部成功但收尾里有内容（LoRA 恢复、词条补齐、自检修正、多步骤指令已停止…）时，只发收尾那一段。
+        if (normalReceipts(event) && record.failure == null && record.complete(total)) {
+            String tail = record.trailing();
+            if (!tail.isEmpty()) reply(event, tail);
+            return;
+        }
         List<JsonArray> messages = new ArrayList<>();
         // Every node is user-facing: commands must read with "." like every other receipt.
         messages.add(Maps.text(publicCommands(record.summary(total))));
@@ -1104,10 +1116,12 @@ public final class Bot implements AutoCloseable {
     private static final Pattern GENERATE_COMMAND = Pattern.compile("^/gen(?:\\s+([\\s\\S]*))?$", Pattern.CASE_INSENSITIVE);
     /** .imgmode：出图是否合成「聊天记录」（QQ 合并转发），按会话保存。 */
     private static final Pattern IMAGE_MODE_COMMAND = Pattern.compile("^/imgmode(?:\\s+([\\s\\S]*))?$", Pattern.CASE_INSENSITIVE);
+    /** .mode：QQ 侧回执档位（normal 只发肯定与图片 / debug 完整回执＝现状），按会话保存。 */
+    private static final Pattern QQ_MODE_COMMAND = Pattern.compile("^/mode(?:\\s+([\\s\\S]*))?$", Pattern.CASE_INSENSITIVE);
     private static final Pattern LORA_COMMAND = Pattern.compile("^/lora(?:\\s+([\\s\\S]*))?$", Pattern.CASE_INSENSITIVE);
     private static final Pattern QUOTED_LORA = Pattern.compile("^(\"(?:[^\"\\\\]|\\\\.)*\")(?:\\s+(\\S+))?$");
     private static final Gson STRICT_JSON = new GsonBuilder().setStrictness(Strictness.STRICT).create();
-    private static final Pattern PUBLIC_COMMAND_PREFIX=Pattern.compile("(?<![\\p{L}\\p{N}_:/])/(help|yh|liv|get|settings|chat|admin|char|batch|sampler|style|size|steps|cfg|seed|model|promptR|prompt|preset|function|lora|gen|rg|imgcnt|imgmode|usage|map|progen|infix|progress|vae|sd)(?![\\p{L}\\p{N}_-])",Pattern.CASE_INSENSITIVE);
+    private static final Pattern PUBLIC_COMMAND_PREFIX=Pattern.compile("(?<![\\p{L}\\p{N}_:/])/(help|yh|liv|get|settings|chat|admin|char|batch|sampler|style|size|steps|cfg|seed|model|promptR|prompt|preset|function|lora|gen|rg|imgcnt|imgmode|mode|usage|map|progen|infix|progress|vae|sd)(?![\\p{L}\\p{N}_-])",Pattern.CASE_INSENSITIVE);
     public static final String HELP = publicCommands("""
         神户小鸟 · Pixiko（SD 生图机器人）　群聊、私聊均可
         群聊先用 @机器人或小鸟名字唤醒；同一用户此后 30 分钟内可连续对话并滚动续期。私聊无需唤名，指令仍直接响应。
@@ -1156,10 +1170,11 @@ public final class Bot implements AutoCloseable {
         /char <角色名或关键词> — 在本机 LoRA 与 WebUI 样式中查找该角色，列出候选并询问是否应用
         /lora query <模型搜索词> [页码] — 搜索 Civitai，结果合并成一条聊天记录（每个节点带本页编号、封面与信息；/lora search 是同一个命令）
         /lora download #编号 [权重] — 下载最近搜索中**本页**的模型（#N 指本页第 N 条）
-        /rg <数量> — 回溯最近的图片，按任务和图片上限分批，不改变待领取列表
+        /rg <数量> — 回溯最近的图片，按图片上限（.imgcnt）分批、发送方式跟随 .imgmode，不改变待领取列表
         /progress — 查看 SD WebUI 当前生成进度（第几步／百分比／预计剩余时间）与机器人队列状态
         /imgcnt <数量> — 每条聊天记录图片上限，默认 300，按任务分开发送
         /imgmode [record|single|auto] — 出图是否合成聊天记录（合并转发）：record 一律合并（一张也合并）、single 一律逐张普通发送、auto 自动（默认：多张合并、单张普通），按会话保存
+        /mode [normal|debug] — 回执档位（按会话保存）：normal（常规）只发一句肯定与图片，不显示生成参数、不发多步/计数这类过程回执；debug（调试，默认）是完整回执。失败、被拒绝、权限不足与用法错误照旧发出
         /jrlp — 今日老婆：随机抽一位群友，回执带群名、昵称、QQ 与头像（每群数据独立）
         /结婚 <@某人|QQ号|群名片> — 向未婚配的群友求婚，对方须在 180 秒内回复 /同意 才成立
         /同意 — 同意最近一次向你的求婚（超过 180 秒失效，须重新求婚）
@@ -1461,6 +1476,8 @@ public final class Bot implements AutoCloseable {
             }
             Matcher imageMode = IMAGE_MODE_COMMAND.matcher(text);
             if (imageMode.matches()) { imageMode(event, Objects.requireNonNullElse(imageMode.group(1), "").strip()); return; }
+            Matcher mode = QQ_MODE_COMMAND.matcher(text);
+            if (mode.matches()) { qqMode(event, Objects.requireNonNullElse(mode.group(1), "").strip()); return; }
             Matcher progress = Pattern.compile("^/(progress|进度)(?:\\s+.*)?$", Pattern.CASE_INSENSITIVE).matcher(text);
             if (progress.matches()) {
                 // 进度直接来自 SD WebUI（GET /sdapi/v1/progress），队列来自机器人自己。
@@ -6003,9 +6020,14 @@ public final class Bot implements AutoCloseable {
                 if (closed.get()) throw new IllegalStateException("机器人正在关闭，请稍后重试。");
                 GenerationJob submitted = new GenerationJob(event.deepCopy(), snapshot, count);
                 submitted.number = nextGenerationId = nextGenerationId.add(BigInteger.ONE);
-                reply(event, "已加入生成队列，任务 #" + submitted.number + "，共 " + count + " 次生成，将依次开始生成图片。\n" + formatSettings(snapshot.settings(), promptScope(event))
-                        + "\n" + snapshot.parameters().describe()
-                        + "\n提示词来源：" + snapshot.prompts().source() + "\n参数来源：" + snapshot.settings().source());
+                // 常规档：只回一句"肯定"，不把参数清单（采样方法/尺寸/步数/CFG/种子/底模/提示词来源/参数来源）
+                // 与任务号一起刷出来。debug 档（默认）就是原来那条完整回执。
+                reply(event, normalReceipts(event)
+                        ? "好的，开始生成 " + count + " 次～"
+                        : "已加入生成队列，任务 #" + submitted.number + "，共 " + count + " 次生成，将依次开始生成图片。\n"
+                                + formatSettings(snapshot.settings(), promptScope(event))
+                                + "\n" + snapshot.parameters().describe()
+                                + "\n提示词来源：" + snapshot.prompts().source() + "\n参数来源：" + snapshot.settings().source());
                 generationJobs.addLast(submitted);
                 waitingGenerations = waitingGenerations.add(count);
                 Log.info("生成任务 #" + submitted.number + " 入队：" + count + " 次，来自 " + describeConversation(event)
@@ -6088,18 +6110,21 @@ public final class Bot implements AutoCloseable {
                 Log.error("生成任务 #"+job.number+" 第 "+job.done.add(BigInteger.ONE)+"/"+job.total
                         +" 次失败，耗时 "+millis(started)+" ms", e);
             }
-            String notice = null;
+            String notice = null, settledReason = null;
             synchronized (generationLock) {
                 job.done = job.done.add(BigInteger.ONE); generationRunning = false;
                 if (currentGeneration == job) currentGeneration = null;
                 // 取消优先：跑完手上这张就结算；挂起则留在队列里等 .gen resume。
-                if (job.refused != null) notice = settleGenerationJob(job, "已拒绝");
-                else if (job.cancelled) notice = settleGenerationJob(job, "已取消");
-                else if (job.remaining.signum() == 0 || closed.get()) notice = settleGenerationJob(job, closed.get() ? "已停止" : "已完成");
+                if (job.refused != null) { settledReason = "已拒绝"; notice = settleGenerationJob(job, settledReason); }
+                else if (job.cancelled) { settledReason = "已取消"; notice = settleGenerationJob(job, settledReason); }
+                else if (job.remaining.signum() == 0 || closed.get()) {
+                    settledReason = closed.get() ? "已停止" : "已完成";
+                    notice = settleGenerationJob(job, settledReason);
+                }
             }
             if (notice != null) {
                 Log.info(notice);
-                reply(job.event, notice);
+                replySettleNotice(job, settledReason, notice);
                 if (!closed.get() && settings.autoGet() && !job.completedImages.isEmpty()) getImages(job.event, List.copyOf(job.completedImages));
             }
         }
@@ -6136,12 +6161,28 @@ public final class Bot implements AutoCloseable {
                 + (job.lastError.isEmpty() ? "" : (job.refused != null ? "\n拒绝原因：" : "\n最近失败原因：") + job.lastError)
                 + (settings.autoGet() ? "\n已生成的图片将自动领取。" : "\n发送 /get 领取已生成的图片。");
     }
+    /**
+     * 结算回执在常规档（{@code .mode normal}）下的发送决策——这是结算回执唯一的落点。
+     *
+     * <p>只有"这一批全部成功、没有失败/拒绝/取消、图片马上会自动发出"这一种情况才不发：
+     * 图片本身就是回执。其余一律照旧发出，绝不吞掉任何异常信息——
+     * 失败（{@code job.failed>0} 或 {@code lastError} 非空）、被拒绝（{@code refused}）、
+     * 取消/停止（reason 不是"已完成"）、一张图都没出来（{@code completedImages} 为空）都算"有事"。
+     * 常规档且关闭了自动领取时，图片不会自己出现，于是只留一句"发送 .get 领取"（要用户动手的提示不能吞）。
+     */
+    private void replySettleNotice(GenerationJob job, String reason, String notice) {
+        boolean trouble = job.refused != null || job.failed.signum() > 0 || !job.lastError.isEmpty()
+                || !"已完成".equals(reason) || job.completedImages.isEmpty();
+        if (trouble || !normalReceipts(job.event)) { reply(job.event, notice); return; }
+        if (settings.autoGet()) return;
+        reply(job.event, "生成完成，发送 /get 领取图片。");
+    }
     /** 回执 + 自动领取；reason 为 null 表示调用方已经自己回过执了。 */
     private void noticeFinishedGeneration(GenerationJob job, String reason) {
         if (reason != null) {
             String notice = settleGenerationJob(job, reason);
             Log.info(notice);
-            reply(job.event, notice);
+            replySettleNotice(job, reason, notice);
         }
         if (!closed.get() && settings.autoGet() && !job.completedImages.isEmpty()) getImages(job.event, List.copyOf(job.completedImages));
     }
@@ -6155,6 +6196,10 @@ public final class Bot implements AutoCloseable {
             outboxDelivery.execute(() -> {
                 String notice;
                 int delivered = 0;
+                // 常规档：图片已经发出去了，"本次领取完成，共 N 张"这种计数回执就不必再发一条。
+                // 领取本身（acknowledgeImages）在本方法里先于回执完成，少发消息不会漏领。
+                // 只对这一条成功计数回执生效：暂无图片、发送失败、预览保留这些说明照旧发出。
+                boolean quietSuccess = false;
                 try {
                     // Freeze incomplete task identities before sending: preview ACK must not consume their images,
                     // even when the task finishes while this upload is in flight.
@@ -6167,7 +6212,12 @@ public final class Bot implements AutoCloseable {
                     if (pending.isEmpty()) notice = recentCount > 0 ? "暂无历史图片。" : "暂无待领取图片，请先发送 /gen。";
                     else {
                         int batchNumber = 0;
-                        for (List<Path> batch : imageBatches(pending, settings.imageCount())) {
+                        // 回溯（.rg）与领取（.get／自动领取）走同一套发送规则：分批之后统一交给 sendBatch 按 .imgmode 分流。
+                        // 只有分批口径不同——领取按生成任务分开发送（同一次 /gen 的多次 SD 调用算一条聊天记录），
+                        // 回溯只按 .imgcnt 切块：历史图片基本上一张一个 task- 目录，按任务切会把本该合成一条
+                        // 聊天记录的几张拆成一串单张消息（线上 .rg 4 打出四行「单张普通发送」就是这个原因）。
+                        for (List<Path> batch : recentCount > 0 ? historyBatches(pending, settings.imageCount())
+                                : imageBatches(pending, settings.imageCount())) {
                         batchNumber++;
                         long started = System.nanoTime();
                         sendBatch(context, batch).get();
@@ -6183,6 +6233,7 @@ public final class Bot implements AutoCloseable {
                                 + batch.size() + " 张，耗时 " + millis(started) + " ms");
                         }
                         notice = (recentCount > 0 ? "历史图片回溯完成，共 " : "本次领取完成，共 ") + delivered + " 张。" + (previewTasks.isEmpty() ? "" : "\n未完成任务的图片仅预览，仍保留在待领取列表。");
+                        quietSuccess = normalReceipts(context);
                     }
                 } catch (Exception e) {
                     if (e instanceof InterruptedException) Thread.currentThread().interrupt();
@@ -6190,7 +6241,7 @@ public final class Bot implements AutoCloseable {
                             : "领取图片失败：本次已确认领取 " + delivered + " 张，未完成的图片已保留。\n" + error(e);
                     Log.error("领取图片失败（" + describeConversation(context) + "，已确认 " + delivered + " 张）", e);
                 } finally { if (automaticImages == null) drainingImages.set(false); }
-                reply(context, notice);
+                if (!quietSuccess) reply(context, notice);
             });
         } catch (RejectedExecutionException e) { if (automaticImages == null) drainingImages.set(false); throw new IllegalStateException("机器人正在关闭，请稍后重试。"); }
     }
@@ -6295,6 +6346,43 @@ public final class Bot implements AutoCloseable {
             detail += "\n注意：当前传输层不支持合并转发（没实现 sendRecord），record 实际会回退成普通发送。";
         return detail;
     }
+    /**
+     * {@code .mode} —— QQ 侧回执档位，按会话持久保存（{@code qq_mode.modes.<会话键>}）。
+     *
+     * <p>不带参数看当前档位；normal/常规/简洁 只发"肯定"与图片，debug/调试/详细/完整 回到完整回执（默认）。
+     * 权限与 {@code .imgmode}、{@code .imgcnt} 这类设置一致：任何会话成员都能改自己会话的设置。
+     * 这条指令自己的回执在两个档位下都照发——用户明确问的，回答不能吞。
+     */
+    private void qqMode(JsonObject event, String argument) throws Exception {
+        String conversation = ChatService.conversationKey(event);
+        if (!argument.isEmpty()) {
+            Settings.QqMode mode = Settings.QqMode.parse(argument);
+            if (mode == null) throw new IllegalArgumentException(
+                    "用法：/mode、/mode normal（常规/简洁）、/mode debug（调试/详细，默认）");
+            settings.setQqMode(conversation, mode);
+            Log.info("QQ 回执档位（" + conversation + "）：" + mode.key());
+            reply(event, "本会话的回执档位已设为「" + mode.label() + "」：" + describeQqMode(mode));
+            return;
+        }
+        Settings.QqMode mode = settings.qqMode(conversation);
+        reply(event, "本会话的回执档位：" + mode.label() + "（" + mode.key() + "）\n" + describeQqMode(mode)
+                + "\n改法：/mode normal（常规/简洁）、/mode debug（调试/详细，默认）");
+    }
+    /** 一种回执档位给用户看的一句话说明。 */
+    private String describeQqMode(Settings.QqMode mode) {
+        return switch (mode) {
+            case DEBUG -> "调试（默认，现状）：完整回执——出图参数、多步执行过程与领取计数都会发出来。";
+            case NORMAL -> "常规：只发一句肯定与图片；出图参数、入队/多步/领取计数这些过程回执不再发。"
+                    + "失败、被拒绝、权限不足、用法错误这些说明照旧发出。";
+        };
+    }
+    /**
+     * 这个会话是不是常规档（{@code .mode normal}）：只发"肯定"与图片。
+     * 没有设置过（含老配置）就是 false＝debug＝现状，一行都不变。
+     */
+    private boolean normalReceipts(JsonObject event) {
+        return settings.qqMode(ChatService.conversationKey(event)) == Settings.QqMode.NORMAL;
+    }
     static List<List<Path>> imageBatches(List<Path> paths, int limit) {
         if (limit < 1) throw new IllegalArgumentException("图片上限须为正整数。");
         // One /gen submission owns a durable task directory spanning all its SD calls.
@@ -6311,6 +6399,20 @@ public final class Bot implements AutoCloseable {
             int end = start + Math.min(limit, task.size() - start);
             batches.add(List.copyOf(task.subList(start, end))); start = end;
         }
+        return batches;
+    }
+    /**
+     * 回溯（{@code .rg}）的分批：只按 {@code .imgcnt} 切块，不按生成任务分开发送。
+     *
+     * <p>历史图片基本上一张一个 {@code task-} 目录（每次 {@code /gen} 一个），按任务切会让一次回溯
+     * 变成一串单张消息，{@code .imgmode record} 也就无从把回溯的几张合成一条聊天记录。
+     * 取哪些图／取几张／顺序都不变，这里只管"发送形式"这一层的分批。
+     */
+    static List<List<Path>> historyBatches(List<Path> paths, int limit) {
+        if (limit < 1) throw new IllegalArgumentException("图片上限须为正整数。");
+        List<List<Path>> batches = new ArrayList<>();
+        for (int start = 0; start < paths.size(); start += limit)
+            batches.add(List.copyOf(paths.subList(start, Math.min(paths.size(), start + limit))));
         return batches;
     }
     private synchronized boolean duplicate(JsonObject event) {
@@ -8790,7 +8892,7 @@ public final class Bot implements AutoCloseable {
     private static final Set<String> CONSOLE_COMMANDS = Set.of(
             "help", "yh", "liv", "get", "settings", "chat", "admin", "char", "batch",
             "sampler", "style", "size", "steps", "cfg", "seed", "model", "prompt", "promptr",
-            "preset", "function", "lora", "gen", "rg", "imgcnt", "imgmode", "usage", "map", "progen", "infix", "progress", "vae", "sd",
+            "preset", "function", "lora", "gen", "rg", "imgcnt", "imgmode", "mode", "usage", "map", "progen", "infix", "progress", "vae", "sd",
             "affinity",
             "jrlp", "wife", "marry", "propose", "divorce", "accept", "reject",
             "帮助", "进度", "老婆", "今日老婆", "强娶", "离婚", "同意", "拒绝");

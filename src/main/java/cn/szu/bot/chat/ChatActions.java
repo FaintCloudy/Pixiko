@@ -39,7 +39,7 @@ public final class ChatActions {
         }
     }
     private static final Pattern COMMAND = Pattern.compile(
-        "^[./](?:help|yh|liv|get|settings|chat|admin|char|batch|jrlp|强娶|离婚|sampler|style|size|steps|cfg|seed|model|promptR|prompt|preset|function|lora|gen|rg|imgcnt|imgmode|vae|usage|map|progen|infix|progress|进度|sd|affinity)(?:\\s+[\\s\\S]*)?$",
+        "^[./](?:help|yh|liv|get|settings|chat|admin|char|batch|jrlp|强娶|离婚|sampler|style|size|steps|cfg|seed|model|promptR|prompt|preset|function|lora|gen|rg|imgcnt|imgmode|mode|vae|usage|map|progen|infix|progress|进度|sd|affinity)(?:\\s+[\\s\\S]*)?$",
         Pattern.CASE_INSENSITIVE);
     /**
      * Models slip a zero-width space, a word joiner or a full-width separator in front of a command,

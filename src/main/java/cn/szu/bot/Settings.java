@@ -190,6 +190,73 @@ public final class Settings {
         return mode;
     }
     /**
+     * QQ 侧的回执档位，按会话持久化（{@code qq_mode.modes.<会话键>}）。
+     *
+     * <p>{@link #DEBUG} 是默认值，也是老配置（没有 {@code qq_mode} 段）读出来的样子：回执就是现状的完整形态，
+     * 一字不变。{@link #NORMAL} 只留"肯定"与图片——不显示生成参数，也不发多步执行、入队与领取计数这类过程回执；
+     * <b>失败、被拒绝、权限不足、用法错误与需要用户决定的说明在 normal 下照旧发出</b>（安全底线，
+     * 落点见 {@code Bot} 里各处回执的组装点）。
+     */
+    public enum QqMode {
+        DEBUG("debug", "调试"), NORMAL("normal", "常规");
+        private final String key, label;
+        QqMode(String key, String label) { this.key = key; this.label = label; }
+        /** 存进 config.json 的取值。 */
+        public String key() { return key; }
+        /** 回执里给用户看的中文说法。 */
+        public String label() { return label; }
+        /**
+         * 从 config.json 里读到的值：大小写不敏感，缺失/未知/类型不对一律当 debug（默认档）。
+         * 手写的、被改坏的或旧版本的配置都不该让机器人读配置失败，更不该悄悄改变现状行为。
+         */
+        public static QqMode stored(String value) {
+            if (value == null) return DEBUG;
+            return switch (value.strip().toLowerCase(java.util.Locale.ROOT)) {
+                case "normal", "quiet", "简洁" -> NORMAL;
+                default -> DEBUG;
+            };
+        }
+        /** 用户输入的参数（含中文别名）；认不出来返回 null，由调用方给出用法。 */
+        public static QqMode parse(String value) {
+            if (value == null) return null;
+            return switch (value.strip().toLowerCase(java.util.Locale.ROOT)) {
+                case "normal", "quiet", "简洁", "常规" -> NORMAL;
+                case "debug", "verbose", "full", "调试", "详细", "完整" -> DEBUG;
+                default -> null;
+            };
+        }
+    }
+    /** 一个会话的回执档位；没有设置过（含老配置）就是 debug。 */
+    public synchronized QqMode qqMode(String conversation) {
+        JsonElement modes = Json.obj(data, "qq_mode").get("modes");
+        if (modes == null || !modes.isJsonObject()) return QqMode.DEBUG;
+        JsonElement value = modes.getAsJsonObject().get(conversation);
+        if (value == null || !value.isJsonPrimitive() || !value.getAsJsonPrimitive().isString()) return QqMode.DEBUG;
+        return QqMode.stored(value.getAsString());
+    }
+    /**
+     * 保存一个会话的回执档位；{@link QqMode#DEBUG} 是默认值，等于删掉这条设置（与 {@code image_send} 同一套写法：
+     * config.json 里只留显式设过 normal 的会话）。返回保存后的值。
+     */
+    public synchronized QqMode setQqMode(String conversation, QqMode mode) throws IOException {
+        if (mode == null) throw new IllegalArgumentException("回执档位不能为空。");
+        JsonObject next = freshSnapshot(), section = Json.obj(next, "qq_mode"), modes = Json.obj(section, "modes");
+        // 逐键写回：别的会话（以及别的代理写进同一段的键）都不会被这次保存抹掉。
+        java.util.TreeMap<String, String> stored = new java.util.TreeMap<>();
+        for (String key : modes.keySet()) {
+            JsonElement value = modes.get(key);
+            if (value != null && value.isJsonPrimitive() && value.getAsJsonPrimitive().isString()
+                    && QqMode.stored(value.getAsString()) != QqMode.DEBUG) stored.put(key, value.getAsString());
+        }
+        if (mode == QqMode.DEBUG) stored.remove(conversation);
+        else stored.put(conversation, mode.key());
+        JsonObject updated = new JsonObject();
+        for (java.util.Map.Entry<String, String> entry : stored.entrySet()) updated.addProperty(entry.getKey(), entry.getValue());
+        section.add("modes", updated); next.add("qq_mode", section);
+        Json.atomicWrite(root.resolve("config.json"), next); data = next;
+        return mode;
+    }
+    /**
      * How long a numbered list stays usable for "#编号". This is separate from the chat topic window on
      * purpose: planning a multi-step request takes seconds, and a list the user just asked for must not
      * expire while the plan is still being built.

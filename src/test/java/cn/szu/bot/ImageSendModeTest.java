@@ -34,7 +34,12 @@ import java.util.concurrent.atomic.AtomicInteger;
  *
  * <p>覆盖：① auto 下 1 张普通、3 张合并（回归既有行为）；② single 下 3 张 = 3 次普通发送、0 次 sendRecord；
  * ③ record 下一张也合并（1 张 = 1 次 sendRecord）；④ record 但没有合并转发能力时如实回退普通发送；
- * ⑤ 设置按会话隔离（含私聊）；⑥ 老配置 / 坏值读成 auto 且不报错；⑦ 中文别名、大小写与非法参数的用法提示。
+ * ⑤ 设置按会话隔离（含私聊）；⑥ 老配置 / 坏值读成 auto 且不报错；⑦ 中文别名、大小写与非法参数的用法提示；
+ * ⑧ 回溯（{@code .rg}）与出图走同一套规则：跨 {@code task-} 目录也能合成一条、遵循 {@code .imgcnt} 分批、
+ * 无合并转发能力或合并失败时回退且一张不丢。
+ *
+ * <p>历史图用真实形态铺盘（{@code data/generated/task-<uuid>/<时间戳>/image-01.png}，一次 /gen 一个
+ * {@code task-} 目录）：这样"按任务分批"与"按 .imgcnt 分批"的差别才和线上一致。
  */
 public final class ImageSendModeTest {
     private static int assertions;
@@ -49,13 +54,19 @@ public final class ImageSendModeTest {
         recordMergesEvenASingleImage();
         recordMergesMultipleImagesToo();
         recordWithoutTransportSupportFallsBackHonestly();
+        historyFollowsImageMode();
+        historySingleAndRecord();
+        historyBatchFollowsImageCount();
+        historyWithoutRecordSupport();
+        historyRecordFailureFallsBack();
         modeIsPerConversation();
         oldConfigAndBrokenValuesStayOnAuto();
         aliasesUsageAndHelp();
         System.out.println("ImageSendModeTest: " + assertions + " assertions passed：.imgmode 查看/record/single/auto、"
                 + "中文别名、auto 行为不变（1 张普通、3 张合并）、single 逐张（3 张=3 次 send/0 次 sendRecord）、"
-                + "record 一张也合并（1 张=1 次 sendRecord）、无合并转发能力时如实回退、按会话（含私聊）隔离、"
-                + "老配置与坏值读成 auto、非法参数给用法、.help 只多一行。");
+                + "record 一张也合并（1 张=1 次 sendRecord）、无合并转发能力时如实回退、"
+                + "回溯 .rg 与出图同一套规则（跨 task- 目录合成一条、遵循 .imgcnt 分批、回退不丢图）、"
+                + "按会话（含私聊）隔离、老配置与坏值读成 auto、非法参数给用法、.help 只多一行。");
     }
 
     /** ① 没设置过（老配置）就是 auto：1 张普通发送，日志与回执一字不变。 */
@@ -221,6 +232,225 @@ public final class ImageSendModeTest {
         }
     }
 
+    /**
+     * ⑧ 回溯（.rg）跟随 .imgmode。历史图各在一个 task- 目录里（真实形态），
+     * 所以这里同时钉住"按任务分批会拆散、按 .imgcnt 分批才合成一条"这个差别与最终行为。
+     */
+    private static void historyFollowsImageMode() throws Exception {
+        try (Fixture f = new Fixture()) {
+            List<Path> newestFirst = newestFirst(f.seedHistory(5));
+            // 分批口径：老口径（按生成任务）把 5 张跨任务的历史图拆成 5 批，这就是线上 .rg 4 打四行「单张普通发送」的原因
+            equal(5, Bot.imageBatches(newestFirst, 300).size(), "按生成任务分批会把跨任务的历史图拆成 5 批（旧行为的病根）");
+            equal(1, Bot.historyBatches(newestFirst, 300).size(), "回溯口径（按 .imgcnt）把 5 张合成 1 批");
+            equal(List.of(2, 2, 1), sizes(Bot.historyBatches(newestFirst, 2)), "回溯按 .imgcnt 2 切成 2/2/1");
+            equal(5, Bot.historyBatches(newestFirst, 1).size(), "上限 1 时退化成逐张一图一批");
+
+            // auto + 1 张 → 普通发送
+            String one = f.captureConsole(() -> {
+                f.bot.accept(f.groupEvent(GROUP, ".rg 1"));
+                Dispatch dispatch = f.recorder.awaitImage(5000);
+                equal("send", dispatch.kind(), "auto 下 .rg 1 是普通发送");
+                equal(1, dispatch.segments(), "1 张 1 段");
+                equal(files(List.of(newestFirst.get(0))), dispatch.files(), "回溯取的是最新那张");
+                dispatch.confirm();
+                check(f.recorder.awaitText(5000).contains("历史图片回溯完成，共 1 张"), "回溯回执不变");
+            });
+            check(one.contains("单张普通发送"), "auto 的日志：" + tail(one));
+            equal(1, f.recorder.plains.get(), "auto 下 1 张 = 1 次普通发送");
+            equal(0, f.recorder.records.get(), "auto 下 1 张不套合并转发");
+
+            // auto + 4 张（跨 4 个 task- 目录）→ 一条合并转发 4 个节点
+            String merged = f.captureConsole(() -> {
+                f.bot.accept(f.groupEvent(GROUP, ".rg 4"));
+                Dispatch dispatch = f.recorder.awaitImage(5000);
+                equal("sendRecord", dispatch.kind(), "auto 下 .rg 4 合成一条合并转发（跨任务也合并）");
+                equal(4, dispatch.nodes().size(), "4 个节点");
+                check(dispatch.singleImageNodes(), "每个节点只含一张图");
+                equal(files(newestFirst.subList(0, 4)), dispatch.files(), "节点顺序＝最近 4 张（新→旧）");
+                equal(1, f.recorder.records.get(), "整次回溯只发一条聊天记录");
+                dispatch.confirm();
+                check(f.recorder.awaitText(5000).contains("历史图片回溯完成，共 4 张"), "回溯回执不变");
+            });
+            check(merged.contains("合并转发 4 张"), "控制台要有合并转发日志：" + tail(merged));
+            check(!merged.contains("（按 .imgmode"), "auto 的日志不带 .imgmode 标注：" + tail(merged));
+            f.recorder.assertNoImage(300);
+        }
+    }
+
+    /** ⑨ 回溯 + single：逐张普通发送（N 次、每条一张、顺序不变），0 次 sendRecord；record：一张也合并、多张一条。 */
+    private static void historySingleAndRecord() throws Exception {
+        try (Fixture f = new Fixture()) {
+            List<Path> newestFirst = newestFirst(f.seedHistory(3));
+            check(f.command(".imgmode single").contains("已设为"), "群 999 设成 single");
+            List<Dispatch> dispatches = new ArrayList<>();
+            String console = f.captureConsole(() -> {
+                f.bot.accept(f.groupEvent(GROUP, ".rg 3"));
+                for (int index = 0; index < 3; index++) {
+                    Dispatch dispatch = f.recorder.awaitImage(5000);
+                    equal("send", dispatch.kind(), "single 下 .rg 第 " + (index + 1) + " 张走普通发送");
+                    equal(1, dispatch.segments(), "每条只带一张图");
+                    dispatches.add(dispatch);
+                    equal(index + 1, f.recorder.plains.get(), "逐张：下一张等这一张确认");
+                    equal(0, f.recorder.records.get(), "single 下至今 0 次 sendRecord");
+                    dispatch.confirm();
+                }
+                check(f.recorder.awaitText(5000).contains("历史图片回溯完成，共 3 张"), "回溯回执不变");
+            });
+            equal(3, f.recorder.plains.get(), "single 下 .rg 3 = 3 次普通发送");
+            equal(0, f.recorder.records.get(), "single 下 0 次 sendRecord");
+            equal(files(newestFirst), allFiles(dispatches), "逐张发送顺序＝最近 3 张（新→旧）");
+            check(console.contains("普通发送 3 张（按 .imgmode single）"), "日志要写明按 .imgmode single：" + tail(console));
+            check(!console.contains("合并转发"), "single 下不出现合并转发日志：" + tail(console));
+            f.recorder.assertNoImage(300);
+        }
+        try (Fixture f = new Fixture()) {
+            List<Path> newestFirst = newestFirst(f.seedHistory(3));
+            check(f.command(".imgmode record").contains("已设为"), "群 999 设成 record");
+            // 一张也合并
+            f.bot.accept(f.groupEvent(GROUP, ".rg 1"));
+            Dispatch one = f.recorder.awaitImage(5000);
+            equal("sendRecord", one.kind(), "record 下 .rg 1 也是合并转发");
+            equal(1, one.nodes().size(), "1 个节点");
+            check(one.singleImageNodes(), "节点里就是那张图");
+            equal(files(List.of(newestFirst.get(0))), one.files(), "就是最新那张");
+            one.confirm();
+            check(f.recorder.awaitText(5000).contains("历史图片回溯完成，共 1 张"), "回溯回执不变");
+            // 多张一条
+            String console = f.captureConsole(() -> {
+                f.bot.accept(f.groupEvent(GROUP, ".rg 3"));
+                Dispatch three = f.recorder.awaitImage(5000);
+                equal("sendRecord", three.kind(), "record 下 .rg 3 仍是一条合并转发");
+                equal(3, three.nodes().size(), "3 个节点");
+                equal(files(newestFirst), three.files(), "顺序＝最近 3 张（新→旧）");
+                three.confirm();
+                check(f.recorder.awaitText(5000).contains("历史图片回溯完成，共 3 张"), "回溯回执不变");
+            });
+            equal(2, f.recorder.records.get(), "两次回溯各一次 sendRecord");
+            equal(0, f.recorder.plains.get(), "record 下一次普通发送都没有");
+            check(console.contains("合并转发 3 张（按 .imgmode record）"), "日志要写明按 .imgmode record：" + tail(console));
+            f.recorder.assertNoImage(300);
+        }
+    }
+
+    /** ⑩ 回溯遵循 .imgcnt 分批：.imgcnt 2 + .rg 5 → 3 批（2/2/1），auto 与 record 下分别断言。 */
+    private static void historyBatchFollowsImageCount() throws Exception {
+        try (Fixture f = new Fixture()) {
+            List<Path> newestFirst = newestFirst(f.seedHistory(5));
+            check(f.command(".imgcnt 2").contains("2 张"), "图片上限设为 2");
+            f.bot.accept(f.groupEvent(GROUP, ".rg 5"));
+            // auto：2 张合并 / 2 张合并 / 1 张普通，与 .get 的分批断言同形
+            Dispatch first = f.recorder.awaitImage(5000);
+            equal("sendRecord", first.kind(), "第 1 批 2 张走合并转发");
+            equal(2, first.nodes().size(), "第 1 批 2 个节点");
+            equal(files(newestFirst.subList(0, 2)), first.files(), "第 1 批顺序");
+            first.confirm();
+            Dispatch second = f.recorder.awaitImage(5000);
+            equal("sendRecord", second.kind(), "第 2 批 2 张走合并转发");
+            equal(files(newestFirst.subList(2, 4)), second.files(), "第 2 批顺序");
+            second.confirm();
+            Dispatch third = f.recorder.awaitImage(5000);
+            equal("send", third.kind(), "第 3 批只剩 1 张，普通发送");
+            equal(1, third.segments(), "第 3 批 1 张");
+            equal(files(newestFirst.subList(4, 5)), third.files(), "第 3 批就是最旧那张");
+            third.confirm();
+            check(f.recorder.awaitText(5000).contains("历史图片回溯完成，共 5 张"), "回溯回执不变");
+            equal(2, f.recorder.records.get(), "3 批里两次合并转发");
+            equal(1, f.recorder.plains.get(), "一次普通发送");
+            f.recorder.assertNoImage(300);
+        }
+        try (Fixture f = new Fixture()) {
+            newestFirst(f.seedHistory(5));
+            f.command(".imgcnt 2");
+            check(f.command(".imgmode record").contains("已设为"), "群 999 设成 record");
+            f.bot.accept(f.groupEvent(GROUP, ".rg 5"));
+            int[] nodes = {2, 2, 1};
+            for (int index = 0; index < nodes.length; index++) {
+                Dispatch batch = f.recorder.awaitImage(5000);
+                equal("sendRecord", batch.kind(), "record 下第 " + (index + 1) + " 批仍是合并转发");
+                equal(nodes[index], batch.nodes().size(), "第 " + (index + 1) + " 批节点数");
+                batch.confirm();
+            }
+            check(f.recorder.awaitText(5000).contains("历史图片回溯完成，共 5 张"), "回溯回执不变");
+            equal(3, f.recorder.records.get(), ".imgcnt 2 + record：3 批 = 3 条聊天记录");
+            equal(0, f.recorder.plains.get(), "record 下一次普通发送都没有");
+        }
+    }
+
+    /** ⑪ 回溯 + 没有合并转发能力的传输层：auto 整批一条普通消息、single 逐张、record 如实回退，都不丢图。 */
+    private static void historyWithoutRecordSupport() throws Exception {
+        try (Fixture f = new Fixture(new LegacyRecorder())) {
+            List<Path> newestFirst = newestFirst(f.seedHistory(3));
+            // auto：沿用既有兜底（整批一条普通消息，不拆散）
+            f.bot.accept(f.groupEvent(GROUP, ".rg 3"));
+            Dispatch plain = f.recorder.awaitImage(5000);
+            equal("send", plain.kind(), "无合并转发能力时 auto 走普通发送");
+            equal(3, plain.segments(), "3 张都在这一条里（沿用既有兜底）");
+            equal(files(newestFirst), plain.files(), "顺序不变、一张不少");
+            equal(0, f.recorder.records.get(), "不调用它没实现的 sendRecord");
+            plain.confirm();
+            check(f.recorder.awaitText(5000).contains("历史图片回溯完成，共 3 张"), "回溯回执不变");
+            equal(1, f.recorder.plains.get(), "auto 只发一条普通消息");
+
+            // single：逐张（3 次），一张不少
+            f.command(".imgmode single");
+            List<Dispatch> dispatches = new ArrayList<>();
+            f.bot.accept(f.groupEvent(GROUP, ".rg 3"));
+            for (int index = 0; index < 3; index++) {
+                Dispatch dispatch = f.recorder.awaitImage(5000);
+                equal("send", dispatch.kind(), "single 下逐张普通发送");
+                equal(1, dispatch.segments(), "每条一张");
+                dispatches.add(dispatch);
+                dispatch.confirm();
+            }
+            check(f.recorder.awaitText(5000).contains("历史图片回溯完成，共 3 张"), "回溯回执不变");
+            equal(4, f.recorder.plains.get(), "single 下累计 4 次普通发送（含 auto 那次）");
+            equal(files(newestFirst), allFiles(dispatches), "逐张顺序不变、一张不少");
+            equal(0, f.recorder.records.get(), "仍然 0 次 sendRecord");
+
+            // record：如实回退 + warn，整批一张不丢
+            check(f.command(".imgmode record").contains("不支持合并转发"), "回执要说明当前传输层做不到");
+            String console = f.captureConsole(() -> {
+                f.bot.accept(f.groupEvent(GROUP, ".rg 3"));
+                Dispatch fallback = f.recorder.awaitImage(5000);
+                equal("send", fallback.kind(), "record 在无合并转发的传输层上回退普通发送");
+                equal(3, fallback.segments(), "3 张都发出去，一张不丢");
+                equal(files(newestFirst), fallback.files(), "顺序不变");
+                fallback.confirm();
+                check(f.recorder.awaitText(5000).contains("历史图片回溯完成，共 3 张"), "图发出去了就照常算回溯完成");
+            });
+            check(console.contains("传输层不支持合并转发") && console.contains("已如实回退"), "日志：" + tail(console));
+            equal(0, f.recorder.records.get(), "全程 0 次 sendRecord");
+            equal(5, f.recorder.plains.get(), "累计 5 次普通发送（1 + 3 + 1）");
+            f.recorder.assertNoImage(300);
+        }
+    }
+
+    /** ⑫ 回溯 + 合并转发失败：回退普通发送、warn 记下、一张不丢、回退成功照常算回溯完成。 */
+    private static void historyRecordFailureFallsBack() throws Exception {
+        try (Fixture f = new Fixture()) {
+            List<Path> newestFirst = newestFirst(f.seedHistory(3));
+            check(f.command(".imgmode record").contains("已设为"), "群 999 设成 record");
+            f.recorder.failRecords = true;
+            String console = f.captureConsole(() -> {
+                f.bot.accept(f.groupEvent(GROUP, ".rg 3"));
+                Dispatch attempt = f.recorder.awaitImage(5000);
+                equal("sendRecord", attempt.kind(), "先尝试一次合并转发");
+                equal(3, attempt.nodes().size(), "节点数不变");
+                Dispatch fallback = f.recorder.awaitImage(5000);
+                equal("send", fallback.kind(), "合并转发失败后回退普通发送");
+                equal(3, fallback.segments(), "整批一张不丢");
+                equal(files(newestFirst), fallback.files(), "回退顺序不变");
+                fallback.confirm();
+                check(f.recorder.awaitText(5000).contains("历史图片回溯完成，共 3 张"), "回退成功照样算回溯完成");
+            });
+            equal(1, f.recorder.records.get(), "只尝试一次合并转发");
+            equal(1, f.recorder.plains.get(), "只回退一次普通发送");
+            check(console.contains("合并转发失败，已改为普通发送 3 张"), "日志要记下这次回退：" + tail(console));
+            equal(0, f.pending(), "回溯本来就不改待领取列表（这里是空的）");
+            f.recorder.assertNoImage(300);
+        }
+    }
+
     /** ⑤ 按会话隔离：A 会话设 single 不影响 B 会话与私聊，私聊自己有独立的会话键。 */
     private static void modeIsPerConversation() throws Exception {
         try (Fixture f = new Fixture()) {
@@ -355,7 +585,8 @@ public final class ImageSendModeTest {
             check(help.contains(".imgcnt <数量>"), "help 里原有的 .imgcnt 没被挤掉");
             check(help.contains(".get — 按命令任务与 imgcnt 分批领取"), "help 里原有的 .get 没被挤掉");
             check(help.contains(".vae [status|list|set"), "help 里原有的 .vae 没被挤掉");
-            equal(1, help.split("\\.imgmode", -1).length - 1, ".help 里 .imgmode 只出现一次（一行）");
+            equal(1, count(help, ".imgmode [record|single|auto]"), ".help 里 .imgmode 的用法行只有一行");
+            check(help.contains(".rg <数量>") && help.contains("发送方式跟随 .imgmode"), ".rg 一行说明回溯跟随 .imgmode：" + line(help, ".rg <数量>"));
 
             // 控制台裸词（不带点）：consoleCommand 认得 imgmode
             equal(".imgmode record", Bot.consoleCommand("imgmode record"), "网页控制台裸词能补成 .imgmode");
@@ -402,6 +633,8 @@ public final class ImageSendModeTest {
         private final AtomicInteger records = new AtomicInteger(), plains = new AtomicInteger(), mapped = new AtomicInteger();
         /** 每一次文本出站（回执、说明、报错）的正文，便于断言"没有失败回执"、也便于超时时给出线索。 */
         final List<String> texts = new java.util.concurrent.CopyOnWriteArrayList<>();
+        /** 打开后 sendRecord 一律失败，用来验证"合并失败→回退普通发送"的兜底。 */
+        volatile boolean failRecords;
 
         final CompletableFuture<Void> record(String kind, JsonObject event, List<JsonArray> nodes) {
             boolean image = !nodes.isEmpty() && !nodes.get(0).isEmpty()
@@ -416,6 +649,8 @@ public final class ImageSendModeTest {
             }
             dispatches.add(dispatch);
             if (!image) { texts.add(Bot.messageText(nodes.get(0))); return CompletableFuture.completedFuture(null); }
+            if (failRecords && "sendRecord".equals(kind))
+                return CompletableFuture.failedFuture(new IOException("模拟合并转发失败（send_group_forward_msg），retcode=1200"));
             return dispatch.ack();
         }
         Dispatch awaitImage(long millis) throws InterruptedException {
@@ -543,6 +778,26 @@ public final class ImageSendModeTest {
 
         int pending() { try { return client.pendingImages().size(); } catch (IOException error) { return -1; } }
 
+        /**
+         * 历史图片（回溯用）：按真实形态铺盘 data/generated/task-&lt;uuid&gt;/&lt;时间戳-uuid&gt;/image-01.png，
+         * 一张一个 {@code task-} 目录（一次 /gen 一个目录），并把 mtime 依次拉开保证
+         * {@link SdClient#recentImages(int)} 的"最近 N 张"顺序确定（它按 mtime 倒序取）。
+         * 不进待领取队列：回溯本来就不看队列、也不 ACK，所以同一个夹具可以连着回溯多次。
+         */
+        List<Path> seedHistory(int count) throws Exception {
+            List<Path> paths = new ArrayList<>();
+            for (int index = 0; index < count; index++) {
+                Path directory = root.resolve("data/generated").resolve("task-" + java.util.UUID.randomUUID())
+                        .resolve(String.format(Locale.ROOT, "20260101-0000%02d-", index) + java.util.UUID.randomUUID());
+                Files.createDirectories(directory);
+                Path path = directory.resolve("image-01.png");
+                Files.write(path, png());
+                Files.setLastModifiedTime(path, java.nio.file.attribute.FileTime.fromMillis(1000L * (index + 1)));
+                paths.add(path);
+            }
+            return List.copyOf(paths);
+        }
+
         void awaitPending(int expected) throws Exception {
             long deadline = System.currentTimeMillis() + 3000;
             while (System.currentTimeMillis() < deadline) {
@@ -622,6 +877,20 @@ public final class ImageSendModeTest {
         return result;
     }
 
+    /** 每批几张（用来断言 .imgcnt 的分批形状）。 */
+    private static List<Integer> sizes(List<List<Path>> batches) {
+        List<Integer> result = new ArrayList<>();
+        for (List<Path> batch : batches) result.add(batch.size());
+        return result;
+    }
+
+    /** seedHistory 按 mtime 升序铺盘，而 recentImages 取"最近 N 张"＝倒序，这里给出期望顺序。 */
+    private static List<Path> newestFirst(List<Path> oldestFirst) {
+        List<Path> result = new ArrayList<>(oldestFirst);
+        java.util.Collections.reverse(result);
+        return List.copyOf(result);
+    }
+
     /** 控制台里跟发送方式有关的最后几行。 */
     private static String tail(String console) {
         List<String> lines = console.lines()
@@ -632,6 +901,12 @@ public final class ImageSendModeTest {
     private static String line(String text, String needle) {
         for (String row : text.split("\\R")) if (row.contains(needle)) return row;
         return "（help 里没有 " + needle + "）";
+    }
+    /** needle 在文本里出现几次（用于"这些用法行只出现一次"这类断言）。 */
+    private static int count(String text, String needle) {
+        int total = 0, at = text.indexOf(needle);
+        while (at >= 0) { total++; at = text.indexOf(needle, at + needle.length()); }
+        return total;
     }
 
     @FunctionalInterface
