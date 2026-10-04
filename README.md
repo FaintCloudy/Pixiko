@@ -5,7 +5,7 @@ Pixiko 是一个自用的 QQ 机器人：接 **NapCat** 收消息，接 **Stable
 领图；机器人自己把生成好的图片发回对话。
 
 - **作者**：loriko（deloriko@outlook.com）
-- **版本**：v1.3.0（发行说明见 [`RELEASE.md`](RELEASE.md)）
+- **版本**：v1.3.1（发行说明见 [`RELEASE.md`](RELEASE.md)）
 - **版本号规则**：**大改动更新中间位**（`1.1.x` → `1.2.0`），**小修小补更新最后一位**（`1.1.1` → `1.1.2`）
 - **当前实现**：**Java 版**（`src/`）——这是线上一直在跑的那一份
 - **网页控制台**：`webui/`（纯静态 HTML/CSS/JS，随机器人一起由内嵌 Spring Boot 提供）
@@ -466,8 +466,8 @@ run.bat --set-map yh "路径"       # 命令行设置地图（需先停止机器
 而图集格仍是 **140px** 方形——对话页里「单张 vs 图集里一格」的大小关系与回执页完全对齐；
 点开仍可看原图（查看器不变），窄屏仍按 `max-width: 100%` 自适应。
 
-**前端资源版本升到 `?v=1.3.0`**：`webui/index.html` 的 `?v=` 由父代理设置（v1.2.4 那版是 `?v=1.2.4`，
-本版因为对话栏全局化与样式面板的改动重新设成 `?v=1.3.0`）。
+**前端资源版本升到 `?v=1.3.1`**：`webui/index.html` 的 `?v=` 由父代理设置（v1.2.4 那版是 `?v=1.2.4`，
+v1.3.0 那版是 `?v=1.3.0`，本版因为底模归属栈与控制台铺满的改动重新设成 `?v=1.3.1`）。
 
 ### 对话栏全局化与对话历史持久化（v1.3.0）
 
@@ -476,6 +476,14 @@ run.bat --set-map yh "路径"       # 命令行设置地图（需先停止机器
 对话栏**（固定不动、自己滚动、输入区常驻底部，和以前对话页里的行为一致）。**「对话」页签已经删除**；
 `/` 与 `/chat`（含 `/chat/`）现在都渲染**出图页 + 右侧对话栏**，所以**在任何一个栏目里都能直接对话**，
 旧的 `/chat` 书签不会 404。**窄屏时右栏改为整宽堆叠**（具体断点以 CSS 为准）。
+
+**控制台铺满窗口（v1.3.1 起）**：以前整个控制台与页脚被 **1120px** 的居中限宽框住
+（`#app { max-width: 1120px; margin: 0 auto }`），宽屏上两边留一大片空白；现在 `#app` 与页脚都
+**铺满可用宽度**（保留左右 12px 内边距、**不设上限**），**右栏仍是内容宽的 1/3**、左栏 2/3
+（两栏比例与「固定」都不变），**窄屏（≤1000px）仍是单列堆叠**。实测（真 Chrome，视口宽 → 左 / 右）：
+1440×900 → 928 / 464、1920 → 1248 / 624、2560 → 1674.7 / 837.3、3440 → 2261.3 / 1130.7。
+因为对话栏保持「右 1/3」，屏幕特别宽时右栏本身也会很宽（3440px 下约 1130px）——这是按「右 1/3」
+的要求来的；`/logs` 全屏终端与页脚／任务信息云的让位算式也跟着重算过，不会被固定右栏压住。
 
 **对话历史由服务端落盘，本地快照只当缓存（v1.3.0 起）**：以前对话记录只存在这个浏览器里，
 换个浏览器或清掉站点数据就没了。现在服务端多一份存档 `data/webui/<会话>-chat-log.json`，
@@ -525,7 +533,8 @@ run.bat --set-map yh "路径"       # 命令行设置地图（需先停止机器
    样式里记着的 LoRA 名（展示图样式生成时写入的 `model.lora`）→
    `data/civitai-style-links.json` 的映射（老样式没有标注就靠它，只读不改）→ 样式名前缀；
    三者都判不出具体是哪个 LoRA 时，才退回 `LoRA 附带`；
-2. 其它样式按**归属栈**：`Anima` / `SDXL 栈` / `SD 1.5 栈` / `Flux 栈` / `Qwen 栈`；
+2. 其它样式按**归属栈**：`Anima` / `SDXL 栈` / `SD 1.5 栈` / `Flux 栈` / `Qwen 栈`，以及 v1.3.1 起补齐的
+   `Krea 栈` / `SD3 栈` / `Hunyuan 栈` 等（**任何底模都有栈**，见下文「底模归属栈」）；
 3. 连栈都判不出来的就是 `未分类`。
 
 改分类有两条路：命令 `.style category <名称|#编号|#6-#9> <分类名>`（只给样式名＝查询；分类名给 `-`/`清除`
@@ -637,17 +646,26 @@ Forge／Forge Neo 把「底模 + VAE + 文本编码器」按预设分成一栈�
 3. **Civitai 下载记录**的 `base_model`；
 4. **Forge 的 LoRA 元数据**，以及 **Forge 预设配置** `forge_checkpoint_<preset>`（哪个预设置的就是这个文件，
    它就属于那一栈——这是"归属"最直接的一条）；
-5. 兜底才按**文件名关键词**猜（anima、illustrious、noob、pony、sdxl、xl、sd1.5、sd_v1、sd 2、flux、qwen），
-   结果一律标成推断。
+5. 兜底才按**文件名关键词**猜（anima、illustrious、noob、pony、sdxl、xl、sd1.5、sd_v1、sd 2、flux、
+   qwen、krea），结果一律标成推断。
 
-判不出来就返回空串，**绝不编造**。用法：
+**底模现在都能归栈（v1.3.1 起）**：以前只认 `anima` / `xl` / `sd` / `flux` / `qwen` 五种栈，关键词表也很短，
+**凡是不认识的底模名一律返回空**、界面就显示「未识别底模」。现在改成**表驱动的 18 个已知族**，并且
+**每个族各自一栈**——`sd` / `xl` / `flux` / `qwen` 照旧，**新增 `krea`（`Flux.1 Krea`，判定必须排在
+`flux` 前面，否则「Flux.1 Krea」会被归成 flux 栈）**，SD3、Hunyuan、Wan Video、Chroma、Lumina、
+Kolors、PixArt、Playground、Stable Cascade、Z-Image、Nitro-E、ODOR 等各自成一栈，`Pony V7` 也自己一栈
+（它换了底模；Pony／V6 仍是 `xl`）。**连族都认不出的底模名**（例如 Civitai 的 `Other`）**用规范化 slug
+自成一族**（`Other` → `other`、`Foo BarXL v2` → `foo-barxl-v2`），并且**标明这是推断出来的**
+（「按文件名/当前预设推断」，不是实测；判据来源与优先级就是上面的 1–5）。顺带修掉一个旧 bug：
+`Animagine XL` 因为名字里含 `anima`，一直被误判成 **anima 栈**，现在正确归 `xl`。
+**只有真的没有底模信息时**才显示「未识别」。用法：
 
 - `.model list` 每个底模后面标出栈：`waiIllustriousSDXL_v170.safetensors [SDXL 栈]`；
 - 网页「基础模型」下拉同样带栈（`GET /api/options` 的 `modelOptions` 给出「底模 → 栈」映射），
   LoRA 面板按**栈**分组（组头 `Anima 栈（1）`、`SDXL 栈（1）`，组里保留底模名）；
 - `.model set <底模>` 与网页改底模时的**防呆**：所选底模的栈 ≠ 当前栈就直说
   「`waiIllustriousSDXL_v170` 属于 SDXL 栈（预设 `xl`），当前是 anima 栈 —— 直接换会出全灰废图，
-  请用 `.model preset xl` 或在 Forge 页面切到 `xl`」；判不出栈时保留原来的通用警告；
+  请用 `.model preset xl` 或在 Forge 页面切到 `xl`」；真的没有底模信息时保留原来的通用警告；
 - 样式里也记 `stack` 字段，`.style load` 时样式栈 ≠ 当前栈会如实提示（**不偷偷切栈**）；
 - `GET /api/loras` 每项带 `stack` / `stackLabel` / `preset` / `stackSource` / `evidence`，
   `groups` 按栈分组（`groupKey` 就是栈键，底模另给 `baseModelGroupKey`）。
@@ -719,7 +737,7 @@ Civitai 下载记录里的 `base_model` → Forge 的 LoRA 元数据（`/sdapi/v
 ```
 pixiko\
 ├─ README.md                       本文件
-├─ RELEASE.md                      v1.3.0 发行说明（含版权声明与已知限制）
+├─ RELEASE.md                      v1.3.1 发行说明（含版权声明与已知限制）
 ├─ THIRD-PARTY-LICENSES.md         随二进制包分发的第三方组件与许可
 ├─ config.example.json             脱敏配置模板（复制成 config.json 再改）
 ├─ .gitignore                      config.json / data / logs / lib jar 等一律不入库

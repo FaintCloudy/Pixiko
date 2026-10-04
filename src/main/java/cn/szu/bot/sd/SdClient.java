@@ -413,31 +413,53 @@ public final class SdClient {
             return attributed(title, name, path, structure.baseModel(), structure.source(), structure.evidence(), owner, presets, owners);
         if (!owner.isEmpty()) {
             String stack = StackClassifier.stackOfPreset(owner);
-            return new ModelInfo(title, name, path, "", "", stack, StackClassifier.PRESET_SOURCE, owner,
+            String inferred = StackClassifier.baseModelOfStack(stack);   // 只有栈、没有底模名：补规范底模名
+            return new ModelInfo(title, name, path, inferred, inferred.isEmpty() ? "" : StackClassifier.INFERRED_SOURCE,
+                    stack, StackClassifier.PRESET_SOURCE, owner,
                     "Forge 预设配置 forge_checkpoint_" + owner + "=" + owners.get(owner)
-                            + (file == null ? "（模型文件读不到，只按配置判）" : ""));
+                            + (file == null ? "（模型文件读不到，只按配置判）" : "")
+                            + (inferred.isEmpty() ? "" : "；" + StackClassifier.stackBaseModelEvidence(stack)));
         }
         String stack = StackClassifier.stackOf("", name);
-        if (!stack.isEmpty())
-            return new ModelInfo(title, name, path, "", "", stack, StackClassifier.INFERRED_SOURCE,
-                    StackClassifier.presetFor(stack, presets), "文件名关键词（推断，不是文件自述）");
+        if (!stack.isEmpty()) {
+            String inferred = StackClassifier.baseModelOfStack(stack);
+            return new ModelInfo(title, name, path, inferred, inferred.isEmpty() ? "" : StackClassifier.INFERRED_SOURCE,
+                    stack, StackClassifier.INFERRED_SOURCE, StackClassifier.presetFor(stack, presets),
+                    "文件名关键词（推断，不是文件自述）"
+                            + (inferred.isEmpty() ? "" : "；" + StackClassifier.stackBaseModelEvidence(stack)));
+        }
         return new ModelInfo(title, name, path, "", "", "", "", "",
                 file == null ? "读不到模型文件（路径不在本机），也没有可用的文件名线索" : "头部元数据、张量结构与文件名都没有可用的判定依据");
     }
 
     /**
      * 识别出来的底模 + 由它判出的栈；如果 Forge 预设配置也认这个文件，栈就以配置为准（那是"归属"本身）。
-     * 底模名认不出家族时，栈退回按文件名关键词猜，并标成推断。
+     * 底模名认不出**已知族**时（栈是按名字自成一族的 slug），先用文件名关键词、再退 Forge 预设配置，
+     * 并且必须把来源标成推断——不许拿"底模有实据"去给一个猜出来的栈背书。
+     *
+     * <p>最后一步：底模名确实为空（占位值/没记底模），但栈已经判出来时，补该栈的规范底模名
+     * （{@link StackClassifier#baseModelOfStack(String)}，来源标 {@code inferred}），别让这条记录
+     * 在"按底模分组"里哪一组都不进。
      */
     private static ModelInfo attributed(String title, String name, String path, String baseModel, String source,
                                         String evidence, String owner, List<String> presets, Map<String, String> owners) {
         String canonical = canonicalBaseModel(baseModel);
         String stack = StackClassifier.stackOfBaseModel(canonical);
         String stackSource = stack.isEmpty() ? "" : (owner.isEmpty() ? source : StackClassifier.PRESET_SOURCE);
-        if (stack.isEmpty()) {
-            stack = StackClassifier.stackOf("", name);
-            if (stack.isEmpty()) stack = StackClassifier.stackOf("", StackClassifier.bareName(path));
-            if (!stack.isEmpty()) stackSource = StackClassifier.INFERRED_SOURCE;
+        if (!StackClassifier.knownStack(stack)) {
+            String byName = StackClassifier.stackOf("", name);
+            if (byName.isEmpty()) byName = StackClassifier.stackOf("", StackClassifier.bareName(path));
+            if (!byName.isEmpty()) stack = byName;
+            else if (!owner.isEmpty()) stack = StackClassifier.stackOfPreset(owner);
+            stackSource = stack.isEmpty() ? "" : StackClassifier.INFERRED_SOURCE;
+        }
+        if (canonical.isEmpty()) {
+            String inferred = StackClassifier.baseModelOfStack(stack);
+            if (!inferred.isEmpty()) {
+                canonical = inferred;
+                source = StackClassifier.INFERRED_SOURCE;
+                evidence = StackClassifier.stackBaseModelEvidence(stack);
+            }
         }
         String preset = owner.isEmpty() ? StackClassifier.presetFor(stack, presets) : owner;
         String why = evidence + (owner.isEmpty() ? "" : "；Forge 预设配置把它当 " + owner + " 栈的检查点（forge_checkpoint_" + owner + "=" + owners.get(owner) + "）");
@@ -469,13 +491,18 @@ public final class SdClient {
         String owner = ownerPreset(forgePresetCheckpoints(), wanted, requested);
         if (!owner.isEmpty()) {
             String stack = StackClassifier.stackOfPreset(owner);
-            return new ModelInfo(requested, wanted, "", "", "", stack, StackClassifier.PRESET_SOURCE, owner,
-                    "Forge 预设配置 forge_checkpoint_" + owner);
+            String inferred = StackClassifier.baseModelOfStack(stack);
+            return new ModelInfo(requested, wanted, "", inferred, inferred.isEmpty() ? "" : StackClassifier.INFERRED_SOURCE,
+                    stack, StackClassifier.PRESET_SOURCE, owner,
+                    "Forge 预设配置 forge_checkpoint_" + owner
+                            + (inferred.isEmpty() ? "" : "；" + StackClassifier.stackBaseModelEvidence(stack)));
         }
         String stack = StackClassifier.stackOf("", wanted);
         if (stack.isEmpty()) return null;
-        return new ModelInfo(requested, wanted, "", "", "", stack, StackClassifier.INFERRED_SOURCE,
-                StackClassifier.presetFor(stack, forgePresets()), "文件名关键词（推断）");
+        String inferred = StackClassifier.baseModelOfStack(stack);
+        return new ModelInfo(requested, wanted, "", inferred, inferred.isEmpty() ? "" : StackClassifier.INFERRED_SOURCE,
+                stack, StackClassifier.INFERRED_SOURCE, StackClassifier.presetFor(stack, forgePresets()),
+                "文件名关键词（推断）" + (inferred.isEmpty() ? "" : "；" + StackClassifier.stackBaseModelEvidence(stack)));
     }
 
     /**
@@ -594,6 +621,20 @@ public final class SdClient {
                 String checkpoint = Json.str(saved, "forge_checkpoint_" + preset, "");
                 if (!checkpoint.isBlank()) result.addProperty("checkpoint", checkpoint);
             }
+        }
+        // 这个快照里**只有检查点名、没有底模名**（`.style save` 存的就是它）：把归属栈和该栈的规范底模名
+        // 一起记下（来源标成推断：栈是拿检查点名/预设名判的），网页「按底模分组」才不会漏掉这条样式。
+        String checkpoint = Json.str(result, "checkpoint", "");
+        String stack = checkpoint.isBlank() ? "" : StackClassifier.stackOf("", StackClassifier.bareName(checkpoint));
+        if (stack.isEmpty()) stack = StackClassifier.stackOfPreset(preset);
+        if (!stack.isEmpty()) {
+            String inferred = StackClassifier.baseModelOfStack(stack);
+            if (!inferred.isEmpty()) {
+                result.addProperty("baseModel", inferred);
+                result.addProperty("baseModelSource", StackClassifier.INFERRED_SOURCE);
+            }
+            result.addProperty("stack", stack);
+            result.addProperty("stackSource", StackClassifier.INFERRED_SOURCE);
         }
         return result;
     }
@@ -1078,18 +1119,30 @@ public final class SdClient {
     /**
      * 识别出来的底模 + 由它判出的栈。
      *
-     * <p>栈先由**底模名**判（底模是实据，栈也就是实据）；底模名认不出家族时，才退回按 LoRA 名字/文件名
-     * 关键词猜，并把栈的来源标成 {@code inferred}——**不许**拿"底模有实据"去给一个猜出来的栈背书。
+     * <p>栈先由**底模名**判（底模是实据，栈也就是实据）；底模名认不出**已知族**时（栈是按名字自成一族的
+     * slug），退回按 LoRA 名字/文件名关键词猜，并把栈的来源标成 {@code inferred}——**不许**拿"底模有实据"
+     * 去给一个猜出来的栈背书；文件名也没有线索时保留 slug 栈，同样标成推断。
+     *
+     * <p>最后一步：底模名确实为空（占位值），但栈能从名字/文件名判出来时，补该栈的规范底模名
+     * （来源 {@code inferred}），别让这条记录底模一栏永远空着。
      */
     private static BaseModel attribute(String baseModel, String source, String evidence, String name, String path) {
         String canonical = canonicalBaseModel(baseModel);
-        if (canonical.isEmpty()) return BaseModel.NONE;
+        if (canonical.isEmpty()) {
+            String stack = StackClassifier.stackOf("", name);
+            if (stack.isEmpty()) stack = StackClassifier.stackOf("", StackClassifier.bareName(path));
+            String inferred = StackClassifier.baseModelOfStack(stack);
+            if (inferred.isEmpty()) return BaseModel.NONE;
+            return new BaseModel(inferred, StackClassifier.INFERRED_SOURCE, stack, StackClassifier.INFERRED_SOURCE,
+                    StackClassifier.stackBaseModelEvidence(stack));
+        }
         String stack = StackClassifier.stackOfBaseModel(canonical);
         String stackSource = stack.isEmpty() ? "" : source;
-        if (stack.isEmpty()) {
-            stack = StackClassifier.stackOf("", name);
-            if (stack.isEmpty()) stack = StackClassifier.stackOf("", StackClassifier.bareName(path));
-            if (!stack.isEmpty()) stackSource = StackClassifier.INFERRED_SOURCE;
+        if (!StackClassifier.knownStack(stack)) {
+            String byName = StackClassifier.stackOf("", name);
+            if (byName.isEmpty()) byName = StackClassifier.stackOf("", StackClassifier.bareName(path));
+            if (!byName.isEmpty()) stack = byName;
+            stackSource = stack.isEmpty() ? "" : StackClassifier.INFERRED_SOURCE;
         }
         return new BaseModel(canonical, source, stack, stackSource, evidence);
     }
@@ -1109,15 +1162,27 @@ public final class SdClient {
         return resolveBaseModel(civitaiBaseModel, loraName, loraPath, null);
     }
 
-    /** 当前 Forge 预设栈的底模，作为"识别不出来"时的兜底（肯定标成推断）。没有预设就是"没有"。 */
+    /**
+     * 当前 Forge 预设栈的底模，作为"识别不出来"时的兜底（肯定标成推断）。没有预设就是"没有"。
+     *
+     * <p>预设**没配检查点**时就只剩一个栈、没有底模名：这时补该栈的规范底模名
+     * （{@link StackClassifier#baseModelOfStack(String)}，判据写成"按 <栈> 推断底模"）；
+     * 栈也认不出来才退回原样用预设名。
+     */
     public synchronized BaseModel presetBaseModel() {
         JsonObject preset = activePresetDefaults();
         String presetName = Json.str(preset, "preset", "");
-        String stack = firstNonBlank(Json.str(preset, "checkpoint", ""), presetName).strip();
-        if (stack.isEmpty()) return BaseModel.NONE;
-        String name = StackClassifier.stackOfPreset(presetName);
-        return new BaseModel(stack, PRESET_SOURCE, name, name.isEmpty() ? "" : StackClassifier.INFERRED_SOURCE,
-                "按当前 Forge 预设 " + presetName + " 推断（没有更硬的实据）");
+        String checkpoint = Json.str(preset, "checkpoint", "");
+        if (firstNonBlank(checkpoint, presetName).strip().isEmpty()) return BaseModel.NONE;
+        String stack = StackClassifier.stackOfPreset(presetName);
+        String inferred = checkpoint.isBlank() ? StackClassifier.baseModelOfStack(stack) : "";
+        String name = checkpoint.isBlank() ? (inferred.isEmpty() ? presetName : inferred) : checkpoint;
+        if (name.isBlank()) return BaseModel.NONE;
+        boolean fromStack = !inferred.isEmpty() && inferred.equals(name);
+        return new BaseModel(name, fromStack ? StackClassifier.INFERRED_SOURCE : PRESET_SOURCE, stack,
+                stack.isEmpty() ? "" : StackClassifier.INFERRED_SOURCE,
+                fromStack ? StackClassifier.stackBaseModelEvidence(stack)
+                        : "按当前 Forge 预设 " + presetName + " 推断（没有更硬的实据）");
     }
 
     /**
@@ -1182,7 +1247,9 @@ public final class SdClient {
             result.addProperty("baseModelSource", baseModelSource == null ? "" : baseModelSource.strip());
             if (!stack.isEmpty()) {
                 result.addProperty("stack", stack);
-                result.addProperty("stackSource", StackClassifier.observed(baseModelSource) ? baseModelSource : StackClassifier.INFERRED_SOURCE);
+                // "自成一族"的 slug 栈是按名字归一出来的，不算看到了实据：来源标成推断。
+                result.addProperty("stackSource", StackClassifier.observed(baseModelSource)
+                        && StackClassifier.knownStack(stack) ? baseModelSource : StackClassifier.INFERRED_SOURCE);
             }
             if (matchesStack(recorded, presetName, checkpoint, stack)) result.addProperty("checkpoint", checkpoint);
         } else if (!checkpoint.isEmpty() || !presetName.isEmpty()) {

@@ -1,11 +1,61 @@
-# Pixiko v1.3.0 发行说明
+# Pixiko v1.3.1 发行说明
 
-- **版本**：v1.3.0
+- **版本**：v1.3.1
 - **日期**：2026-10-04
 - **作者**：loriko（deloriko@outlook.com）
 - **当前实现**：Java 版（`src/`）。另有一次**未完成的** Next.js 重构，见 `nextjs-wip/`，**不可运行**。
 
 ---
+
+## 〇、本版新增（v1.3.1）
+
+**两件事**：底模（基模）归属栈从「只认 5 栈、其余一律未识别」改成「**任何底模都有栈**」；
+控制台去掉 1120px 的居中限宽，**铺满窗口**。
+
+- **任何底模都能归栈，不再有「未识别底模」**：以前只认 `anima` / `xl` / `sd` / `flux` / `qwen`
+  五种栈，关键词表也很短，**凡是不认识的底模名一律返回空**——界面就显示「未识别底模」。
+  现在改成**表驱动的 18 个已知族**，并且**每个族各自一栈**：`sd` / `xl` / `flux` / `qwen` 照旧，
+  **新增 `krea` 栈**，SD3、Hunyuan、Wan Video、Chroma、Lumina、Kolors、PixArt、Playground、
+  Stable Cascade、Z-Image、Nitro-E、ODOR 等**各自成一栈**。**只要底模名不是空的，就一定有一个栈**；
+  **只有真的没有底模信息时**才叫「未识别」。
+  - **新增 `krea` 栈**：`Flux.1 Krea`（Civitai 的准确写法）以及 `Krea` / `flux krea` / `flux1_krea` /
+    `FLUX.1-Krea-dev` / `Krea 2` 这些写法都归 `krea`，**判定顺序排在 flux 之前**——「Flux.1 Krea」里含
+    `flux`，顺序反了就会归错栈。Forge 里有同名预设时才提示切过去（`.model preset krea`），
+    没有同名预设就照旧给提示。
+  - **`sd` 栈**收 SD 1.4 / 1.5（含 LCM / Hyper / DMD2 / Inpainting）与 SD 2.0 / 2.0 768 / 2.1 /
+    2.1 768 / 2.1 Unclip；**`xl` 栈**按 SDXL 架构收 SDXL 0.9 / 1.0（含 LCM / Turbo / Lightning /
+    Hyper / DMD2 / Base / Refiner）、Pony（含 V6）、Illustrious（XL）、NoobAI（XL）、Animagine XL、
+    Nova Anime XL；`flux` / `qwen` 照旧（Flux.1 S/D/dev/schnell/Kontext、Flux.2 Klein；
+    Qwen Image 含 Edit）。
+  - **`Pony V7` 自己一栈**（它换了底模，架构不再是 SDXL），不再并进 `xl`；Pony / V6 仍是 `xl`。
+  - **认不出的兜底**：连族都认不出的底模名（例如 Civitai 的 `Other`）**用规范化 slug 当栈名**
+    （`Other` → `other`、`Foo BarXL v2` → `foo-barxl-v2`），界面照旧能显示「某某栈」，
+    并且**标明这是推断出来的**（不是实测）。
+  - **判据来源不变**：safetensors 头部元数据 / 张量结构 / Civitai 记录 / Forge 元数据 / Forge 预设；
+    推断出来的一律标「按文件名/当前预设推断」。
+  - **顺带修掉一个原有 bug**：`Animagine XL` 因为名字里含 `anima`，一直被误判成 **anima 栈**，
+    现在正确归 `xl`（规范名 `Animagine XL`）。
+  - **词表已联网核实**：能认的都认了（Civitai 公开 API 上对过 `Flux.1 Krea`、`Krea 2`、
+    `Flux.1 D`、`SD 1.5`、`SDXL 0.9/1.0/Hyper`、`Hunyuan Video`、`Wan Video`、`Chroma`、`Lumina`、
+    `Kolors`、`PixArt`、`Playground v2`、`Stable Cascade`、`ZImageTurbo/ZImageBase`、`ODOR`、
+    `Pony V7`、`Illustrious`、`NoobAI`、`Qwen`、`Anima` 等真实枚举），**认不出的自己一栈并标注为推断**。
+  - **实际效果**：LoRA 面板的底模分组、样式面板的底模／栈分组、切栈提示（`.model preset <栈名>`）
+    都因此更全；以前显示「未识别底模」的条目，现在要么归进已知族、要么自成一栈并标注为推断。
+- **控制台铺满窗口（不再居中限宽 1120px）**：以前整个控制台被
+  `#app { max-width: 1120px; margin: 0 auto }` **居中限死在 1120px**，页脚也是同样的 1120px，
+  宽屏上两边留一大片空白（用户原话：「body 的宽度不够，继续向外延伸」）。现在 `#app` 与页脚都
+  **铺满可用宽度**（保留左右 **12px** 内边距、**不设上限**），**右侧对话栏仍然是内容宽的 1/3**、
+  左侧主界面 2/3——两栏比例与「固定」都不变。
+  - **真 Chrome 实测**（视口宽 → 左 / 右）：**1440×900** → 928 / 464；**1920** → 1248 / 624；
+    **2560** → 1674.7 / 837.3；**3440** → 2261.3 / **1130.7**（右栏就是内容宽的 1/3，没有额外上限）。
+  - **窄屏（≤1000px）仍是单列堆叠**，行为不变；`/logs` 全屏终端与页脚／任务信息云的让位算式
+    跟着重算过，不会被固定右栏压住。
+  - **说明**：因为对话栏保持「右 1/3」，屏幕特别宽时右栏本身也会很宽（3440px 下约 1130px）——
+    这是按「右 1/3」的要求来的。
+- **前端**：`webui/index.html` 的 `?v=` 由父代理设为 **`?v=1.3.1`**。
+
+<details>
+<summary>上一版（v1.3.0）</summary>
 
 ## 〇、本版新增（v1.3.0）
 
@@ -54,6 +104,8 @@
   里加任何新字段，也不动 `previewImage` / `sizeSource`）；控制台另有 `POST /api/styles/cover` 可以单独换封面。
   **QQ 侧 `.style save` 不设封面**（封面是控制台样式面板的功能）。
 - **前端**：`webui/index.html` 的 `?v=` 由父代理设为 **`?v=1.3.0`**（`webui` 是磁盘静态资源，拷进去即生效，无需重启）。
+
+</details>
 
 <details>
 <summary>上一版（v1.2.4）</summary>
@@ -790,7 +842,7 @@ Danbooru 词条（↑↓ 选择、Esc 关闭；空词条上按 **Ctrl+Space** �
 
 ## 三、安装与启动（三步）
 
-### 开箱即用包 `pixiko-v1.3.0-runnable.zip`
+### 开箱即用包 `pixiko-v1.3.1-runnable.zip`
 
 1. 装好 **JDK 17+**。
 2. **双击 `start.bat`**。第一次运行会自动生成 `config.json`（照 `config.example.json` 起一份），
@@ -800,7 +852,7 @@ Danbooru 词条（↑↓ 选择、Esc 关闭；空词条上按 **Ctrl+Space** �
 
 > `start.bat` 跑的是包内已编译好的 `build/pixiko.jar`；只有需要改代码时才用 `build.ps1` + `run.bat`。
 
-### 源码包 `pixiko-v1.3.0.zip`
+### 源码包 `pixiko-v1.3.1.zip`
 
 1. 装好 **JDK 17+**。
 2. 在项目根目录准备好依赖 jar：`lib/gson-2.13.1.jar` 由 `build.ps1` **自动下载并校验**，
@@ -865,8 +917,8 @@ copy config.example.json config.json
 
 ## 六、在 GitHub Releases 里发布这个 zip
 
-1. 打开仓库 → 右侧 **Releases** → **Draft a new release**，Tag 填 `v1.3.0`（新建 tag），标题填 `Pixiko v1.3.0`。
-2. 把 `pixiko-v1.3.0.zip` 与 `pixiko-v1.3.0-runnable.zip`（以及各自的 `.sha256`）拖进附件区，
+1. 打开仓库 → 右侧 **Releases** → **Draft a new release**，Tag 填 `v1.3.1`（新建 tag），标题填 `Pixiko v1.3.1`。
+2. 把 `pixiko-v1.3.1.zip` 与 `pixiko-v1.3.1-runnable.zip`（以及各自的 `.sha256`）拖进附件区，
    正文粘贴本文件内容后点 **Publish release**。
 
 > 建仓库时 License 请选 **None**（本项目保留所有权利，不使用开源许可证）。

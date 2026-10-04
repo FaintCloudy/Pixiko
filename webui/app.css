@@ -87,7 +87,10 @@ code { background: rgba(120, 160, 220, .14); padding: 1px 5px; border-radius: 6p
 @keyframes pulse { 0% { box-shadow: 0 0 0 0 rgba(79,215,168,.45); } 70% { box-shadow: 0 0 0 10px rgba(79,215,168,0); } 100% { box-shadow: 0 0 0 0 rgba(79,215,168,0); } }
 .muted { color: var(--muted); font-size: 13px; }
 
-#app { max-width: 1120px; margin: 0 auto; padding: 12px 12px 48px; }
+/* 铺满可用宽度：原来这里是 max-width: 1120px + margin: 0 auto —— 宽屏两边留一大片空白（用户嫌窄）。
+   现在不再有任何居中限宽（也不引入新的上限）：内容宽 = 视口宽 - 2 × 12px 内边距，右栏几何变量
+   （见下面 --rail-* 那一节）跟着这条事实算。 */
+#app { max-width: none; margin: 0; padding: 12px 12px 48px; }
 .banner {
   border-radius: 12px; padding: 10px 14px; margin-bottom: 10px; font-size: 14px;
   animation: drop-in .32s var(--ease) both;
@@ -175,15 +178,16 @@ code { background: rgba(120, 160, 220, .14); padding: 1px 5px; border-radius: 6p
    右栏在宽屏用 **position: fixed** —— 真正钉在视口右侧，页面怎么滚都不动。
    （**不用 sticky**：/loras、/functions、/chatcfg、/system、/setup、/quest、/help 这些左栏比右栏矮的
    路由上，.shell 没有可吸顶的余量，sticky 的右栏只能跟着页面一起滚上去、顶栏被切掉。）
-   宽度不再靠 grid 分列，而是左右两边用同一套变量算出来：
+   宽度不再靠 grid 分列，而是左右两边用同一套变量算出来（#app 已经**取消居中限宽**，铺满可用宽度）：
 
-     内容宽 = min(#app 的 max-width, 视口宽) - 2 × #app 左右内边距
+     内容宽 = 视口宽 - 2 × #app 左右内边距（不再有 max-width 上限）
      右栏宽 = (内容宽 - 栏间距) / 3        左栏宽 = 内容宽 - 右栏宽 - 栏间距（= 右栏宽的 2 倍）
-     右栏右边距 = #app 的居中留白 + #app 左右内边距  →  右栏内容框与 #app 内容右边缘对齐
+     右栏右边距 = #app 左右内边距  →  右栏内容框与 #app 内容右边缘对齐
 
-   注意百分比：fixed 元素上的 `100%` = **视口宽**（不含滚动条），而 .workspace 上的 `100%` = 它的包含块
-   （.shell 内容框）—— 两者不是一回事，所以变量分成 --rail-w-flow（在流内）与 --rail-w-fixed（固定右栏）
-   两个写，别混用。
+   注意百分比：fixed 元素上的 `100%` = **视口内容宽**（不含滚动条），而 .workspace 上的 `100%` = 它的
+   包含块（.shell 内容框，= 视口内容宽 - 2 × 内边距）—— 两者差着 #app 的左右内边距，所以变量分成
+   --rail-w-flow（在流内，不用减内边距）与 --rail-w-fixed（固定右栏，要自己减掉内边距）两个写，别混用：
+   两条算式算出来是**同一个数**（都等于 (视口内容宽 - 2×内边距 - 栏间距) / 3），这正是 2:1 的保证。
 
    祖先链上**不能**有 transform / filter / backdrop-filter / perspective / will-change / contain：
    有的话 fixed 会以那一层为包含块、右栏直接跑偏。实测这条链（html → body → main#app → .shell）
@@ -197,8 +201,7 @@ code { background: rgba(120, 160, 220, .14); padding: 1px 5px; border-radius: 6p
      --rail-gap:       14px     两栏之间的间距（窄屏堆叠时也是上下间距）
      --rail-stick-top: 62px     页头 .bar 的实测高度（右栏顶边贴页头下沿，与 .tabs 的 top:62px 同口径）
      --rail-bottom:    14px     右栏底边与视口底边的留白
-     --rail-page:      1120px   #app 的 max-width（右栏要跟它对齐；改 #app 的宽度这里也要改）
-     --rail-pad:       12px     #app 的左右内边距（宽屏 12px）
+     --rail-pad:       12px     #app 的左右内边距（宽屏 12px；≤620px 时 #app 是 8px，那时已单列堆叠、用不到）
      --rail-w-flow:    在流内的右栏宽（.workspace 的右留白基准）
      --rail-w-fixed:   固定右栏的宽
      --rail-right:     固定右栏的右边距（与 #app 内容右边缘对齐）
@@ -207,13 +210,13 @@ body {
   --rail-gap: 14px;
   --rail-stick-top: 62px;
   --rail-bottom: 14px;
-  --rail-page: 1120px;
   --rail-pad: 12px;
-  /* 在流内用：百分比按使用处的包含块解析（.workspace 的包含块 = .shell 内容框） */
+  /* 在流内用：百分比按使用处的包含块解析（.workspace 的包含块 = .shell 内容框 = 内容宽） */
   --rail-w-flow: calc((100% - var(--rail-gap)) / 3);
-  /* 固定右栏用：fixed 的百分比按视口解析，所以 #app 的 1120px 与左右内边距要自己写进来 */
-  --rail-w-fixed: calc((min(var(--rail-page) - 2 * var(--rail-pad), 100% - 2 * var(--rail-pad)) - var(--rail-gap)) / 3);
-  --rail-right: calc((100% - min(var(--rail-page), 100%)) / 2 + var(--rail-pad));
+  /* 固定右栏用：fixed 的百分比按视口解析，比内容宽多出 #app 的左右内边距，这里自己减掉 */
+  --rail-w-fixed: calc((100% - 2 * var(--rail-pad) - var(--rail-gap)) / 3);
+  /* 固定右栏的右边距：与 #app 内容右边缘对齐（#app 铺满，所以就是它的左右内边距） */
+  --rail-right: var(--rail-pad);
 }
 .workspace {
   min-width: 0;                                   /* 长内容/窄屏不许把整页顶出横向滚动 */
@@ -264,9 +267,12 @@ body {
 .shell .terminal { width: auto; margin-left: 0; }
 
 /* 宽屏：固定右栏占住了右下角，会盖住**页脚文字**与**任务信息云**（两者都在 .shell 之外）：
-   页脚给同样的右边留白（+ --rail-pad：页脚盒子与 #app 盒子同宽同起点，但两边内边距是 16px vs 12px，
-   补上这 12px，#app 内容右边缘减掉右栏与间距就正好等于页脚内容的右边缘）；
-   信息云整体挪到左栏那一列的右下角。用 `body > …` 提高一级优先级，免得被文件后面那两条基础规则盖回去。 */
+   页脚右边距的推导（#app 与 .footer 现在都是铺满、margin 0，两个盒子同宽同起点）：
+     页脚内容右边缘 = 视口内容宽 - padding-right
+     目标           = #app 内容右边缘 - 右栏宽 - 栏间距 = (视口内容宽 - --rail-pad) - --rail-w-fixed - --rail-gap
+     所以 padding-right = --rail-w-fixed + --rail-gap + --rail-pad  →  两者正好相等（不是"大约"）。
+   信息云整体挪到左栏那一列的右下角（它 z-index 60，否则会浮在对话输入区上面）。
+   用 `body > …` 提高一级优先级，免得被文件后面那两条基础规则盖回去。 */
 @media (min-width: 1001px) {
   body > .footer { padding-right: calc(var(--rail-w-fixed) + var(--rail-gap) + var(--rail-pad)); }
   body > .quest-clouds { right: calc(var(--rail-w-fixed) + var(--rail-gap) + var(--rail-pad) + 6px); }
@@ -465,9 +471,11 @@ body {
 .terms span b { color: var(--muted); font-weight: 500; margin-right: 4px; }
 .terms button { padding: 5px 10px; min-height: 32px; font-size: 12px; border-radius: 999px; }
 
-/* 页脚：版权与 powered by */
+/* 页脚：版权与 powered by。与 #app 一样铺满（原来是同样的 max-width: 1120px + margin: 0 auto），
+   两者盒子同宽同起点（都是 body 内容宽的整宽），所以宽屏那条给固定右栏让位的 padding-right
+   算式（见下面 @media (min-width: 1001px)）依然精确。 */
 .footer {
-  max-width: 1120px; margin: 0 auto; padding: 10px 16px 34px;
+  max-width: none; margin: 0; padding: 10px 16px 34px;
   display: flex; flex-direction: column; gap: 4px; align-items: center; text-align: center;
   color: var(--muted); font-size: 12.5px; line-height: 1.6;
 }
@@ -501,10 +509,11 @@ body.console-full { overflow: hidden; }
 body.console-full #app { max-width: none; margin: 0; padding: 0; }
 body.console-full .panel.active { gap: 0; }
 /* 控制台全屏（/logs 默认）：**右栏照旧在右边 1/3**（用户要「无论哪个栏目都能对话」）。
-   这里只把右栏几何换成「满宽、无页头」：--rail-page:100% + --rail-pad:0 → 右栏仍是内容宽的 1/3、
-   贴住视口右边；--rail-stick-top:0 → 这条模式没有页头，右栏从视口顶开始。终端占左 2/3 那一列（见下）。
-   于是「全屏」的语义 = **终端占满它那一列的高度**（不再是 100vw/100vh 独占整个窗口）。 */
-body.console-full { --rail-page: 100%; --rail-pad: 0px; --rail-stick-top: 0px; }
+   这里只把右栏几何换成「无页头、无 #app 内边距」：--rail-pad:0 → 右栏仍是内容宽的 1/3、贴住视口右边
+   （--rail-right 就等于 0）；--rail-stick-top:0 → 这条模式没有页头，右栏从视口顶开始。
+   终端占左 2/3 那一列（见下）。于是「全屏」的语义 = **终端占满它那一列的高度**（不再是 100vw 独占整窗）。
+   （#app 本身已经是铺满的，所以这里不再需要 --rail-page。） */
+body.console-full { --rail-pad: 0px; --rail-stick-top: 0px; }
 body.console-full .terminal {
   height: 100vh; width: auto; margin: 0; border: 0; border-radius: 0; box-shadow: none;
 }

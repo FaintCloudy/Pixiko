@@ -291,13 +291,15 @@ public final class WebUiTest {
                         && script.body().contains("await chatArchiveMerge(log, saved)"),
                 "前端不再有 'chat' 栏目语义：loadChatHistory 在 loadPage 里每个栏目都调（含服务端存档的合并）");
         check(css.body().contains(".agent-rail #chat-log") && !css.body().contains("#panel-chat")
-                        && css.body().contains("--rail-w-fixed: calc((min(var(--rail-page) - 2 * var(--rail-pad), 100% - 2 * var(--rail-pad)) - var(--rail-gap)) / 3);")
+                        && css.body().contains("#app { max-width: none; margin: 0; padding: 12px 12px 48px; }")
+                        && css.body().contains("--rail-w-fixed: calc((100% - 2 * var(--rail-pad) - var(--rail-gap)) / 3);")
+                        && css.body().contains("--rail-right: var(--rail-pad);")
                         && css.body().contains("margin-right: calc(var(--rail-w-flow) + var(--rail-gap));")
                         && css.body().contains("height: min(60vh, 520px)")
-                        && css.body().contains("body.console-full { --rail-page: 100%; --rail-pad: 0px; --rail-stick-top: 0px; }")
+                        && css.body().contains("body.console-full { --rail-pad: 0px; --rail-stick-top: 0px; }")
                         && css.body().contains(".shell .terminal { width: auto; margin-left: 0; }"),
-                "右栏样式挂在 .agent-rail 上（旧的 #panel-chat 死规则已迁走）：宽屏固定右栏宽 = (内容宽-间距)/3、"
-                        + "左栏留白对称、窄屏单列 60vh/520px、console-full 仍保持两栏");
+                "右栏样式挂在 .agent-rail 上（旧的 #panel-chat 死规则已迁走）：#app 取消 1120px 居中限宽、铺满可用宽度，"
+                        + "宽屏固定右栏宽 = (内容宽-间距)/3、左栏留白对称、窄屏单列 60vh/520px、console-full 仍保持两栏");
         check(script.body().contains("openViewer(src, caption)") && script.body().contains("点击放大（Esc 关闭）"),
                 "点图直接调查看器，链接上只留提示不再跳转");
         check(script.body().contains("applyGeneration(true)"), "点「开始生成」前先把面板里没提交的改动发出去");

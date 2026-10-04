@@ -6682,13 +6682,26 @@ public final class Bot implements AutoCloseable {
                 if (style.hasModel()) {
                     item.add("model", style.model().deepCopy());
                     item.addProperty("modelSummary", style.modelSummary());
-                    item.addProperty("baseModel", Json.str(style.model(), "baseModel", ""));
                     // 样式属于哪一栈（样式里的 stack 字段；老样式没有就用底模名判一次）。
                     String stack = Json.str(style.model(), "stack", "");
                     if (stack.isBlank()) stack = cn.szu.bot.sd.StackClassifier.stackOf(
                             Json.str(style.model(), "baseModel", ""), Json.str(style.model(), "checkpoint", ""));
+                    // 底模名：样式自己记着的优先；**老样式**只有检查点名、没有底模名时，按归属栈补该栈的规范
+                    // 底模名，好让「按底模分组」不漏项。只读回填，**不写回** data/local-styles.json；
+                    // 栈也判不出来（检查点名毫无线索）就照旧留空——那是"真的没有底模信息"，不填默认值。
+                    String baseModel = Json.str(style.model(), "baseModel", "");
+                    String baseModelSource = Json.str(style.model(), "baseModelSource", "");
+                    if (baseModel.isBlank() && !stack.isBlank()) {
+                        baseModel = cn.szu.bot.sd.StackClassifier.baseModelOfStack(stack);
+                        if (!baseModel.isBlank()) baseModelSource = cn.szu.bot.sd.StackClassifier.INFERRED_SOURCE;
+                    }
+                    item.addProperty("baseModel", baseModel);
+                    item.addProperty("baseModelSource", baseModelSource);
                     item.addProperty("stack", stack);
                     item.addProperty("stackLabel", cn.szu.bot.sd.StackClassifier.stackLabel(stack));
+                    String stackSource = Json.str(style.model(), "stackSource", "");
+                    if (stackSource.isBlank() && !stack.isBlank()) stackSource = cn.szu.bot.sd.StackClassifier.INFERRED_SOURCE;
+                    item.addProperty("stackSource", stackSource);
                     item.addProperty("forgePreset", Json.str(style.model(), "forge_preset", ""));
                     // 尺寸单独给一份（展示图样式记的就是这张展示图自己的像素）：面板单独标一个尺寸标签。
                     item.addProperty("width", Json.num(style.model(), "width", 0));

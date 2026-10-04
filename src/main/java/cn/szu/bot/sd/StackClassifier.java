@@ -13,27 +13,45 @@ import cn.szu.bot.Json;
  * 底模**归属栈**的判定：一个底模（或一个 LoRA / 一份样式）属于 Forge 的哪一栈。
  *
  * <p>Forge／Forge Neo 把「底模 + VAE + 文本编码器」按预设分成一栈一栈（{@code anima} / {@code xl} /
- * {@code sd} / {@code flux} / {@code qwen} …）。只换底模不换栈会出全灰废图，所以「这个底模属于哪一栈」
- * 必须能自动判出来，而不是靠人去记。
+ * {@code sd} / {@code flux} / {@code qwen} / {@code krea} / {@code sd3} …）。只换底模不换栈会出全灰废图，
+ * 所以「这个底模属于哪一栈」必须能自动判出来，而不是靠人去记。
  *
- * <p>判据按可靠性排序，全部来自**真实数据**，判不出来就返回空串（绝不编造）：
+ * <p>判据按可靠性排序，全部来自**真实数据**：
  * <ol>
  *   <li>{@code safetensors} 头部 {@code __metadata__} 里声明的架构/底模：{@code ss_base_model_version}
- *       （如 {@code anima}）、{@code modelspec.architecture}（如 {@code stable-diffusion-xl-v1-base}、
- *       {@code stable-diffusion-v1/lora}）、{@code ss_sd_model_name}（sd-scripts 的
- *       {@code model.safetensors} 是占位，不算）；</li>
+ *       （如 {@code anima}、{@code krea}）、{@code modelspec.architecture}（如
+ *       {@code stable-diffusion-xl-v1-base}、{@code stable-diffusion-v1/lora}）、{@code ss_sd_model_name}
+ *       （sd-scripts 的 {@code model.safetensors} 是占位，不算）；</li>
  *   <li>头部里的**张量名结构**（同一份头部，只读前若干 KB）：SDXL 有第二个文本编码器
  *       {@code conditioner.embedders.1.*}，SD1.5 只有 {@code conditioner.embedders.0.transformer.*}，
  *       SD2 是 {@code conditioner.embedders.0.model.*}（OpenCLIP），Anima 是 {@code net.llm_adapter.*} /
  *       {@code net.blocks.*}，Flux 是 {@code double_blocks.* + single_blocks.*}，LoRA 侧则看
  *       {@code lora_te_*}（单文本编码器＝SD1.5）与 {@code lora_te1_*}/{@code lora_te2_*}（＝SDXL）；</li>
  *   <li>Forge 预设配置（{@code forge_checkpoint_<preset>}）：哪个预设置的就是这个文件，它就属于那一栈；</li>
- *   <li>文件名关键词兜底，结果必须标成推断。</li>
+ *   <li>底模名/文件名关键词兜底（{@link #FAMILIES}），结果必须标成推断。</li>
  * </ol>
+ *
+ * <p>栈的判定**不再是"五种里猜一个，其余返回空"**：底模名只要非空，认不出已知族也会用它自己的
+ * slug 当栈名（见 {@link #stackOfBaseModel(String)}），调用方用 {@link #knownStack(String)} 区分
+ * 「已知族」与「自成一族」，后者标成 {@link #INFERRED_SOURCE}。只有真的没有底模信息（空串、占位值）
+ * 才返回空串——绝不无中生有。
  */
 public final class StackClassifier {
-    /** 五种标准栈，与 Forge 预设同名：切栈就是 {@code .model preset <栈名>}。 */
+    /**
+     * 已知的**底模族**栈 key，与 Forge 预设同名：切栈就是 {@code .model preset <栈名>}。
+     *
+     * <p>前五个是 Forge 自带预设；{@code krea} 是 Flux.1 Krea 自己的一栈（Civitai 写 {@code Flux.1 Krea}，
+     * 名字里含 {@code flux}，判定必须排在 flux **前面**）；{@code sd3} 是 SD 3 / 3.5；其余各族
+     * （Hunyuan / Wan / Chroma / Lumina / Kolors / PixArt / Playground / Stable Cascade / Z-Image /
+     * Nitro-E / ODOR）各自成一栈，见 {@link #FAMILIES}。
+     */
     public static final String ANIMA = "anima", XL = "xl", SD = "sd", FLUX = "flux", QWEN = "qwen";
+    public static final String KREA = "krea", SD3 = "sd3";
+    public static final String HUNYUAN = "hunyuan", WAN = "wan", CHROMA = "chroma", LUMINA = "lumina",
+            KOLORS = "kolors", PIXART = "pixart", PLAYGROUND = "playground", CASCADE = "cascade",
+            Z_IMAGE = "z-image", NITRO = "nitro", ODOR = "odor";
+    /** 名字里一个字母数字都没有时用的兜底栈（slug 会是空串，但"有底模名"就得有一个栈名）。 */
+    public static final String OTHER = "other";
     /** 判定来源（回执与网页 source 字段共用这一份词表）。 */
     public static final String HEADER_SOURCE = "safetensors-header";
     public static final String KEYS_SOURCE = "safetensors-keys";
@@ -46,6 +64,103 @@ public final class StackClassifier {
     /** {@code __metadata__} 里按这个顺序找声明式底模。 */
     private static final List<String> METADATA_KEYS =
             List.of("ss_base_model_version", "modelspec.architecture", "ss_sd_model_name", "modelspec.importer");
+
+    /** 一个底模族的定义：栈 key、中文标签、给外人看的规范名、判定关键词（子串）与整词。 */
+    private record Family(String stack, String label, String canonical, List<String> keywords, List<String> tokens) {
+        Family(String stack, String label, String canonical, List<String> keywords) {
+            this(stack, label, canonical, keywords, List.of());
+        }
+    }
+
+    /**
+     * **底模族判定表**：顺序＝优先级，从上往下一个一个试，命中即返回。
+     *
+     * <p>关键词分两种：{@code keywords} 按**子串**匹配（illustrious / noob / sdxl 这类长词拼在文件名里
+     * 也认，如 {@code waiIllustriousSDXL_v170.safetensors}）；{@code tokens} 按**整词**匹配
+     * （{@code xl} / {@code sd} / {@code wan} 这类短词当子串会把 {@code wandering}、{@code waiXlabs}
+     * 之类的名字带偏）。表里没有的族不硬塞：{@link #stackOfBaseModel(String)} 用名字自己的 slug 当栈名。
+     */
+    private static final List<Family> FAMILIES = List.of(
+            // Krea 必须排在 Flux 前面：Flux.1 Krea 里含 flux，反了就把 Krea 判成 flux 栈。
+            new Family(KREA, "Krea 栈", "Flux.1 Krea", List.of("krea")),
+            new Family(ANIMA, "Anima 栈", "Anima", List.of("anima")),
+            new Family(FLUX, "Flux 栈", "Flux", List.of("flux")),
+            new Family(QWEN, "Qwen 栈", "Qwen Image", List.of("qwen")),
+            // SD 3 / 3.5 是独立架构（MMDiT），不能混进 sd（SD1.x/SD2.x）那一栈。
+            new Family(SD3, "SD3 栈", "SD 3.5", List.of("sd 3", "sd3", "stable diffusion 3")),
+            // SDXL 家族：Pony（V6 及以前）/ Illustrious / NoobAI / Animagine XL / Nova Anime XL 都是 SDXL 架构。
+            new Family(XL, "SDXL 栈", "SDXL",
+                    List.of("illustrious", "noob", "pony", "sdxl", "sd xl", "stable diffusion xl"), List.of("xl")),
+            // SD1.x / SD2.x 共用 sd 栈（Forge 的 sd 预设就是这两代的底模）。
+            new Family(SD, "SD 1.5 栈", "SD 1.5",
+                    List.of("sd 1", "sd1", "sd v1", "stable diffusion 1", "stable diffusion v1",
+                            "sd 2", "sd2", "stable diffusion 2"), List.of("sd")),
+            new Family(HUNYUAN, "Hunyuan 栈", "Hunyuan", List.of("hunyuan")),
+            new Family(WAN, "Wan 栈", "Wan Video", List.of(), List.of("wan", "wan video")),
+            new Family(CHROMA, "Chroma 栈", "Chroma", List.of("chroma")),
+            new Family(LUMINA, "Lumina 栈", "Lumina", List.of("lumina")),
+            new Family(KOLORS, "Kolors 栈", "Kolors", List.of("kolors")),
+            new Family(PIXART, "PixArt 栈", "PixArt", List.of("pixart")),
+            new Family(PLAYGROUND, "Playground 栈", "Playground", List.of("playground")),
+            new Family(CASCADE, "Stable Cascade 栈", "Stable Cascade", List.of("cascade")),
+            new Family(Z_IMAGE, "Z-Image 栈", "Z-Image", List.of("z image", "zimage")),
+            new Family(NITRO, "Nitro 栈", "Nitro-E", List.of("nitro")),
+            new Family(ODOR, "ODOR 栈", "ODOR", List.of("odor")));
+
+    /**
+     * 名字里含这些串的，架构**无法确证**：不许硬塞进 xl，走"自成一族"（栈名＝slug，如 {@code pony-v7}）。
+     * Pony V6 及以前是 SDXL（归 xl），Pony V7 换了底模，不能再当 SDXL 用。
+     */
+    private static final List<String> UNCONFIRMED = List.of("pony v7", "ponyv7", "pony 7");
+
+    /** 底模名的规范写法（**整词优先**，键是 {@link #normalize(String)} 之后的名字）。 */
+    private static final Map<String, String> CANONICAL = canonicalTable();
+
+    private static Map<String, String> canonicalTable() {
+        Map<String, String> table = new LinkedHashMap<>();
+        table.put("anima", "Anima");
+        for (String name : List.of("krea", "flux krea", "flux 1 krea", "flux1 krea", "flux.1 krea",
+                "flux 1 krea dev", "flux.1 krea dev", "flux1 krea dev")) table.put(name, "Flux.1 Krea");
+        // Civitai 上另有一个 "Krea 2" 底模（同名族，仍是 krea 栈）。
+        for (String name : List.of("krea 2", "krea2", "krea 2 turbo")) table.put(name, "Krea 2");
+        for (String name : List.of("flux", "flux.1", "flux 1", "flux1", "flux 1 dev", "flux.1 dev", "flux1 dev",
+                "flux 1 s", "flux.1 s", "flux1 s", "flux 1 d", "flux.1 d", "flux1 d",
+                "flux 1 schnell", "flux.1 schnell", "flux1 schnell",
+                "flux 1 kontext", "flux.1 kontext", "flux1 kontext", "flux kontext")) table.put(name, "Flux");
+        for (String name : List.of("qwen", "qwen image", "qwen image edit", "qwen image edit 2509",
+                "qwen image 2509", "qwen image edit plus")) table.put(name, "Qwen Image");
+        for (String name : List.of("sd15", "sd 1.5", "sd 1", "sd1", "sd v1", "sd 1.5 lcm", "sd 1.5 hyper",
+                "sd 1.5 dmd2", "sd 1.5 inpainting", "sd 1.5 base", "stable diffusion 1.5",
+                "stable diffusion v1")) table.put(name, "SD 1.5");
+        for (String name : List.of("sd14", "sd 1.4", "stable diffusion 1.4")) table.put(name, "SD 1.4");
+        for (String name : List.of("sd21", "sd 2.1", "sd 2.1 768", "sd 2.1 unclip", "sd 2.1 base",
+                "stable diffusion 2.1")) table.put(name, "SD 2.1");
+        for (String name : List.of("sd20", "sd 2.0", "sd 2.0 768", "sd 2", "stable diffusion 2",
+                "stable diffusion 2.0")) table.put(name, "SD 2.0");
+        for (String name : List.of("sdxl", "sd xl", "xl", "sdxl 0.9", "sdxl 1.0", "sdxl base", "sdxl base 1.0",
+                "sdxl refiner", "stable diffusion xl", "stable diffusion xl 1.0")) table.put(name, "SDXL");
+        for (String name : List.of("illustrious", "illustrious xl")) table.put(name, "Illustrious");
+        for (String name : List.of("noobai", "noobai xl", "noob ai")) table.put(name, "NoobAI");
+        for (String name : List.of("pony", "pony v6", "pony v6 xl")) table.put(name, "Pony");
+        for (String name : List.of("pony v7", "ponyv7", "pony 7")) table.put(name, "Pony V7");
+        for (String name : List.of("animagine xl", "animagine xl 3.0", "animagine xl 3.1")) table.put(name, "Animagine XL");
+        for (String name : List.of("nova anime xl", "nova anime xl 8.0")) table.put(name, "Nova Anime XL");
+        for (String name : List.of("sd 3", "sd3", "stable diffusion 3")) table.put(name, "SD 3");
+        for (String name : List.of("sd 3.5", "sd3.5", "sd35", "sd 3.5 large", "sd 3.5 large turbo",
+                "sd 3.5 medium", "stable diffusion 3.5")) table.put(name, "SD 3.5");
+        for (String name : List.of("hunyuan", "hunyuan 1", "hunyuan dit", "hunyuan video")) table.put(name, "Hunyuan");
+        for (String name : List.of("wan", "wan video", "wan 2.1", "wan 2.2")) table.put(name, "Wan Video");
+        table.put("chroma", "Chroma");
+        table.put("lumina", "Lumina");
+        table.put("kolors", "Kolors");
+        for (String name : List.of("pixart", "pixart a", "pixart e", "pixart alpha", "pixart sigma")) table.put(name, "PixArt");
+        for (String name : List.of("playground", "playground v2")) table.put(name, "Playground");
+        for (String name : List.of("cascade", "stable cascade")) table.put(name, "Stable Cascade");
+        for (String name : List.of("z image", "zimage", "z image turbo", "zimage turbo")) table.put(name, "Z-Image");
+        for (String name : List.of("nitro", "nitro e", "nitro-e")) table.put(name, "Nitro-E");
+        table.put("odor", "ODOR");
+        return Map.copyOf(table);
+    }
 
     /** 一次头部读取的结论：{@code baseModel} 是规范化底模名，读不到就是空串。 */
     public record Header(String baseModel, String source, String evidence) {
@@ -79,65 +194,141 @@ public final class StackClassifier {
     public static Header structural(Path safetensors) { return parse(safetensors).structural(); }
 
     /**
-     * 底模名（或兜底的文件名）→ 栈名：{@code anima} / {@code xl} / {@code sd} / {@code flux} / {@code qwen}，
-     * 判不出来是空串。关键词表覆盖 anima、illustrious、noobai、noob、pony、sdxl、xl、sd 1.5、sd1.5、
-     * sd_v1、sd 2、flux、qwen。
+     * 底模名（或兜底的文件名）→ 栈名：{@code anima} / {@code xl} / {@code sd} / {@code flux} / {@code qwen} /
+     * {@code krea} / {@code sd3} / {@code hunyuan} / {@code wan} / …（见 {@link #FAMILIES}）。
+     * 底模名非空时**一定**有一个栈；只有真的没有底模信息（空串、占位值）时才空串。
      */
     public static String stackOf(String baseModel, String filename) {
         String stack = stackOfBaseModel(baseModel);
         return stack.isEmpty() ? stackOfFilename(filename) : stack;
     }
 
-    /** 只按底模名判栈（识别出来的底模名优先用它，别被文件名带偏）。 */
+    /**
+     * 只按底模名判栈（识别出来的底模名优先用它，别被文件名带偏）。任何**有内容**的底模名都会得到一个栈：
+     * <ol>
+     *   <li>已知族按 {@link #FAMILIES} 判：{@code krea} 排在 {@code flux} 前面，{@code Flux.1 Krea} 不会被
+     *       判成 flux 栈；{@code SD 1.5} / {@code SDXL} / {@code SD 2.1} / {@code SD 3.5} 各归各的；</li>
+     *   <li>认不出族但名字非空：用**规范化 slug** 当栈名（{@code Foo BarXL v2} → {@code foo-barxl-v2}）——
+     *       分不到已知族，也要有一个明确、可复现的栈名；{@link #knownStack(String)} 能认出这种"自成一族"，
+     *       调用方据此把来源标成 {@link #INFERRED_SOURCE}；</li>
+     *   <li>空串，以及 {@code model.safetensors} / {@code unknown} / {@code none} 这类占位值：空串——
+     *       那是"没有底模信息"，不是"认不出族"，绝不无中生有。</li>
+     * </ol>
+     */
     public static String stackOfBaseModel(String baseModel) {
-        String key = normalize(baseModel);
-        if (key.isEmpty()) return "";
-        switch (key) {
-            case "anima": return ANIMA;
-            case "xl", "sdxl": return XL;
-            case "sd", "sd15", "sd 1.5", "sd 1", "sd v1": return SD;
-            case "sd21", "sd 2.1", "sd 2": return SD;
-            case "flux", "flux.1": return FLUX;
-            case "qwen", "qwen image": return QWEN;
-            default: break;
-        }
-        if (key.contains("anima")) return ANIMA;
-        if (key.contains("flux")) return FLUX;
-        if (key.contains("qwen")) return QWEN;
-        // SDXL 家族（Illustrious / NoobAI / Pony 都是 SDXL 架构，走的都是 xl 这一栈）
-        if (key.contains("illustrious") || key.contains("noob") || key.contains("pony")
-                || key.contains("sdxl") || key.contains("sd xl") || key.contains("stable diffusion xl")) return XL;
-        if (key.contains("sd 1.5") || key.contains("sd1.5") || key.contains("sd15") || key.contains("sd v1")
-                || key.contains("sd_v1") || key.contains("stable diffusion 1.5") || key.contains("stable diffusion v1")) return SD;
-        if (key.contains("sd 2.1") || key.contains("sd2.1") || key.contains("sd21")
-                || key.contains("sd 2") || key.contains("stable diffusion 2")) return SD;
-        return "";
+        String value = baseModel == null ? "" : baseModel.strip();
+        if (value.isEmpty() || SdClient.usableBaseModel(value).isEmpty()) return "";
+        String known = stackOfFamily(value);
+        if (!known.isEmpty()) return known;
+        String slug = slug(value);
+        return slug.isEmpty() ? OTHER : slug;
     }
 
-    /** 只按文件名判栈（兜底；结果要标成推断）。 */
+    /**
+     * 只按文件名判栈（兜底；结果要标成推断）。关键词与底模名共用同一张表，但**没有 slug 兜底**：
+     * 文件名认不出关键词就是空串（{@code model.safetensors} 这种占位不该变成一个栈）。
+     */
     public static String stackOfFilename(String filename) {
-        String key = normalize(filename);
-        if (key.isEmpty()) return "";
-        if (key.contains("anima")) return ANIMA;
-        if (key.contains("flux")) return FLUX;
-        if (key.contains("qwen")) return QWEN;
-        if (key.contains("illustrious") || key.contains("noobai") || key.contains("noob")
-                || key.contains("pony") || key.contains("sdxl") || key.contains("sd xl")
-                || key.contains("sd_xl") || key.contains(" xl")) return XL;
-        if (key.contains("sd15") || key.contains("sd 1.5") || key.contains("sd1.5")
-                || key.contains("sd v1") || key.contains("sd_v1")) return SD;
-        if (key.contains("sd21") || key.contains("sd 2.1") || key.contains("sd 2")) return SD;
+        return filename == null ? "" : stackOfFamily(filename);
+    }
+
+    /**
+     * 只认已知底模族（{@link #FAMILIES}），认不出来返回空串——**不编 slug**。
+     * 归一化：小写，下划线/连字符/斜杠都当空格（{@code SD_XL} → {@code sd xl}）。
+     */
+    private static String stackOfFamily(String name) {
+        String key = normalize(name);
+        if (key.isEmpty() || unconfirmed(key)) return "";
+        // 「animagine」里有「anima」子串（原关键词表就把它误判成 anima 栈了）：这两个 SDXL 族名先认掉。
+        if (key.contains("animagine") || key.contains("nova anime")) return XL;
+        for (Family family : FAMILIES) {
+            for (String keyword : family.keywords()) if (key.contains(keyword)) return family.stack();
+            for (String token : family.tokens()) if (wholeWord(key, token)) return family.stack();
+        }
         return "";
     }
 
     /**
-     * Forge 预设名 → 栈名：五种标准栈按同名/别名归一；其他预设（klein / lumina / zit / wan / ernie …）
-     * 本机也有自己的一栈，原样当栈名返回，别硬塞进五种里。
+     * 整词匹配：{@code wholeWord("wan 2.1 t2v", "wan")} 为真，{@code wholeWord("wandering", "wan")} 为假。
+     * 短词还认"词后直接跟数字"的写法（{@code wan2.1} / {@code xl1.0} / {@code sd15}），那在文件名里很常见。
+     */
+    private static boolean wholeWord(String key, String phrase) {
+        if ((" " + key + " ").contains(" " + phrase + " ")) return true;
+        for (String token : key.split(" ")) {
+            if (token.length() > phrase.length() && token.startsWith(phrase)
+                    && Character.isDigit(token.charAt(phrase.length()))) return true;
+        }
+        return false;
+    }
+
+    /** 架构无法确证的名字（Pony V7）：不进任何已知族，走"自成一族"。 */
+    private static boolean unconfirmed(String key) {
+        for (String marker : UNCONFIRMED) if (key.contains(marker)) return true;
+        return false;
+    }
+
+    /**
+     * 未知底模名 → 干净的栈名（slug）：小写、非字母数字换成 {@code -}、压缩连续连字符、去掉首尾连字符。
+     * {@code Foo BarXL v2} → {@code foo-barxl-v2}；汉字算字母，整串中文名原样保留。
+     */
+    public static String slug(String value) {
+        String text = value == null ? "" : value;
+        StringBuilder out = new StringBuilder();
+        boolean dash = false;
+        for (int index = 0; index < text.length(); index++) {
+            char ch = Character.toLowerCase(text.charAt(index));
+            if (Character.isLetterOrDigit(ch)) {
+                out.append(ch);
+                dash = false;
+            } else if (out.length() > 0 && !dash) {
+                out.append('-');
+                dash = true;
+            }
+        }
+        int end = out.length();
+        while (end > 0 && out.charAt(end - 1) == '-') end--;
+        return out.substring(0, end);
+    }
+
+    /** 这个栈 key 是不是认识的**底模族**；不是就是按名字 slug 出来的"自成一族"（来源该标成推断）。 */
+    public static boolean knownStack(String stack) {
+        String value = stack == null ? "" : stack.strip().toLowerCase(Locale.ROOT);
+        if (value.isEmpty()) return false;
+        for (Family family : FAMILIES) if (family.stack().equals(value)) return true;
+        return false;
+    }
+
+    /**
+     * 栈 → 该栈的**规范底模名**：只有栈、没有底模名时用它回填（见 {@code SdClient} 判定链的最后一步）。
+     *
+     * <p>与 {@link #stackLabel(String)} 共用 {@link #FAMILIES} 同一张表：{@code xl} → {@code SDXL}、
+     * {@code sd} → {@code SD 1.5}、{@code krea} → {@code Flux.1 Krea}、{@code sd3} → {@code SD 3.5} …
+     * 补出来的名字必须能被 {@link #stackOfBaseModel(String)} 判回同一个栈（有往返断言兜着）。
+     *
+     * <p>未知 slug 栈（{@link #knownStack(String)} 为 false）返回空串：那种栈本身就是从"未知底模名"
+     * 归一出来的，再回填会变成自我循环，宁可照旧显示"未识别"。
+     */
+    public static String baseModelOfStack(String stack) {
+        String value = stack == null ? "" : stack.strip().toLowerCase(Locale.ROOT);
+        if (value.isEmpty()) return "";
+        for (Family family : FAMILIES) if (family.stack().equals(value)) return family.canonical();
+        return "";
+    }
+
+    /** "只有栈、没有底模名"时补出底模名的判据原文（回执与网页 evidence 共用这一句）。 */
+    public static String stackBaseModelEvidence(String stack) {
+        return stack == null || stack.isBlank() ? ""
+                : "按 " + stackLabel(stack) + " 推断底模（没有记录具体底模）";
+    }
+
+    /**
+     * Forge 预设名 → 栈名：已知底模族按同名/别名归一；其他预设（klein / zit / lumina / ernie …）
+     * 本机也有自己的一栈，**原样**当栈名返回（这里不做 slug，否则就对不上预设名本身了），别硬塞进已知族。
      */
     public static String stackOfPreset(String preset) {
         String value = preset == null ? "" : preset.strip();
         if (value.isEmpty()) return "";
-        String known = stackOfBaseModel(value);
+        String known = stackOfFamily(value);
         return known.isEmpty() ? value : known;
     }
 
@@ -165,17 +356,13 @@ public final class StackClassifier {
         return stackOfPreset(active).equalsIgnoreCase(wanted) || stackOfBaseModel(active).equalsIgnoreCase(wanted);
     }
 
-    /** 栈的中文说法（组头与警告里用）。 */
+    /** 栈的中文说法（组头与警告里用）。已知族用表里的标签；"自成一族"的 slug 栈显示成「<栈名> 栈」。 */
     public static String stackLabel(String stack) {
         String value = stack == null ? "" : stack.strip();
-        return switch (value.toLowerCase(Locale.ROOT)) {
-            case ANIMA -> "Anima 栈";
-            case XL -> "SDXL 栈";
-            case SD -> "SD 1.5 栈";
-            case FLUX -> "Flux 栈";
-            case QWEN -> "Qwen 栈";
-            default -> value.isEmpty() ? "" : value + " 栈";
-        };
+        if (value.isEmpty()) return "";
+        String key = value.toLowerCase(Locale.ROOT);
+        for (Family family : FAMILIES) if (family.stack().equals(key)) return family.label();
+        return value + " 栈";
     }
 
     /** 判定来源的中文说法（与网页/回执同一个词表）。 */
@@ -198,35 +385,48 @@ public final class StackClassifier {
                 || CIVITAI_SOURCE.equals(source) || FORGE_SOURCE.equals(source) || PRESET_SOURCE.equals(source);
     }
 
-    /** 各来源对同一个底模的写法不一样（Civitai 写 Anima，Forge 写 anima，架构串写 stable-diffusion-xl-v1-base）。 */
+    /**
+     * 各来源对同一个底模的写法不一样（Civitai 写 Anima，Forge 写 anima，架构串写 stable-diffusion-xl-v1-base）。
+     * 先按**整词**归一（Civitai/Forge 的常见写法，见 {@link #CANONICAL}），再按关键词族兜底（架构串）。
+     */
     public static String canonicalBaseModel(String raw) {
         String value = SdClient.usableBaseModel(raw);
         if (value.isEmpty()) return "";
         String key = normalize(value);
-        // 先按整词归一（Civitai/Forge 的常见写法），再按关键词族兜底（架构串）。
-        switch (key) {
-            case "anima": return "Anima";
-            case "sd15", "sd 1.5", "sd 1", "sd v1", "stable diffusion 1.5", "stable diffusion v1": return "SD 1.5";
-            case "sd21", "sd 2.1", "sd 2", "stable diffusion 2.1": return "SD 2.1";
-            case "sdxl", "sd xl", "sdxl 1.0", "stable diffusion xl": return "SDXL";
-            case "illustrious": return "Illustrious";
-            case "noobai", "noobai xl": return "NoobAI";
-            case "pony": return "Pony";
-            case "flux", "flux.1", "flux 1": return "Flux";
-            case "qwen", "qwen image": return "Qwen Image";
-            default: break;
-        }
+        String canonical = CANONICAL.get(key);
+        if (canonical != null) return canonical;
+        // 关键词族兜底：架构串（stable-diffusion-xl-v1-base）、带后缀的变体（SD 1.5 LCM / SDXL Turbo）走这里。
+        if (key.contains("krea")) return "Flux.1 Krea";          // 必须排在 flux 前面
+        // 「animagine」里有「anima」子串：SDXL 族名先认掉，别被 anima 抢先。
+        if (key.contains("animagine")) return "Animagine XL";
+        if (key.contains("nova anime")) return "Nova Anime XL";
         if (key.contains("anima")) return "Anima";
         if (key.contains("flux")) return "Flux";
         if (key.contains("qwen")) return "Qwen Image";
+        if (key.contains("sd 3") || key.contains("sd3") || key.contains("stable diffusion 3"))
+            return key.contains("3.5") ? "SD 3.5" : "SD 3";
         if (key.contains("illustrious")) return "Illustrious";
         if (key.contains("noob")) return "NoobAI";
+        if (unconfirmed(key)) return "Pony V7";
         if (key.contains("pony")) return "Pony";
         if (key.contains("sdxl") || key.contains("sd xl") || key.contains("stable diffusion xl")) return "SDXL";
+        if (key.contains("sd 1.4") || key.contains("sd1.4") || key.contains("stable diffusion 1.4")) return "SD 1.4";
         if (key.contains("sd 1.5") || key.contains("sd1.5") || key.contains("sd15") || key.contains("sd v1")
                 || key.contains("stable diffusion 1.5") || key.contains("stable diffusion v1")) return "SD 1.5";
         if (key.contains("sd 2.1") || key.contains("sd2.1") || key.contains("sd21")
-                || key.contains("sd 2") || key.contains("stable diffusion 2")) return "SD 2.1";
+                || key.contains("stable diffusion 2.1")) return "SD 2.1";
+        if (key.contains("sd 2") || key.contains("stable diffusion 2")) return "SD 2.0";
+        if (key.contains("hunyuan")) return "Hunyuan";
+        if (wholeWord(key, "wan")) return "Wan Video";
+        if (key.contains("chroma")) return "Chroma";
+        if (key.contains("lumina")) return "Lumina";
+        if (key.contains("kolors")) return "Kolors";
+        if (key.contains("pixart")) return "PixArt";
+        if (key.contains("playground")) return "Playground";
+        if (key.contains("cascade")) return "Stable Cascade";
+        if (key.contains("z image") || key.contains("zimage")) return "Z-Image";
+        if (key.contains("nitro")) return "Nitro-E";
+        if (key.contains("odor")) return "ODOR";
         return value;
     }
 
@@ -262,6 +462,17 @@ public final class StackClassifier {
             case SD -> List.of("sd15", "sd1.5", "sd_1.5", "sd-1.5", "v1", "sd1");
             case FLUX -> List.of("flux1", "flux.1");
             case QWEN -> List.of("qwen_image", "qwen-image", "qwenimage");
+            // Flux.1 Krea 在 Forge／Civitai 里的几种写法（预设名可能是 flux-krea / flux1_krea …）。
+            case KREA -> List.of("flux_krea", "flux-krea", "flux1_krea", "flux1-krea", "flux.1 krea",
+                    "flux.1_krea", "flux.1-krea", "flux1 krea", "krea-dev", "kreadev");
+            case SD3 -> List.of("sd_3", "sd-3", "sd3.5", "sd_3.5", "sd-3.5", "sd35", "stable-diffusion-3");
+            case HUNYUAN -> List.of("hunyuan_video", "hunyuan-video", "hunyuanvideo", "hunyuan_dit");
+            case WAN -> List.of("wan_video", "wan-video", "wanvideo", "wan2.1", "wan_2.1");
+            case Z_IMAGE -> List.of("z_image", "zimage", "z-image-turbo", "z_image_turbo");
+            case CASCADE -> List.of("stable_cascade", "stable-cascade");
+            case NITRO -> List.of("nitro_e", "nitro-e", "nitroe");
+            case PLAYGROUND -> List.of("playground_v2", "playground-v2", "playgroundv2");
+            case PIXART -> List.of("pixart_alpha", "pixart-alpha", "pixart_sigma", "pixart-sigma");
             default -> List.of();
         };
     }
