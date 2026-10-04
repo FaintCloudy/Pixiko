@@ -139,6 +139,31 @@ public class WebPageController {
         return WebJson.of(HttpStatus.NOT_FOUND, WebJson.error("未找到 " + path));
     }
 
+    /**
+     * Android 外壳的**网页预览**：把 app 那套原生外壳（标题栏 / 菜单 / 服务器设置 / 错误页 /
+     * 长按图片的原生菜单）在浏览器里演一遍，中间用同源 iframe 装真正的控制台。
+     *
+     * <p>为什么必须由机器人自己伺服：同源才能把令牌写进 iframe 的 localStorage、才能往 iframe 里
+     * 注入与 APK 里逐字相同的那段长按脚本（跨源会被浏览器拦住）。页面文件是 {@code webui/android-preview.html}，
+     * 改完刷新即可，不用重新打包。
+     */
+    @RequestMapping(value = {"/android", "/android/"}, method = RequestMethod.GET)
+    public ResponseEntity<byte[]> androidPreview() {
+        Path target = webRoot.resolve("android-preview.html").normalize();
+        if (!target.startsWith(webRoot) || !Files.isRegularFile(target)) {
+            return WebJson.bytes(HttpStatus.NOT_FOUND,
+                    "没找到 webui/android-preview.html：这是 Android 外壳的网页预览页，随 webui/ 目录一起分发。"
+                            .getBytes(StandardCharsets.UTF_8), "text/plain; charset=utf-8", "no-store");
+        }
+        try {
+            return WebJson.bytes(HttpStatus.OK, Files.readAllBytes(target), "text/html; charset=utf-8", "no-store");
+        } catch (IOException error) {
+            Log.warn("Android 预览页读取失败：" + Bot.error(error));
+            return WebJson.bytes(HttpStatus.INTERNAL_SERVER_ERROR, ("读取失败：" + Bot.error(error)).getBytes(StandardCharsets.UTF_8),
+                    "text/plain; charset=utf-8", "no-store");
+        }
+    }
+
     /** 静态资源：app.js / app.css / 图标。目录穿越一律 404。 */
     @RequestMapping(value = {"/app.js", "/app.css", "/favicon.ico", "/favicon-32.png",
             "/apple-touch-icon.png", "/icon-192.png", "/icon-512.png"},

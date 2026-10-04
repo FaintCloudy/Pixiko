@@ -1,11 +1,45 @@
-# Pixiko v1.4.0 发行说明
+# Pixiko v1.4.1 发行说明
 
-- **版本**：v1.4.0
+- **版本**：v1.4.1
 - **日期**：2026-10-04
 - **作者**：loriko（deloriko@outlook.com）
 - **当前实现**：Java 版（`src/`）。另有一次**未完成的** Next.js 重构，见 `nextjs-wip/`，**不可运行**。
 
 ---
+
+## 〇、本版新增（v1.4.1）
+
+**一件事：不用装 APK，就能在浏览器里跑一遍 Android 外壳——控制台新增页面 `/android`**（用户原话是
+「我想让你用 webview 在网页上跑一个预览版」）。
+
+- **预览页是机器人自己发出来的一页**：`webui/android-preview.html`（**单文件、零外部依赖**），
+  由机器人在 **`http://<电脑地址>:8787/android`** 伺服。**同源很关键**：靠同源才能把令牌写进
+  iframe 的 `localStorage`、才能往 iframe 里注入与 APK **逐字相同**的那段长按脚本。
+- **入口有两个**：控制台**每一页页脚**都有「安卓外观预览」链接（`href="/android"`）；
+  也可以直接敲 `http://<电脑地址>:8787/android`。
+- **复刻了 app 外壳**：
+  - 顶部 **`Pixiko` 标题栏 + 进度条 + `⋮` 菜单**，菜单是**与真机一致的 9 项**：
+    刷新 / 回到首页 / 切换服务器 / 服务器设置 / 在浏览器打开 / 屏幕常亮 / 清空网页缓存 /
+    清除登录状态 / 关于；
+  - **手机机身外框**：设备预设 **手机 390×844（默认）/ 大屏手机 430×932 / 平板 768×1024 / 自适应**，
+    缩放 **50–100%**，另有「**旋转**」（844×390）；
+  - 中间是同源 iframe 里的**真控制台**（**11 个栏目 + 常驻对话栏，一个不少**；
+    手机宽度下网页自己变单列堆叠）；
+  - **服务器设置屏**（地址 / 令牌 / 测试连接 / 保存 / 多服务器列表）；
+    「测试连接」**能区分「连不上」与「令牌不对」**（与真机同一个判据）；「**扫描局域网**」在网页里
+    做不到，页面会明确说明（真机才有）；
+  - **图片长按 / 右键 → app 原生菜单**（保存到相册 / 分享… / 在新标签打开 / 取消）：
+    脚本与 APK 里那一段**逐字相同**（**1834 字节**），
+    只是「保存到相册」在浏览器里等价为**下载**；
+  - **原生错误页**（打不开控制台时列出 **4 条**可能原因 + 重试 / 去设置 / 用浏览器打开）。
+- **已知限制（如实写）**：只在**同一台机器人上同源**时才能注入令牌与长按菜单（跨源服务器打开会提示
+  不可用）；浏览器里**不能扫局域网**；**不能真正写手机相册**（是下载）；**屏幕常亮**依赖 Wake Lock API；
+  **「分享」**在部分浏览器退化为复制地址。
+
+**前端**：本版没有改动 `webui/app.js`、`webui/app.css`，网页资源版本保持 `?v=1.3.1`。
+
+<details>
+<summary>上一版（v1.4.0）</summary>
 
 ## 〇、本版新增（v1.4.0）
 
@@ -43,6 +77,8 @@
   `F:\Bot\android\dist\`。工具链与参数的完整说明见
   [`android/README.md`](android/README.md)「怎么构建 APK」。
 - **前端**：本版没有改动 `webui/`，网页资源版本保持 `?v=1.3.1`。
+
+</details>
 
 <details>
 <summary>上一版（v1.3.1）</summary>
@@ -884,7 +920,7 @@ Danbooru 词条（↑↓ 选择、Esc 关闭；空词条上按 **Ctrl+Space** �
 
 ## 三、安装与启动（三步）
 
-### 开箱即用包 `pixiko-v1.4.0-runnable.zip`
+### 开箱即用包 `pixiko-v1.4.1-runnable.zip`
 
 1. 装好 **JDK 17+**。
 2. **双击 `start.bat`**。第一次运行会自动生成 `config.json`（照 `config.example.json` 起一份），
@@ -894,7 +930,7 @@ Danbooru 词条（↑↓ 选择、Esc 关闭；空词条上按 **Ctrl+Space** �
 
 > `start.bat` 跑的是包内已编译好的 `build/pixiko.jar`；只有需要改代码时才用 `build.ps1` + `run.bat`。
 
-### 源码包 `pixiko-v1.4.0.zip`
+### 源码包 `pixiko-v1.4.1.zip`
 
 1. 装好 **JDK 17+**。
 2. 在项目根目录准备好依赖 jar：`lib/gson-2.13.1.jar` 由 `build.ps1` **自动下载并校验**，
@@ -907,12 +943,13 @@ copy config.example.json config.json
 .\run.bat
 ```
 
-### Android 客户端 `pixiko-android-1.4.0.apk`（v1.4.0 起）
+### Android 客户端 `pixiko-android-1.4.0-debug.apk`（v1.4.0 起）
 
 1. **不用装 JDK、也不用装 Android Studio**——直接把这个 APK 拷进手机点安装即可。
 2. 手机与电脑要在**同一个 Wi-Fi**，app 里填「电脑的局域网 IP:8787」+「访问令牌」
    （令牌在电脑 `config.json` 的 `webui.access_token`），或点「**扫描局域网**」自动找。
 3. 进去就是**完整的网页控制台**（13 栏全在），**长按图片**可以存进相册 `Pictures/Pixiko`。
+4. 不想先装 APK？直接在电脑浏览器打开 `http://<电脑地址>:8787/android` 看**网页预览**（v1.4.1 起）。
 
 > 这是**用 Android SDK 现构建出来的 debug 签名包**（`cn.szu.bot.app` / **1.4.0**，`compileSdk 34`、`minSdk 26`），
 > **不是官方签名的正式包**；想自己构建就用 `android/build-apk.ps1`（要 **JDK 21 + Android SDK**，
@@ -971,10 +1008,10 @@ copy config.example.json config.json
 
 ## 六、在 GitHub Releases 里发布这个 zip
 
-1. 打开仓库 → 右侧 **Releases** → **Draft a new release**，Tag 填 `v1.4.0`（新建 tag），标题填 `Pixiko v1.4.0`。
-2. 把 `pixiko-v1.4.0.zip` 与 `pixiko-v1.4.0-runnable.zip`（以及各自的 `.sha256`），
-   外加 Android 客户端 `pixiko-android-1.4.0.apk`（**debug 签名**，由 `android/build-apk.ps1` 跑
-   `assembleDebug` 产出、复制到 `F:\Bot\android\dist\`），一共三个附件拖进附件区，
+1. 打开仓库 → 右侧 **Releases** → **Draft a new release**，Tag 填 `v1.4.1`（新建 tag），标题填 `Pixiko v1.4.1`。
+2. 把 `pixiko-v1.4.1.zip` 与 `pixiko-v1.4.1-runnable.zip`（以及各自的 `.sha256`），
+   外加 Android 客户端 `pixiko-android-1.4.0-debug.apk`（**debug 签名**，由 `android/build-apk.ps1` 跑
+   `assembleDebug` 产出、复制到 `F:\Bot\android\dist\`；客户端自身版本仍是 1.4.0——v1.4.1 只改了网页侧的预览页），一共三个附件拖进附件区，
    正文粘贴本文件内容后点 **Publish release**。
 
 > 建仓库时 License 请选 **None**（本项目保留所有权利，不使用开源许可证）。

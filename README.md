@@ -5,7 +5,7 @@ Pixiko 是一个自用的 QQ 机器人：接 **NapCat** 收消息，接 **Stable
 领图；机器人自己把生成好的图片发回对话。
 
 - **作者**：loriko（deloriko@outlook.com）
-- **版本**：v1.4.0（发行说明见 [`RELEASE.md`](RELEASE.md)）
+- **版本**：v1.4.1（发行说明见 [`RELEASE.md`](RELEASE.md)）
 - **版本号规则**：**大改动更新中间位**（`1.1.x` → `1.2.0`），**小修小补更新最后一位**（`1.1.1` → `1.1.2`）
 - **当前实现**：**Java 版**（`src/`）——这是线上一直在跑的那一份
 - **网页控制台**：`webui/`（纯静态 HTML/CSS/JS，随机器人一起由内嵌 Spring Boot 提供）
@@ -469,7 +469,8 @@ run.bat --set-map yh "路径"       # 命令行设置地图（需先停止机器
 
 **前端资源版本升到 `?v=1.3.1`**：`webui/index.html` 的 `?v=` 由父代理设置（v1.2.4 那版是 `?v=1.2.4`，
 v1.3.0 那版是 `?v=1.3.0`，本版因为底模归属栈与控制台铺满的改动重新设成 `?v=1.3.1`）。
-**v1.4.0 没有改网页资源，所以 `?v=` 仍是 `1.3.1`**（这一版新增的是 Android 客户端 `android/`）。
+**v1.4.0 与 v1.4.1 都没有改网页资源，所以 `?v=` 仍是 `1.3.1`**（v1.4.0 新增的是 Android 客户端 `android/`，
+v1.4.1 新增的是它的网页预览页 `webui/android-preview.html`）。
 
 ### 对话栏全局化与对话历史持久化（v1.3.0）
 
@@ -761,6 +762,13 @@ Civitai 下载记录里的 `base_model` → Forge 的 LoRA 元数据（`/sdapi/v
    `webui.access_token`），或点「**扫描局域网**」；
 3. 进去就是控制台，**长按图片**可存进手机相册。
 
+**先看效果（不用装 APK，v1.4.1 起）**：控制台**每一页页脚**都有「安卓外观预览」链接（`href="/android"`），
+也可以直接在浏览器里开 **`http://<电脑地址>:8787/android`**——机器人自己伺服的预览页，用**手机机身外框**
+装下**同源的真控制台**（**11 个栏目 + 常驻对话栏一个不少**，手机宽度下自己变单列堆叠），并复刻顶部标题栏 /
+进度条 / `⋮` 菜单（**9 项，与真机一致**）、服务器设置屏（含「测试连接」区分「连不上」与「令牌不对」）、
+**长按 / 右键图片的原生菜单**与**原生错误页**。**与真机的差别**：「保存到相册」在浏览器里是**下载**、
+**不能扫描局域网**、**屏幕常亮**依赖浏览器的 Wake Lock API。预览页与 APK 用的是**同一段长按脚本（逐字相同）**。
+
 **怎么构建**：`android/` 是标准 Gradle 工程，仓库里带一键脚本 `android/build-apk.ps1`
 （要 **JDK 21 + Android SDK**，跑 `assembleDebug` 并把 APK 复制到输出目录 `F:\Bot\android\dist\`）：
 
@@ -780,7 +788,7 @@ powershell -File android\build-apk.ps1 -SdkRoot <Android SDK 路径> -JdkHome <J
 ```
 pixiko\
 ├─ README.md                       本文件
-├─ RELEASE.md                      v1.4.0 发行说明（含版权声明与已知限制）
+├─ RELEASE.md                      v1.4.1 发行说明（含版权声明与已知限制）
 ├─ THIRD-PARTY-LICENSES.md         随二进制包分发的第三方组件与许可
 ├─ config.example.json             脱敏配置模板（复制成 config.json 再改）
 ├─ .gitignore                      config.json / data / logs / lib jar 等一律不入库
@@ -817,9 +825,10 @@ pixiko\
 │  │  └─ web\                      Spring Boot 网页层（鉴权、API、页面）
 │  └─ test\java\cn\szu\bot\        60 个测试套件（*Test.java，由 test.bat 逐个运行）+ 5 个评测类（*Eval.java，由 eval-*.ps1 运行）
 │
-├─ webui\                          Java 版网页控制台（8 个文件，静态资源）
+├─ webui\                          Java 版网页控制台（9 个文件，静态资源）
 │  ├─ index.html                   外壳 + 11 个栏目页签（另含全局右侧对话栏）
 │  ├─ app.js / app.css             前端逻辑与样式
+│  ├─ android-preview.html         Android 外壳的网页预览页（控制台 /android 伺服）
 │  └─ favicon.ico / favicon-32.png / apple-touch-icon.png / icon-192.png / icon-512.png
 │
 ├─ webui-extension\pixiko-bridge\  SD WebUI 桥接扩展

@@ -214,6 +214,21 @@ public final class WebUiTest {
                 "页面带图片查看器（点图放大，不再跳新标签页）");
         check(index.body().contains("aurora") || index.body().contains("gradient") || index.body().contains("card"),
                 "页面使用卡片式布局");
+        // Android 外壳的网页预览：同源 iframe 装真控制台，外框复刻 app（标题栏/菜单/设置/错误页/图片菜单）。
+        check(index.body().contains("href=\"/android\"") && index.body().contains("安卓外观预览"),
+                "页脚有「安卓外观预览」入口（指向 /android）");
+        HttpResponse<String> preview = HTTP.send(HttpRequest.newBuilder(URI.create(base + "/android")).GET().build(),
+                HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+        check(preview.statusCode() == 200 && String.valueOf(preview.headers().firstValue("Content-Type").orElse("")).startsWith("text/html"),
+                "安卓预览页 /android 可访问且是 HTML：" + preview.statusCode());
+        check(preview.body().contains("id=\"device-inner\"") && preview.body().contains("id=\"view\"")
+                        && preview.body().contains("src=\"/\"") && preview.body().contains("id=\"app-menu\"")
+                        && preview.body().contains("id=\"settings-screen\"") && preview.body().contains("id=\"image-menu\"")
+                        && preview.body().contains("id=\"errorpage\""),
+                "预览页带机身/iframe/菜单/设置/图片菜单/错误页（外框复刻 app 外壳）");
+        check(preview.body().contains("__pixikoNativeHooked") && preview.body().contains("kotori-webui-token")
+                        && preview.body().contains("showImageMenu"),
+                "预览页内联了与 APK 相同的长按脚本（钩子标志 + 网页令牌键 + showImageMenu）");
         HttpResponse<String> css = HTTP.send(HttpRequest.newBuilder(URI.create(base + "/app.css")).GET().build(),
                 HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
         check(css.statusCode() == 200 && css.body().contains("transition") && css.body().contains("linear-gradient"),
