@@ -226,7 +226,10 @@ public final class WebUiTest {
                 "提示符下面那片空白的高度写死在 CSS 里（把提示符托到屏幕上方三分之一处）");
         check(css.body().contains("font: 15px/1.72") && css.body().contains("font: 15px/1.6"),
                 "控制台正文与提示符都是 15px（日志/回执看着不费劲）");
-        check(css.body().contains("max-width: min(100%, 700px)"), "对话/回执里的图片最大给到 700px");
+        check(css.body().contains(".receipt img.receipt-image") && css.body().contains("max-width: min(100%, 700px)"),
+                "回执栏（面板底部）的图片最大给到 700px");
+        check(css.body().contains("max-width: min(100%, 260px)") && css.body().contains(".msg .gallery-grid img"),
+                "对话页单张图收到与回执页一致的 260px，图集格另有一段显式规则钉住（不被带成 260px）");
         check(css.body().contains("img.civitai-cover") && css.body().contains("aspect-ratio: 832 / 1216"),
                 "LoRA 搜索结果的封面按 832:1216 竖版显示（不再裁成正方形）");
         check(css.body().contains("::-webkit-scrollbar") && css.body().contains("scrollbar-color"),
@@ -264,6 +267,18 @@ public final class WebUiTest {
                 "所有出图位置（对话、回执、网格、控制台）都走同一个图片节点");
         check(!script.body().contains("function receiptGroup") && script.body().contains("function appendCaptureGroup"),
                 "面板底部不再渲染回执卡（对话仍按出站消息分条渲染）");
+        check(script.body().contains("function chatAppendImages")
+                        && script.body().substring(script.body().indexOf("async function pollCapture"),
+                                script.body().indexOf("async function runCommands")).contains("chatAppendImages(id, files)"),
+                "对话里一次发送的多张图合成一条图集（连续图片组攒起来交给 chatAppendImages，含文字的组仍各自成条）");
+        check(script.body().contains("chatImageRun: null")
+                        && countOf(script.body(), "state.chatImageRun = null") >= 3
+                        && script.body().contains("chatAppendImages(capture.id || '', missing, pictureBase)"),
+                "图集游标只在运行时用：清空对话 / 铺回历史时作废，回执补漏也并进同一张图集");
+        check(!script.body().contains("（一张图片）"),
+                "对话里的图片条目不再有「（一张图片）」占位文字（只发图的那条只有图）");
+        check(script.body().contains("chat-gallery-entry") && css.body().contains(".messages .msg.chat-gallery-entry"),
+                "带图集的气泡有确定宽度（chat-gallery-entry + align-self:stretch），网格才能排成一行多格");
         check(script.body().contains("openViewer(src, caption)") && script.body().contains("点击放大（Esc 关闭）"),
                 "点图直接调查看器，链接上只留提示不再跳转");
         check(script.body().contains("applyGeneration(true)"), "点「开始生成」前先把面板里没提交的改动发出去");

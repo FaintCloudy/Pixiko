@@ -13,7 +13,10 @@
     questList: null, questListError: '', questListLoading: false, questListWarned: false,
     loras: null, loraGroups: null, terminalHistory: [], terminalCursor: 0,
     // Civitai 搜索的翻页状态：搜索词与当前页留在前端，翻页时不用重敲。
-    civitaiQuery: '', civitaiPage: 1 };
+    civitaiQuery: '', civitaiPage: 1,
+    // 对话页「一次发送 = 一条图集」的运行时游标：`{captureId, entry, node}`，记这一轮图集画在哪
+    // （entry 是快照里的那个对象、node 是它在 #chat-log 里的节点）。**不持久化**：页面一重建就重来。
+    chatImageRun: null };
 
   const $ = (id) => document.getElementById(id);
   const el = (tag, cls, text) => { const node = document.createElement(tag); if (cls) node.className = cls; if (text !== undefined) node.textContent = text; return node; };
@@ -1818,7 +1821,8 @@
         const file = image && image.file ? String(image.file) : '';
         if (file && !seen.has(file) && missing.indexOf(file) < 0) missing.push(file);
       });
-      if (missing.length) chatEntryAdd({ role: 'bot', text: pictureBase, images: missing });
+      // 同一回执里后到的图并进**同一张图集**（末尾那条还是它就并进去），不再叠一条新气泡。
+      if (missing.length) chatAppendImages(capture.id || '', missing, pictureBase);
     }
   }
 
@@ -1934,7 +1938,8 @@
       else if (segment.text) texts.push(segment.text);
     });
     if (!texts.length && !images.length) return;
-    appendMessage('bot', texts.join('\n') || '（一张图片）', images);
+    // 没有文字但有图：文字给空串（只发图的那条不该多出「一张图片」这种占位文字）。
+    appendMessage('bot', texts.join('\n') || '', images);
   }
 
   async function pollCapture(id, attempt = 0, follow = false) {
@@ -1950,7 +1955,28 @@
       if (groups) {
         const seenGroups = state.seenGroups.get(id) || 0;
         if (groups.length > seenGroups) {
-          for (let index = seenGroups; index < groups.length; index++) appendCaptureGroup(groups[index]);
+          // 一次发送的多张图在服务端是一条合并转发：**每个节点各自一组**，所以新组里会出现
+          // 「连续的、只含图片（没有 text 片段）」的一串 —— 它们攒起来一次交给 chatAppendImages，
+          // 对话页里就合成**一条图集**（以前是一组一条，三次单图气泡）。
+          // 含文字的组照旧各自成条；它会把图片那一串截断：之后的图片另起一条新图集。
+          let files = [];
+          const flushImages = () => {
+            if (!files.length) return;
+            chatAppendImages(id, files);           // 并进已有图集或新建一条（文字用不着）
+            files = [];
+          };
+          for (let index = seenGroups; index < groups.length; index++) {
+            const segments = groups[index] || [];
+            const imageOnly = segments.some((segment) => segment && segment.type === 'image' && segment.file)
+              && !segments.some((segment) => segment && segment.text);
+            if (imageOnly) {
+              segments.forEach((segment) => { if (segment.file && files.indexOf(segment.file) < 0) files.push(segment.file); });
+              continue;
+            }
+            flushImages();
+            appendCaptureGroup(groups[index]);
+          }
+          flushImages();
           state.seenGroups.set(id, groups.length);
           loadImages().catch(() => {});
         }
@@ -2100,6 +2126,7 @@
     chatSnapshot.entries = [];
     chatSnapshot.server = 0;
     chatSnapshot.dirty = false;
+    state.chatImageRun = null;         // 快照清了：图集游标指向的那条已经不存在（#chat-log 也空了）
     try { sessionStorage.removeItem(chatLogKey(chatSnapshot.scope)); }
     catch (error) { console.warn('对话快照未删除（不影响聊天）：' + (error && error.message ? error.message : error)); }
   }
@@ -2113,7 +2140,11 @@
    */
   function chatEntryNode(entry) {
     const images = entry.images || [];
-    const node = el('div', 'msg ' + entry.role + (images.length ? ' chat-receipt-images' : ''));
+    // 2 张以上 = 图集：多挂一个 `chat-gallery-entry`，让 CSS 能把这种气泡的宽度定下来
+    // （`.messages` 是 flex 纵向容器、`.msg` 默认 shrink-to-fit，宽高不确定的轴上
+    //  `repeat(auto-fill, 140px)` 只会解析出 1 条轨道 → 缩略图会竖着排成一列，见 app.css 那条注释）。
+    const node = el('div', 'msg ' + entry.role + (images.length ? ' chat-receipt-images' : '')
+      + (images.length > 1 ? ' chat-gallery-entry' : ''));
     if (entry.text || !images.length) node.appendChild(el('div', null, entry.text || ''));
     if (images.length === 1) {
       // 点图打开查看器放大（不再跳到新标签页）。
@@ -2152,6 +2183,50 @@
   function chatEntryAdd(entry) {
     const clean = chatSnapshotRemember(entry);
     return clean ? chatEntryAppend(clean) : null;
+  }
+
+  /**
+   * 对话页的「一次发送 = 一条图集」：同一条回执（captureId）陆续到的图片，全部攒进**同一条**条目 ——
+   * 机器人一次发多张（`/rg 3`、领取图片、地图合并转发）在对话里就是一条图集，而不是 N 条单图气泡。
+   *
+   * <p>游标 {@link state.chatImageRun} 记住这一条画在哪：只要还是 `#chat-log` 的末尾那一条
+   * （中间没插进别的消息），新图就并进 `run.entry.images` 并**就地重建这一条的节点**（`replaceChild`，
+   * 位置与贴底不变）；`run.entry` 就是快照里的那个对象，追加后由 `chatSnapshotSchedule()` 标脏落盘。
+   * 换了发送（别的 captureId）或末尾已经是别人的消息，就重新起一条。
+   *
+   * @param {string} captureId 这一轮回执的 id（与游标相同才有资格并进同一条）
+   * @param {string[]} files 这次要画的图片（已经画过的自动跳过）
+   * @param {string} [text] 新建一条时的文字（并进已有图集时不看它）
+   * @returns {object|null} 这条条目（快照里的那个对象）；不在对话页时 null、什么都不做
+   */
+  function chatAppendImages(captureId, files, text) {
+    const log = $('chat-log');
+    if (!log) return null;                        // 别的栏目没有 #chat-log：返回 null、什么都不做（appendMessage 同此）
+    const list = (files || []).map((file) => String(file || '')).filter(Boolean);
+    if (!list.length) return null;
+    const key = String(captureId || '');
+    const run = state.chatImageRun;
+    // 只在「还是末尾那一条」时并进去：中间来过别的消息（用户发言、文字回执）就必须另起一条。
+    if (run && run.captureId === key && run.node && log.lastChild === run.node) {
+      const images = run.entry.images || (run.entry.images = []);
+      list.forEach((file) => { if (images.indexOf(file) < 0) images.push(file); });
+      chatSnapshotSchedule();                     // 节流窗口可能已经写过一次：这里显式再标脏，切栏目/隐藏前一定落盘
+      const fresh = chatEntryNode(run.entry);     // 张数变了：重建这一条（图集网格按新张数画）
+      log.replaceChild(fresh, run.node);
+      run.node = fresh;
+      log.scrollTop = log.scrollHeight;           // 与单条消息一样贴底（图片异步撑高由 chatStickImages 再校准）
+      chatStickImages(log);
+      return run.entry;
+    }
+    // 新建一条：先记进快照、再渲染，游标记住**快照里那个条目对象**（后面的图要追加进它的 images）。
+    // 这里不直接调 chatEntryAdd：它返回的是渲染出来的**节点**（历史行为，现有调用方都不用它），
+    // 而游标必须拿到条目本身（`chatSnapshotRemember` + `chatEntryAppend` 就是它的两步）。
+    const entry = chatSnapshotRemember({ role: 'bot', text: text || '', images: list });
+    if (!entry) return null;
+    const node = chatEntryAppend(entry);
+    if (!node) return null;
+    state.chatImageRun = { captureId: key, entry, node };
+    return entry;
   }
 
   /** 快照里已经画过的图片：renderCapture 的补漏靠它去重，同一张图不会画两回。 */
@@ -2229,6 +2304,7 @@
     chatSnapshot.dirty = false;
     // 读回来被裁过（超 200 条 / 超 512KB）：把裁过的版本写回去，存储里不留超限的旧账。
     if (snapshot.dropped) chatSnapshotSchedule();
+    state.chatImageRun = null;                  // 重建 #chat-log 之前丢掉游标：旧节点马上就没了
     log.innerHTML = '';
     chatSnapshot.entries.forEach((entry) => chatEntryAppend(entry));
     // 2) 再拉服务端历史，只追加比基准多出来的那部分。
@@ -4403,6 +4479,7 @@
     on('chat-reset', 'click', async () => {
       await api('/api/chat/reset', { body: { scope: scope() } });
       $('chat-log').innerHTML = '';
+      state.chatImageRun = null;         // 清空对话：图集游标作废（下一次发送重新起一条）
       chatSnapshotClear();               // 会话存储里的那份也一起删：清空之后切回来不能又"复活"
       toast('对话已清空');
     });

@@ -148,15 +148,18 @@ code { background: rgba(120, 160, 220, .14); padding: 1px 5px; border-radius: 6p
 .msg.user { align-self: flex-end; background: linear-gradient(135deg, var(--accent), #3f7fe0); color: #04101f; border-bottom-right-radius: 5px; box-shadow: 0 8px 20px rgba(90, 162, 255, .2); }
 .msg.bot { align-self: flex-start; background: var(--panel); border: 1px solid var(--line); border-bottom-left-radius: 5px; }
 .msg.sys { align-self: center; color: var(--muted); font-size: 12px; background: transparent; }
-/* 对话里的图片：给足尺寸（最大 700px，横向自适应），点开还是原图 */
-.msg a.msg-image { display: inline-block; margin-top: 8px; line-height: 0; }
+/* 对话里的图片：**单张**和回执页的单张图一个尺寸（回执页见 .quest-images img：min(100%, 260px)），
+   这样「单张 vs 图集格（140px 见方）」的比例关系两页一致；窄屏仍是 max-width:100% 自适应，点开还是原图。
+   注意：图集缩略图不归这条管（它按 140px 方格铺满，上限由 .gallery-grid img 钉死，见下面图集那一节）。
+   （这里原来还有一条 `.msg a.msg-image { display:inline-block; margin-top:8px; line-height:0 }`：
+    `msg-image` 这个类是挂在 `<img>` 上的（`<a>` 的类是 image-link），选择器从来没命中过，
+    行内块/上边距/行高都从未生效 —— 死规则已删掉，单图观感与之前完全一致。） */
 .msg img {
-  max-width: min(100%, 700px); max-height: 700px; width: auto; height: auto;
+  max-width: min(100%, 260px); max-height: 260px; width: auto; height: auto;
   object-fit: contain; border-radius: 12px; display: block;
   border: 1px solid var(--line); background: rgba(6, 11, 20, .5);
   transition: transform .18s var(--ease);
 }
-.msg a.msg-image:hover img { transform: translateY(-1px) scale(1.01); }
 .msg .spin { margin-right: 6px; }
 @keyframes bubble-in { from { opacity: 0; transform: translateY(8px) scale(.98); } to { opacity: 1; transform: none; } }
 
@@ -814,6 +817,18 @@ a.image-link.gallery-thumb:hover { transform: translateY(-2px); border-color: rg
   display: block; width: 100%; height: auto; aspect-ratio: 1; object-fit: cover;
   max-width: none; max-height: none; border: 0; border-radius: 0;
 }
+/* 对话页里的图集格：尺寸归 .gallery-grid 管（140px 方格），这里把上限显式钉死。
+   `.msg img`（对话单张图，上限 260px）与本规则优先级相同（0,1,1），只靠「写在后面」太脆；
+   这条 0,2,1 的规则让图集格无论 .msg img 写在哪儿都不会被带成 260px。 */
+.msg .gallery-grid img { max-width: none; max-height: none; }
+/* 带图集的气泡必须给一个**确定宽度**（这是「图集网格」能不能排成一行前提，不只是好不好看）：
+   `#chat-log` 是 `.messages`（flex 纵向）、`.msg` 默认 shrink-to-fit，宽度由内容决定 →
+   `.gallery-grid` 的 `repeat(auto-fill, 140px)` 在该轴尺寸不确定时按规范只解析出 **1 条轨道**，
+   3 张缩略图于是竖着排成一列、气泡只有一格宽（同一个组件在整宽的回执卡里是正常的）。
+   `align-self: stretch` 让这种气泡撑到容器宽的 88%（`.msg` 的 max-width），网格才排成一行；
+   单图气泡**没有**这个类，仍是 260px 上限、仍按内容收窄。
+   前缀 `.messages` 是为了稳定压过 `.msg.bot { align-self: flex-start }`（0,3,0 > 0,2,0，与源码顺序无关）。 */
+.messages .msg.chat-gallery-entry { align-self: stretch; }
 .gallery-receipt { padding: 8px; }
 
 /* ---------------------------------------------------------------- 图集占位格（未生成 / 生成中 / 失败）
