@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  自适应图标（Android 8+ 用这两层，8 以下回退到 mipmap-*/ic_launcher.png）。
+  前景是 drawable/ic_launcher_foreground.xml（把 webui/icon-192.png 用 inset 收进安全区），
+  没有重画任何图形。
+-->
+<adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+    <background android:drawable="@color/pixiko_ic_launcher_background" />
+    <foreground android:drawable="@drawable/ic_launcher_foreground" />
+</adaptive-icon>

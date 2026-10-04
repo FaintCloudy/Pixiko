@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  自适应图标的前景：直接复用 webui/icon-192.png，但用 <inset> 收进安全区。
+
+  为什么需要这一层：自适应图标的前景是一张 108dp 画布，系统只保证中间约 66×66dp 可见，
+  其余部分会被厂商的圆形/方圆遮罩裁掉。icon-192.png 是「满幅带底色」的方块图，
+  原样当前景会被裁掉四边；inset 18% 让整张图落在安全区内，视觉上就成了「图标外面一圈底色」。
+-->
+<inset xmlns:android="http://schemas.android.com/apk/res/android"
+    android:drawable="@mipmap/ic_launcher"
+    android:inset="18%" />

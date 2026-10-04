@@ -5,10 +5,11 @@ Pixiko 是一个自用的 QQ 机器人：接 **NapCat** 收消息，接 **Stable
 领图；机器人自己把生成好的图片发回对话。
 
 - **作者**：loriko（deloriko@outlook.com）
-- **版本**：v1.3.1（发行说明见 [`RELEASE.md`](RELEASE.md)）
+- **版本**：v1.4.0（发行说明见 [`RELEASE.md`](RELEASE.md)）
 - **版本号规则**：**大改动更新中间位**（`1.1.x` → `1.2.0`），**小修小补更新最后一位**（`1.1.1` → `1.1.2`）
 - **当前实现**：**Java 版**（`src/`）——这是线上一直在跑的那一份
 - **网页控制台**：`webui/`（纯静态 HTML/CSS/JS，随机器人一起由内嵌 Spring Boot 提供）
+- **Android 客户端**：`android/`（**v1.4.0 起**；原生外壳 + WebView 承载完整控制台，见 [`android/README.md`](android/README.md)）
 - **SD WebUI 桥接扩展**：`webui-extension/pixiko-bridge/`（把文生图页正在编辑的提示词同步给机器人）
 - **另有一次未完成的 Next.js 重构**：见 [`nextjs-wip/`](nextjs-wip/README.md)，**不可运行，勿用于生产**
 
@@ -468,6 +469,7 @@ run.bat --set-map yh "路径"       # 命令行设置地图（需先停止机器
 
 **前端资源版本升到 `?v=1.3.1`**：`webui/index.html` 的 `?v=` 由父代理设置（v1.2.4 那版是 `?v=1.2.4`，
 v1.3.0 那版是 `?v=1.3.0`，本版因为底模归属栈与控制台铺满的改动重新设成 `?v=1.3.1`）。
+**v1.4.0 没有改网页资源，所以 `?v=` 仍是 `1.3.1`**（这一版新增的是 Android 客户端 `android/`）。
 
 ### 对话栏全局化与对话历史持久化（v1.3.0）
 
@@ -730,6 +732,47 @@ Civitai 下载记录里的 `base_model` → Forge 的 LoRA 元数据（`/sdapi/v
 `GET /api/loras` 的每一项带 `baseModel` / `baseModelSource` / `stack` / `stackLabel` / `preset` /
 `stackSource` / `evidence` / `groupKey`（栈键）/ `baseModelGroupKey`，并在 `groups` 里给出按**栈**分组的结果。
 
+### Android 客户端（v1.4.0 起）
+
+**是什么**：`android/` 是一个 **Android app**，把**整个网页控制台搬到手机上**。
+做法是**原生外壳 + WebView 承载完整控制台**——app 里加载的就是你机器人发出来的那套网页，
+所以**网页有的栏目 app 里一个都不少**：出图 / 提示词 / 样式 / LoRA / 提示词集 / 聊天配置 /
+系统 / 首次配置 / 日志 / 回执 / 帮助（**11 个栏目**）+ **常驻右侧的对话栏**，共 **13 栏**。
+也正因为它加载的是网页本体，**以后网页更新，app 自动跟着更新**，不用重新出包。
+
+**原生增强（网页做不到或做不好的）**：
+
+| 能力 | 说明 |
+|---|---|
+| 服务器管理 | 填地址与访问令牌，可存**多台服务器**一键切换；地址支持简写（`192.168.1.5:8787` 会自动补 `http://` 与默认端口 8787） |
+| 测试连接 | 先打 `/healthz`，再打**带令牌的** `/api/status`，能**区分「连不上」和「令牌不对」** |
+| 局域网扫描 | 按当前 Wi-Fi 网段扫 `:8787` 上的机器人，**找到就一键填入** |
+| 令牌自动注入 | 不用在网页锁屏页里再敲一次令牌 |
+| 图片保存 / 分享 | 在网页里**长按图片**即可存进相册（`Pictures/Pixiko`）或分享出去（网页版只能看大图） |
+| 下拉刷新 + 进度条 + 原生错误页 | 连不上时列出可能原因（不在同一局域网 / 地址端口不对 / 机器人没开 / 令牌不对），并给「重试 / 去设置 / 用浏览器打开」 |
+
+另外还有**返回键行为**（回退 → 回首页 → 再按一次退出）、**屏幕常亮**开关、**清网页缓存 / 清登录状态**、
+「在浏览器打开」、关于页；文件选择、下载、新窗口、图片查看器都做了原生适配。
+
+**三步用起来**：
+
+1. 手机和电脑连**同一个 Wi-Fi**；
+2. 打开 app，填「**电脑的局域网 IP:8787**」+「**访问令牌**」（令牌在电脑 `config.json` 的
+   `webui.access_token`），或点「**扫描局域网**」；
+3. 进去就是控制台，**长按图片**可存进手机相册。
+
+**怎么构建**：`android/` 是标准 Gradle 工程，仓库里带一键脚本 `android/build-apk.ps1`
+（要 **JDK 21 + Android SDK**，跑 `assembleDebug` 并把 APK 复制到输出目录 `F:\Bot\android\dist\`）：
+
+```powershell
+powershell -File android\build-apk.ps1 -SdkRoot <Android SDK 路径> -JdkHome <JDK 21 路径>
+```
+
+工具链组件、参数、APK 产物路径与两种安装方式，见 [`android/README.md`](android/README.md)。
+
+> **安全**：手机与电脑之间是局域网 **http 明文**传输，访问令牌也以**明文**存在 app 私有目录里，
+> **只建议在家里或可信局域网用**；app 不向任何第三方服务器发数据，它只连你填的那台机器人。
+
 ---
 
 ## 六、目录结构
@@ -737,7 +780,7 @@ Civitai 下载记录里的 `base_model` → Forge 的 LoRA 元数据（`/sdapi/v
 ```
 pixiko\
 ├─ README.md                       本文件
-├─ RELEASE.md                      v1.3.1 发行说明（含版权声明与已知限制）
+├─ RELEASE.md                      v1.4.0 发行说明（含版权声明与已知限制）
 ├─ THIRD-PARTY-LICENSES.md         随二进制包分发的第三方组件与许可
 ├─ config.example.json             脱敏配置模板（复制成 config.json 再改）
 ├─ .gitignore                      config.json / data / logs / lib jar 等一律不入库
@@ -752,6 +795,12 @@ pixiko\
 ├─ eval-effect.ps1                 提示词链路评测：改写效果
 ├─ eval-scale.ps1                  提示词链路评测：规模/抽样
 ├─ eval-decompose.ps1              提示词链路评测：场景拆解
+│
+├─ android/                        Android 客户端（原生外壳 + 完整控制台，v1.4.0 起）
+│  ├─ README.md                    是什么、怎么用、怎么构建 APK、安全与已知限制
+│  ├─ build-apk.ps1                一键构建：assembleDebug 并把 APK 复制到输出目录
+│  ├─ build.gradle / settings.gradle / gradle.properties
+│  └─ app/                         app 模块（Java 源码、资源、清单）
 │
 ├─ src\
 │  ├─ main\java\cn\szu\bot\        机器人本体（37 个 .java）

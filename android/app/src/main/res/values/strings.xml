@@ -1,0 +1,58 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Pixiko</string>
+    <string name="app_subtitle">网页控制台的原生外壳</string>
+
+    <!-- 主界面菜单 -->
+    <string name="menu_refresh">刷新</string>
+    <string name="menu_home">回到首页</string>
+    <string name="menu_switch_server">切换服务器</string>
+    <string name="menu_server_settings">服务器设置</string>
+    <string name="menu_open_browser">在浏览器打开</string>
+    <string name="menu_keep_screen_on">屏幕常亮</string>
+    <string name="menu_clear_cache">清空网页缓存</string>
+    <string name="menu_clear_login">清除登录状态</string>
+    <string name="menu_about">关于</string>
+
+    <!-- 错误页 -->
+    <string name="error_title">打不开控制台</string>
+    <string name="error_reasons">可能的原因：\n\n• 手机和服务端不在同一个局域网（或没连 Wi-Fi）\n• 地址 / 端口写错（默认端口 8787）\n• 机器人（Pixiko）没有在运行\n• 访问令牌不对（config.json → webui.access_token）\n\n先点「去设置」用「测试连接」和「扫描局域网」确认地址与令牌。</string>
+    <string name="error_retry">重试</string>
+    <string name="error_settings">去设置</string>
+    <string name="error_browser">用浏览器打开</string>
+
+    <!-- 服务器设置页 -->
+    <string name="settings_title">服务器设置</string>
+    <string name="settings_edit_title">添加 / 编辑服务器</string>
+    <string name="settings_edit_hint">地址支持 192.168.1.5:8787、http://192.168.1.5:8787、http://host:端口/ 等写法，会自动补 http:// 和默认端口 8787。</string>
+    <string name="settings_name">名称（可留空，默认显示主机名）</string>
+    <string name="settings_address">地址，例如 192.168.1.5:8787</string>
+    <string name="settings_token">访问令牌（config.json → webui.access_token）</string>
+    <string name="settings_test">测试连接</string>
+    <string name="settings_scan">扫描局域网</string>
+    <string name="settings_save">保存</string>
+    <string name="settings_reset">清空输入</string>
+    <string name="settings_set_active">保存后设为当前服务器</string>
+    <string name="settings_saved_title">已保存的服务器</string>
+    <string name="settings_empty">还没有保存任何服务器。填好地址与令牌后点「保存」。</string>
+    <string name="settings_security_note">说明：多台服务器的「名称 / 地址 / 令牌」存在应用私有的 SharedPreferences 里（卸载 app 即清除），令牌是明文存储，不要用外部存储保存或把该文件拷给别人。清理数据会一并清掉。</string>
+
+    <!-- 连接测试 / 扫描 -->
+    <string name="probe_testing">正在测试连接…</string>
+    <string name="scan_running">正在扫描局域网…</string>
+    <string name="scan_none">没有扫到正在运行的控制台。确认机器人已启动、手机与它在同一个 Wi-Fi。</string>
+
+    <!-- 关于 -->
+    <string name="about_title">关于 Pixiko</string>
+    <string name="about_message">Pixiko Android 外壳（cn.szu.bot.app）\n\n这就是网页控制台的全量功能：出图、对话、提示词、风格、LoRA、功能、聊天设置、系统、首次配置、日志、回执、帮助——全部栏目都在内置的 WebView 里，和电脑浏览器打开的是同一个界面（手机宽度下网页自己会变成单列堆叠）。\n\n原生新增的只有这些：服务器配置与局域网扫描、下拉刷新与原生错误页、长按图片保存到相册 / 分享、屏幕常亮、顶部加载进度。\n\n作者 loriko · 与网页控制台同版本号。</string>
+    <string name="about_ok">知道了</string>
+
+    <!-- 提示语 -->
+    <string name="toast_press_again">再按一次退出</string>
+    <string name="toast_keep_screen_on">屏幕常亮：开</string>
+    <string name="toast_keep_screen_off">屏幕常亮：关</string>
+    <string name="toast_cache_cleared">网页缓存已清空</string>
+    <string name="toast_login_cleared">登录状态已清除，网页会回到锁屏</string>
+    <string name="no_browser">没有找到可用的浏览器</string>
+    <string name="no_server">还没有配置服务器</string>
+</resources>

@@ -1,0 +1,55 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  主界面工具条菜单。原生的东西只有「怎么把网页装进去」这一类：
+  刷新/回首页/换服务器/设置/浏览器打开/常亮/清缓存/清登录态/关于。
+  网页自身的栏目（出图、提示词、风格、LoRA…）全在页面里，不在这里重复一份。
+-->
+<menu xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto">
+
+    <item
+        android:id="@+id/action_refresh"
+        android:title="@string/menu_refresh"
+        app:showAsAction="never" />
+
+    <item
+        android:id="@+id/action_home"
+        android:title="@string/menu_home"
+        app:showAsAction="never" />
+
+    <item
+        android:id="@+id/action_switch"
+        android:title="@string/menu_switch_server"
+        app:showAsAction="never" />
+
+    <item
+        android:id="@+id/action_settings"
+        android:title="@string/menu_server_settings"
+        app:showAsAction="never" />
+
+    <item
+        android:id="@+id/action_browser"
+        android:title="@string/menu_open_browser"
+        app:showAsAction="never" />
+
+    <item
+        android:id="@+id/action_keep_screen_on"
+        android:checkable="true"
+        android:title="@string/menu_keep_screen_on"
+        app:showAsAction="never" />
+
+    <item
+        android:id="@+id/action_clear_cache"
+        android:title="@string/menu_clear_cache"
+        app:showAsAction="never" />
+
+    <item
+        android:id="@+id/action_clear_login"
+        android:title="@string/menu_clear_login"
+        app:showAsAction="never" />
+
+    <item
+        android:id="@+id/action_about"
+        android:title="@string/menu_about"
+        app:showAsAction="never" />
+</menu>

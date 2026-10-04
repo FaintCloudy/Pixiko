@@ -1,0 +1,18 @@
+// 顶层构建脚本：只声明插件版本，具体配置在 :app 模块里。
+// 这里用 legacy 的 `apply plugin` 方式（而不是 plugins {} 块）是为了让根工程不依赖
+// settings.gradle 的 pluginManagement 解析顺序，构建更稳。
+buildscript {
+    repositories {
+        google()
+        mavenCentral()
+    }
+    dependencies {
+        // 8.7.3：与 Gradle 8.14.x 兼容（AGP 8.7 要求 Gradle >= 8.9），
+        // 也在需求允许的 8.4.x~8.7.x 区间内。
+        classpath 'com.android.tools.build:gradle:8.7.3'
+    }
+}
+
+tasks.register('clean', Delete) {
+    delete rootProject.layout.buildDirectory
+}

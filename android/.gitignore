@@ -1,0 +1,9 @@
+# 构建产物不入库：这一份工程只提交源码。
+build/
+app/build/
+.gradle/
+dist/
+local.properties
+*.iml
+.idea/
+captures/

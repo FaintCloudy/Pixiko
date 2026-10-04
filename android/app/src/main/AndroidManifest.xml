@@ -1,0 +1,73 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Pixiko Android 外壳的清单。
+
+  几个「不写就会踩坑」的点：
+  * usesCleartextTraffic="true"：局域网控制台是 http://192.168.x.x:8787，Android 9+ 默认禁明文，
+    不开这一项 WebView 会直接 net::ERR_CLEARTEXT_NOT_PERMITTED。
+  * hardwareAccelerated="true"：网页里有大量图片与过渡动画，不加速会卡。
+  * WRITE_EXTERNAL_STORAGE 带 maxSdkVersion="28"：Android 10+ 保存图片走 MediaStore，不再需要这个权限，
+    带着它反而会被应用商店提示"申请了不必要的存储权限"。
+  * configChanges：旋转/分屏/字体缩放不重建 Activity，WebView 的滚动位置与页面状态原地保留
+    （配合 MainActivity 的 onSaveInstanceState 双保险）。
+  * 只导出 LAUNCHER Activity，其它 Activity 不导出。
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <uses-permission android:name="android.permission.INTERNET" />
+    <!-- 扫描局域网/判断有没有连 Wi-Fi 需要看网络状态（不需要定位权限）。 -->
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+    <!-- Android 9 及以下把图片写进公共 Pictures 需要它；10+ 走 MediaStore，不再申请。 -->
+    <uses-permission
+        android:name="android.permission.WRITE_EXTERNAL_STORAGE"
+        android:maxSdkVersion="28" />
+    <!-- Android 10 上若 ROM 仍以 legacy 方式挂载外部存储，这个标记让写入照旧成功。 -->
+    <uses-permission
+        android:name="android.permission.READ_EXTERNAL_STORAGE"
+        android:maxSdkVersion="32" />
+
+    <application
+        android:name=".PixikoApp"
+        android:allowBackup="false"
+        android:hardwareAccelerated="true"
+        android:icon="@mipmap/ic_launcher"
+        android:label="@string/app_name"
+        android:supportsRtl="true"
+        android:theme="@style/Theme.Pixiko"
+        android:usesCleartextTraffic="true"
+        tools:targetApi="33">
+
+        <activity
+            android:name=".MainActivity"
+            android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|keyboardHidden|uiMode|density|fontScale|locale|layoutDirection"
+            android:exported="true"
+            android:launchMode="singleTop"
+            android:theme="@style/Theme.Pixiko"
+            android:windowSoftInputMode="adjustResize">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <activity
+            android:name=".SettingsActivity"
+            android:configChanges="orientation|screenSize|screenLayout|keyboardHidden|uiMode|density|fontScale"
+            android:exported="false"
+            android:label="@string/settings_title"
+            android:parentActivityName=".MainActivity" />
+
+        <!-- 只服务分享图片的 FileProvider（authority = 包名 + .fileprovider）。 -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.fileprovider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/file_paths" />
+        </provider>
+    </application>
+</manifest>

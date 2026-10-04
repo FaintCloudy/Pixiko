@@ -1,11 +1,51 @@
-# Pixiko v1.3.1 发行说明
+# Pixiko v1.4.0 发行说明
 
-- **版本**：v1.3.1
+- **版本**：v1.4.0
 - **日期**：2026-10-04
 - **作者**：loriko（deloriko@outlook.com）
 - **当前实现**：Java 版（`src/`）。另有一次**未完成的** Next.js 重构，见 `nextjs-wip/`，**不可运行**。
 
 ---
+
+## 〇、本版新增（v1.4.0）
+
+**一件事：多了一个平台客户端——Android app（`android/`）**，把网页控制台**全部搬到手机上**。
+包名与版本：`cn.szu.bot.app`、**1.4.0**；`webui/` 一个字节没动（网页资源版本仍是 `?v=1.3.1`）。
+
+- **做法：原生外壳 + WebView 承载完整控制台**：以前控制台只能在电脑浏览器里开；
+  现在 app 里用 WebView 装下**整个网页控制台**，所以**网页有的栏目 app 里一个都不少**——
+  出图 / 提示词 / 样式 / LoRA / 提示词集 / 聊天配置 / 系统 / 首次配置 / 日志 / 回执 / 帮助
+  **11 个栏目**，加上**常驻右侧的对话栏**，共 **13 栏**，按钮、表单、面板全都在。
+  **以后网页更新，app 自动跟着更新**（app 不内嵌一份写死的界面，直接加载你机器人发出来的页面）。
+- **原生新增（网页做不到或做不好的）六类**：
+  - **服务器管理**：填地址与访问令牌即可连上，可保存**多台服务器**并一键切换。
+    地址支持**简写**——填 `192.168.1.5:8787` 这种就行，app 会**自动补 `http://` 与默认端口 8787**；
+    令牌写在 app 私有的 `SharedPreferences` 里（**明文**，见「安全与隐私」）。
+  - **测试连接**：打一次 `/healthz`，再打一次**带令牌的 `/api/status`**，
+    因此能**区分「连不上」和「令牌不对」**——不是笼统的一句「连接失败」。
+  - **局域网扫描**：拿当前 Wi-Fi 网段扫 `:8787` 上的机器人，**找到就能一键填入**地址。
+  - **令牌自动注入**：不用在网页的锁屏页里再敲一次令牌，app 直接带进去。
+  - **原生图片保存 / 分享**：在网页里**长按图片**就能**存进手机相册**（`Pictures/Pixiko`）
+    或**分享出去**（以前在网页版里只能看大图，存不下来）。
+  - **下拉刷新 + 顶部进度条 + 原生错误页**：连不上时不再是一片白，而是明确列出**可能原因**——
+    不在同一局域网 / 地址端口不对 / 机器人没开 / 令牌不对——并给三个按钮：
+    **重试 / 去设置 / 用浏览器打开**。
+- **还有这些顺手做的**：**返回键**行为（回退 → 回首页 → 再按一次退出）、**屏幕常亮**开关、
+  **清网页缓存 / 清登录状态**、**在浏览器打开**、**关于**页；**文件选择、下载、新窗口、
+  图片查看器**都做了原生适配（点「选择文件」能开系统文件选择器，下载能落到手机里）。
+- **手机宽度不用另做一套界面**：控制台本身就是**响应式的**（**≤1000px 变单列堆叠**），
+  **390×844 的手机宽度已经在真机浏览器里验收过**：无横向滚动、右侧对话栏在下方堆叠、结构完整。
+  所以 app 里直接复用同一套响应式网页，**不做手机端专属界面**。
+- **怎么构建（本机 Gradle 工程）**：`android/` 是**标准的 Gradle 工程**
+  （Java、Android Gradle Plugin **8.x**、`compileSdk 34`、`minSdk 26`、`applicationId cn.szu.bot.app`、
+  版本 **1.4.0**），仓库里带一个**一键脚本** `android/build-apk.ps1`：
+  用它指定的 **JDK 21** 与 **Android SDK** 路径跑 `assembleDebug`，并把 APK 复制到输出目录
+  `F:\Bot\android\dist\`。工具链与参数的完整说明见
+  [`android/README.md`](android/README.md)「怎么构建 APK」。
+- **前端**：本版没有改动 `webui/`，网页资源版本保持 `?v=1.3.1`。
+
+<details>
+<summary>上一版（v1.3.1）</summary>
 
 ## 〇、本版新增（v1.3.1）
 
@@ -53,6 +93,8 @@
   - **说明**：因为对话栏保持「右 1/3」，屏幕特别宽时右栏本身也会很宽（3440px 下约 1130px）——
     这是按「右 1/3」的要求来的。
 - **前端**：`webui/index.html` 的 `?v=` 由父代理设为 **`?v=1.3.1`**。
+
+</details>
 
 <details>
 <summary>上一版（v1.3.0）</summary>
@@ -842,7 +884,7 @@ Danbooru 词条（↑↓ 选择、Esc 关闭；空词条上按 **Ctrl+Space** �
 
 ## 三、安装与启动（三步）
 
-### 开箱即用包 `pixiko-v1.3.1-runnable.zip`
+### 开箱即用包 `pixiko-v1.4.0-runnable.zip`
 
 1. 装好 **JDK 17+**。
 2. **双击 `start.bat`**。第一次运行会自动生成 `config.json`（照 `config.example.json` 起一份），
@@ -852,7 +894,7 @@ Danbooru 词条（↑↓ 选择、Esc 关闭；空词条上按 **Ctrl+Space** �
 
 > `start.bat` 跑的是包内已编译好的 `build/pixiko.jar`；只有需要改代码时才用 `build.ps1` + `run.bat`。
 
-### 源码包 `pixiko-v1.3.1.zip`
+### 源码包 `pixiko-v1.4.0.zip`
 
 1. 装好 **JDK 17+**。
 2. 在项目根目录准备好依赖 jar：`lib/gson-2.13.1.jar` 由 `build.ps1` **自动下载并校验**，
@@ -864,6 +906,18 @@ cd <解压目录>
 copy config.example.json config.json
 .\run.bat
 ```
+
+### Android 客户端 `pixiko-android-1.4.0.apk`（v1.4.0 起）
+
+1. **不用装 JDK、也不用装 Android Studio**——直接把这个 APK 拷进手机点安装即可。
+2. 手机与电脑要在**同一个 Wi-Fi**，app 里填「电脑的局域网 IP:8787」+「访问令牌」
+   （令牌在电脑 `config.json` 的 `webui.access_token`），或点「**扫描局域网**」自动找。
+3. 进去就是**完整的网页控制台**（13 栏全在），**长按图片**可以存进相册 `Pictures/Pixiko`。
+
+> 这是**用 Android SDK 现构建出来的 debug 签名包**（`cn.szu.bot.app` / **1.4.0**，`compileSdk 34`、`minSdk 26`），
+> **不是官方签名的正式包**；想自己构建就用 `android/build-apk.ps1`（要 **JDK 21 + Android SDK**，
+> 跑 `assembleDebug` 并把 APK 复制到 `F:\Bot\android\dist\`）。安装时 Android 会要求允许
+> 「**安装未知来源应用**」。用法、构建步骤与安全提醒见 [`android/README.md`](android/README.md)。
 
 ---
 
@@ -917,8 +971,10 @@ copy config.example.json config.json
 
 ## 六、在 GitHub Releases 里发布这个 zip
 
-1. 打开仓库 → 右侧 **Releases** → **Draft a new release**，Tag 填 `v1.3.1`（新建 tag），标题填 `Pixiko v1.3.1`。
-2. 把 `pixiko-v1.3.1.zip` 与 `pixiko-v1.3.1-runnable.zip`（以及各自的 `.sha256`）拖进附件区，
+1. 打开仓库 → 右侧 **Releases** → **Draft a new release**，Tag 填 `v1.4.0`（新建 tag），标题填 `Pixiko v1.4.0`。
+2. 把 `pixiko-v1.4.0.zip` 与 `pixiko-v1.4.0-runnable.zip`（以及各自的 `.sha256`），
+   外加 Android 客户端 `pixiko-android-1.4.0.apk`（**debug 签名**，由 `android/build-apk.ps1` 跑
+   `assembleDebug` 产出、复制到 `F:\Bot\android\dist\`），一共三个附件拖进附件区，
    正文粘贴本文件内容后点 **Publish release**。
 
 > 建仓库时 License 请选 **None**（本项目保留所有权利，不使用开源许可证）。

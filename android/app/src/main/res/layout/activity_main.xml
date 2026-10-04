@@ -1,0 +1,121 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  主界面：标题栏 + 顶部细进度条 + (下拉刷新)SwipeRefreshLayout 包着 WebView，再叠一层原生错误页。
+
+  为什么 WebView 放在 FrameLayout 里而不是直接当 SwipeRefreshLayout 的子节点：
+  SwipeRefreshLayout 只允许一个直接子节点，而我们还要往上叠一个错误占位页，
+  所以用一层 FrameLayout 把 WebView 和错误页装在一起。
+-->
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
+    android:id="@+id/root"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="@color/pixiko_bg"
+    android:orientation="vertical">
+
+    <com.google.android.material.appbar.MaterialToolbar
+        android:id="@+id/toolbar"
+        android:layout_width="match_parent"
+        android:layout_height="?attr/actionBarSize"
+        android:background="@color/pixiko_bar"
+        android:elevation="0dp"
+        app:title="@string/app_name"
+        app:titleTextColor="@color/pixiko_text" />
+
+    <!-- 细进度条：WebView 的 onProgressChanged 直接驱动它；空载时 INVISIBLE，不占位跳动。 -->
+    <ProgressBar
+        android:id="@+id/progress"
+        style="?android:attr/progressBarStyleHorizontal"
+        android:layout_width="match_parent"
+        android:layout_height="2dp"
+        android:indeterminate="false"
+        android:max="100"
+        android:progress="0"
+        android:progressTint="@color/pixiko_accent"
+        android:visibility="invisible" />
+
+    <androidx.swiperefreshlayout.widget.SwipeRefreshLayout
+        android:id="@+id/swipe"
+        android:layout_width="match_parent"
+        android:layout_height="0dp"
+        android:layout_weight="1">
+
+        <FrameLayout
+            android:layout_width="match_parent"
+            android:layout_height="match_parent">
+
+            <WebView
+                android:id="@+id/webview"
+                android:layout_width="match_parent"
+                android:layout_height="match_parent"
+                android:background="@color/pixiko_bg" />
+
+            <!-- 原生错误页：加载失败/超时才显示，说明可能原因并给三个出口。 -->
+            <ScrollView
+                android:id="@+id/error_page"
+                android:layout_width="match_parent"
+                android:layout_height="match_parent"
+                android:background="@color/pixiko_bg"
+                android:fillViewport="true"
+                android:visibility="gone">
+
+                <LinearLayout
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:gravity="center_horizontal"
+                    android:orientation="vertical"
+                    android:padding="28dp">
+
+                    <TextView
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:layout_marginTop="48dp"
+                        android:text="@string/error_title"
+                        android:textColor="@color/pixiko_text"
+                        android:textSize="20sp"
+                        android:textStyle="bold" />
+
+                    <TextView
+                        android:id="@+id/error_detail"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:layout_marginTop="8dp"
+                        android:gravity="center"
+                        android:textColor="@color/pixiko_muted"
+                        android:textSize="13sp" />
+
+                    <TextView
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:layout_marginTop="20dp"
+                        android:lineSpacingExtra="4dp"
+                        android:text="@string/error_reasons"
+                        android:textColor="@color/pixiko_text"
+                        android:textSize="15sp" />
+
+                    <Button
+                        android:id="@+id/error_retry"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:layout_marginTop="24dp"
+                        android:text="@string/error_retry" />
+
+                    <Button
+                        android:id="@+id/error_settings"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:layout_marginTop="8dp"
+                        android:text="@string/error_settings" />
+
+                    <Button
+                        android:id="@+id/error_browser"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:layout_marginTop="8dp"
+                        android:text="@string/error_browser" />
+                </LinearLayout>
+            </ScrollView>
+        </FrameLayout>
+    </androidx.swiperefreshlayout.widget.SwipeRefreshLayout>
+</LinearLayout>

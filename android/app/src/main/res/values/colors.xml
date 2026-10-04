@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- 深色外壳：色值与 webui/app.css 的暗色底协调，切换页面时不至于闪白。 -->
+    <color name="pixiko_bg">#FF12141A</color>
+    <color name="pixiko_bar">#FF1A1D26</color>
+    <color name="pixiko_text">#FFE7E9EE</color>
+    <color name="pixiko_muted">#FF9AA3B2</color>
+    <color name="pixiko_accent">#FF7AA2F7</color>
+    <color name="pixiko_divider">#FF2A2F3A</color>
+    <color name="pixiko_ic_launcher_background">#FF12141A</color>
+</resources>

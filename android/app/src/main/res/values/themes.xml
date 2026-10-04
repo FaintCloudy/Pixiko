@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Material Components 的 DayNight 主题：values-night 下会自然用暗色变体。
+  网页控制台本身就是暗色的，所以这里统一把窗口背景压暗，避免 WebView 首帧白闪。
+-->
+<resources xmlns:tools="http://schemas.android.com/tools">
+
+    <style name="Theme.Pixiko" parent="Theme.MaterialComponents.DayNight.NoActionBar">
+        <item name="colorPrimary">@color/pixiko_accent</item>
+        <item name="colorPrimaryVariant">@color/pixiko_bar</item>
+        <item name="colorOnPrimary">#FF0B0D12</item>
+        <item name="colorSecondary">@color/pixiko_accent</item>
+        <item name="colorOnSecondary">#FF0B0D12</item>
+        <item name="android:colorBackground">@color/pixiko_bg</item>
+        <item name="colorSurface">@color/pixiko_bar</item>
+        <item name="colorOnSurface">@color/pixiko_text</item>
+        <item name="android:textColorPrimary">@color/pixiko_text</item>
+        <item name="android:textColorSecondary">@color/pixiko_muted</item>
+        <item name="android:windowBackground">@color/pixiko_bg</item>
+        <item name="android:statusBarColor">@color/pixiko_bar</item>
+        <item name="android:navigationBarColor">@color/pixiko_bg</item>
+        <item name="android:windowLightStatusBar">false</item>
+        <item name="android:windowLightNavigationBar" tools:targetApi="o_mr1">false</item>
+        <item name="android:windowDrawsSystemBarBackgrounds">true</item>
+    </style>
+
+    <!-- 对话框（长按图片的原生菜单、关于、切换服务器）用同一套暗色，别冒出白底黑字。 -->
+    <style name="Theme.Pixiko.Dialog" parent="Theme.MaterialComponents.DayNight.Dialog.Alert">
+        <item name="android:colorBackground">@color/pixiko_bar</item>
+        <item name="colorSurface">@color/pixiko_bar</item>
+        <item name="colorOnSurface">@color/pixiko_text</item>
+        <item name="android:textColorPrimary">@color/pixiko_text</item>
+    </style>
+</resources>

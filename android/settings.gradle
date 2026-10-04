@@ -1,0 +1,20 @@
+// Pixiko Android 外壳工程：只有一个 :app 模块。
+// 插件与依赖都来自 google()/mavenCentral()，不引入任何需要联网下载额外代码的插件。
+pluginManagement {
+    repositories {
+        google()
+        mavenCentral()
+        gradlePluginPortal()
+    }
+}
+
+dependencyResolutionManagement {
+    repositoriesMode.set(RepositoriesMode.PREFER_SETTINGS)
+    repositories {
+        google()
+        mavenCentral()
+    }
+}
+
+rootProject.name = 'pixiko-android'
+include ':app'

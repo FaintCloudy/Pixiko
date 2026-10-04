@@ -1,0 +1,68 @@
+// :app 模块。刻意用 `apply plugin`（老写法）而不是 `plugins {}`：
+// 插件 jar 已经由根 build.gradle 的 buildscript.classpath 拿到，
+// 这样 gradle 不必再去 pluginManagement 里解析一次 AGP。
+apply plugin: 'com.android.application'
+
+android {
+    namespace 'cn.szu.bot.app'
+    compileSdk 34
+
+    buildFeatures {
+        // AGP 8 默认不再生成 BuildConfig；PixikoApp 里要用 BuildConfig.DEBUG / VERSION_NAME，
+        // 所以要显式打开（buildConfigField 之类的能力也一并可用）。
+        buildConfig true
+    }
+
+    defaultConfig {
+        applicationId "cn.szu.bot.app"
+        minSdk 26
+        targetSdk 34
+        versionCode 140
+        versionName "1.4.0"
+        // 没有自定义 vector drawable / 多密度拆分，保持单一 APK。
+        resourceConfigurations += ['zh', 'en']
+    }
+
+    buildTypes {
+        debug {
+            // 调试包也保留符号，方便真机看堆栈。
+            minifyEnabled false
+        }
+        release {
+            // 本工程不发 release（发布走 debug 签名即可局域网自用）；
+            // 真要用 release 时把 signingConfig 配上再打开混淆。
+            minifyEnabled false
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+        }
+    }
+
+    compileOptions {
+        // 代码里用了极少量 Java 8 API（Base64 的 java.util 版本、Locale.ROOT 等），
+        // desugar 打开以免在 minSdk 26 上出意外。
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+
+    packaging {
+        resources {
+            excludes += ['META-INF/*.kotlin_module', 'META-INF/DEPENDENCIES']
+        }
+    }
+
+    lint {
+        // 打包时不跑 lint：lint 失败会挡住 assembleDebug，而我们只关心能编译。
+        checkReleaseBuilds false
+        abortOnError false
+    }
+}
+
+dependencies {
+    // 只用 AndroidX 基础件：不引入 Retrofit/OkHttp（HttpURLConnection 够用），
+    // 也不引入任何需要联网下载额外代码的插件。
+    implementation 'androidx.appcompat:appcompat:1.7.0'
+    implementation 'androidx.constraintlayout:constraintlayout:2.1.4'
+    implementation 'androidx.swiperefreshlayout:swiperefreshlayout:1.1.0'
+    implementation 'com.google.android.material:material:1.12.0'
+    // WebViewCompat/WebViewFeature（深色模式与 WebView 版本判断用得上）。
+    implementation 'androidx.webkit:webkit:1.11.0'
+}

@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 与 values/themes.xml 同源；Material 的 DayNight 在夜间模式会自动取用这里。
+     刻意只重述窗口背景与状态栏，避免两处主题漂移。 -->
+<resources>
+    <style name="Theme.Pixiko" parent="Theme.MaterialComponents.DayNight.NoActionBar">
+        <item name="colorPrimary">@color/pixiko_accent</item>
+        <item name="colorPrimaryVariant">@color/pixiko_bar</item>
+        <item name="colorOnPrimary">#FF0B0D12</item>
+        <item name="colorSecondary">@color/pixiko_accent</item>
+        <item name="colorOnSecondary">#FF0B0D12</item>
+        <item name="android:colorBackground">@color/pixiko_bg</item>
+        <item name="colorSurface">@color/pixiko_bar</item>
+        <item name="colorOnSurface">@color/pixiko_text</item>
+        <item name="android:textColorPrimary">@color/pixiko_text</item>
+        <item name="android:textColorSecondary">@color/pixiko_muted</item>
+        <item name="android:windowBackground">@color/pixiko_bg</item>
+        <item name="android:statusBarColor">@color/pixiko_bar</item>
+        <item name="android:navigationBarColor">@color/pixiko_bg</item>
+        <item name="android:windowLightStatusBar">false</item>
+    </style>
+
+    <style name="Theme.Pixiko.Dialog" parent="Theme.MaterialComponents.DayNight.Dialog.Alert">
+        <item name="android:colorBackground">@color/pixiko_bar</item>
+        <item name="colorSurface">@color/pixiko_bar</item>
+        <item name="colorOnSurface">@color/pixiko_text</item>
+        <item name="android:textColorPrimary">@color/pixiko_text</item>
+    </style>
+</resources>

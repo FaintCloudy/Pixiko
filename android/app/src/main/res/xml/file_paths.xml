@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  FileProvider 的路径白名单：只暴露 cacheDir/share（分享图片时下载的临时文件）。
+  不暴露 files/、更不暴露外部存储——避免把 app 私有数据意外开个口子。
+-->
+<paths xmlns:android="http://schemas.android.com/apk/res/android">
+    <cache-path
+        name="shared_images"
+        path="share/" />
+</paths>
