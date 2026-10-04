@@ -1446,6 +1446,46 @@ public final class DeepSeekPrompts {
         return "用户在要求画面内容，但回复是拒绝或说教，且没有任何指令";
     }
     /**
+     * 提到"下载"只说明在聊下载这件事，**不等于**在下载指令：必须同时给出一个下载目标
+     * （Civitai 链接，或 {@code #编号} 这类指代）才算。反例（都返回 false）：
+     * 「下载速度好慢」「这个模型不好下载」「下载完了吗」——这些话一个字都不许执行，
+     * 也不该被 {@link #requiresCommands} 判成"要执行却没给指令"去重试四遍。
+     */
+    private static final java.util.regex.Pattern MENTIONS_DOWNLOAD = java.util.regex.Pattern.compile(
+            "(?s).*(下载|download|下下来|收下|存下|都要).*");
+    /** 下载目标：Civitai 的模型链接（含镜像站），或一个编号指代（#N / 第 N 个）。 */
+    private static final java.util.regex.Pattern DOWNLOAD_TARGET = java.util.regex.Pattern.compile(
+            "(?s).*(?:"
+            // https://<任意 civitai 站点或配置的镜像>/models/<数字>（可带 slug 与 ?modelVersionId=…）
+            + "https?://[^\\s/]*civitai[^\\s/]*/models/[1-9][0-9]*(?![0-9])"
+            // 版本/下载直链：/api/v1/model-versions/<数字>、/api/download/models/<数字>
+            + "|https?://[^\\s/]*civitai[^\\s/]*/(?:api/v1/model-versions|api/download/models)/[1-9][0-9]*(?![0-9])"
+            + "|#\\s*[0-9]{1,3}|第\\s*[0-9一二三四五六七八九十]{1,3}\\s*(?:个|条|项|号)).*");
+    /**
+     * 预告「之后要发链接让你下载」：这句话只是在说要发，不是让你现在下载（现在也还没有链接目标）。
+     * 命中必须返回 true：「之后我会发一连串的 lora 链接，你全都要下载」「以后有 Civitai 链接就下载」——
+     * 只有它不成立时，"提到下载 + 有目标"才算一条下载请求。
+     */
+    static boolean announcesDownloadLater(String message) {
+        if (message == null || message.isBlank()) return false;
+        if (message.matches("(?s).*(以后|之后|回头|下次|等会儿|稍后|一会).*(发|给|贴|丢|扔).*(链接|link|地址).*")) return true;
+        // 「会/将/要 + 发/给/贴 + 链接」这类将来时说法同样是预告。
+        return message.matches("(?s).*(会|将|将要|要|打算|准备)[^，。；\\n]{0,8}(发|给|贴|丢|扔)[^，。；\\n]{0,8}(链接|link).*");
+    }
+    /**
+     * 用户这次是不是在要机器人下载**某个具体东西**：提到下载（或其同义说法）且消息里有目标，
+     * 而且不是"以后/等下我再发链接"这种预告。
+     * 这是"下载"进入执行判定的唯一入口，ChatActions 兑现"下载"承诺时也读它，两处不会走偏。
+     */
+    public static boolean downloadTargeted(String message) {
+        if (message == null || message.isBlank()) return false;
+        if (announcesDownloadLater(message)) return false;
+        // 只说"发链接让你下载"、链接还没发过来（既没有 URL 也没有 #编号）：那是预告，不是这次就要下载。
+        if (MENTIONS_DOWNLOAD.matcher(message).find() && message.contains("链接")
+                && !DOWNLOAD_TARGET.matcher(message).find()) return false;
+        return MENTIONS_DOWNLOAD.matcher(message).find() && DOWNLOAD_TARGET.matcher(message).find();
+    }
+    /**
      * 用户明确要求"做"某个操作（不是在问怎么做，也不是在说过去已经做过）。这类请求必须真的产生指令；
      * 只回一句"好，删掉列表里第 12 到第 16 项"然后什么都不做，是最要不得的。
      */
@@ -1458,7 +1498,11 @@ public final class DeepSeekPrompts {
         if (message.matches("(?s).*(刚才|刚刚|上次|之前|昨天|已经[^，。；]{0,8}了).*")) return false;
         // 修 bug 4：指代 + 动作（"套上那个 LoRA"）同样是需要真指令的请求。
         if (basisNounVerb(message)) return true;
-        return message.matches("(?s).*(删除|删掉|去除|移除|去掉|改名|重命名|清空|清掉|加载|载入|应用|换成|改成|改为|调整|设置|保存|下载|查询|搜索|列出|查看|生成|出图|画一张|来一张|撤销|回退|离婚|结婚|强娶).*");
+        // 收紧误判：光说"下载"而没有目标（链接/#编号）时，这只是在聊下载，不是要执行；
+        // 去掉下面那条通用正则里的"下载"分支，交给 downloadTargeted 单独判。
+        if (MENTIONS_DOWNLOAD.matcher(message).find() && !downloadTargeted(message)) return false;
+        return message.matches("(?s).*(删除|删掉|去除|移除|去掉|改名|重命名|清空|清掉|加载|载入|应用|换成|改成|改为|调整|设置|保存|查询|搜索|列出|查看|生成|出图|画一张|来一张|撤销|回退|离婚|结婚|强娶).*")
+                || downloadTargeted(message);
     }
     /** 用户要求执行却没有可用指令时，如实说明并给出可直接使用的写法。 */
     public static ChatActions.Plan noActionPlan() {
@@ -1835,7 +1879,7 @@ public final class DeepSeekPrompts {
                 ChatActions.Plan plan = parseChatPlan(response);
                 // 守卫只看本次请求正文：引用里的旧列表/旧编号不能当成本次要求，否则会拿引用里的编号去加载。
                 String request = currentRequest(message);
-                if (ChatActions.promisesUnappliedEdit(plan.reply(), plan.commands()))
+                if (ChatActions.promisesUnappliedEdit(plan.reply(), plan.commands(), request))
                     throw new IOException("回复声称修改了提示词，但计划里没有改写指令");
                 if (looksLikeActionRequest(request) && ChatActions.claimsUnverifiedExecution(plan.reply(), plan.commands()))
                     throw new IOException("回复声称已经执行或完成，但计划里没有任何指令");

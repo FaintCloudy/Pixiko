@@ -93,10 +93,10 @@
     <div class="card">
       <div class="card-head"><b>生成</b><span class="muted">当前任务在下面的「任务队列」里看</span></div>
       <div class="row wrap">
-        <span class="stepper">
-          <button class="stepper-btn" type="button" data-step-for="gen-count" data-step="-1" aria-label="生成张数 减少" title="减少">−</button>
+        <span class="num">
           <input id="gen-count" type="number" min="1" value="1" inputmode="numeric">
-          <button class="stepper-btn" type="button" data-step-for="gen-count" data-step="1" aria-label="生成张数 增加" title="增加">＋</button>
+          <button class="num-step num-step-up" type="button" data-step-for="gen-count" data-step="1" aria-label="生成张数 增加" title="增加"></button>
+          <button class="num-step num-step-down" type="button" data-step-for="gen-count" data-step="-1" aria-label="生成张数 减少" title="减少"></button>
         </span>
         <button type="button" id="gen-btn">开始生成</button>
         <button class="ghost" type="button" id="gen-status-btn">队列状态</button>
@@ -120,37 +120,37 @@
     <div class="card">
       <div class="card-head"><b>生成参数</b><span class="muted">没有「应用」按钮：改完立刻生效，只影响之后提交的任务</span></div>
       <div class="grid-2">
-        <span class="stepper">
-          <button class="stepper-btn" type="button" data-step-for="set-width" data-step="-1" aria-label="宽 减少" title="减少">−</button>
+        <span class="num">
           <label class="field"><span>宽（8 的倍数）</span><input id="set-width" type="number" min="64" max="2048" step="8" inputmode="numeric"></label>
-          <button class="stepper-btn" type="button" data-step-for="set-width" data-step="1" aria-label="宽 增加" title="增加">＋</button>
+          <button class="num-step num-step-up" type="button" data-step-for="set-width" data-step="1" aria-label="宽 增加" title="增加"></button>
+          <button class="num-step num-step-down" type="button" data-step-for="set-width" data-step="-1" aria-label="宽 减少" title="减少"></button>
         </span>
-        <span class="stepper">
-          <button class="stepper-btn" type="button" data-step-for="set-height" data-step="-1" aria-label="高 减少" title="减少">−</button>
+        <span class="num">
           <label class="field"><span>高（8 的倍数）</span><input id="set-height" type="number" min="64" max="2048" step="8" inputmode="numeric"></label>
-          <button class="stepper-btn" type="button" data-step-for="set-height" data-step="1" aria-label="高 增加" title="增加">＋</button>
+          <button class="num-step num-step-up" type="button" data-step-for="set-height" data-step="1" aria-label="高 增加" title="增加"></button>
+          <button class="num-step num-step-down" type="button" data-step-for="set-height" data-step="-1" aria-label="高 减少" title="减少"></button>
         </span>
         <label class="field"><span>采样方法</span><select id="set-sampler"></select></label>
         <label class="field"><span>基础模型</span><select id="set-model"></select></label>
-        <span class="stepper">
-          <button class="stepper-btn" type="button" data-step-for="set-steps" data-step="-1" aria-label="步数 减少" title="减少">−</button>
+        <span class="num">
           <label class="field"><span>步数</span><input id="set-steps" type="number" min="1" inputmode="numeric"></label>
-          <button class="stepper-btn" type="button" data-step-for="set-steps" data-step="1" aria-label="步数 增加" title="增加">＋</button>
+          <button class="num-step num-step-up" type="button" data-step-for="set-steps" data-step="1" aria-label="步数 增加" title="增加"></button>
+          <button class="num-step num-step-down" type="button" data-step-for="set-steps" data-step="-1" aria-label="步数 减少" title="减少"></button>
         </span>
-        <span class="stepper">
-          <button class="stepper-btn" type="button" data-step-for="set-cfg" data-step="-1" aria-label="CFG 减少" title="减少">−</button>
+        <span class="num">
           <label class="field"><span>CFG</span><input id="set-cfg" type="number" min="0.1" step="0.1" inputmode="decimal"></label>
-          <button class="stepper-btn" type="button" data-step-for="set-cfg" data-step="1" aria-label="CFG 增加" title="增加">＋</button>
+          <button class="num-step num-step-up" type="button" data-step-for="set-cfg" data-step="1" aria-label="CFG 增加" title="增加"></button>
+          <button class="num-step num-step-down" type="button" data-step-for="set-cfg" data-step="-1" aria-label="CFG 减少" title="减少"></button>
         </span>
-        <span class="stepper">
-          <button class="stepper-btn" type="button" data-step-for="set-seed" data-step="-1" aria-label="种子 减少" title="减少">−</button>
+        <span class="num">
           <label class="field"><span>种子（-1 随机）</span><input id="set-seed" type="number" inputmode="numeric"></label>
-          <button class="stepper-btn" type="button" data-step-for="set-seed" data-step="1" aria-label="种子 增加" title="增加">＋</button>
+          <button class="num-step num-step-up" type="button" data-step-for="set-seed" data-step="1" aria-label="种子 增加" title="增加"></button>
+          <button class="num-step num-step-down" type="button" data-step-for="set-seed" data-step="-1" aria-label="种子 减少" title="减少"></button>
         </span>
-        <span class="stepper">
-          <button class="stepper-btn" type="button" data-step-for="set-imgcnt" data-step="-1" aria-label="图片上限 减少" title="减少">−</button>
+        <span class="num">
           <label class="field"><span>图片上限/条</span><input id="set-imgcnt" type="number" min="1" inputmode="numeric"></label>
-          <button class="stepper-btn" type="button" data-step-for="set-imgcnt" data-step="1" aria-label="图片上限 增加" title="增加">＋</button>
+          <button class="num-step num-step-up" type="button" data-step-for="set-imgcnt" data-step="1" aria-label="图片上限 增加" title="增加"></button>
+          <button class="num-step num-step-down" type="button" data-step-for="set-imgcnt" data-step="-1" aria-label="图片上限 减少" title="减少"></button>
         </span>
       </div>
       <div class="muted" id="gen-applied">当前生效参数会显示在这里。</div>
@@ -192,10 +192,10 @@
     <div class="card">
       <div class="card-head"><b>回溯 recent</b></div>
       <div class="row wrap">
-        <span class="stepper">
-          <button class="stepper-btn" type="button" data-step-for="rg-count" data-step="-1" aria-label="回溯张数 减少" title="减少">−</button>
+        <span class="num">
           <input id="rg-count" type="number" min="1" value="4" inputmode="numeric">
-          <button class="stepper-btn" type="button" data-step-for="rg-count" data-step="1" aria-label="回溯张数 增加" title="增加">＋</button>
+          <button class="num-step num-step-up" type="button" data-step-for="rg-count" data-step="1" aria-label="回溯张数 增加" title="增加"></button>
+          <button class="num-step num-step-down" type="button" data-step-for="rg-count" data-step="-1" aria-label="回溯张数 减少" title="减少"></button>
         </span>
         <button class="ghost" type="button" id="rg-btn">回溯最近 N 张</button>
       </div>
@@ -367,10 +367,10 @@
       <label class="check"><input type="checkbox" id="set-chat-global"> 全局聊天开关</label>
       <div class="row wrap">
         <span class="muted">每分钟回复上限</span>
-        <span class="stepper">
-          <button class="stepper-btn" type="button" data-step-for="set-frequency" data-step="-1" aria-label="每分钟回复上限 减少" title="减少">−</button>
+        <span class="num">
           <input id="set-frequency" type="number" min="0" inputmode="numeric" placeholder="每分钟上限">
-          <button class="stepper-btn" type="button" data-step-for="set-frequency" data-step="1" aria-label="每分钟回复上限 增加" title="增加">＋</button>
+          <button class="num-step num-step-up" type="button" data-step-for="set-frequency" data-step="1" aria-label="每分钟回复上限 增加" title="增加"></button>
+          <button class="num-step num-step-down" type="button" data-step-for="set-frequency" data-step="-1" aria-label="每分钟回复上限 减少" title="减少"></button>
         </span>
         <button type="button" id="apply-frequency">应用频率</button>
       </div>
@@ -684,13 +684,14 @@
 <!-- 任务信息云：从下方弹出，带跳去 /quest/#N 的链接 -->
 <div id="quest-clouds" class="quest-clouds" aria-live="polite"></div>
 <script src="/app.js?v=1.5.2"></script>
-<!-- 数字框的加减按钮（.stepper-btn）在这里接线。
-     app.css 已经把原生 spinner 关掉（appearance: textfield），这一对按钮就是它的替身；
-     样式走项目自己的 .stepper / .stepper-btn（和手机端同一套外观，44×44 触摸目标）。
-     它只做两件事：调值（stepUp/stepDown，按 min/max/step 走规范算法，0.1 这种小数不会算出
-     7.1000000000000005）和派发 input + change —— 于是既有的「改完即生效」（app.js 的
-     change 监听 → POST /api/generation）、min/max/step 校验、键盘 ↑↓、手输数字全都原样不变，
-     没有任何一条既有行为被替换掉。放在 app.js 之后，确保 app.js 的监听先注册。 -->
+<!-- 数字框那对「上下调整箭头」的点击热区（.num-step）在这里接线。
+     app.css 已经把原生 spinner 关掉（appearance: textfield），并**逐字节复用下拉框（模型预设）
+     那张 16×16 双 chevron 的 data URI** 画在数字框右侧 —— 所以箭头的外观 100% 是标准那一个，
+     页面上不出现任何「−/＋」文本（这两个热区按钮 textContent 为空、无边框无底色）。
+     热区只做两件事：调值（stepUp/stepDown，按 min/max/step 走规范算法，0.1 这种小数不会算出
+     7.1000000000000005）和派发 input + change —— 于是既有的「改完即生效」（app.js 的 change
+     监听 → POST /api/generation）、min/max/step 校验、键盘 ↑↓、手输数字全都原样不变。
+     放在 app.js 之后，确保 app.js 的 change 监听先注册。 -->
 <script>
 (function () {
   function stepFor(input, button) {

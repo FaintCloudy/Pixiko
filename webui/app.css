@@ -69,49 +69,6 @@ input:focus, textarea:focus, select:focus {
 textarea { resize: vertical; }
 code { background: rgba(120, 160, 220, .14); padding: 1px 5px; border-radius: 6px; font-size: .9em; }
 
-/* ------------------------------------------------------------ 数字框的「上下调整」（步进）
-   2026-10 用户反馈：宽输入框右侧那对「上下调整箭头」是裸的 UA 原生样式（Chromium 在悬停/聚焦时
-   会在右边缘画一个白色小方块 + 两个灰三角），跟这套深色玻璃风格完全不搭。
-   处理办法（首选方案，两层保险）：
-     ① 关掉原生 spinner：`appearance: textfield` 让 UA 不再画那对箭头，
-        `::-webkit-inner-spin-button` / `::-webkit-outer-spin-button` 再显式归零（老 Blink/WebKit 也吃）。
-        这一步**只管绘制**：type=number 的键盘 ↑↓、手输数字、min/max/step 校验、change 事件一律不变。
-     ② 补一对项目自己的加减按钮 `.stepper-btn`：外观沿用既有的 ghost 按钮语言
-        （1px var(--line) 边框 + 淡蓝底 + 12px 圆角 + 悬停提亮 + 按下下沉 + 聚焦 3px 蓝色光环），
-        尺寸 44×44（项目硬规矩：触摸/点击目标 ≥44px）。
-   结构：`.stepper` 是一条 flex 行，里面是 [−][输入框][＋]。带文字标签的字段仍然保留 `label.field`
-   （标签包着输入框），所以「点标签文字聚焦输入框」照旧；加减按钮是 label 的**兄弟节点**，不会被
-   标签的激活行为误触。宽输入框（`.row` 里 flex: 1 1 150px）与窄输入框（`.grid-2` 里 1fr）
-   共用同一个 `.stepper`，外观与行为完全一致。 */
-input[type=number] {
-  -moz-appearance: textfield;
-  -webkit-appearance: textfield;
-  appearance: textfield;
-  font-variant-numeric: tabular-nums;   /* 数字等宽：加减时数值不左右跳 */
-}
-input[type=number]::-webkit-outer-spin-button,
-input[type=number]::-webkit-inner-spin-button { -webkit-appearance: none; appearance: none; margin: 0; }
-
-.stepper { display: flex; align-items: flex-end; gap: 6px; min-width: 0; }
-.stepper > input[type=number] { flex: 1 1 0; min-width: 0; width: auto; }
-.stepper > .field { flex: 1 1 auto; min-width: 0; }
-/* `.row` 里的宽输入框原本吃的是 `.row > input { flex: 1 1 150px }`；包进 .stepper 之后由它顶上，
-   否则这条会落空、输入框缩成内容宽。 */
-.row > .stepper { flex: 1 1 150px; }
-.stepper-btn {
-  flex: 0 0 auto; width: 44px; min-width: 44px; height: 44px; min-height: 44px; padding: 0;
-  display: inline-flex; align-items: center; justify-content: center;
-  border: 1px solid var(--line); border-radius: 12px;
-  background: rgba(120, 160, 220, .08); color: var(--text);
-  font-size: 18px; font-weight: 650; line-height: 1; box-shadow: none; cursor: pointer;
-  transition: background .2s var(--ease), border-color .18s var(--ease), box-shadow .18s var(--ease),
-    transform .16s var(--ease), opacity .2s linear;
-}
-.stepper-btn:hover { background: rgba(120, 160, 220, .16); box-shadow: none; filter: none; }
-.stepper-btn:active { transform: translateY(1px) scale(.985); }
-.stepper-btn:focus { outline: none; border-color: rgba(90, 162, 255, .65); box-shadow: 0 0 0 3px rgba(90, 162, 255, .16); }
-.stepper-btn:disabled { opacity: .45; cursor: not-allowed; transform: none; }
-
 .aurora {
   position: fixed; inset: -20% -10% auto -10%; height: 60vh; z-index: -1; pointer-events: none;
   background: conic-gradient(from 210deg at 30% 40%, rgba(90,162,255,.16), rgba(185,139,255,.14), rgba(79,215,168,.12), rgba(90,162,255,.16));
@@ -891,6 +848,70 @@ select::-ms-expand { display: none; }
   background-repeat: no-repeat; background-position: right 8px center; background-size: 13px 13px;
 }
 .terminal-head select:focus { background-repeat: no-repeat; background-position: right 8px center; background-size: 13px 13px; }
+
+/* ------------------------------------------------------------------ 数字框的「上下调整箭头」
+   2026-10 用户反馈：宽输入框右侧那对「上下调整箭头」是裸的 UA 原生样式（Chromium 在悬停/聚焦时
+   会在右边缘画一个白色小方块 + 两个灰三角），跟这套深色玻璃风格完全不搭；要求**做成与上面
+   「下拉框（模型预设那个 select）」的选择箭头同一种样式**，而不是另加一对「−/＋」按钮。
+
+   标准（就是上面 select 那一条，逐字节复用）：
+     stroke='%238ea2bf'、stroke-width 1.6、round 端点，viewBox 0 0 16 16，两个 path：
+       M4.5 6.2 8 2.9l3.5 3.3   ← 上箭头（apex 朝上）
+       M11.5 9.8 8 13.1 4.5 9.8 ← 下箭头（apex 朝下）
+     两者互为**绕 (8,8) 旋转 180°**（把第一段的点 (4.5,6.2)(8,2.9)(11.5,6.2) 绕中心转 180°
+     得到 (11.5,9.8)(8,13.1)(4.5,9.8)，正是第二段），所以「一个 chevron + 它的 180° 旋转」
+     本来就是标准箭头这一个图元，不需要另描一遍。
+     尺寸 15px、位置 right 11px center、no-repeat、padding-right 36px —— 与 select 完全同一套数值。
+     聚焦时换成 stroke='%235aa2ff'、stroke-width 1.8（同 select:focus）。
+
+   做法：① 关掉原生 spinner（appearance: textfield + ::-webkit-inner-spin-button 归零）；
+        ② 把上面那**同一个 data URI** 作为 background-image 画在数字框自己身上，`background-position`
+           与 `background-size` 与 select 一字不差 —— 于是数字框右侧的箭头与模型预设下拉箭头**同色、
+           同大、同位置、同聚焦变化**；
+        ③ 箭头要能点：`.num` 里叠两个**全透明**按钮（各 44px 宽 × 半个框高），正好落在箭头图形的
+           上半/下半 —— 点上半 = +step、点下半 = −step。它们自身不带任何描边/底色/文字（所以
+           textContent 里没有「−/＋」），视觉 100% 来自上面那张标准箭头图。
+   只影响绘制与点击：type=number 的键盘 ↑↓、手输、min/max/step 校验、change 事件一律不变。 */
+input[type=number] {
+  -moz-appearance: textfield;
+  -webkit-appearance: textfield;
+  appearance: textfield;
+  font-variant-numeric: tabular-nums;   /* 数字等宽：加减时数值不左右跳 */
+  padding-right: 36px;                  /* 与 select 同一个内边距：给箭头留位 */
+  background-image: url("data:image/svg+xml;charset=utf-8,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='%238ea2bf' stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M4.5 6.2 8 2.9l3.5 3.3'/%3E%3Cpath d='M11.5 9.8 8 13.1 4.5 9.8'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 11px center;
+  background-size: 15px 15px;
+}
+input[type=number]::-webkit-outer-spin-button,
+input[type=number]::-webkit-inner-spin-button { -webkit-appearance: none; appearance: none; margin: 0; }
+/* 与 select:hover 同一条反馈（标准里箭头本身没有单独的 hover，只有边框色） */
+input[type=number]:hover { border-color: rgba(120, 160, 220, .45); }
+/* 上面的 input:focus 用的是 background 简写（会把 background-image 清成 none），
+   所以这里必须像 select:focus 那样把箭头重新声明一遍 —— 换成蓝色加粗那一版。 */
+input[type=number]:focus {
+  background-image: url("data:image/svg+xml;charset=utf-8,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='%235aa2ff' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M4.5 6.2 8 2.9l3.5 3.3'/%3E%3Cpath d='M11.5 9.8 8 13.1 4.5 9.8'/%3E%3C/svg%3E");
+  background-repeat: no-repeat; background-position: right 11px center; background-size: 15px 15px;
+}
+/* 包住「标签 + 数字框 + 两个透明箭头热区」的定位容器；宽度行为与原输入框一致。 */
+.num { position: relative; display: block; min-width: 0; }
+.num > input[type=number] { display: block; width: 100%; }
+/* `.row` 里的宽输入框原本吃的是 `.row > input { flex: 1 1 150px }`；包进 .num 之后由它顶上，
+   否则这条会落空、输入框缩成内容宽。 */
+.row > .num { flex: 1 1 150px; }
+/* 箭头的两个点击热区：**完全透明**（无边框/无底色/无文字），只负责命中；
+   落在箭头图形的上半/下半。宽 44px 是为了「整个箭头列 44×44」这个触摸目标。 */
+.num-step {
+  position: absolute; right: 0; width: 44px; height: 22px; min-height: 22px; max-height: 22px; padding: 0;
+  border: 0; background: none; box-shadow: none; color: transparent; font-size: 0; line-height: 0;
+  cursor: pointer; -webkit-appearance: none; appearance: none;
+}
+.num-step-up { bottom: 22px; }
+.num-step-down { bottom: 0; }
+.num-step:hover, .num-step:active { background: none; box-shadow: none; transform: none; filter: none; }
+/* 键盘可达：热区本身不画任何东西，聚焦时改用「整列淡蓝底」给一个不抢箭头的位置提示 */
+.num-step:focus { outline: none; box-shadow: none; }
+.num-step:focus-visible { outline: none; background: rgba(90, 162, 255, .14); }
 
 /* ------------------------------------------------------------------ 任务队列 */
 .kv#task-list { display: flex; flex-direction: column; gap: 8px; }

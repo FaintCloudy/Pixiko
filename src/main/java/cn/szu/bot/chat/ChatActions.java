@@ -92,27 +92,51 @@ public final class ChatActions {
         "(?is)^[./](?:style|lora|function)\\s+(?:delete|remove|rename|save|overwrite|clear)(?:\\s|$)"
         + "|(?is)^[./]lora\\s+download(?:\\s|$)"
         + "|(?is)^[./](?:size|steps|cfg|seed|sampler|model|preset|imgcnt)\\s+(?:set|clear)(?:\\s|$)");
+    /** 真的会下载东西的指令：只有它才能兑现回复里那句"下载了"。 */
+    private static final java.util.regex.Pattern DOWNLOAD_COMMAND = java.util.regex.Pattern.compile(
+        "(?is)^[./]lora\\s+download(?:\\s|$)");
+    /** 回复正文里声称"下载"的说法。 */
+    private static final java.util.regex.Pattern DOWNLOAD_CLAIM = java.util.regex.Pattern.compile("下载");
     /**
      * True when the reply claims something the plan does not actually do. A picture claim needs a picture
      * command (.infix / .prompt / style or LoRA load); a "deleted / renamed / saved" claim is satisfied by a
      * management command, so "好，删掉列表里第 12 到第 16 项" with .style delete #12-#16 is honest, while a
      * claimed scene change with only a delete is a lie.
+     *
+     * <p><b>"下载"要单独判（修误判）</b>：以前只要有任意管理类指令（例如一条无关的 .style delete）就
+     * 算"下载"这句兑现了；更糟的是用户只是抱怨"下载速度好慢"，回复照抄一句"下载"也要被当成"声称做了事"。
+     * 现在分两条硬判据：① 声称"下载"必须有 {@code .lora download}；② 只有用户这次**真的给了下载目标**
+     * （链接或 #编号，见 {@code DeepSeekPrompts.requiresCommands}）时，这句"下载"才算承诺——没有目标的
+     * 闲聊里提到"下载"不是指令，也不该被当成空头承诺去重试。
      */
     private static final java.util.regex.Pattern REBUKE = java.util.regex.Pattern.compile(
         "不正经|禁止|免谈|别闹|不行|不可以|不许|NG|拒绝|适可而止|注意分寸");
     /** A refusal or rebuke: correct when the bot is addressed, but it must never be used to chime in. */
     public static boolean isRebuke(String reply) { return reply != null && REBUKE.matcher(reply).find(); }
     public static boolean promisesUnappliedEdit(String reply, List<String> commands) {
+        return promisesUnappliedEdit(reply, commands, reply);
+    }
+    /**
+     * 同 {@link #promisesUnappliedEdit(String, List)}，但"这次请求到底要什么"由 {@code request} 给出
+     * （模型回复不能自证：回复里的"下载"只有用户**这次真的给了下载目标**时才算承诺）。
+     */
+    public static boolean promisesUnappliedEdit(String reply, List<String> commands, String request) {
         if (reply == null || reply.isBlank()) return false;
         boolean picture = PICTURE_CLAIM.matcher(reply).find(), management = MANAGEMENT_CLAIM.matcher(reply).find();
         if (!picture && !management) return false;
-        boolean pictureCommand = false, managementCommand = false;
+        boolean download = DOWNLOAD_CLAIM.matcher(reply).find();
+        // 没有下载目标的闲聊（「下载速度好慢」「这个模型不好下载」）：回复里的"下载"不是承诺，不拦、不重试。
+        if (download && !DeepSeekPrompts.downloadTargeted(request)) return false;
+        boolean pictureCommand = false, managementCommand = false, downloadCommand = false;
         for (String command : commands) {
             String text = command == null ? "" : command.strip();
             if (PICTURE_COMMAND.matcher(text).find()) pictureCommand = true;
             if (MANAGEMENT_COMMAND.matcher(text).find()) managementCommand = true;
+            if (DOWNLOAD_COMMAND.matcher(text).find()) downloadCommand = true;
         }
         if (picture && !pictureCommand) return true;
+        // 声称"下载"只有 .lora download 兑现，别的管理类指令（删除/改名/保存）都不算。
+        if (download) return !downloadCommand;
         return management && !managementCommand && !pictureCommand;
     }
     private static final java.util.regex.Pattern DONE_CLAIM = java.util.regex.Pattern.compile(
