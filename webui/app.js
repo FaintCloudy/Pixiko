@@ -622,7 +622,7 @@
     const unread = questUnreadCount();
     if (state.questListError) {
       questListState(state.questListError);
-      const hint = el('div', 'quest-empty', '列表接口不可用：单条回执照样看（上面填任务号，或用「最新一条」）。');
+      const hint = el('div', 'quest-empty', '列表接口不可用：单条回执照样看（从右下角的回执云，或直接打开 /quest#编号）。');
       hint.setAttribute('data-quest', 'list-unavailable');
       box.appendChild(hint);
       renderQuestTabBadge();
