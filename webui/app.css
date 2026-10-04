@@ -816,3 +816,118 @@ a.image-link.gallery-thumb:hover { transform: translateY(-2px); border-color: rg
 }
 .gallery-receipt { padding: 8px; }
 
+/* ---------------------------------------------------------------- 图集占位格（未生成 / 生成中 / 失败）
+   网格里的每一格都包一层 .gallery-tile（真实缩略图或占位都算一格），尺寸与 .gallery-grid 的
+   140px 方形保持一致：真实缩略图仍是 a.image-link.gallery-thumb 铺满整格，观感不变。
+   占位格按「圆形进度环 + 状态文字」竖排，不参与文字撑高（min-width: 0 + overflow: hidden）。 */
+.gallery-tile {
+  position: relative; display: flex; flex-direction: column;
+  align-items: center; justify-content: center; gap: 6px;
+  width: 100%; min-width: 0; aspect-ratio: 1; overflow: hidden;
+}
+/* 真实缩略图那一格：让缩略图铺满整格，不被这一层引入额外内边距 */
+.gallery-tile > a.image-link.gallery-thumb { width: 100%; height: 100%; }
+.gallery-tile > a.image-link.gallery-thumb > img { width: 100%; height: 100%; }
+
+/* 占位格本体：和缩略图同一套圆角 / 底色，比真实缩略图更低调 */
+.gallery-placeholder {
+  /* 百分比环的驱动变量：默认 0；逻辑代理写在 .is-running 上（继承下来）或写在
+     .gallery-ring 自身上（声明在元素本身，覆盖继承值）都能生效。 */
+  --ring-percent: 0;
+  position: relative; display: flex; flex-direction: column;
+  align-items: center; justify-content: center; gap: 6px;
+  width: 100%; min-width: 0; height: 100%; padding: 8px;
+  border: 1px solid var(--line); border-radius: 10px;
+  background: rgba(9, 15, 27, .5); color: var(--muted);
+  text-align: center;
+}
+
+/* 还没轮到：虚线边框 + muted 文字，刻意不抢眼 */
+.gallery-placeholder.is-pending {
+  border-style: dashed; border-color: rgba(120, 150, 200, .26);
+  background: rgba(9, 15, 27, .38);
+}
+
+/* 生成中：描边亮一点，环里显示百分比 */
+.gallery-placeholder.is-running {
+  border-color: rgba(90, 162, 255, .42);
+  background: rgba(9, 15, 27, .55);
+  color: var(--text);
+}
+
+/* 失败：警示色只用在描边与文字上，底色是极低透明度的红，不铺大面积纯红 */
+.gallery-placeholder.is-failed {
+  border-color: rgba(255, 125, 138, .42);
+  background: rgba(255, 125, 138, .08);
+  color: var(--danger);
+}
+
+/* 状态文字：最多两行，超出省略；窄格里也不撑破格子 */
+.gallery-placeholder-state {
+  max-width: 100%; min-width: 0;
+  font-size: 12px; line-height: 1.3; font-weight: 550;
+  overflow: hidden; text-overflow: ellipsis;
+  display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2;
+  overflow-wrap: anywhere; word-break: break-word;
+}
+.gallery-placeholder.is-pending .gallery-placeholder-state { color: var(--muted); }
+.gallery-placeholder.is-running .gallery-placeholder-state { color: #dce9ff; }
+.gallery-placeholder.is-failed .gallery-placeholder-state { color: var(--danger); }
+
+/* 圆形进度条：轨道（.gallery-ring 自己的底）+ 已填充（::before 的 conic-gradient 圆环）。
+   百分比 = calc(var(--ring-percent) * 1%)，被 clamp() 夹在 0%~100%，越界也不会画坏。
+   注意：这里**不能**给 .gallery-ring 自己写 `--ring-percent: 0` —— 自定义属性若是声明在元素
+   本身上，会盖掉从祖先继承来的值（实测：子元素自带声明时父级继承值失效）。所以默认值一律走
+   var() 的 fallback `, 0`，这样逻辑代理把 --ring-percent 写在 .is-running 格上（继承下来）或
+   写在 .gallery-ring 上（元素自身声明）都能生效。
+   环的内孔用 ::after 盖一块与占位格同色系的底色，中间放小号百分比数字。 */
+.gallery-ring {
+  /* 在环自己身上把「0~100 的百分比」解析成百分比长度，供 ::before 使用（fallback 覆盖没设变量的情况） */
+  --ring-percent-fill: calc(clamp(0, var(--ring-percent, 0), 100) * 1%);
+  position: relative; flex: 0 0 auto;
+  width: 52px; height: 52px; border-radius: 50%;
+  display: flex; align-items: center; justify-content: center;
+  background: rgba(120, 150, 200, .18);
+}
+.gallery-ring::before {
+  content: ""; position: absolute; inset: 0; border-radius: 50%;
+  background: conic-gradient(from -90deg,
+    var(--accent) 0,
+    var(--accent-2) var(--ring-percent-fill),
+    transparent var(--ring-percent-fill));
+}
+.gallery-ring::after {
+  content: ""; position: absolute; inset: 6px; border-radius: 50%;
+  background: #101a2c;
+}
+/* 环中心的百分比数字（比状态文字更小；逻辑代理没给这个元素时自然不占位） */
+.gallery-ring-percent {
+  position: relative; z-index: 1;
+  font-size: 11px; line-height: 1; font-weight: 650;
+  color: #dce9ff; font-variant-numeric: tabular-nums;
+}
+
+/* 生成中：环轻微呼吸 + 状态文字轻微脉冲；关掉动效就完全静止 */
+@keyframes gallery-ring-breathe {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: .82; transform: scale(.98); }
+}
+@keyframes gallery-state-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: .68; }
+}
+.gallery-placeholder.is-running .gallery-ring { animation: gallery-ring-breathe 1.5s var(--ease) infinite; }
+.gallery-placeholder.is-running .gallery-placeholder-state { animation: gallery-state-pulse 1.5s var(--ease) infinite; }
+@media (prefers-reduced-motion: reduce) {
+  .gallery-placeholder.is-running .gallery-ring,
+  .gallery-placeholder.is-running .gallery-placeholder-state { animation: none; }
+}
+
+/* 窄屏：每行最多两格（宽度够时仍是 140px 见方），占位格子同步收窄但不变形 */
+@media (max-width: 620px) {
+  .gallery-grid { grid-template-columns: repeat(auto-fill, minmax(0, 140px)); }
+  .gallery-ring { width: 46px; height: 46px; }
+  .gallery-placeholder { padding: 6px; gap: 5px; }
+  .gallery-placeholder-state { font-size: 11.5px; }
+}
+

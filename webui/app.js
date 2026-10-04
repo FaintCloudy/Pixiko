@@ -587,6 +587,9 @@
     taskNumber: '', percent: 0, cancelled: false,
     gallery: null, single: null, singleFile: '', base: '',
     files: new Set(), extras: [], baseline: null, startedAt: 0,
+    // 任务级格子规划：这条正在跑的任务总共要铺 total 个格子（真实缩略图 + 失败格 + 生成中格 + 等待格）。
+    // `plan` 非空 = 此刻页面上铺着占位格；`planTotal` 跑完/取消后仍然留着，表头用它补「任务共 N 张，实际 M 张」。
+    plan: null, planTotal: 0, tiles: [],
   };
 
   /**
@@ -790,14 +793,23 @@
     }
   }
 
-  /** 图集表头：生成期间「已生成 N 张（生成中…）」，跑完回到「共 N 张」。 */
+  /**
+   * 图集表头：**正在铺格子**（这条任务还在跑、没被取消）时「图集 · 已生成 N 张（生成中…）」；
+   * 跑完 / 被取消后回到「图集 · 共 N 张」，张数少于这条任务的总张数时再补一句「（任务共 N 张，实际 M 张）」
+   * ——失败与未生成的那些格子这时已经收掉了，差多少就靠这句话交代（总张数用 planTotal，换回执时清掉）。
+   */
   function questGalleryHead() {
     const gallery = questLive.gallery;
     if (!gallery || !gallery.head) return;
     const count = gallery.items.length;
-    gallery.head.textContent = questGenerating()
-      ? '图集 · 已生成 ' + count + ' 张（生成中…）'
-      : '图集 · 共 ' + count + ' 张';
+    if (questLive.plan) {
+      gallery.head.textContent = '图集 · 已生成 ' + count + ' 张（生成中…）';
+      return;
+    }
+    const total = questCount(questLive.planTotal);
+    let text = '图集 · 共 ' + count + ' 张';
+    if (total > 0 && count < total) text += '（任务共 ' + total + ' 张，实际 ' + count + ' 张）';
+    gallery.head.textContent = text;
   }
 
   /** 把进度卡插到 #quest-body 顶部（已经在里面就不动它）。 */
@@ -845,13 +857,168 @@
     return baseline ? !baseline.has(path) : true;
   }
 
+  // ---------------------------------------------------------------- 图集占位格（还没轮到 / 正在生成 / 生成失败）
+
+  /** 图集里的一格：真实缩略图与占位格都包一层 .gallery-tile（CSS 按这一层量出固定方形的一格）。 */
+  function galleryTile(child) {
+    const tile = el('div', 'gallery-tile');
+    if (child) tile.appendChild(child);
+    return tile;
+  }
+
+  /**
+   * 这一轮图集的格子规划（任务级）：总共 `total` 个格子
+   * = 真实缩略图 + 失败格 + （还在跑时的 1 个生成中格）+ 等待格，四者相加**恒等于 total**。
+   *
+   * 口径以 /api/tasks 为准：`images` 是成功产出的张数、`failed` 是失败次数，
+   * 而 **`done` 含失败**（done = images + failed），所以绝不能拿 done 去算「还差几张」。
+   * `shown` 是网格里已经画出来的真实缩略图数（接口计数偶尔落后于文件），取两者大的那个，
+   * 格子总数才不会被顶过 total。拿不到 total（没有这一条任务 / total<=0）返回 null：这时一个占位格都不铺。
+   */
+  function questTilePlan(task, shown) {
+    const total = task ? questCount(task.total) : 0;
+    if (total <= 0) return null;
+    const images = Math.min(total, Math.max(questCount(task.images), questCount(shown)));
+    const failed = Math.min(questCount(task.failed), total - images);
+    const room = total - images - failed;                       // 还没定下内容的格子：生成中那一格 + 等待格
+    const running = !!task.running && room > 0;
+    return { total, images, failed, running, pending: room - (running ? 1 : 0) };
+  }
+
+  /** 一个占位格：.gallery-tile 里放 .gallery-placeholder（圆形进度环 + 状态文字都归它）。 */
+  function questPlaceholderTile() {
+    const box = el('div', 'gallery-placeholder');
+    const ring = el('div', 'gallery-ring');
+    const ringText = el('div', 'gallery-ring-percent');
+    const state = el('div', 'gallery-placeholder-state');
+    ring.appendChild(ringText);
+    box.appendChild(state);
+    const tile = galleryTile(box);
+    tile._box = box; tile._state = state; tile._ring = ring; tile._ringText = ringText;
+    return tile;
+  }
+
+  /**
+   * 就地改一个占位格的状态：等待中 / 生成中（带圆形进度环）/ 生成失败。
+   *
+   * `--ring-percent`（0–100 的无单位数字）设在 **.gallery-ring 元素自己**身上：app.css 里
+   * `.gallery-ring { --ring-percent: 0 }` 是声明在元素自身的，父层继承下来的值会被它盖掉，
+   * 所以只有设在环上（或环的 inline style）才算数；同时在 .gallery-placeholder.is-running 上
+   * 也设一份，万一以后环那一层的默认值被去掉，继承也还接得住。
+   *
+   * 环只在生成中那一格**挂进 DOM**：其它状态直接从格子里摘掉（不用 hidden —— CSS 里的 display 会盖掉 [hidden]）。
+   */
+  function questPaintTile(tile, kind, ordinal, sample) {
+    const box = tile._box, state = tile._state, ring = tile._ring;
+    if (!box || !state || !ring) return;
+    const percent = Math.max(0, Math.min(100, Math.round(Number(sample) || 0)));
+    box.classList.toggle('is-running', kind === 'running');
+    box.classList.toggle('is-pending', kind === 'pending');
+    box.classList.toggle('is-failed', kind === 'failed');
+    if (kind === 'running') {
+      if (!ring.parentNode) box.insertBefore(ring, box.firstChild || null);
+      ring.style.setProperty('--ring-percent', String(percent));
+      box.style.setProperty('--ring-percent', String(percent));
+      if (tile._ringText) tile._ringText.textContent = percent + '%';
+      state.textContent = '生成中 ' + percent + '%';
+      box.setAttribute('role', 'progressbar');
+      box.setAttribute('aria-valuemin', '0');
+      box.setAttribute('aria-valuemax', '100');
+      box.setAttribute('aria-valuenow', String(percent));
+      box.setAttribute('aria-label', '正在生成第 ' + ordinal + ' 张（' + percent + '%）');
+      return;
+    }
+    if (ring.parentNode) ring.parentNode.removeChild(ring);
+    box.removeAttribute('role');
+    box.removeAttribute('aria-valuemin');
+    box.removeAttribute('aria-valuemax');
+    box.removeAttribute('aria-valuenow');
+    if (kind === 'failed') {
+      state.textContent = '生成失败';
+      box.setAttribute('aria-label', '第 ' + ordinal + ' 张生成失败');
+    } else {
+      state.textContent = '等待中';
+      box.setAttribute('aria-label', '第 ' + ordinal + ' 张等待中');
+    }
+  }
+
+  /** 网格里的第一个占位格：真实缩略图永远插在它前面（顺序：缩略图 → 失败 → 生成中 → 等待）。 */
+  function questFirstTile() {
+    const gallery = questLive.gallery;
+    if (!gallery) return null;
+    for (const tile of (questLive.tiles || [])) if (tile && tile.parentNode === gallery.grid) return tile;
+    return null;
+  }
+
+  /**
+   * 占位格就地对齐到这一轮的规划：只改每一格的状态、只在**尾部**增删，绝不重建图集卡、
+   * 不重建 #quest-body、不动滚动位置（已经渲染好的缩略图一个都不重新加载）。
+   * `plan` 为 null（没在跑 / 被取消 / 拿不到 total）时把所有占位格收掉，只留真实缩略图。
+   * 900ms 的回执重画会把整块 body 换掉：图集对象换了（grid 不是同一个）时旧格子自动作废，按新 grid 重铺。
+   */
+  function questSyncTiles(plan, sample) {
+    const gallery = questLive.gallery;
+    if (!gallery || !gallery.grid) return;
+    const desired = [];
+    if (plan) {
+      for (let i = 0; i < plan.failed; i++) desired.push('failed');
+      if (plan.running) desired.push('running');
+      for (let i = 0; i < plan.pending; i++) desired.push('pending');
+    }
+    const tiles = (questLive.tiles || []).filter((tile) => tile && tile.parentNode === gallery.grid);
+    while (tiles.length < desired.length) {                    // 少了：在尾部补
+      const tile = questPlaceholderTile();
+      gallery.grid.appendChild(tile);
+      tiles.push(tile);
+    }
+    while (tiles.length > desired.length) {                    // 多了：从尾部撤（收尾时全撤）
+      const tile = tiles.pop();
+      if (tile.parentNode) tile.parentNode.removeChild(tile);
+    }
+    const first = gallery.items.length;                        // 缩略图占前面的格子，占位格的序号从它后面数
+    tiles.forEach((tile, index) => questPaintTile(tile, desired[index], first + index + 1, sample));
+    questLive.tiles = tiles;
+  }
+
+  /**
+   * 有格子要铺时先把图集卡放到页面上：一张真图都还没有的时候也要有这张卡，占位格才有地方待。
+   * 卡已经在页面上就不动它；被 900ms 的回执重画撸掉了就按**同一个节点**挂回去（里面的图不重新加载）。
+   * 已经出了一张（单张图片卡）时就地升级成图集，那张加载好的图跟着挪进网格。
+   */
+  function questEnsureGallery() {
+    const gallery = questLive.gallery;
+    if (gallery) {
+      if (!gallery.card.parentNode) questMountGallery(gallery.card);
+      return gallery;
+    }
+    if (questLive.single && questLive.single.parentNode) {
+      const upgraded = createGallery({ base: questLive.base, cardClass: 'quest-step gallery-step',
+        gridClass: 'gallery-grid', reuse: questLive.single, firstFile: questLive.singleFile });
+      questLive.gallery = upgraded;
+      questLive.single = null;
+      questLive.singleFile = '';
+      return upgraded;
+    }
+    const created = createGallery({ base: questLive.base, cardClass: 'quest-step gallery-step', gridClass: 'gallery-grid' });
+    questLive.gallery = created;
+    questMountGallery(created.card);
+    return created;
+  }
+
+  /** 收掉这条回执图集里的全部占位格（任务跑完 / 被取消 / 换回执时用；真实缩略图一个都不动）。 */
+  function questClearTiles() {
+    (questLive.tiles || []).forEach((tile) => { if (tile && tile.parentNode) tile.parentNode.removeChild(tile); });
+    questLive.tiles = [];
+  }
+
   /** 一张新图就地追加进这条回执的图集（单张卡会被就地升级成图集，已经加载好的图不重新加载）。 */
   function questAddImage(file) {
     const fileKey = questFileKey(file);
     if (questLive.files.has(fileKey)) return;
     questLive.files.add(fileKey);
     if (questLive.gallery) {
-      questLive.gallery.add(file);
+      // 真实缩略图插在第一个占位格前面：图永远排在「失败 / 生成中 / 等待」这些格子的前面。
+      questLive.gallery.add(file, null, null, questFirstTile());
       questGalleryHead();
       return;
     }
@@ -861,7 +1028,7 @@
       questLive.gallery = gallery;
       questLive.single = null;
       questLive.singleFile = '';
-      gallery.add(file);
+      gallery.add(file, null, null, questFirstTile());
       questGalleryHead();
       return;
     }
@@ -876,14 +1043,17 @@
    * /api/images 里属于**这条正在跑的任务自己的目录**、还没画过的图 → 增量追加（按 path 去重，绝不出现重复项）。
    * /api/images 是全局的（别的任务、webui/ 下的临时内嵌图都在里面），所以先认目录再收图：
    * 跨目录与 webui/ 临时图一律不进这个预览；仍然只追加，不重建 #quest-body、不动滚动位置。
+   *
+   * `dirOnly` 是收尾那一轮用的：任务已经不在跑了，就不再按「最新那张任务图」去猜目录（可能已经换成下一个任务），
+   * 只用生成期间认下来的那个目录，最后一张图才不会因为「图刚落盘、任务就结束」而漏掉。
    */
-  function questAppendImages(payload) {
+  function questAppendImages(payload, dirOnly) {
     const list = payload && Array.isArray(payload.images) ? payload.images : null;
     if (!list) return;
     if (!questLive.baseline) questLive.baseline = new Set(list.map((image) => String((image && image.path) || '')));
-    const dir = questRunningDir(list);                                       // 最新那张任务图的所在目录＝运行中任务的目录
+    const dir = dirOnly || questRunningDir(list);                            // 最新那张任务图的所在目录＝运行中任务的目录
     if (!dir) return;
-    questLive.dir = dir;
+    if (!dirOnly) questLive.dir = dir;                                       // 收尾那一轮不许改已认下的目录
     const fresh = [];
     list.forEach((image) => {
       const path = String((image && image.path) || '');
@@ -901,13 +1071,13 @@
 
   /**
    * 生成期间的一轮：进度（/api/progress + /api/tasks）与提前预览（/api/images）。
-   * 严格门槛：只有「最新一条 + 生成类指令 + 队列里真有 running 的任务」才建卡、才追加实时图；
-   * 缺一条就把之前建过的卡撤掉（实时图不再追加），队列空了就把卡就地标「已完成」并停表。
+   * 严格门槛：只有「最新一条 + 生成类指令 + 队列里真有 running 的任务」才建卡、才铺格子、才追加实时图；
+   * 缺一条就把之前建过的卡撤掉（实时图不再追加），队列空了/被取消就收掉占位格、把卡就地标「已完成」并停表。
    */
   async function questLiveTick() {
     const number = questLive.number;
     if (!number) { questLiveStop(); return; }
-    // 不是「最新一条 + 生成类指令」：连 /api/tasks 都不问，进度卡与实时图一律没有。
+    // 不是「最新一条 + 生成类指令」：连 /api/tasks 都不问，进度卡、占位格与实时图一律没有。
     if (!questLiveCandidate(number)) { questLiveDrop(); return; }
     const [progress, tasks, images] = await Promise.all([
       api('/api/progress').catch(() => null),
@@ -919,18 +1089,41 @@
     questLive.tasksRunning = list.some((task) => task && task.running);
     questLive.progressRunning = !!(progress && progress.running);
     const running = questGenerating();
+    const task = questTaskOf(list, number);
+    // 被取消（接口说的或本地点过取消的）与跑完一样是收尾：不再铺格子，表头回到「共 M 张」。
+    const cancelled = !!(task && task.cancelled) || questLive.cancelled;
+    const live = running && !cancelled;
+    // 格子规划：只认 /api/tasks 的 images/failed（done 含失败），`shown` 是网格里已经画出来的缩略图数。
+    const plan = live ? questTilePlan(task, questLive.gallery ? questLive.gallery.items.length : 0) : null;
+    questLive.plan = plan;
+    // 总张数留着：收尾那一轮表头要靠它补「（任务共 N 张，实际 M 张）」。
+    const planned = plan ? plan.total : (task ? questCount(task.total) : 0);
+    if (planned > 0) questLive.planTotal = planned;
     if (running && questLiveCandidate(number)) {
       if (!questLive.card) { questBuildCard(); questMountCard(); }
-      questPaintCard(questTaskOf(list, number), progress);
+      if (plan) questEnsureGallery();                                       // 一张真图都还没有时也要先有图集卡，占位格才有地方待
+      questPaintCard(task, progress);
       questAppendImages(images);
+      questSyncTiles(plan, questSamplePercent(progress));
       questGalleryHead();
     } else if (questLive.card && running) {
       questDropCard();                                                        // 跑到一半不再是「最新 + 生成类」：撤卡
+      questLive.plan = null;                                                  // 表头也不再算「生成中…」
+      questSyncTiles(null, 0);
+      questGalleryHead();
     } else if (questLive.card) {
-      questPaintCard(questTaskOf(list, number), progress);                    // 收尾：卡片留在原地标「已完成」
+      questPaintCard(task, progress);                                         // 收尾：卡片留在原地标「已完成 / 已取消」
+      // 最后一张图恰好和「跑完」同一轮到达也别漏：生成期间认下的目录优先，一次都没认下才退回「最新那张任务图」的目录。
+      questAppendImages(images, questLive.dir || null);
+      questSyncTiles(null, 0);                                                // 跑完 / 被取消：占位格收掉，只留真实缩略图
       questGalleryHead();
     } else {
       questDropCard();                                                       // 没建过卡也没在跑：确保页面上没有残留的卡
+      questSyncTiles(null, 0);
+    }
+    // 900ms 的回执重画会把图集卡从 body 上撸下来：卡里已经有图就按**同一个节点**挂回去（图不重新加载、不闪）。
+    if (questLive.gallery && questLive.gallery.items.length > 0 && !questLive.gallery.card.parentNode) {
+      questMountGallery(questLive.gallery.card);
     }
     if (!running) questLiveStop();                                            // 空闲：卡片留在原地标「已完成」，表停掉
   }
@@ -954,9 +1147,12 @@
     questLive.cancelBtn = null;
   }
 
-  /** 不合格的实时视图：进度卡撤掉、表停掉，实时图也不再追加。 */
+  /** 不合格的实时视图：进度卡撤掉、占位格收掉、表停掉，实时图也不再追加。 */
   function questLiveDrop() {
     questDropCard();
+    questLive.plan = null;
+    questSyncTiles(null, 0);
+    questGalleryHead();
     questLive.tasksRunning = false;
     questLive.progressRunning = false;
     questLiveStop();
@@ -976,6 +1172,8 @@
     questLive.dir = '';
     questLive.card = null; questLive.head = null; questLive.fill = null; questLive.note = null;
     questLive.cancelBtn = null; questLive.taskNumber = ''; questLive.percent = 0; questLive.cancelled = false;
+    questLive.plan = null; questLive.planTotal = 0;                    // 上一条任务的格子规划与总张数作废
+    questClearTiles();                                                 // 上一张回执铺过的占位格收掉（图集随 body 重画，这里只管 DOM 干净）
     questLive.gallery = null; questLive.single = null; questLive.singleFile = '';
     questLive.files = new Set();
     questLive.extras = [];
@@ -1490,8 +1688,8 @@
    * 一个图集卡片：表头「图集 · 共 N 张（点击看大图）」+ 缩略图网格，点任意一张用查看器翻整组。
    * `items` 是**活的**数组（缩略图点击的那一刻才交给查看器），所以后到的图也能翻到。
    *
-   * 增量渲染靠它：`add()` 只往网格里 append 一张缩略图并就地改表头张数，卡片节点从头到尾是同一个 ——
-   * 图片陆续到达时不会整块重建，滚动位置与其它卡片都不受影响。
+   * 增量渲染靠它：`add()` 只往网格里追加一格（缩略图外面包一层 .gallery-tile）并就地改表头张数，
+   * 卡片节点从头到尾是同一个 —— 图片陆续到达时不会整块重建，滚动位置与其它卡片都不受影响。
    * `reuse` 用来把已经渲染好的单张图片卡**就地**改成图集：卡片节点不换，里面那张已经加载好的
    * <a>/<img> 直接挪进网格（图不重新加载，页面上也不闪）。
    *
@@ -1511,8 +1709,11 @@
     const syncHead = () => { head.textContent = '图集 · 共 ' + items.length + ' 张（点击看大图）'; };
     const gallery = {
       card, head, grid, items,
-      /** 追加一张缩略图；`existing` 是要复用/挪进来的那个 <a>。 */
-      add(file, alt, existing) {
+      /**
+       * 追加一张缩略图；`existing` 是要复用/挪进来的那个 <a>，`before` 是插到哪一格前面
+       * （正在生成的那条任务：缩略图要插在占位格前面，图才永远排在「失败 / 生成中 / 等待」前面）。
+       */
+      add(file, alt, existing, before) {
         const index = items.length;
         const caption = alt || imageAlt(base, index, file);
         const src = existing ? (viewerSrcOf(existing) || imageUrl(file)) : imageUrl(file);
@@ -1529,7 +1730,9 @@
           link.classList.add('gallery-thumb');
         }
         link.title = caption + ' · 点击看大图';
-        grid.appendChild(link);
+        const tile = galleryTile(link);                     // 每一格都包一层 .gallery-tile（与占位格同一套格子）
+        if (before && before.parentNode === grid) grid.insertBefore(tile, before);
+        else grid.appendChild(tile);
         syncHead();
         return index;
       }
