@@ -169,14 +169,50 @@
     if (iso) { var date = new Date(String(iso)); if (!Number.isNaN(date.getTime())) return date.toLocaleString('zh-CN'); }
     return days + ' 天前';
   }
-  /** 图片地址：外链走原样，本地路径交给契约的 imageUrl（它会拼令牌与 /api/image）。 */
-  function imageSrc(file) {
-    var value = text(file);
-    if (/^https?:\/\//i.test(value)) return value;
-    var path = value.replace(/\\/g, '/').replace(/^.*?(data\/generated\/)/, '$1');
-    if (typeof P.imageUrl === 'function') { try { return P.imageUrl(path); } catch (error) { /* 落下面 */ } }
+  /** 缩略图长边（契约 `&w=`；格子约 110 CSS px，320 够 2–3 倍屏）。查看器/桥一律不用它。 */
+  var THUMB_W = 320;
+
+  /**
+   * 服务端存档里的图片字段有三种写法（见 app.js 的同名说明）：
+   *   · 纯字符串 —— `/api/chat/log` 的 `images:["file:///…"]`；
+   *   · `{file}` —— `/api/quest` 的 `images` 与 `messages` 里的 `{type:'image', file:"…"}`；
+   *   · `{path}` / `{url}` —— `/api/images` 的 `{path:"data/generated/…"}`。
+   * 直接 `String(对象)` 会拼出 `path=%5Bobject%20Object%5D`（服务端 400）—— 这里先取出字符串。
+   */
+  function imageOf(value) {
+    if (value === null || value === undefined) return '';
+    if (typeof value === 'string') return value;
+    if (typeof value === 'object') {
+      var keys = ['file', 'path', 'url', 'src'];
+      for (var i = 0; i < keys.length; i++) {
+        var got = value[keys[i]];
+        if (typeof got === 'string' && got) return got;
+      }
+      return '';
+    }
+    return String(value);
+  }
+  /** 路径归一：任何含 `data/generated/` 的写法都截成从它开始的相对路径；其余原样。 */
+  function normalizePath(value) {
+    var path = imageOf(value).replace(/\\/g, '/');
+    if (!path) return '';
+    var at = path.indexOf('data/generated/');
+    return at >= 0 ? path.slice(at) : path;
+  }
+  /**
+   * 图片地址：外链走原样，本地路径交给契约的 imageUrl（它会拼令牌与 /api/image）。
+   * `thumb=true`（默认）加 `&w=` 拿缩略图；查看器/原生桥要原图，必须 `thumb=false`。
+   */
+  function imageSrc(file, thumb) {
+    var path = normalizePath(file);
+    if (/^https?:\/\//i.test(path)) return path;
+    if (typeof P.imageUrl === 'function') {
+      try { return P.imageUrl(path, thumb === false ? undefined : { w: THUMB_W }); } catch (error) { /* 落下面 */ }
+    }
     return path;
   }
+  /** 原图地址（查看器、原生桥保存/分享、复制地址专用）。 */
+  function imageFullSrc(file) { return imageSrc(file, false); }
   /** 路径 → 文件名（图集与查看器的说明文字用）。 */
   function shortName(file) { return text(file).replace(/^.*[\\/]/, '').split('?')[0]; }
 
@@ -463,6 +499,8 @@
     detail.error = '';
     detail.files = [];
     detail.extras = [];
+    detail.stepNodes = [];      // 新条目：DOM 会被整屏重挂，增量记账跟着清
+    detail.stepCount = 0;
     if (typeof P.go === 'function') P.go('quest-detail');
   }
 
@@ -525,8 +563,10 @@
   P.register('quest', { title: '回执', mount: mountList, refresh: refreshList, menu: listMenu });
 
   /* ───────────────────────── 4. 详情屏 id = 'quest-detail' ───────────────────────── */
-  var detail = { root: null, body: null, head: null, number: 0, payload: null, error: '',
-    loading: false, files: [], extras: [], timer: null, progress: null };
+  /* `stepNodes` / `stepCount` 是增量渲染的记账：已画好的步骤行节点与它们的数量。
+     换条目（openDetail）或整屏重挂（mountDetail）时必须清掉 —— 那时 DOM 已经不在，留着会串页。 */
+  var detail = { root: null, body: null, head: null, headNodes: null, number: 0, payload: null, error: '',
+    loading: false, files: [], extras: [], timer: null, progress: null, stepNodes: [], stepCount: 0 };
 
   function piecesOf(payload) {
     var groups = payload && Array.isArray(payload.messages) && payload.messages.length ? payload.messages : null;
@@ -536,44 +576,64 @@
   }
   function filesOf(payload, groups) {
     var files = [];
+    function push(value) {
+      var path = normalizePath(value);      // 对象（{file}/{path}）与字符串都收，统一成相对路径
+      if (path && files.indexOf(path) < 0) files.push(path);
+    }
     if (groups) {
       groups.forEach(function (pieces) {
-        (pieces || []).forEach(function (piece) { if (piece && piece.type === 'image' && piece.file) files.push(text(piece.file)); });
+        (pieces || []).forEach(function (piece) { if (piece && piece.type === 'image' && piece.file) push(piece.file); });
       });
     } else if (payload && Array.isArray(payload.images)) {
-      payload.images.forEach(function (image) { if (image && image.file) files.push(text(image.file)); });
+      payload.images.forEach(function (image) { push(image); });   // 元素本身就是 {file:"…"}
     }
-    detail.extras.forEach(function (file) { if (files.indexOf(file) < 0) files.push(file); });
+    detail.extras.forEach(push);
     return files;
   }
 
+  /**
+   * 详情头部：**结构建一次，之后只改文本**。
+   *
+   * <p>原来每轮 `renderDetail()` 都 `clear(detail.head)` 重建整张卡片 —— 头部一重建，
+   * 挂在它下面的进度条也一起没了，进度条于是每 3 秒从 0 重新长一遍；标签行重建还会让文字闪。
+   * 现在节点认一次，`#号 / 指令 / 元信息` 只改 `textContent`，标签行最多重建几个 `<span>`（不涉及图片解码）。
+   */
   function renderDetailHead() {
     if (!detail.head) return;
-    clear(detail.head);
     var payload = detail.payload || {};
+    if (!detail.headNodes) {
+      clear(detail.head);
+      var card = el('div', 'q-card q-head');
+      var no = el('div', 'q-no', '');
+      var cmd = el('div', 'q-cmd', '');
+      var meta = el('div', 'q-head-meta', '');
+      var tags = el('div', 'q-tags');
+      card.appendChild(no);
+      card.appendChild(cmd);
+      card.appendChild(meta);
+      card.appendChild(tags);
+      detail.head.appendChild(card);
+      detail.headNodes = { card: card, no: no, cmd: cmd, meta: meta, tags: tags };
+    }
+    var nodes = detail.headNodes;
     var number = num(payload.quest, detail.number) || detail.number;
     var command = text(payload.command);
     var failed = !!payload.error || !!detail.error;
     var running = !failed && !(payload.done && !payload.busy);
-    var card = el('div', 'q-card q-head');
-    card.appendChild(el('div', 'q-no', '#' + number));
-    card.appendChild(el('div', 'q-cmd', command || '（没有指令文本）'));
-    var meta = el('div', 'q-head-meta');
+    nodes.no.textContent = '#' + number;
+    nodes.cmd.textContent = command || '（没有指令文本）';
     var whenText = when(payload.startedAt, payload.ageMillis);
-    meta.textContent = (whenText ? whenText + ' · ' : '') + (failed ? '失败' : (running ? '执行中…' : '已完成'))
+    nodes.meta.textContent = (whenText ? whenText + ' · ' : '') + (failed ? '失败' : (running ? '执行中…' : '已完成'))
       + (payload.closed ? ' · 回执已关闭' : '')
       + (payload.latest ? ' · 最新一条 #' + num(payload.latest, 0) : '');
-    card.appendChild(meta);
-    var tags = el('div', 'q-tags');
-    if (running) tags.appendChild(el('span', 'q-tag q-live q-run', '执行中'));
-    if (failed) tags.appendChild(el('span', 'q-tag q-warn', '失败'));
-    if (payload.fromDisk) tags.appendChild(el('span', 'q-tag', '从磁盘读回'));
+    clear(nodes.tags);
+    if (running) nodes.tags.appendChild(el('span', 'q-tag q-live q-run', '执行中'));
+    if (failed) nodes.tags.appendChild(el('span', 'q-tag q-warn', '失败'));
+    if (payload.fromDisk) nodes.tags.appendChild(el('span', 'q-tag', '从磁盘读回'));
     var texts = Array.isArray(payload.texts) ? payload.texts.length : 0;
     var images = detail.files.length;
-    if (texts) tags.appendChild(el('span', 'q-tag', texts + ' 段文字'));
-    if (images) tags.appendChild(el('span', 'q-tag', images + ' 张图'));
-    card.appendChild(tags);
-    detail.head.appendChild(card);
+    if (texts) nodes.tags.appendChild(el('span', 'q-tag', texts + ' 段文字'));
+    if (images) nodes.tags.appendChild(el('span', 'q-tag', images + ' 张图'));
   }
 
   function renderProgress() {
@@ -581,6 +641,7 @@
     var old = detail.head.querySelector('.q-progress');
     if (old && detail.progress) { detail.progress.card = old; detail.progress.fill = old.querySelector('.q-prog-fill'); detail.progress.text = old.querySelector('.q-progress-text'); return; }
     if (old) old.remove();
+    if (detail.progress) { detail.progress.card = null; detail.progress.fill = null; detail.progress.text = null; }
     var payload = detail.payload || {};
     if (!detail.progress || !detail.progress.visible) return;
     var box = el('div', 'q-progress');
@@ -600,7 +661,10 @@
     if (!detail.progress || !detail.progress.fill) return;
     if (!detail.progress.visible) {
       if (detail.progress.card && detail.progress.card.parentNode) detail.progress.card.remove();
+      // 节点一起放掉：留着的话下次 renderProgress() 会以为"进度条还在"而不再建，进度条就再也不出现了
       detail.progress.card = null;
+      detail.progress.fill = null;
+      detail.progress.text = null;
       return;
     }
     var percent = Math.max(0, Math.min(100, num(detail.progress.percent, 0)));
@@ -630,7 +694,7 @@
       var images = (data && Array.isArray(data.images)) ? data.images : [];
       var before = detail.extras.length;
       images.forEach(function (image) {
-        var path = text(image && image.path);
+        var path = normalizePath(image);            // {path:"data/generated/…"} 或裸字符串都收
         if (!path || path.indexOf('data/generated/webui/') === 0) return;
         if (detail.files.indexOf(path) < 0 && detail.extras.indexOf(path) < 0) detail.extras.push(path);
       });
@@ -639,58 +703,126 @@
     }).catch(function () { return 0; });
   }
 
+  /**
+   * 回执详情的图集：**增量**——已画过的格子（连同已加载好的 `<img>`）原样不动，只 append 新出现的图。
+   *
+   * <p>为什么必须增量：进度轮询每 3 秒走一次 `renderDetail()`，原来整屏 `clear(detail.body)` +
+   * 重新 append，`<img>` 被反复销毁重建 —— 浏览器要重新解码、`loading=lazy` 的图还会被重新判定成
+   * 屏外，这就是用户说的"每次加载都有延迟"。格子按 `data-path` 认，顺序变了也不重画。
+   */
   function gallery(tiles) {
     var grid = el('div', 'q-grid');
+    syncGallery(grid, tiles);
+    return grid;
+  }
+
+  /** 把 `tiles` 同步进已有的 `.q-grid`：只补新格子、只摘掉不再需要的格子（已有的绝不动）。 */
+  function syncGallery(grid, tiles) {
+    var keep = Object.create(null);
+    tiles.forEach(function (file) { keep[file] = true; });
+    // 1) 先摘掉"这次不该有"的格子（**只摘这一格**，别的格子连同已解码的 <img> 原样留着）。
+    //    回执在跑的时候图集是**一轮一轮长出来**的，也会因为重读而变短 —— 不加这条就会留孤儿格子。
+    var painted = grid.querySelectorAll('.q-tile');
+    for (var i = 0; i < painted.length; i++) {
+      if (!keep[painted[i].getAttribute('data-path')]) grid.removeChild(painted[i]);
+    }
+    // 2) 再补缺（顺序按 tiles；已存在的格子只做必要的移动，insertBefore 移动节点不会重新解码图片）
+    var have = Object.create(null);
+    var now = grid.querySelectorAll('.q-tile');
+    for (var j = 0; j < now.length; j++) have[now[j].getAttribute('data-path')] = now[j];
+    var previous = null;
     tiles.forEach(function (file, index) {
-      var tile = el('div', 'q-tile');
-      var src = imageSrc(file);
-      var img = document.createElement('img');
-      img.alt = '任务 #' + (detail.number || 0) + ' 第 ' + (index + 1) + ' 张：' + shortName(file);
-      img.loading = 'lazy';
-      img.decoding = 'async';
-      img.addEventListener('error', function () {
-        tile.classList.add('q-fail');
-        clear(tile);
-        tile.appendChild(el('div', '', '图取不到'));
-      });
-      img.src = src;
-      tile.appendChild(img);
-      tile.addEventListener('click', function () {
-        if (typeof P.openViewer === 'function') {
-          try {
-            P.openViewer(detail.files.map(function (path, at) {
-              return { src: imageSrc(path), caption: '任务 #' + (detail.number || 0) + ' 第 ' + (at + 1) + ' 张：' + shortName(path) };
-            }), index);
-          } catch (error) { toast('查看器打不开：' + (text(error && error.message) || String(error))); }
-        }
-      });
-      /* 长按：优先交给原生桥（Android 外壳的保存/分享菜单），没有桥就退到底部 sheet。 */
-      var holdTimer = null;
-      var startAt = null;
-      var cancelHold = function () { if (holdTimer) { clearTimeout(holdTimer); holdTimer = null; } };
-      tile.addEventListener('touchstart', function (event) {
-        if (event.touches.length !== 1) { cancelHold(); return; }
-        startAt = { x: event.touches[0].clientX, y: event.touches[0].clientY };
-        cancelHold();
-        holdTimer = setTimeout(function () {
-          holdTimer = null;
-          showImageMenu(src, img.alt);
-        }, 550);
-      }, { passive: true });
-      tile.addEventListener('touchmove', function (event) {
-        if (!holdTimer || event.touches.length !== 1) return;
-        if (Math.abs(event.touches[0].clientX - startAt.x) > 10 || Math.abs(event.touches[0].clientY - startAt.y) > 10) cancelHold();
-      }, { passive: true });
-      tile.addEventListener('touchend', cancelHold, { passive: true });
-      tile.addEventListener('touchcancel', cancelHold, { passive: true });
-      tile.addEventListener('contextmenu', function (event) {
-        if (event && event.preventDefault) event.preventDefault();
-        showImageMenu(src, img.alt);
-      });
-      grid.appendChild(tile);
+      var tile = have[file];
+      if (!tile) { tile = tileFor(file, index); have[file] = tile; }
+      if (previous ? previous.nextSibling !== tile : grid.firstChild !== tile) {
+        grid.insertBefore(tile, previous ? previous.nextSibling : grid.firstChild);
+      }
+      previous = tile;
     });
     return grid;
   }
+
+  /** 一个图集格子：1:1 盒子 + 缩略图 + 失败占位（失败只换这一格，别的图不受影响）。 */
+  function tileFor(file, index) {
+    var tile = el('div', 'q-tile');
+    tile.setAttribute('data-path', file);
+    var img = document.createElement('img');
+    img.alt = '任务 #' + (detail.number || 0) + ' ' + shortName(file);
+    img.loading = index < 4 ? 'eager' : 'lazy';       // 首屏可见的前几张先加载，别让用户看到空白格
+    img.decoding = 'async';
+    img.addEventListener('error', function () { markTileFail(tile, file); }, { once: true });
+    function judge() {
+      // 非 1:1 的图在 1:1 的格子里会被 `.q-tile img{object-fit:cover}` 裁掉两头 → 换 contain
+      var w = img.naturalWidth, h = img.naturalHeight;
+      if (w > 0 && h > 0 && Math.abs(w / h - 1) > 0.06) img.classList.add('mx-contain');
+    }
+    img.addEventListener('load', judge, { once: true });
+    img.src = imageSrc(file, true);      // 格子只是小尺寸展示 → 缩略图
+    if (img.complete && img.naturalWidth > 0) judge();
+    tile.appendChild(img);
+    tile.addEventListener('click', function () {
+      if (tile.classList.contains('q-fail')) return;   // 失败态点击 = 复制路径（见 markTileFail）
+      if (typeof P.openViewer !== 'function') return;
+      // 索引**在点击这一刻**按当前 detail.files 算（异步轮询会让图集增长，创建时记下的下标会过期）
+      var at = detail.files.indexOf(file);
+      try { P.openViewer(viewerItems(), at < 0 ? 0 : at); } catch (error) { toast('查看器打不开：' + (text(error && error.message) || String(error))); }
+    });
+    /* 长按：优先交给原生桥（Android 外壳的保存/分享菜单），没有桥就退到底部 sheet。 */
+    var holdTimer = null;
+    var startAt = null;
+    var cancelHold = function () { if (holdTimer) { clearTimeout(holdTimer); holdTimer = null; } };
+    tile.addEventListener('touchstart', function (event) {
+      if (event.touches.length !== 1) { cancelHold(); return; }
+      if (tile.classList.contains('q-fail')) return;   // 失败态由点击处理复制路径
+      startAt = { x: event.touches[0].clientX, y: event.touches[0].clientY };
+      cancelHold();
+      holdTimer = setTimeout(function () {
+        holdTimer = null;
+        showImageMenu(imageFullSrc(file), img.alt);     // 桥拿**原图**
+      }, 550);
+    }, { passive: true });
+    tile.addEventListener('touchmove', function (event) {
+      if (!holdTimer || event.touches.length !== 1) return;
+      if (Math.abs(event.touches[0].clientX - startAt.x) > 10 || Math.abs(event.touches[0].clientY - startAt.y) > 10) cancelHold();
+    }, { passive: true });
+    tile.addEventListener('touchend', cancelHold, { passive: true });
+    tile.addEventListener('touchcancel', cancelHold, { passive: true });
+    tile.addEventListener('contextmenu', function (event) {
+      if (event && event.preventDefault) event.preventDefault();
+      if (tile.classList.contains('q-fail')) return;
+      showImageMenu(imageFullSrc(file), img.alt);
+    });
+    return tile;
+  }
+
+  /** 查看器的一份条目：**原图地址**（不带 w），能和 detail.files 一一对上。 */
+  function viewerItems() {
+    return detail.files.map(function (path, at) {
+      return { src: path, caption: '任务 #' + (detail.number || 0) + ' 第 ' + (at + 1) + ' 张：' + shortName(path) };
+    });
+  }
+
+  /** 图取不到：把这一格换成「图取不到」占位（带上文件名，点一下复制完整路径）。 */
+  function markTileFail(tile, file) {
+    if (!tile || tile.getAttribute('data-img-failed') === '1') return;
+    tile.setAttribute('data-img-failed', '1');
+    tile.classList.add('q-fail');
+    clear(tile);
+    var box = el('div', '', '图取不到');
+    box.title = file;
+    box.addEventListener('click', function (event) {
+      if (event && event.stopPropagation) event.stopPropagation();
+      copyText(file);
+    });
+    tile.appendChild(box);
+    var small = el('div', '', shortName(file));
+    small.style.fontSize = '10px';
+    small.style.opacity = '.75';
+    small.style.overflowWrap = 'anywhere';
+    tile.appendChild(small);
+    rememberedFails[file] = true;      // 按路径去重：同一张图多处失败只记一次
+  }
+  var rememberedFails = Object.create(null);
   /** 长按图片：有 PixikoNative 桥就用桥，没有就用底部 sheet 兜底（两端都能用）。 */
   function showImageMenu(src, label) {
     var bridge = window.PixikoNative;
@@ -708,9 +840,10 @@
   function openViewerFor(src, label) {
     if (typeof P.openViewer !== 'function') return;
     var at = 0;
+    // 用**原图地址**跟传进来的 src 比对（`src` 是 imageFullSrc 给的，不带 w）
     var items = detail.files.map(function (path, index) {
-      if (imageSrc(path) === src) at = index;
-      return { src: imageSrc(path), caption: '任务 #' + (detail.number || 0) + ' 第 ' + (index + 1) + ' 张：' + shortName(path) };
+      if (imageFullSrc(path) === src) at = index;
+      return { src: path, caption: '任务 #' + (detail.number || 0) + ' 第 ' + (index + 1) + ' 张：' + shortName(path) };
     });
     try { P.openViewer(items, at); } catch (error) { /* 查看器不可用就什么也不做 */ }
   }
@@ -729,58 +862,185 @@
     document.body.removeChild(input);
   }
 
+  /**
+   * 整屏同步（**增量**）。
+   *
+   * <p>顺序固定为：`head → 状态/错误 → 步骤 → 图集 → 还在跑`，每次进来只**补缺**：
+   * 该有的节点已经在位就只改文本，绝不 `clear(detail.body)` —— 图集格子里的 `<img>` 一旦画好就留住，
+   * 进度轮询（3 秒一次）不会再让它们重新解码。
+   */
   function renderDetail() {
     if (!detail.body) return;
-    clear(detail.body);
     var payload = detail.payload || {};
+    ensureEmpty();
+
+    var skeletonNode = detail.body.querySelector('[data-q-skeleton]');
     if (detail.loading && !detail.payload) {
-      detail.body.appendChild(detail.head);
-      detail.body.appendChild(skeleton(4));
+      if (skeletonNode) skeletonNode.remove();
+      if (detail.head.parentNode !== detail.body) detail.body.insertBefore(detail.head, detail.body.firstChild);
+      var sk = skeleton(4);
+      sk.setAttribute('data-q-skeleton', '1');
+      detail.body.appendChild(sk);
       renderDetailHead();
       return;
     }
-    detail.body.appendChild(detail.head);
+    if (skeletonNode) skeletonNode.remove();
+
+    if (detail.head.parentNode !== detail.body) detail.body.insertBefore(detail.head, detail.body.firstChild);
+
+    var errNode = detail.body.querySelector('[data-q-error]');
     if (detail.error) {
-      detail.body.appendChild(stateBox('q-err', detail.error, function () { loadDetail(detail.number, false); }));
-      if (detail.payload) renderDetailBody(detail.payload);
-      renderDetailHead();
-      return;
+      if (!errNode) {
+        errNode = stateBox('q-err', detail.error, function () { loadDetail(detail.number, false); });
+        errNode.setAttribute('data-q-error', '1');
+        detail.body.appendChild(errNode);
+      } else {
+        clear(errNode);
+        errNode.appendChild(document.createTextNode(detail.error));
+        var retry = el('button', 'q-retry', '重试');
+        retry.type = 'button';
+        retry.addEventListener('click', function () { loadDetail(detail.number, false); });
+        errNode.appendChild(document.createElement('br'));
+        errNode.appendChild(retry);
+      }
+    } else if (errNode) {
+      errNode.remove();
     }
-    renderDetailBody(payload);
+    if (detail.payload) renderDetailBody(detail.payload);
     renderDetailHead();
   }
 
-  function renderDetailBody(payload) {
+  /** 空态占位：只在"真的没有任何输出"时存在，其它时候必定摘掉。 */
+  function ensureEmpty() {
+    var node = detail.body.querySelector('[data-q-empty]');
+    var payload = detail.payload || {};
     var groups = piecesOf(payload);
     var files = filesOf(payload, Array.isArray(payload.messages) && payload.messages.length ? payload.messages : null);
     detail.files = files;
-    var steps = groups || [];
-    if (!steps.length && !files.length) {
-      detail.body.appendChild(el('div', 'q-state', payload.error ? text(payload.error) : '这条回执还没有任何输出。'));
+    var need = !groups.length && !files.length && !detail.error;
+    if (!need) {
+      if (node) node.remove();
       return;
     }
+    var wanted = payload.error ? text(payload.error) : '这条回执还没有任何输出。';
+    if (!node) { node = el('div', 'q-state', wanted); node.setAttribute('data-q-empty', '1'); detail.body.appendChild(node); }
+    else if (node.textContent !== wanted) node.textContent = wanted;
+  }
+
+  /**
+   * 正文：步骤行与图集都按**已有节点**复用。
+   *
+   * <p>步骤行：`steps[i]` ↔ 第 i 个 `.q-step`，只改标题与正文文本，绝不重建。
+   * <p>图集：整屏只有一个 `.q-grid`，格子按路径增量补（见 `syncGallery`）；
+   * 位置用 `insertBefore` 放到第 `stepWithoutGrid` 个步骤之前 —— 原地移动已有节点不会重新解码图片。
+   */
+  function renderDetailBody(payload) {
+    var groups = piecesOf(payload);
+    var isMessages = Array.isArray(payload.messages) && payload.messages.length > 0;
+    var files = filesOf(payload, isMessages ? payload.messages : null);
+    detail.files = files;
+    var steps = groups || [];
     var tiles = files.slice();
-    var grid = tiles.length ? gallery(tiles) : null;
+    syncSteps(payload, isMessages, steps, tiles.length > 0);
+    syncGrid(payload, tiles);
+    pruneGridTiles(tiles);      // 摘完步骤行再收一次：图集"变短"时不留孤儿格子
+    syncRunningLine(payload);
+  }
+
+  /** 步骤行增量化：只补新出现的行，已在位的只改文本。 */
+  function syncSteps(payload, isMessages, steps, hasTiles) {
+    var count = detail.stepCount || 0;
     var placed = false;
-    steps.forEach(function (pieces, index) {
-      var stepText = (pieces || []).filter(function (piece) { return piece && piece.type !== 'image' && piece.text; })
+    for (var index = 0; index < steps.length; index++) {
+      var group = steps[index] || [];
+      var stepText = group.filter(function (piece) { return piece && piece.type !== 'image' && piece.text; })
         .map(function (piece) { return text(piece.text); }).join('\n');
-      var hasPicture = !!(Array.isArray(payload.messages) && payload.messages.length
-        && (pieces || []).some(function (piece) { return piece && piece.type === 'image' && piece.file; }));
-      var here = hasPicture && !placed && !!grid;
-      if (!stepText && hasPicture && !here) return;
-      var step = el('div', 'q-step');
-      if (/(^|\n)[^\n]{0,16}(失败|错误|不正确|无效|超时|拒绝|找不到)[:：]/.test(stepText)) step.classList.add('q-err');
-      step.appendChild(el('div', 'q-step-head', Array.isArray(payload.messages) && payload.messages.length ? '第 ' + (index + 1) + ' 步' : '输出'));
-      if (stepText) step.appendChild(el('div', 'q-text', stepText));
-      if (here) { placed = true; step.appendChild(grid); }
-      detail.body.appendChild(step);
-    });
-    if (!placed && grid) detail.body.appendChild(grid);
+      var hasPic = !!(isMessages && group.some(function (piece) { return piece && piece.type === 'image' && piece.file; }));
+      var here = hasPic && !placed && hasTiles;
+      var skip = !stepText && hasPic && !here;   // 纯图片片段：内容已经由图集负责，不再单开一行
+      if (skip) {
+        // 这一行不占位：它原来的节点（如果建过）留着不用，收尾时按数量清掉
+        continue;
+      }
+      var node = detail.stepNodes[count];
+      if (!node) {
+        node = el('div', 'q-step');
+        node.appendChild(el('div', 'q-step-head', ''));
+        node.appendChild(el('div', 'q-text', ''));
+        detail.stepNodes[count] = node;
+      }
+      if (node.parentNode !== detail.body) detail.body.insertBefore(node, bodyAnchor());
+      if (here) placed = true;
+      node.classList.toggle('q-err', /(^|\n)[^\n]{0,16}(失败|错误|不正确|无效|超时|拒绝|找不到)[:：]/.test(stepText));
+      var head = node.firstChild;
+      var body = node.lastChild;
+      var title = isMessages ? '第 ' + (index + 1) + ' 步' : '输出';
+      if (head && head.textContent !== title) head.textContent = title;
+      if (body && body.textContent !== stepText) body.textContent = stepText;
+      if (body) body.style.display = stepText ? '' : 'none';
+      count++;
+    }
+    // 行数变少（换了条目/回执重读）：把多出来的节点摘掉；行数变多则**只补不重画**
+    for (var k = count; k < detail.stepNodes.length; k++) {
+      var stale = detail.stepNodes[k];
+      if (stale && stale.parentNode) stale.remove();
+    }
+    detail.stepNodes.length = count;
+    detail.stepCount = count;
+  }
+
+  /**
+   * 图集：把步骤行前面的那个 `.q-grid` 与 `tiles` 对齐（格子按路径增量补）。
+   * 已经在 DOM 里的格子**原样不动**（`insertBefore` 移动节点不会触发重新解码）。
+   *
+   * <p>这里对"整屏所有 `.q-grid`"做一次收口：只保留第一个（`renderDetail` 整屏重挂、或条目切换后
+   * 残留的旧网格会被摘掉），并在摘掉步骤行之后**再收一次**孤儿格子 —— 否则图集"变短"时
+   * 多余的格子会挂在一个已经不在文档里的网格上，DOM 里看不到但节点还在。
+   */
+  function syncGrid(payload, tiles) {
+    var grids = detail.body.querySelectorAll('.q-grid');
+    var grid = null;
+    for (var g = 0; g < grids.length; g++) {
+      if (grid) { if (grids[g].parentNode) grids[g].parentNode.removeChild(grids[g]); }
+      else grid = grids[g];
+    }
+    if (!tiles.length) {
+      if (grid && grid.parentNode) grid.parentNode.removeChild(grid);
+      return;
+    }
+    if (!grid) {
+      grid = el('div', 'q-grid');
+      detail.body.insertBefore(grid, bodyAnchor());
+    }
+    syncGallery(grid, tiles);
+    var anchor = bodyAnchor();
+    if (grid.nextSibling !== anchor && grid.parentNode === detail.body) detail.body.insertBefore(grid, anchor);
+  }
+
+  /** 收尾：把图集里"这次不该有"的格子摘掉（HTMLCollection 是活的，倒着删）。 */
+  function pruneGridTiles(tiles) {
+    var grid = detail.body.querySelector('.q-grid');
+    if (!grid) return;
+    var keep = Object.create(null);
+    tiles.forEach(function (file) { keep[file] = true; });
+    var painted = grid.querySelectorAll('.q-tile');
+    for (var i = painted.length - 1; i >= 0; i--) {
+      if (!keep[painted[i].getAttribute('data-path')]) grid.removeChild(painted[i]);
+    }
+  }
+
+  /** 图集该插到哪儿：第一个".q-step"（它上面是 head / 错误行）。 */
+  function bodyAnchor() { return detail.body.querySelector('.q-step'); }
+
+  /** 「还在跑，正在实时刷新…」一行：按需增删，删了就不再重建。 */
+  function syncRunningLine(payload) {
+    var node = detail.body.querySelector('[data-q-running]');
     var running = !payload.error && !(payload.done && !payload.busy);
-    if (running) {
-      var line = el('div', 'q-state', '（还在跑，正在实时刷新…）');
-      detail.body.appendChild(line);
+    if (!running) { if (node) node.remove(); return; }
+    if (!node) {
+      node = el('div', 'q-state', '（还在跑，正在实时刷新…）');
+      node.setAttribute('data-q-running', '1');
+      detail.body.appendChild(node);
     }
   }
 
@@ -826,6 +1086,9 @@
     var body = el('div', 'q-body');
     detail.body = body;
     detail.head = el('div');
+    detail.headNodes = null;      // 新的一屏：头部结构重新认一次
+    detail.stepNodes = [];        // 旧的步骤行节点属于上一屏的 DOM，全部作废
+    detail.stepCount = 0;
     root.appendChild(body);
     /* 详情**不再自己画 app bar**：外壳的顶栏已经给了「← 返回 / 回执详情 / 刷新 / 更多操作」，
        二级屏的返回按钮由外壳按 currentId 自动显示（见 app.js renderBar 的 isTab 判断）。 */

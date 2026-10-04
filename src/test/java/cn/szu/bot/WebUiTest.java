@@ -2,6 +2,7 @@ package cn.szu.bot;
 
 import com.google.gson.*;
 import com.sun.net.httpserver.*;
+import java.awt.image.BufferedImage;
 import java.net.*;
 import java.net.http.*;
 import java.nio.charset.StandardCharsets;
@@ -10,6 +11,7 @@ import java.time.Duration;
 import java.util.*;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicInteger;
+import javax.imageio.ImageIO;
 import cn.szu.bot.sd.SdClient;
 import cn.szu.bot.sd.UserPromptStore;
 import cn.szu.bot.web.WebUiServer;
@@ -136,7 +138,7 @@ public final class WebUiTest {
                     consoleCommands(base, root);
                     imageGuard(base, root);
                     configEndpoints(base, root, sd.getAddress().getPort());
-                    System.out.println("WebUiTest: " + checks + " assertions passed：鉴权、静态页、全局对话栏、状态、列表、提示词编辑、内部面板接口、生成参数即时生效、控制台并发指令、图片路径校验、网页端配置");
+                    System.out.println("WebUiTest: " + checks + " assertions passed：鉴权、静态页、全局对话栏、状态、列表、提示词编辑、内部面板接口、生成参数即时生效、控制台并发指令、图片路径校验（含 file:/// 形态与缩略图 w）、网页端配置");
                 }
             }
         } finally {
@@ -1053,7 +1055,13 @@ public final class WebUiTest {
                 "被拒绝之后尺寸仍是上一次生效的值");
     }
 
-    /** 图片接口只允许 data/generated 下的真实图片；列表要列得出已领取的历史图片（刷新/重启后仍在）。 */
+    /**
+     * 图片接口只允许 data/generated 下的真实图片；列表要列得出已领取的历史图片（刷新/重启后仍在）。
+     *
+     * <p>另外钉住两件与"回执图集加载慢/偶发不显示"直接相关的事：
+     * ① 存档里存的是 {@code file:///F:/Bot/data/generated/…}（data/quests 约 100 条、web-chat-log.json 34 条），
+     * 这种形态以前一律 400，移动端整屏图都出不来；② {@code w} 要走缩略图，Cache-Control 从 60 秒改成一天。
+     */
     private static void imageGuard(String base, Path root) throws Exception {
         String token = "test-token-123456";
         Files.writeString(root.resolve("data/generated/evil.txt"), "not an image");
@@ -1067,13 +1075,80 @@ public final class WebUiTest {
         check(!sample.get("pending").getAsBoolean(), "不在待领取队列里的图片标 pending=false：" + sample);
         check(sample.get("name").getAsString().equals("sample.png") && sample.get("size").getAsLong() > 0,
                 "列表项带文件名与体积：" + sample);
-        HttpResponse<String> ok = HTTP.send(HttpRequest.newBuilder(URI.create(base + "/api/image?token=" + token + "&path=data/generated/sample.png")).GET().build(),
-                HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+
+        byte[] fake = {(byte) 0x89, 'P', 'N', 'G'};
+        HttpResponse<byte[]> ok = imageGet(base, "path=data/generated/sample.png");
         check(ok.statusCode() == 200, "data/generated 下的图片可以读取（" + ok.statusCode() + "）");
+        check(Arrays.equals(ok.body(), fake), "原图字节原样返回");
+        check("private, max-age=86400".equals(ok.headers().firstValue("Cache-Control").orElse("")),
+                "图片缓存头改成一天（原来是 60 秒，退出再进要重拉十几 MB）："
+                        + ok.headers().firstValue("Cache-Control").orElse(""));
+
+        // ① 存档里的 file:/// 形态：以前 400，网页/移动端整屏出不来。
+        String absolute = root.resolve("data/generated/sample.png").toAbsolutePath().normalize().toString().replace('\\', '/');
+        HttpResponse<byte[]> fileUrl = imageGet(base, "path=file:///" + absolute);
+        check(fileUrl.statusCode() == 200, "file:/// 三斜杠形态能读（" + fileUrl.statusCode() + "）");
+        check(Arrays.equals(fileUrl.body(), fake), "file:/// 形态字节一致");
+        check(imageGet(base, "path=file://" + absolute).statusCode() == 200, "file:// 双斜杠形态能读");
+        check(imageGet(base, "path=file:/" + absolute).statusCode() == 200, "file:/ 单斜杠形态能读");
+        check(imageGet(base, "path=" + absolute).statusCode() == 200, "绝对路径形态能读");
+        check(imageGet(base, "path=" + URLEncoder.encode(absolute.replace('/', '\\'), StandardCharsets.UTF_8)).statusCode() == 200,
+                "反斜杠绝对路径（编码成 %5C）能读");
+        check(imageGet(base, "path=" + URLEncoder.encode("file:///" + absolute, StandardCharsets.UTF_8)).statusCode() == 200,
+                "URL 编码过的 file:/// 形态能读");
+        check(postRaw(base, "/api/image", token, path("file:///" + absolute + "/../../../../config.json")).has("error"),
+                "file:/// + .. 穿越仍被拒绝");
+
         check(postRaw(base, "/api/image", token, path("../../config.json")).has("error"), "路径穿越被拒绝");
         check(postRaw(base, "/api/image", token, path("config.json")).has("error"), "工作目录里非缓存图片不可读");
         check(postRaw(base, "/api/image", token, path("data/generated/evil.txt")).has("error"), "非图片扩展名被拒绝");
         check(postRaw(base, "/api/image", token, path("data/generated/missing.png")).has("error"), "不存在的图片返回错误");
+
+        // ② 缩略图：真图 w=320 明显更小、长边 ≤ 320；不放大；坏图退回原图字节。
+        Path real = root.resolve("data/generated/real.png");
+        writeNoisePng(real, 1200, 900);
+        long sourceBytes = Files.size(real);
+        HttpResponse<byte[]> thumbnail = imageGet(base, "path=data/generated/real.png&w=320");
+        check(thumbnail.statusCode() == 200, "带 w 请求返回 200（" + thumbnail.statusCode() + "）");
+        check(String.valueOf(thumbnail.headers().firstValue("Content-Type").orElse("")).startsWith("image/jpeg"),
+                "不透明生成图缩略图是 JPEG：" + thumbnail.headers().firstValue("Content-Type").orElse(""));
+        check("private, max-age=86400".equals(thumbnail.headers().firstValue("Cache-Control").orElse("")), "缩略图缓存头也是一天");
+        BufferedImage scaled = ImageIO.read(new java.io.ByteArrayInputStream(thumbnail.body()));
+        check(scaled != null && Math.max(scaled.getWidth(), scaled.getHeight()) == 320,
+                "缩略图长边正好 320：" + (scaled == null ? "解码失败" : scaled.getWidth() + "×" + scaled.getHeight()));
+        check(thumbnail.body().length * 4 < sourceBytes,
+                "缩略图远小于原图（" + thumbnail.body().length + " < " + sourceBytes + " / 4）");
+        HttpResponse<byte[]> again = imageGet(base, "path=data/generated/real.png&w=320");
+        check(Arrays.equals(again.body(), thumbnail.body()), "同一个 w 第二次字节完全一致（走缓存）");
+        check(Files.isDirectory(root.resolve("data/cache/thumbs")), "缩略图落在 data/cache/thumbs（不污染 data/generated）");
+        long cachedFiles;
+        try (var cached = Files.list(root.resolve("data/cache/thumbs"))) { cachedFiles = cached.count(); }
+        check(cachedFiles >= 1, "缓存目录里真的有缩略图文件（" + cachedFiles + " 个）");
+
+        HttpResponse<byte[]> noUpscale = imageGet(base, "path=data/generated/real.png&w=1600");
+        check(Arrays.equals(noUpscale.body(), Files.readAllBytes(real)) && noUpscale.body().length == sourceBytes,
+                "原图长边 1200 ≤ w=1600：绝不放大，回原图字节");
+        check(imageGet(base, "path=data/generated/real.png&w=abc").body().length == sourceBytes, "非法 w 当没传，回原图字节");
+        HttpResponse<byte[]> broken = imageGet(base, "path=data/generated/sample.png&w=320");
+        check(broken.statusCode() == 200 && Arrays.equals(broken.body(), fake),
+                "坏图配 w 时退回原图字节而不是 500（" + broken.statusCode() + "）");
+    }
+
+    /** GET 图片接口，返回原始字节（要看 Content-Type／Cache-Control 与字节本身）。 */
+    private static HttpResponse<byte[]> imageGet(String base, String query) throws Exception {
+        HttpRequest request = HttpRequest.newBuilder(
+                URI.create(base + "/api/image?token=test-token-123456&" + query)).GET().build();
+        return HTTP.send(request, HttpResponse.BodyHandlers.ofByteArray());
+    }
+
+    /** 写一张不可压缩的噪声 PNG（纯色图会被压到比缩略图还小，比不出"明显更小"）。 */
+    private static void writeNoisePng(Path file, int width, int height) throws Exception {
+        BufferedImage image = new BufferedImage(width, height, BufferedImage.TYPE_INT_RGB);
+        int[] pixels = new int[width * height];
+        Random random = new Random(11);
+        for (int index = 0; index < pixels.length; index++) pixels[index] = random.nextInt(0xFFFFFF);
+        image.setRGB(0, 0, width, height, pixels, 0, width);
+        ImageIO.write(image, "png", file.toFile());
     }
 
     /**

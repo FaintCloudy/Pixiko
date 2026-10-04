@@ -289,7 +289,7 @@ public class WebApiController {
                 requirePost(method);
                 return WebJson.ok(bot.webTaskAction(Json.str(body, "action", ""), Json.str(body, "number", "")));
             }
-            case "/api/image": return serveImage(imageQuery(request, body));
+            case "/api/image": return serveImage(imageQuery(request, body), imageWidth(request, body));
             default: return WebJson.of(HttpStatus.NOT_FOUND, WebJson.error("未知接口：" + path));
         }
     }
@@ -334,6 +334,15 @@ public class WebApiController {
         return value == null ? "" : value;
     }
 
+    /** 缩略图宽度：body 与查询串都认；非整数当没传，越界由 ImageThumbs 夹到 32–1600。 */
+    static Integer imageWidth(HttpServletRequest request, JsonObject body) {
+        if (body.has("w") && !body.get("w").isJsonNull()) {
+            try { return ImageThumbs.parseWidth(body.get("w").getAsString()); }
+            catch (RuntimeException ignored) { /* 不是标量就当没传 */ }
+        }
+        return ImageThumbs.parseWidth(request.getParameter("w"));
+    }
+
     /** LoRA 名称同理：<img src="/api/lora/preview?name=..."> 只能走查询串。 */
     static String loraNameQuery(HttpServletRequest request, JsonObject body) {
         String name = Json.str(body, "name", "");
@@ -366,16 +375,25 @@ public class WebApiController {
         return WebJson.bytes(HttpStatus.OK, Files.readAllBytes(file), WebJson.contentTypeOf("x.png"), "private, max-age=300");
     }
 
-    /** 只允许读取机器人目录内的 data/generated 图片，杜绝路径穿越。 */
-    private ResponseEntity<?> serveImage(String relative) throws IOException {
+    /**
+     * 只允许读取机器人目录内的 data/generated 图片，杜绝路径穿越。
+     *
+     * <p>路径形态交给 {@link ImageThumbs#resolveImage(Path, String)}：相对路径、{@code file:///F:/…}、
+     * 绝对路径、URL 编码写法都认（存档里存的就是 file URI 形态，以前一律 400，移动端整屏图都出不来）。
+     * 给了 {@code w} 就尽量回缩略图；缩略图任何一步失败都退回原图字节，绝不 500。
+     */
+    private ResponseEntity<?> serveImage(String raw, Integer width) throws IOException {
         Path root = settings.root.toAbsolutePath().normalize();
-        Path target = root.resolve(relative).normalize();
-        if (!target.startsWith(root.resolve("data").resolve("generated")) || !Files.isRegularFile(target))
-            return WebJson.of(HttpStatus.NOT_FOUND, WebJson.error("图片不存在。"));
+        Path target = ImageThumbs.resolveImage(root, raw);
+        if (target == null) return WebJson.of(HttpStatus.FORBIDDEN, WebJson.error("图片路径不合法或不是支持的图片类型。"));
+        if (!Files.isRegularFile(target)) return WebJson.of(HttpStatus.NOT_FOUND, WebJson.error("图片不存在。"));
+        if (width != null) {
+            ImageThumbs.Thumb thumb = ImageThumbs.thumbnail(root, target, width);
+            if (thumb != null) return WebJson.bytes(HttpStatus.OK, thumb.bytes(), thumb.contentType(), ImageThumbs.IMAGE_CACHE_CONTROL);
+        }
         String name = target.getFileName().toString().toLowerCase(Locale.ROOT);
-        if (!(name.endsWith(".png") || name.endsWith(".jpg") || name.endsWith(".jpeg") || name.endsWith(".webp") || name.endsWith(".gif")))
-            return WebJson.of(HttpStatus.FORBIDDEN, WebJson.error("不支持的文件类型。"));
-        return WebJson.bytes(HttpStatus.OK, Files.readAllBytes(target), WebJson.contentTypeOf(name), "private, max-age=60");
+        return WebJson.bytes(HttpStatus.OK, Files.readAllBytes(target), WebJson.contentTypeOf(name),
+                ImageThumbs.IMAGE_CACHE_CONTROL);
     }
 
     /** 读取当天日志的最后若干行（网页日志面板）：source 取 all / qq / web。 */

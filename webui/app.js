@@ -194,13 +194,32 @@
   }
 
   /** 统一的图片节点：包一层链接（中键可以新标签打开），左键点击打开查看器。
-   *  传了 list/index 就是图集里的一张：点击时把整组交给查看器翻页（list 可以是活的数组，后到的图也算）。 */
-  function imageNode(src, caption, className, list, index) {
+   *  传了 list/index 就是图集里的一张：点击时把整组交给查看器翻页（list 可以是活的数组，后到的图也算）。
+   *
+   *  <p>`options`：
+   *  <ul>
+   *    <li>`full`  **原图**地址：`src` 是带 `&w=` 的缩略图时必传，查看器与 `<a href>`（中键/右键复制地址）用它；</li>
+   *    <li>`eager` 首屏可见的那几张用 `loading="eager"`（其余仍 lazy：屏幕外的不一进来就拉）；</li>
+   *    <li>`size`  已知的原图尺寸 `[w,h]`，只用于加载前占位（见下面 width/height 属性那两行）。</li>
+   *  </ul>
+   */
+  function imageNode(src, caption, className, list, index, options) {
+    const opts = options || {};
     const link = el('a', 'image-link');
-    link.href = src;
+    // 缩略图只给 <img> 看：链接与查看器都用原图（不然中键新标签、放大看到的都是缩略图）。
+    link._viewerFull = opts.full || src;
+    link.href = link._viewerFull;
     link.title = (caption ? caption + ' · ' : '') + '点击放大（Esc 关闭）';
     const img = el('img', className || null);
-    img.loading = 'lazy';
+    // 图没到时的占位比例：`width`/`height` **属性**在加载前给一个比例，加载后浏览器按真实比例画（不变形）。
+    // 实测（320px 容器）：不设 → 2×2 再突然撑到 186；设 1664×1216 → 先占 297×186，加载完横图 297×186、
+    // 竖图 297×433，都不变形。注意**不能**用内联 aspect-ratio：那会把已加载的 1024×640 压成 4:3（297×223）。
+    if (String(src).indexOf('/api/image?') === 0) {
+      const hint = Array.isArray(opts.size) ? opts.size : [IMAGE_HINT_WIDTH, IMAGE_HINT_HEIGHT];
+      img.width = hint[0];
+      img.height = hint[1];
+    }
+    img.loading = opts.eager ? 'eager' : 'lazy';
     img.src = src;
     img.alt = caption || '图片';
     // 封面代理只认 Civitai 图床：代理取不到就退回原始远程地址再试一次；两次都不行就把 HTTP 状态
@@ -227,7 +246,8 @@
     link.addEventListener('click', (event) => {
       if (event.metaKey || event.ctrlKey || event.shiftKey) return;   // 保留浏览器的新标签行为
       event.preventDefault();
-      openViewer(img.getAttribute('src'), caption, link._viewerList, link._viewerIndex);   // 兜底换过的地址也照样放大
+      // 兜底换过地址的也用原图放大：_viewerFull 一直没变，只是 <img> 可能被换成了远程原图。
+      openViewer(link._viewerFull || img.getAttribute('src'), caption, link._viewerList, link._viewerIndex);
     });
     return link;
   }
@@ -1433,7 +1453,9 @@
     if (!list.length) return null;
     if (list.length === 1) {
       const box = el('div', 'quest-images');
-      box.appendChild(imageNode(imageUrl(list[0]), base, 'quest-image'));
+      // 单张图也是回执里的主角：用格子尺寸的缩略图（格子/单张图上限都是 260px），首屏就该看见 → eager。
+      box.appendChild(imageNode(imageUrl(list[0], THUMB_TILE), base, 'quest-image', null, 0,
+        { eager: true, full: imageUrl(list[0]) }));
       questLive.gallery = null;
       questLive.single = box;
       questLive.singleFile = list[0];
@@ -1779,8 +1801,10 @@
         const file = images[index].file;
         if (images.length < 2) {
           // 生成的图片只在这里出现一次；回溯/领取的图也走它，点一下弹查看器放大。
+          // 这张是回执卡里的大图（app.css 上限 700px）→ 用 w=1400 的缩略图；放大仍然给原图。
           const card = el('div', 'receipt ok image-receipt');
-          card.appendChild(imageNode(imageUrl(file), shortName(file), 'receipt-image'));
+          card.appendChild(imageNode(imageUrl(file, THUMB_LARGE), shortName(file), 'receipt-image', null, 0,
+            { eager: true, full: imageUrl(file) }));
           box.appendChild(card);
           state.receiptSingle = card;
           state.receiptSingleFile = file;
@@ -1834,15 +1858,58 @@
   }
 
   /**
+   * 缩略图宽度（服务端契约：`…&w=<32..1600>` 返回**长边 ≤ w 的等比缩略图**（不放大），不带 `w` 就是原图）。
+   *
+   * <p>原图是 1664×1216 的 PNG、一张约 2.3 MB（实测 #132 十张 = 22.3 MB）。按**实际渲染宽度 × 2**（2 倍屏）
+   * 取，而且**必须 ≥ CSS 里那条上限**——否则图会被缩得比原来还小（`width: auto` 用的是图片自身宽度）：
+   * <ul>
+   *   <li>图集格子 140px、对话/回执页单张图 260px、生成进度格 140px、最近图片网格 136px、终端里的图 260px → 520</li>
+   *   <li>回执页那张大图（app.css 的 `.receipt img.receipt-image { max-width: min(100%, 700px) }`）→ 1400</li>
+   *   <li>样式/LoRA 行内小封面 48px、保存样式时的封面预览 60px → 160</li>
+   * </ul>
+   * 查看器（点图放大）与任何给外部用的地址一律用**不带 w 的原图**（见 {@link imageNode} 的 `full`）。
+   */
+  const THUMB_TILE = 520;
+  const THUMB_LARGE = 1400;
+  const THUMB_ROW = 160;
+  /** 一个图集里前几格算「首屏」：这几张用 `loading="eager"`，后面的仍交给懒加载。 */
+  const EAGER_TILES = 4;
+  /** 图没到时的占位比例（本机出图的常见尺寸 1664×1216 = 4:3）：只影响加载前那一下，加载后按真实比例。 */
+  const IMAGE_HINT_WIDTH = 1664;
+  const IMAGE_HINT_HEIGHT = 1216;
+
+  /**
+   * 服务端 /api/image 只认 `data/generated/…` 的相对路径。存档里实测只有两种形态
+   * （data/quests 的 430 条 + 对话存档 45 条 + sd-latest 的 1 条）：`file:///F:/Bot/data/generated/…`
+   * 与已经相对的 `data/generated/…`；**没归一过的形态在服务端分别是 400/404**（Windows 下 `:`、`?`
+   * 是非法文件名字符，`Path.resolve` 直接抛 → 400；只差盘符的 → 404）：实测 `file:///…` → 400、
+   * `file:/…` → 400、反斜杠 `…\…` → 400、`data/generated/x.png?t=1` → 400、`F:/…`（无 scheme）→ 404。
+   * 所以这里一次全归一：反斜杠 → 剥 query/hash → 剥 `file:` 与盘符 → 只留 `data/generated/…` 那段。
+   */
+  function normalizedImagePath(file) {
+    let path = String(file || '').replace(/\\/g, '/');
+    path = path.replace(/[?#].*$/, '');                    // query/hash 不属于文件名（服务端当非法字符 → 400）
+    path = path.replace(/^file:\/{0,3}/i, '');              // file:///、file://、file:/ 一律剥掉
+    path = path.replace(/^[A-Za-z]:\//, '');                // 盘符前缀（F:/…）
+    const at = path.toLowerCase().indexOf('data/generated/');
+    return at >= 0 ? 'data/generated/' + path.slice(at + 'data/generated/'.length) : path;
+  }
+
+  /**
    * 图片地址：本地路径走 /api/image。但机器人发给 QQ 的封面是**图床 URL**
    * （回执里存的是 `https://image.civitai.com/…`），套到 /api/image 上必然取不到图——这里改走封面代理。
    * 代理只认 Civitai 图床，兜底见 {@link imageNode} 里的加载失败重试。
+   *
+   * @param {string} file 存档里的图片路径（形态见 {@link normalizedImagePath}）
+   * @param {number} [w] 只给**格子里的 `<img>`** 用：长边 ≤ w 的缩略图地址。
+   *                     省略 = 原图——查看器（点图放大）、复制出去的地址**必须省略**。
    */
-  function imageUrl(file) {
+  function imageUrl(file, w) {
     const value = String(file || '');
     if (/^https?:\/\//i.test(value)) return coverUrl(value);
-    const path = value.replace(/\\/g, '/').replace(/^.*?(data\/generated\/)/, '$1');
-    return '/api/image?token=' + encodeURIComponent(state.token) + '&path=' + encodeURIComponent(path);
+    const thumb = Number(w) > 0 ? '&w=' + Math.round(Number(w)) : '';
+    return '/api/image?token=' + encodeURIComponent(state.token)
+      + '&path=' + encodeURIComponent(normalizedImagePath(value)) + thumb;
   }
 
   // ---------------------------------------------------------------- 图集（一条回执里的多张图 = 一个图集）
@@ -1862,6 +1929,11 @@
     return (img && img.getAttribute('src')) || (link && link.getAttribute('href')) || '';
   }
 
+  /** <a> 要放大时用的**原图**地址（显示的是缩略图时两者不一样，见 {@link imageNode}）。 */
+  function viewerFullOf(link) {
+    return (link && link._viewerFull) || viewerSrcOf(link);
+  }
+
   /**
    * 一个图集卡片：表头「图集 · 共 N 张（点击看大图）」+ 缩略图网格，点任意一张用查看器翻整组。
    * `items` 是**活的**数组（缩略图点击的那一刻才交给查看器），所以后到的图也能翻到。
@@ -1871,7 +1943,12 @@
    * `reuse` 用来把已经渲染好的单张图片卡**就地**改成图集：卡片节点不换，里面那张已经加载好的
    * <a>/<img> 直接挪进网格（图不重新加载，页面上也不闪）。
    *
-   * @param {{base?:string, cardClass:string, gridClass?:string, reuse?:object, firstFile?:string}} options
+   * <p>带宽：格子里的 `<img>` 用 `w=` 缩略图（默认 {@link THUMB_TILE}）——格子只有 140px，
+   * 拉 1664×1216 的原图一张 2.3 MB 是纯浪费；而 `items` 里存的是**原图**地址（查看器放大用）。
+   * 前 {@link EAGER_TILES} 格用 `loading="eager"`（它们就是首屏那一行，进来不该是空白），其余 lazy。
+   *
+   * @param {{base?:string, cardClass:string, gridClass?:string, reuse?:object, firstFile?:string,
+   *          thumb?:number, eager?:boolean}} options
    */
   function createGallery(options) {
     const base = options.base || '';
@@ -1884,6 +1961,8 @@
     card.appendChild(head);
     card.appendChild(grid);
     const items = [];
+    const thumb = Number(options.thumb) > 0 ? Number(options.thumb) : THUMB_TILE;
+    const firstScreen = options.eager !== false;            // 历史对话条目整批铺时传 false：屏外的图别一起拉
     const syncHead = () => { head.textContent = '图集 · 共 ' + items.length + ' 张（点击看大图）'; };
     const gallery = {
       card, head, grid, items,
@@ -1894,17 +1973,22 @@
       add(file, alt, existing, before) {
         const index = items.length;
         const caption = alt || imageAlt(base, index, file);
-        const src = existing ? (viewerSrcOf(existing) || imageUrl(file)) : imageUrl(file);
-        items.push({ src, caption });
+        const full = imageUrl(file);                         // 原图：查看器翻页 / href 用（不带 w）
+        const src = existing ? (viewerSrcOf(existing) || imageUrl(file, thumb)) : imageUrl(file, thumb);
+        // 复用那张已经加载好的图**不换 src**（换了就要重新下载、重新解码，页面上会闪一下）。
+        items.push({ src: existing ? (viewerFullOf(existing) || full) : full, caption });
+        const eager = firstScreen && index < EAGER_TILES;
         let link = existing || null;
         if (link) {
           link._viewerList = items;                         // 接管成图集里的第 index 张（点击行为本来就读这两项）
           link._viewerIndex = index;
+          link._viewerFull = link._viewerFull || full;
+          link.href = link._viewerFull;
           link.classList.add('gallery-thumb');
           const img = link.querySelector('img');
-          if (img) { img.className = 'gallery-thumb-image'; img.alt = caption; img.loading = 'lazy'; }
+          if (img) { img.className = 'gallery-thumb-image'; img.alt = caption; img.loading = eager ? 'eager' : 'lazy'; }
         } else {
-          link = imageNode(src, caption, 'gallery-thumb-image', items, index);
+          link = imageNode(src, caption, 'gallery-thumb-image', items, index, { eager, full });
           link.classList.add('gallery-thumb');
         }
         link.title = caption + ' · 点击看大图';
@@ -1929,7 +2013,8 @@
     if (!list.length) return null;
     if (list.length === 1) {
       const box = el('div', options.singleClass);
-      box.appendChild(imageNode(imageUrl(list[0]), base, options.imageClass));
+      box.appendChild(imageNode(imageUrl(list[0], THUMB_TILE), base, options.imageClass, null, 0,
+        { eager: true, full: imageUrl(list[0]) }));
       return box;
     }
     const gallery = createGallery({ base, cardClass: options.cardClass, gridClass: options.gridClass, firstFile: list[0] });
@@ -2241,7 +2326,8 @@
       chatSnapshot.entries = chatSnapshotTrim(list);
       state.chatImageRun = null;                 // 整块重建之前丢掉图集游标：旧节点马上就没了
       log.innerHTML = '';
-      chatSnapshot.entries.forEach((entry) => chatEntryAppend(entry));
+      // 整批铺历史：只有**最后一条**（贴底、第一眼看见）用 eager，其余交给懒加载。
+      chatSnapshot.entries.forEach((entry, index, all) => chatEntryAppend(entry, index === all.length - 1));
       chatSnapshotWrite();                       // 只重写本地这份；服务端已经是它，不用回推
       chatArchiveDrop();
       chatScrollRestore(log, saved);
@@ -2256,8 +2342,11 @@
    *
    * <p>**2 张以上**用图集网格（内部还是 imageUrl + imageNode），点任意一张都用查看器打开
    * **这条消息的整组图**并能在其中前后翻页；**1 张**仍是原来那张 `.msg-image`。
+   *
+   * <p>`eager` 只给**最新那条**（贴在右栏底部、第一眼就在屏幕上）：历史那 30 多条整批铺的时候
+   * 一律 lazy，不然一进页面就把几十 MB 全拉下来（这正是「每次加载都有延迟」的另一半）。
    */
-  function chatEntryNode(entry) {
+  function chatEntryNode(entry, eager) {
     const images = entry.images || [];
     // 2 张以上 = 图集：多挂一个 `chat-gallery-entry`，让 CSS 能把这种气泡的宽度定下来
     // （`.messages` 是 flex 纵向容器、`.msg` 默认 shrink-to-fit，宽高不确定的轴上
@@ -2267,21 +2356,23 @@
     if (entry.text || !images.length) node.appendChild(el('div', null, entry.text || ''));
     if (images.length === 1) {
       // 点图打开查看器放大（不再跳到新标签页）。
-      node.appendChild(imageNode(imageUrl(images[0]), shortName(images[0]), 'msg-image'));
+      node.appendChild(imageNode(imageUrl(images[0], THUMB_TILE), shortName(images[0]), 'msg-image', null, 0,
+        { eager: !!eager, full: imageUrl(images[0]) }));
     } else if (images.length > 1) {
       // createGallery 内部就是 imageUrl() + imageNode()，并把「活的」图集数组交给查看器 —— 翻页天然可用。
-      const gallery = createGallery({ cardClass: 'chat-gallery', gridClass: 'gallery-grid', firstFile: images[0] });
+      const gallery = createGallery({ cardClass: 'chat-gallery', gridClass: 'gallery-grid',
+        firstFile: images[0], eager: !!eager });
       images.slice(1).forEach((file) => gallery.add(file));
       node.appendChild(gallery.grid);
     }
     return node;
   }
 
-  /** 只渲染（不记快照）：铺回上次的对话用。 */
-  function chatEntryAppend(entry) {
+  /** 只渲染（不记快照）：铺回上次的对话用。`eager` 见 {@link chatEntryNode}。 */
+  function chatEntryAppend(entry, eager) {
     const log = $('chat-log');
     if (!log) return null;
-    const node = chatEntryNode(entry);
+    const node = chatEntryNode(entry, eager);
     log.appendChild(node);
     log.scrollTop = log.scrollHeight;
     chatStickImages(log);                 // 图片是异步加载的：加载完再贴一次底，别让图把视图顶上去
@@ -2299,9 +2390,9 @@
   }
 
   /** 追加一条对话条目：先记进快照（切页面回来要恢复），再渲染进 #chat-log。 */
-  function chatEntryAdd(entry) {
+  function chatEntryAdd(entry, eager) {
     const clean = chatSnapshotRemember(entry);
-    return clean ? chatEntryAppend(clean) : null;
+    return clean ? chatEntryAppend(clean, eager) : null;
   }
 
   /**
@@ -2330,7 +2421,7 @@
       const images = run.entry.images || (run.entry.images = []);
       list.forEach((file) => { if (images.indexOf(file) < 0) images.push(file); });
       chatSnapshotSchedule();                     // 节流窗口可能已经写过一次：这里显式再标脏，切栏目/隐藏前一定落盘
-      const fresh = chatEntryNode(run.entry);     // 张数变了：重建这一条（图集网格按新张数画）
+      const fresh = chatEntryNode(run.entry, true);   // 张数变了：重建这一条（图集网格按新张数画）；最新那条 eager
       log.replaceChild(fresh, run.node);
       run.node = fresh;
       log.scrollTop = log.scrollHeight;           // 与单条消息一样贴底（图片异步撑高由 chatStickImages 再校准）
@@ -2342,7 +2433,7 @@
     // 而游标必须拿到条目本身（`chatSnapshotRemember` + `chatEntryAppend` 就是它的两步）。
     const entry = chatSnapshotRemember({ role: 'bot', text: text || '', images: list });
     if (!entry) return null;
-    const node = chatEntryAppend(entry);
+    const node = chatEntryAppend(entry, true);      // 刚发出来的这条就在屏幕底部：首屏那几张图要 eager
     if (!node) return null;
     state.chatImageRun = { captureId: key, entry, node };
     return entry;
@@ -2470,7 +2561,8 @@
     if (snapshot.dropped) chatSnapshotSchedule();
     state.chatImageRun = null;                  // 重建 #chat-log 之前丢掉游标：旧节点马上就没了
     log.innerHTML = '';
-    chatSnapshot.entries.forEach((entry) => chatEntryAppend(entry));
+    // 整批铺历史：只有**最后一条**用 eager（右栏贴底那条就是第一眼看见的），其余 lazy。
+    chatSnapshot.entries.forEach((entry, index, all) => chatEntryAppend(entry, index === all.length - 1));
     // 1.5) 服务端正文存档（/api/chat/log）：本地这份已经秒开在上面了，这里按条数合并
     //      （服务端更多就采用服务端并重建，#chat-log 的滚动位置由收尾那次 chatScrollRestore 恢复；
     //        本地更多就把本地整份推上去；一样多以本地为准不推）。
@@ -3331,7 +3423,8 @@
     handle.title = '按住这一行拖到别的分类组头上，就能把它挪过去';
     li.appendChild(handle);
     li.appendChild(el('span', 'num', '#' + (item.number || '')));
-    li.appendChild(previewThumb(item.preview ? stylePreviewUrl(item.name) : '', item.name));
+    li.appendChild(previewThumb(item.preview ? stylePreviewUrl(item.name, THUMB_ROW) : '', item.name,
+      item.preview ? stylePreviewUrl(item.name) : ''));
     const name = el('span', 'name');
     name.appendChild(el('span', 'tag on', '样式'));
     // 名字只读：行内不改名（批量那栏已删，面板上**没有**改名入口）——改名走 QQ 侧的
@@ -3488,7 +3581,7 @@
       if (!preview) return;
       if (!value || value === '-') { hideCoverPreview(); return; }   // 默认/不设两档等保存成功后再说
       preview.hidden = false;
-      preview.src = imageUrl(value);                                  // 选了具体图就先给她看一眼
+      preview.src = imageUrl(value, THUMB_ROW);                       // 选了具体图就先给她看一眼（60px 小预览）
     };
     const preview = el('img', 'cover-preview');
     preview.id = 'style-cover-preview';
@@ -3790,10 +3883,10 @@
    * 列表行里的竖版小封面：本机 LoRA 的展示图、样式的预览图共用。
    * 没有图给"无图"占位；图取不到（401/404）也退回占位，不显示成坏图。
    */
-  function previewThumb(src, caption) {
+  function previewThumb(src, caption, full) {
     const box = el('div', 'row-thumb');
     if (!src) { box.appendChild(el('div', 'row-nocover', '无图')); return box; }
-    const link = imageNode(src, caption, 'row-cover');
+    const link = imageNode(src, caption, 'row-cover', null, 0, { full: full || src });
     const image = link.querySelector('img');
     if (image) image.addEventListener('error', () => box.replaceChild(el('div', 'row-nocover', '无图'), link));
     box.appendChild(link);
@@ -3803,7 +3896,8 @@
   function loraRow(item) {
     const li = el('li', 'fresh');
     li.appendChild(el('span', 'num', '#' + (item.number || '')));
-    li.appendChild(previewThumb(item.preview ? loraPreviewUrl(item.name) : '', item.name));
+    li.appendChild(previewThumb(item.preview ? loraPreviewUrl(item.name, THUMB_ROW) : '', item.name,
+      item.preview ? loraPreviewUrl(item.name) : ''));
     const name = el('span', 'name');
     const label = el('span', 'editable', item.name);
     label.title = '点一下直接改名';
@@ -3960,13 +4054,18 @@
   /**
    * 本机 LoRA 展示图 / 样式预览图的地址。同样是 `<img>` 带不了 Authorization 头，
    * 令牌只能挂在查询串上（少了它图会 401，页面上看起来就是"无图"）。
+   *
+   * <p>行内小封面只有 48px（app.css 的 `.row-thumb img.row-cover`），同样走缩略图参数 `w=`；
+   * 点开查看器要的是原图，所以调用处把不带 `w` 的那个地址也传下去（`previewThumb` 的第三个参数）。
    */
-  function loraPreviewUrl(name) {
-    return '/api/lora/preview?token=' + encodeURIComponent(state.token) + '&name=' + encodeURIComponent(name);
+  function loraPreviewUrl(name, w) {
+    return '/api/lora/preview?token=' + encodeURIComponent(state.token) + '&name=' + encodeURIComponent(name)
+      + (Number(w) > 0 ? '&w=' + Math.round(Number(w)) : '');
   }
 
-  function stylePreviewUrl(name) {
-    return '/api/style/preview?token=' + encodeURIComponent(state.token) + '&name=' + encodeURIComponent(name);
+  function stylePreviewUrl(name, w) {
+    return '/api/style/preview?token=' + encodeURIComponent(state.token) + '&name=' + encodeURIComponent(name)
+      + (Number(w) > 0 ? '&w=' + Math.round(Number(w)) : '');
   }
 
   // ---------------------------------------------------------------- 提示词集
@@ -4265,9 +4364,13 @@
     const pending = images.filter((image) => image.pending).length;
     if (note) note.textContent = '最近生成 ' + images.length + ' 张'
       + (pending ? '，其中 ' + pending + ' 张待领取' : '（都已领取）');
-    images.forEach((image) => {
+    images.forEach((image, index) => {
       // 缩略图点开进查看器放大（列表本身不再跳新标签页）。
-      const link = imageNode(imageUrl(image.path), image.name + '（' + Math.round(image.size / 1024) + ' KB）');
+      // 网格格子 136px（app.css 的 `.grid img` 已经给了 aspect-ratio:1，不会塌）→ 缩略图 w=520；
+      // 首屏那几格 eager，其余 lazy（最多 60 张，不能一进来全拉）。
+      const link = imageNode(imageUrl(image.path, THUMB_TILE),
+        image.name + '（' + Math.round(image.size / 1024) + ' KB）', null, null, 0,
+        { eager: index < EAGER_TILES, full: imageUrl(image.path) });
       const meta = el('div', 'meta', image.name + '\n' + Math.round(image.size / 1024) + ' KB'
         + (image.pending ? '\n待领取' : ''));
       link.appendChild(meta);
@@ -4375,8 +4478,9 @@
     const node = el('div', 'line ' + kind);
     if (text !== undefined && text !== null && text !== '') node.textContent = text;
     if (imagePath) {
-      // 终端里的图也走查看器（点一下放大，Esc 关闭）。
-      node.appendChild(imageNode(imageUrl(imagePath), String(imagePath).replace(/^.*[\\/]/, '')));
+      // 终端里的图也走查看器（点一下放大，Esc 关闭）：显示用缩略图（app.css 上限 260px），放大给原图。
+      node.appendChild(imageNode(imageUrl(imagePath, THUMB_TILE), String(imagePath).replace(/^.*[\\/]/, ''), null, null, 0,
+        { full: imageUrl(imagePath) }));
     }
     const prompt = $('terminal-form');
     if (prompt && prompt.parentElement === body) body.insertBefore(node, prompt);

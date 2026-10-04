@@ -487,21 +487,175 @@
     });
   };
 
+  /** 缩略图长边（契约：服务端返回长边 ≤ w 的等比缩略图，不放大）。格子约 110 CSS px，320 够 2–3 倍屏。 */
+  var IMAGE_THUMB_W = 320;
+
   /**
-   * 图片地址 → <img src> 能用的地址。
+   * 服务端存档里的图片字段有**三种写法**，这里统一取出可用的字符串：
+   *   · 纯字符串            —— `/api/chat/log` 的 `images:["file:///F:/Bot/data/generated/…"]`；
+   *   · 对象带 `file`       —— `/api/quest` 的 `images:[{file:"file:///…"}]` 与
+   *                            `messages` 里的 `{type:'image', file:"…"}`；
+   *   · 对象带 `url`/`path` —— `/api/images` 的 `{path:"data/generated/…"}`。
+   * 以前把对象整个 `String()` 会拼出 `path=%5Bobject%20Object%5D`（服务端 400）—— 这是"图不显示"的另一个来源。
+   */
+  function imageOf(value) {
+    if (value === null || value === undefined) return '';
+    if (typeof value === 'string') return value;
+    if (typeof value === 'object') {
+      var keys = ['file', 'path', 'url', 'src'];
+      for (var i = 0; i < keys.length; i++) {
+        var got = value[keys[i]];
+        if (typeof got === 'string' && got) return got;
+      }
+      return '';
+    }
+    return String(value);
+  }
+
+  /**
+   * 路径归一：`file:///F:/Bot/data/generated/…`、`F:/Bot/data/generated/…`、反斜杠写法、
+   * 已经干净的 `data/generated/…` —— 一律截成从 `data/generated/` 开始的相对路径；
+   * 不含这一段的一律原样返回（`file://` 前缀由服务端那一侧去认，这里绝不自己猜）。
+   *
+   * <p>从**第一个**出现处截取（防目录名里带 `data/generated` 前缀时被啃掉一截）；
+   * 只有在"第一个出现处后面紧跟着任务目录"时才往后挪，这是出于兼容的保守判断，
+   * 对实测的 `…/data/generated/task-…` 与 `…/data/generated/webui/…` 都走第一个。
+   */
+  function normalizeImagePath(value) {
+    var path = imageOf(value).replace(/\\/g, '/');
+    if (!path) return '';
+    var needle = 'data/generated/';
+    var at = path.indexOf(needle);
+    if (at < 0) return path;
+    var later = path.lastIndexOf(needle);
+    if (later > at && /^(task|webui)\//.test(path.slice(later + needle.length)) && !/^(task|webui)\//.test(path.slice(at + needle.length))) {
+      at = later;
+    }
+    return path.slice(at);
+  }
+
+  /**
+   * 图片地址 → `<img src>` 能用的地址。
    *
    * 已经"能直接用"的一律原样返回：`http(s)://`、`data:`、`blob:`、`/api/…`（比如
    * `/api/lora/preview?name=…`、`/api/style/preview?name=…`）、以及 `/m/…` 这类站内绝对路径。
-   * 只有 `data/generated/…` 这种**相对图片路径**才包成 `/api/image?token=…&path=…`。
+   * 其余（`data/generated/…` 及 `file://…` / `F:\…` 等各种存档写法）先归一，再包成
+   * `/api/image?token=…&path=…`。
+   *
+   * @param {string|{file?:string,path?:string,url?:string}} pathOrUrl
+   * @param {{w?:number}|number} [optsOrW] 给了 `w` 就加 `&w=<32..1600>` 拿缩略图。
+   *   **默认不加 w**（原图）—— 全屏查看器、原生桥保存/分享、复制图片地址都必须用默认调用；
+   *   只有图集格子/对话气泡这种小尺寸展示才传 `{w: IMAGE_THUMB_W}`。
+   *   参数现在会被旧服务端忽略（照返回原图，不报错），加上就已经是新旧都好。
    */
-  PixikoM.imageUrl = function (pathOrUrl) {
-    var value = String(pathOrUrl === null || pathOrUrl === undefined ? '' : pathOrUrl);
+  PixikoM.imageUrl = function (pathOrUrl, optsOrW) {
+    var value = normalizeImagePath(pathOrUrl);
     if (!value) return '';
     if (/^(https?:|blob:|data:)/i.test(value)) return value;
     if (value.charAt(0) === '/') return value;                 // /api/…、/m/… 等站内绝对路径直接放行
-    var token = PixikoM.token();
-    return '/api/image?token=' + encodeURIComponent(token) + '&path=' + encodeURIComponent(value);
+    var url = '/api/image?token=' + encodeURIComponent(PixikoM.token()) + '&path=' + encodeURIComponent(value);
+    var w = Number(optsOrW && typeof optsOrW === 'object' ? optsOrW.w : optsOrW);
+    if (Number.isFinite(w) && w >= 32 && w <= 1600) url += '&w=' + Math.round(w);
+    return url;
   };
+
+  /** 缩略图地址（格子/气泡/列表用）。语义上单独一个函数，调用点一眼看得出"这是小图"。 */
+  function thumbUrl(value) { return PixikoM.imageUrl(value, { w: IMAGE_THUMB_W }); }
+
+  /** 要不要马上加载：首屏可见的那几张 eager，其余 lazy（避免一进来满屏空白格子）。 */
+  function loadingFor(node, index) {
+    if (index < 4) return 'eager';
+    var rect = node && node.getBoundingClientRect ? node.getBoundingClientRect() : null;
+    if (rect && rect.top < (window.innerHeight || 800) && rect.bottom > 0) return 'eager';
+    return 'lazy';
+  }
+
+  /* 失败态 + 比例：`<img>` 加载不出来时，用 `!important` 的样式表压掉 app.css 里"强制定高"的规则，
+     让占位块在气泡/图集/进度格子里都真的占得住位置、看得见字；`.mx-contain` 则给**非 1:1** 的图
+     换掉 `object-fit:cover`（app.css 不归本文件改，只能这样覆盖）。 */
+  (function installImageFailStyle() {
+    var id = 'pixiko-m-imgfail-style';
+    if (document.getElementById(id)) return;
+    var style = document.createElement('style');
+    style.id = id;
+    style.textContent = '.m-img-fail{display:flex!important;align-items:center;justify-content:center!important;'
+      + 'width:100%!important;height:100%!important;min-height:64px;padding:6px;box-sizing:border-box;'
+      + 'background:#1b1119!important;border:1px dashed #5a2b33!important;border-radius:10px!important;'
+      + 'color:#ff9b9b!important;font-size:11.5px;line-height:1.35;text-align:center;'
+      + 'overflow-wrap:anywhere;word-break:break-word;cursor:pointer;user-select:none;}'
+      + '.grid-imgs .cell .thumb img.mx-contain,.q-tile img.mx-contain{object-fit:contain!important}';
+    document.head.appendChild(style);
+  })();
+
+  /** 复制一段文本（失败时至少把原文 toast 出来，方便手抄）。 */
+  function copyToClipboard(value) {
+    var textValue = String(value === null || value === undefined ? '' : value);
+    try {
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(textValue).then(function () { PixikoM.toast('路径已复制'); }, function () { PixikoM.toast(textValue); });
+        return;
+      }
+    } catch (error) { /* 落到 execCommand */ }
+    var input = el('textarea');
+    input.value = textValue;
+    document.body.appendChild(input);
+    input.select();
+    try { document.execCommand('copy'); PixikoM.toast('路径已复制'); } catch (error) { PixikoM.toast(textValue); }
+    document.body.removeChild(input);
+  }
+
+  /** 图取不到时按路径去重的记录（同一张图多处失败只提示一次，不刷屏 toast）。 */
+  var imageFailures = Object.create(null);
+  PixikoM.imageFailures = function () { return Object.keys(imageFailures); };
+
+  /** 统一的失败占位块：文案「图取不到」，带上路径 + 文件名，点一下复制路径。 */
+  function imageFailBox(label) {
+    var box = el('div', 'm-img-fail');
+    box.textContent = '图取不到';
+    box.title = String(label || '');
+    box.addEventListener('click', function (event) {
+      event.preventDefault();
+      event.stopPropagation();
+      copyToClipboard(label);
+    });
+    return box;
+  }
+
+  /**
+   * 统一的图片装载（对话气泡 / 出图图集 / 进度格子都走它）：
+   *   · 归一后的缩略图地址；`decoding=async`；
+   *   · 失败 → 换成「图取不到」占位块（**只换这一张**，不清空整个图集/气泡），长按/点击复制路径；
+   *   · 成功 → `onReady`（调用点用它按原图长宽补齐 aspect-ratio，避免布局跳）。
+   */
+  function mountImage(img, rawPath, index, onReady) {
+    var path = normalizeImagePath(rawPath);
+    var src = thumbUrl(path);
+    img.decoding = 'async';
+    img.loading = loadingFor(img, index);
+    img.src = src;
+    if (!path) { markImageFail(img, img.alt || rawPath); return img; }
+    img.addEventListener('error', function () { markImageFail(img, path); }, { once: true });
+    function ready() {
+      // 非 1:1 的图在"强制定高 + cover"的盒子里会被裁掉两头 —— 换成 contain，完整看得见
+      var w = img.naturalWidth, h = img.naturalHeight;
+      if (w > 0 && h > 0 && Math.abs(w / h - 1) > 0.06) img.classList.add('mx-contain');
+      if (typeof onReady === 'function') onReady(img);
+    }
+    if (img.complete) { if (img.naturalWidth > 0) ready(); }
+    else img.addEventListener('load', ready, { once: true });
+    return img;
+  }
+
+  /** 把失败的 `<img>` 换成占位块（保留盒子尺寸，别的图不受影响）。 */
+  function markImageFail(img, label) {
+    var host = img.parentNode;
+    if (!host || host.getAttribute('data-img-failed') === '1') return;
+    host.setAttribute('data-img-failed', '1');
+    var path = String(label || img.alt || '');
+    if (path && !imageFailures[path]) imageFailures[path] = true;
+    try { host.removeChild(img); } catch (error) { /* 已经被换掉了 */ }
+    host.appendChild(imageFailBox(path));
+  }
 
   /**
    * 全屏图片查看器：左右翻页、双指缩放、长按交给原生桥。
@@ -510,9 +664,13 @@
    * @returns {{close:function}}
    */
   PixikoM.openViewer = function (list, index) {
+    // 归一成 {src, caption}：`src` 保持**原始写法**（`file:///…` 或 `data/generated/…` 都行），
+    // 由 `imageUrl` 在真正设 `<img src>` 时归一 —— 查看器一律**原图**（不带 w），保存/分享才拿得到全分辨率。
     var items = (list || []).filter(Boolean).map(function (item) {
-      return typeof item === 'string' ? { src: item, caption: '' } : { src: item.src, caption: item.caption || '' };
-    });
+      if (typeof item === 'string') return { src: item, caption: '' };
+      if (item && typeof item === 'object' && typeof item.src === 'string') return { src: item.src, caption: item.caption || '' };
+      return { src: imageOf(item), caption: (item && item.caption) || '' };
+    }).filter(function (item) { return !!item.src; });
     if (!items.length) return { close: function () { } };
     var at = Math.max(0, Math.min(items.length - 1, Number(index) || 0));
 
@@ -1201,13 +1359,17 @@
     if (entry.images && entry.images.length) {
       var box = el('div', 'bubble-imgs' + (entry.images.length === 1 ? ' one' : ''));
       var list = entry.images.map(function (src, index) { return { src: src, caption: '第 ' + (index + 1) + ' 张' }; });
-      entry.images.forEach(function (src, index) {
+      entry.images.forEach(function (raw, index) {
+        var src = normalizeImagePath(raw);
         var img = el('img');
-        img.src = PixikoM.imageUrl(src);
-        img.alt = '图片 ' + (index + 1);
-        img.loading = 'lazy';
+        img.alt = '图片 ' + (index + 1) + '：' + String(src).replace(/^.*[\\/]/, '');
+        // 气泡是首屏内容：前几张 eager，其余 lazy（mountImage 里按可见性判断）
+        mountImage(img, raw, index);
         img.setAttribute('data-img-index', String(index));
-        img.addEventListener('click', function () { PixikoM.openViewer(list, index); });
+        img.addEventListener('click', function () {
+          if (img.parentNode && img.parentNode.getAttribute('data-img-failed') === '1') return;   // 失败态点击 = 复制路径
+          PixikoM.openViewer(list, index);
+        });
         box.appendChild(img);
       });
       node.appendChild(box);
@@ -1295,17 +1457,48 @@
   function legacyScrollChatToBottomRemoved() { return 0; }
   void legacyScrollChatToBottomRemoved;
 
-  function chatRenderAll() {
+  /**
+   * 把 `chat.entries` 同步进 DOM —— **增量**：只 append 还没画过的条目。
+   *
+   * <p>为什么要增量：回执跟随时每轮 `chatRenderAll()` 都会 `clear(chat.host)` 整屏重建，
+   * 已经加载好的 `<img>` 被反复销毁重建 —— 浏览器要重新建连接、重新解码，"每次加载都有延迟"
+   * 就是它（`loading=lazy` 的图还会被重新判定成屏外）。现在已画过的气泡原样不动。
+   *
+   * <p>认"画过没画过"用 `entry.seq`（`chatEntry`/`chatNormalize` 都发单调递增号），
+   * 记在气泡的 `data-seq` 上；数量对不上（比如被别的分支清过）就退回整屏重建一次。
+   */
+  function chatSyncEntries() {
     if (!chat.host) return;
-    clear(chat.host);
     if (!chat.entries.length) {
-      var host = chat.host;
-      var box = emptyState('还没有对话。下面输入一句话就能开始（这一屏的 scope 是「' + PixikoM.scope() + '」）。');
-      host.appendChild(box);
+      clear(chat.host);
+      chat.host.appendChild(emptyState('还没有对话。下面输入一句话就能开始（这一屏的 scope 是「' + PixikoM.scope() + '」）。'));
       return;
     }
-    chat.entries.forEach(function (entry) { chat.host.appendChild(chatBubble(entry)); });
+    var placeholder = chat.host.querySelector('[data-state="empty"]');
+    if (placeholder) clear(chat.host);
+    var painted = chat.host.querySelectorAll('[data-seq]');
+    var first = painted.length ? Number(painted[0].getAttribute('data-seq')) : 0;
+    // 第一条对不上说明 DOM 与 entries 不同步（清空过/整屏换过）→ 重建一次，之后都走增量
+    if (!painted.length || first !== chat.entries[0].seq || painted.length > chat.entries.length) {
+      clear(chat.host);
+      chat.entries.forEach(function (entry) {
+        var node = chatBubble(entry);
+        node.setAttribute('data-seq', String(entry.seq));
+        chat.host.appendChild(node);
+      });
+    } else {
+      for (var i = painted.length; i < chat.entries.length; i++) {
+        var fresh = chatBubble(chat.entries[i]);
+        fresh.setAttribute('data-seq', String(chat.entries[i].seq));
+        chat.host.appendChild(fresh);
+      }
+    }
     chatWatchMedia();
+  }
+
+  function chatRenderAll() {
+    if (!chat.host) return;
+    chatSyncEntries();
   }
 
   function chatAppend(entry, scroll) {
@@ -1998,9 +2191,8 @@
       if (item) {
         var thumb = el('div', 'thumb');       // 缩略图盒（1:1、圆角、裁切）；文件名在它下面完整换行
         var img = el('img');
-        img.src = PixikoM.imageUrl(item.path);
         img.alt = item.name || ('生成图 ' + (i + 1));
-        img.loading = 'lazy';
+        mountImage(img, item.path, i);
         thumb.appendChild(img);
         cell.appendChild(thumb);
         var cap = el('div', 'cap', item.name || '');
@@ -2078,9 +2270,8 @@
           cell.setAttribute('data-gallery-cell', String(index));
           var thumb = el('div', 'thumb');     // 与上面同一套：缩略图 + 完整文件名在下面换行
           var img = el('img');
-          img.src = PixikoM.imageUrl(item.path);
           img.alt = item.name || '';
-          img.loading = 'lazy';
+          mountImage(img, item.path, index);
           thumb.appendChild(img);
           cell.appendChild(thumb);
           if (item.pending) cell.appendChild(el('div', 'cap', '待领取'));

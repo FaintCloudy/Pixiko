@@ -1,11 +1,74 @@
-# Pixiko v1.5.1 发行说明
+# Pixiko v1.5.2 发行说明
 
-- **版本**：v1.5.1
+- **版本**：v1.5.2
 - **日期**：2026-10-04
 - **作者**：loriko（deloriko@outlook.com）
 - **当前实现**：Java 版（`src/`）。另有一次**未完成的** Next.js 重构，见 `nextjs-wip/`，**不可运行**。
 
 ---
+
+## 〇、本版新增（v1.5.2）
+
+**一件事：修「回执图集」的加载延迟与"有时不显示"。** 用户原话是「**回执的图集生成动态显示每次加载都有
+延迟，且有时会出现不显示的bug，尝试解决**」。两个真因都实测定位了：**路径形态不认**（存档里的
+`file:///F:/…` 被拼成 400 地址）与**图集拉的是 2.5 MB 全尺寸原图**。这一版加了服务端缩略图、
+把路径归一改成 tolerant，移动端与桌面控制台都改走缩略图（**查看器 / 保存 / 分享仍是原图**）。
+
+- **真因 1 —— 不显示（路径形态）**：服务端 `/api/quest` 与对话存档 `/api/chat/log` 里存下来的图片路径
+  形态是 **`file:///F:/Bot/data/generated/…`**（`data/quests/` 里 **198 条**、
+  `data/webui/web-chat-log.json` 里 **34 条**），移动端 `PixikoM.imageUrl()` 不认这种写法 →
+  拼成 `/api/image?path=file%3A%2F%2F%2F…` → 服务端 **400**。实测对话屏
+  **`<img> 34 · 画出 0 · 坏图 / 一直在加载 33`**，**整屏图片一张都出不来**；回执详情每次也夹带 1 条 400。
+- **真因 2 —— 延迟（拉的是原图）**：图集拉的是**全尺寸原图**（1664×1216 PNG ≈ **2.5 MB/张**），
+  而格子只有 **110–260px**。实测回执 #167（5 张）= **12.9 MB**；10 张 ≈ **26 MB**；20 张 ≈ **52 MB**。
+  `/api/image` 的缓存头原来只有 `max-age=60`。
+- **服务端：新增 `ImageThumbs.java` + 改 `WebApiController.java`**：
+  - `/api/image?…&w=<32..1600>` 返回**长边 ≤ w 的等比缩略图**（**不放大**）；源图带 alpha → **PNG**，
+    否则 **JPEG（q≈0.85）**；缓存在 `data/cache/thumbs/`（键 = `sha1(相对路径|w)` 前 16 位、
+    **原子写入**、源图变了就重做、目录超 **300 MB** 按写入时间删到 **90%**）；
+    **任何失败都退回原图字节（不 500）**。**必须带 `w` 才走缩略图**，不带 `w` 的行为与以前完全一致。
+  - **路径归一改成 tolerant**：`file:///`、`file://`、`file:/`、反斜杠、绝对盘符路径、URL 编码
+    （含**双重编码**）都认；**最终一定要求落在 `data/generated` 之内**（`..`、符号链接、别的盘符
+    一律拒），扩展名白名单不变；**非法路径现在统一 403**。
+  - 缓存头：原图与缩略图统一 **`private, max-age=86400`**（生成图文件名带时间戳与 uuid，内容不会变）。
+- **移动端 `/m`（`webui/m/app.js`、`webui/m/screen-quest.js`）**：
+  - `imageUrl` 认下所有上述形态（**对象 `{file}` 与字符串两种输入**都处理，**不再拼出 400 地址**）。
+  - **图集格子 / 对话气泡 / 进度格子用 `w=320`**；**查看器、给原生桥的保存 / 分享地址、复制图片地址
+    一律用不带 `w` 的原图**。
+  - 回执详情改**增量渲染**（进度轮询不再整屏重建，已显示的 `<img>` 不被重建）；容器给稳定
+    `aspect-ratio`；首屏前几张 `eager`；**失败的图显示「图取不到」占位**（可复制路径），不再静默空白。
+- **桌面控制台（`webui/app.js`）**：`imageUrl(file, w)`——图集 **w=520** / 单张 **w=1400** /
+  网格 **w=160** / 对话 **w=520**；**查看器与 `<a href>` 保持原图**；路径归一更严；前 4 格与最新一条
+  对话 `eager`；单张图用 `width` / `height` 属性占位（**内联 `aspect-ratio` 会把 1024×640 压变形**）。
+  **前端资源版本也跟着升**：`webui/index.html` 的 `?v=` 由 **`?v=1.5.0`** 升到 **`?v=1.5.2`**
+  （这版确实改了 `webui/app.js`）。
+- **实测数字（改前 → 改后）**：
+  - 移动端对话屏（34 张存档图）：画出 **0 → 26**（其余 8 张是屏幕外懒加载，滚到就出）、
+    非 200 **1 → 0**、单张 **2.5 MB → 20–25 KB**。
+  - 移动端回执 #167：单格 **~2.5 MB → 23 KB（109.8×）**；整屏含列表缩略图 **12.9 MB → 约 0.7 MB**。
+  - 桌面控制台回执 #132（10 张）：**25.8 MB → 0.5 MB**、非 200 = 0、首屏第一条缩略图 **92 ms**；
+    10 张图集 `<img>` 全带 `w=`、10 个 `<a href>` 全是原图；**8 次采样 `<img>` 身份只有 1 种**
+    （确认不再重建）。
+  - 服务端单图：**2607464 B → w=320 23744 B、w=520 56316 B、w=1400 260303 B**；
+    首次 **65–92 ms**、命中缓存 **6–7 ms**。
+  - `data/quests/` 里 **198 条 `file:///` 存档路径现在全部 200**（以前 400）。
+  - 独立复核（探针）：格子带 `w=320`（`naturalWidth` 320）、**查看器 `naturalWidth` 1664 且不带 `w`**、
+    **原生桥 `showImageMenu` 收到的是不带 `w` 的原图**。
+- **测试 / 发布**：
+  - 新增 **`ImageThumbsTest`（86 条断言：路径归一 36 / w 解析 12 / 不放大 7 / alpha→PNG 6 /
+    不透明→JPEG 6 / 缓存 12 / 坏图退回 5 / 清理 8）**；`WebUiTest` **425 → 446** 条断言；
+    测试套件 **66 → 67**，`build.ps1 -Test` **全绿**。
+  - **机器人已经重启**（用户要求），所以 **v1.5.1 那个「日志跨零点」修复也随这次重启生效**了：
+    实测 `/api/logs {"source":"all"}` 有内容、`logs/bot-20261005.log` 已按天新建。
+  - **APK 不受影响**（网页不在 APK 里）：仍是 `pixiko-android-1.5.0-debug.apk` / **1.5.0** /
+    sha256 前 16 位 **`048779403d511a51`**。
+  - **如实写**：本版**仍然没有真机 / 模拟器验证**（用的是 headless Chrome + CDP）。
+
+**前端**：`webui/index.html` 的 `?v=` **由 `1.5.0` 升到 `1.5.2`**（本版改了 `webui/app.js` 与
+`webui/m/`；`webui/index.html` 里两处已同步成 `/app.css?v=1.5.2` 与 `/app.js?v=1.5.2`）。
+
+<details>
+<summary>上一版（v1.5.1）</summary>
 
 ## 〇、本版新增（v1.5.1）
 
@@ -88,6 +151,8 @@
 
 **前端**：本版只改了手机端界面（`webui/m/`），桌面控制台 `webui/index.html` 的 `?v=` **仍是 `?v=1.5.0`**
 （`webui/app.js` / `webui/app.css` 这轮没动）。
+
+</details>
 
 <details>
 <summary>上一版（v1.5.0）</summary>
@@ -1090,7 +1155,7 @@ Danbooru 词条（↑↓ 选择、Esc 关闭；空词条上按 **Ctrl+Space** �
 
 ## 三、安装与启动（三步）
 
-### 开箱即用包 `pixiko-v1.5.1-runnable.zip`
+### 开箱即用包 `pixiko-v1.5.2-runnable.zip`
 
 1. 装好 **JDK 17+**。
 2. **双击 `start.bat`**。第一次运行会自动生成 `config.json`（照 `config.example.json` 起一份），
@@ -1100,7 +1165,7 @@ Danbooru 词条（↑↓ 选择、Esc 关闭；空词条上按 **Ctrl+Space** �
 
 > `start.bat` 跑的是包内已编译好的 `build/pixiko.jar`；只有需要改代码时才用 `build.ps1` + `run.bat`。
 
-### 源码包 `pixiko-v1.5.1.zip`
+### 源码包 `pixiko-v1.5.2.zip`
 
 1. 装好 **JDK 17+**。
 2. 在项目根目录准备好依赖 jar：`lib/gson-2.13.1.jar` 由 `build.ps1` **自动下载并校验**，
@@ -1124,7 +1189,7 @@ copy config.example.json config.json
 4. 不想先装 APK？直接在电脑浏览器打开 `http://<电脑地址>:8787/android` 看**网页预览**（v1.4.1 起）。
 
 > 这是**用 Android SDK 现构建出来的 debug 签名包**（`cn.szu.bot.app` / **1.5.0**，`compileSdk 34`、`minSdk 26`，
-> **v1.5.1 没有重新出包**，客户端仍是 **1.5.0**——这版改的网页不在 APK 里），
+> **v1.5.1 / v1.5.2 都没有重新出包**，客户端仍是 **1.5.0**——这两版改的网页不在 APK 里），
 > **不是官方签名的正式包**；想自己构建就用 `android/build-apk.ps1`（要 **JDK 21 + Android SDK**，
 > 跑 `assembleDebug` 并把 APK 复制到 `F:\Bot\android\dist\`）。安装时 Android 会要求允许
 > 「**安装未知来源应用**」。用法、构建步骤与安全提醒见 [`android/README.md`](android/README.md)。
@@ -1172,7 +1237,7 @@ copy config.example.json config.json
    属于个人信息，已移除）。**务必在配置页或 `config.json` 里设置 `owner_user_id`**，否则所有 owner 专属指令都会被拒绝。
 6. **`test.bat` 的行为依赖工作目录。** `WebUiTest` 通过「进程工作目录下的 `webui/`」找页面资源
    （见 `WebPageController` 的回退逻辑），所以请在**项目根目录**运行 `test.bat`，
-   不要从别的目录调用。在项目根目录运行，66 个测试套件全部通过（`build.ps1 -Test`）。
+   不要从别的目录调用。在项目根目录运行，67 个测试套件全部通过（`build.ps1 -Test`）。
 7. **Logback 两个 jar 内不含许可文本**（上游如此），其 EPL-1.0 / LGPL-2.1 全文需查
    `THIRD-PARTY-LICENSES.md` 里给出的官方链接；`gson` 与 `snakeyaml` 的 jar 内同样没有许可文件，
    但二者均为 Apache-2.0，文本已随包提供。
@@ -1181,12 +1246,12 @@ copy config.example.json config.json
 
 ## 六、在 GitHub Releases 里发布这个 zip
 
-1. 打开仓库 → 右侧 **Releases** → **Draft a new release**，Tag 填 `v1.5.1`（新建 tag），标题填 `Pixiko v1.5.1`。
-2. 把 `pixiko-v1.5.1.zip` 与 `pixiko-v1.5.1-runnable.zip`（以及各自的 `.sha256`），
+1. 打开仓库 → 右侧 **Releases** → **Draft a new release**，Tag 填 `v1.5.2`（新建 tag），标题填 `Pixiko v1.5.2`。
+2. 把 `pixiko-v1.5.2.zip` 与 `pixiko-v1.5.2-runnable.zip`（以及各自的 `.sha256`），
    外加 Android 客户端 `pixiko-android-1.5.0-debug.apk`（**debug 签名**，由 `android/build-apk.ps1` 跑
    `assembleDebug` 产出、复制到 `F:\Bot\android\dist\`；脚本给的原名是 `pixiko-1.5.0-debug.apk`，
-   内容是同一个文件；**v1.5.1 没有重新出包**，客户端自身版本仍是 **1.5.0**——APK 只是外壳，
-   网页（含这版改的 `/m`）不在里面），一共三个附件拖进附件区，
+   内容是同一个文件；**v1.5.1 / v1.5.2 都没有重新出包**，客户端自身版本仍是 **1.5.0**——APK 只是外壳，
+   网页（含这两版改的 `/m` 与图集缩略图）不在里面），一共三个附件拖进附件区，
    正文粘贴本文件内容后点 **Publish release**。
 
 > 建仓库时 License 请选 **None**（本项目保留所有权利，不使用开源许可证）。
