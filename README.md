@@ -5,7 +5,7 @@ Pixiko 是一个自用的 QQ 机器人：接 **NapCat** 收消息，接 **Stable
 领图；机器人自己把生成好的图片发回对话。
 
 - **作者**：loriko（deloriko@outlook.com）
-- **版本**：v1.1.1（发行说明见 [`RELEASE.md`](RELEASE.md)）
+- **版本**：v1.1.2（发行说明见 [`RELEASE.md`](RELEASE.md)）
 - **版本号规则**：**大改动更新中间位**（`1.1.x` → `1.2.0`），**小修小补更新最后一位**（`1.1.1` → `1.1.2`）
 - **当前实现**：**Java 版**（`src/`）——这是线上一直在跑的那一份
 - **网页控制台**：`webui/`（纯静态 HTML/CSS/JS，随机器人一起由内嵌 Spring Boot 提供）
@@ -278,6 +278,23 @@ run.bat --set-map yh "路径"       # 命令行设置地图（需先停止机器
   （仓库里跑过，输出「与现有 data/prompt-zh-tags.json 一致」）。详见 `data/danbooru/README.md`。- 想改词库：直接编辑 `data/prompt-zh-extra.txt`（手工同义词，优先级最高）后跑
   `node tools/build-zh-tags.mjs` 重新生成 `data/prompt-zh-tags.json`；差异用
   `node tools/diff-zh-tags.mjs` 看。
+
+#### 中文不会被写进提示词：交给改写（v1.1.2）
+
+**SD（以及任何底模）只认标准英文 Danbooru 词条，中文词条等于废词条**。以前对机器人说「通过反向提示词禁止
+不存在的手」时，它会照原话计划出 `.promptR add 不存在的手`，中文原样进了反向提示词；从这一版起
+**机器人不会把中文写进正向／反向 prompt**。
+
+- **不做中文词库替换**：`.prompt add/set`、`.promptR add/set` 的取值里含中文时，这条要求会被**转成 `.infix`**，
+  交给改写模型产出标准英文词条。例如：
+  - `.promptR add 不存在的手` → 实际按 `.infix 反向提示词里加上：不存在的手` 处理；
+  - `.prompt add 微笑` → `.infix 正向提示词里加上：微笑`；
+  - `.prompt remove 微笑` → `.infix …提示词里删掉：微笑`。
+- **英文取值行为完全不变**：`extra_hands`、`from above`、`(smile:1.2)`、`<lora:…>` 照旧直接落地。
+- **聊天计划层同样兜底**：模型给出的计划里凡 `.prompt` / `.promptR` 的 `add` / `set` 取值含中文，一样转成
+  `.infix`；「用户要求加入 X 而计划没覆盖」的合成逻辑也照此办理，绝不产出含中文的 `.prompt add`。
+- **想直接加词条就写标准英文**（`.promptR add extra_hands`）；想用中文描述，就用一句中文要求让机器人改写：
+  `.infix 反向提示词里加上：不要出现多余的手`。
 
 ### 样式、参数与提示词集
 
@@ -568,7 +585,7 @@ Civitai 下载记录里的 `base_model` → Forge 的 LoRA 元数据（`/sdapi/v
 ```
 pixiko\
 ├─ README.md                       本文件
-├─ RELEASE.md                      v1.1.1 发行说明（含版权声明与已知限制）
+├─ RELEASE.md                      v1.1.2 发行说明（含版权声明与已知限制）
 ├─ THIRD-PARTY-LICENSES.md         随二进制包分发的第三方组件与许可
 ├─ config.example.json             脱敏配置模板（复制成 config.json 再改）
 ├─ .gitignore                      config.json / data / logs / lib jar 等一律不入库

@@ -1,11 +1,42 @@
-# Pixiko v1.1.1 发行说明
+# Pixiko v1.1.2 发行说明
 
-- **版本**：v1.1.1
+- **版本**：v1.1.2
 - **日期**：2026-10-04
 - **作者**：loriko（deloriko@outlook.com）
 - **当前实现**：Java 版（`src/`）。另有一次**未完成的** Next.js 重构，见 `nextjs-wip/`，**不可运行**。
 
 ---
+
+## 〇、本版新增（v1.1.2）
+
+**中文不会再被写进提示词。** 用户对机器人说：
+
+> 通过反向提示词禁止不存在的手。然后加入 from above；女性的胸部衣物被扯开，生成。
+
+机器人却计划出 `.promptR add 不存在的手`——把**中文**原样塞进提示词。而 SD 只认标准英文 Danbooru 词条，
+中文词条等于废词条，这次改动落到 SD 那边等于什么也没写。
+
+修法是：**含中文的提示词类指令一律转 `.infix`，交给改写模型**，不做任何词条（词库）替换。
+
+- **指令层兜底**（`Bot` 的 `.prompt` / `.promptR`）：`add` / `set` / `remove` 的取值里含汉字时不再直接落地，
+  而是把这条要求转成 `.infix` 交给改写模型，由它产出标准英文 Danbooru 词条——例如
+  `.promptR add 不存在的手` → `.infix 反向提示词里加上：不存在的手`，`.prompt add 微笑` →
+  `.infix 正向提示词里加上：微笑`，`.prompt remove 微笑` → `.infix …提示词里删掉：微笑`。
+  **任何路径都不会把汉字写进 prompt。**
+- **计划层兜底**（`DeepSeekPrompts`）：计划提示词里明确提示词类指令（`.prompt add/set`、`.promptR add/set`）
+  的参数只能是标准英文 Danbooru 词条，**绝不能写中文**；代码里再对模型给出的计划做一次过滤：`add`/`set`
+  取值含汉字时整条改成 `.infix 正向/反向提示词里加上：<原话>`；「用户要求加入 X」那条合成逻辑同样遵守
+  （以前它会直接把中文 X 拼成 `.prompt add X`，正是这次 bug 的一半来源）。
+- **英文取值不变**：`add` / `set` / `remove` 的取值全是英文时（如 `extra_hands`、`from above`、`(smile:1.2)`、
+  `<lora:…>`）行为与以前完全一样，计划和落地都逐条不变。
+- **测试**：新增 `ChineseTagCommandTest`、`ChineseTagPlanTest`（用仓库自带词库的只读拷贝 + 临时根目录），
+  覆盖「含中文的取值一律走 `.infix`、绝不把中文写进 prompt、英文计划逐条不变」（若干条用例）。
+
+**保证**：无论走哪条路径，**汉字都不会进入正向／反向 prompt**——中文要求只出现在 `.infix` 与回执说明里，
+落进 prompt 的标准英文词条由改写模型产出。
+
+<details>
+<summary>上一版（v1.1.1）</summary>
 
 ## 〇、本版新增（v1.1.1）
 
@@ -40,6 +71,8 @@
 - **前端**：`webui/index.html` 资源版本升到 **`?v=1.1.1`**。
 - **测试**：新增 `QuestPersistenceTest`（53 条断言）、`QuestListTest` 更新到 82 条断言；
   `build.ps1 -Test` **60 套全绿**。
+
+</details>
 
 <details>
 <summary>上一版（v1.0.18）</summary>
@@ -548,7 +581,7 @@ Danbooru 词条（↑↓ 选择、Esc 关闭；空词条上按 **Ctrl+Space** �
 
 ## 三、安装与启动（三步）
 
-### 开箱即用包 `pixiko-v1.1.1-runnable.zip`
+### 开箱即用包 `pixiko-v1.1.2-runnable.zip`
 
 1. 装好 **JDK 17+**。
 2. **双击 `start.bat`**。第一次运行会自动生成 `config.json`（照 `config.example.json` 起一份），
@@ -558,7 +591,7 @@ Danbooru 词条（↑↓ 选择、Esc 关闭；空词条上按 **Ctrl+Space** �
 
 > `start.bat` 跑的是包内已编译好的 `build/pixiko.jar`；只有需要改代码时才用 `build.ps1` + `run.bat`。
 
-### 源码包 `pixiko-v1.1.1.zip`
+### 源码包 `pixiko-v1.1.2.zip`
 
 1. 装好 **JDK 17+**。
 2. 在项目根目录准备好依赖 jar：`lib/gson-2.13.1.jar` 由 `build.ps1` **自动下载并校验**，
@@ -623,8 +656,8 @@ copy config.example.json config.json
 
 ## 六、在 GitHub Releases 里发布这个 zip
 
-1. 打开仓库 → 右侧 **Releases** → **Draft a new release**，Tag 填 `v1.1.1`（新建 tag），标题填 `Pixiko v1.1.1`。
-2. 把 `pixiko-v1.1.1.zip` 与 `pixiko-v1.1.1-runnable.zip`（以及各自的 `.sha256`）拖进附件区，
+1. 打开仓库 → 右侧 **Releases** → **Draft a new release**，Tag 填 `v1.1.2`（新建 tag），标题填 `Pixiko v1.1.2`。
+2. 把 `pixiko-v1.1.2.zip` 与 `pixiko-v1.1.2-runnable.zip`（以及各自的 `.sha256`）拖进附件区，
    正文粘贴本文件内容后点 **Publish release**。
 
 > 建仓库时 License 请选 **None**（本项目保留所有权利，不使用开源许可证）。

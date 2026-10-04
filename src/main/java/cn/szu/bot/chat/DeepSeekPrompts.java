@@ -280,6 +280,10 @@ public final class DeepSeekPrompts {
         Every newly introduced prompt phrase must be a canonical Danbooru/A1111 tag-completion vocabulary entry;
         prefer underscore-form canonical tags. Existing non-dictionary terms and structured syntax may only be preserved or removed.
         Never invent words, names or phrases that are not established prompt vocabulary.
+        Both prompts are fed to Stable Diffusion, which only understands English tags: never copy Chinese wording
+        (from the instruction or the current prompts) into positive or negative. Express the requested change with
+        canonical English Danbooru tags (微笑 -> smile, 长发 -> long_hair); when no tag expresses it,
+        leave that phrase out instead of writing Chinese, and say so.
         Change as little as possible: keep every existing term that the instruction does not ask to change.
         The output must stay as long as the input: never summarise, compress, reorder or drop unaffected terms.
         """;
@@ -632,7 +636,8 @@ public final class DeepSeekPrompts {
             plan = plan.copy(plan.reply(), kept, plan.searchQuery());
         }
         plan = withAssertionMark(withRequestedAdditions(withRequestedEdits(withRequestedCount(plan, message), message), message), message);
-        return withVerifiedNumbers(withListCommand(plan, message), selections);
+        // 最后再过滤一遍：模型自己写的 .prompt add/set 与上面合成出来的指令都不许含中文（SD 只认英文词条）。
+        return withChineseTagGuard(withVerifiedNumbers(withListCommand(plan, message), selections));
     }
     /**
      * 程序只说自己核对过的事实：回复里把 #编号 说成某个名称时，必须与程序真正会解析的那份列表一致。
@@ -792,6 +797,11 @@ public final class DeepSeekPrompts {
      */
     public static final java.util.regex.Pattern REQUESTED_ADDITION = java.util.regex.Pattern.compile(
             "(?:加上|加上去|加入|加个|加进|添加|追加|补上|来点|来一个)\\s*[「\"']?([^「」\"'，。；;、\\s]{1,24})");
+    /**
+     * 用户要求加入的取值**含中文**时不能拼进 `.prompt add`（SD 只认英文词条），改成
+     * `{@code .infix <正向|反向>提示词里加上：<中文原话>}`，由 .infix 的改写模型在上下文里处理；
+     * 不含中文的取值仍按原判断走字面 add 或 .infix。**不查任何中文词库、不做词条替换。**
+     */
     public static ChatActions.Plan withRequestedAdditions(ChatActions.Plan plan, String message) {
         if (plan == null || message == null || message.isBlank()) return plan;
         List<String> wanted = new ArrayList<>();
@@ -822,11 +832,13 @@ public final class DeepSeekPrompts {
                 Log.warn("用户要求加入「" + targeted + "」，计划里另有 remove：已丢弃该 remove（要加就绝不能删）");
                 continue;
             }
-            // 这条 remove 打的正是用户要加的词：换成 add，绝不删。
+            // 这条 remove 打的正是用户要加的词：换成只增不删的指令，绝不删。含中文的取值只走 .infix。
             boolean negative = text.matches("(?is)^[./]promptR\\s+.*$");
-            commands.add((negative ? ".promptR add " : ".prompt add ") + targeted);
+            commands.add(hasHan(targeted)
+                    ? ".infix " + (negative ? "反向" : "正向") + "提示词里加上：" + targeted
+                    : (negative ? ".promptR add " : ".prompt add ") + targeted);
             changed = true;
-            Log.warn("用户要求加入「" + targeted + "」，计划里却是 remove：已改为 add（要加就绝不能删）");
+            Log.warn("用户要求加入「" + targeted + "」，计划里却是 remove：已改为只增不删（要加就绝不能删）");
         }
         // 计划里完全没有覆盖这个新增项时，按用户原话补一条非破坏性的 .infix，别让它静默丢失。
         String joined = String.join(" \n ", commands);
@@ -835,14 +847,75 @@ public final class DeepSeekPrompts {
             if (commands.size() >= 8) break;
             int generation = -1;
             for (int index = 0; index < commands.size(); index++) if (isGeneration(commands.get(index))) { generation = index; break; }
-            // 像词条的取值用字面 add（不会被改写模型"顺"成别的词），像整句要求的才走 .infix。
-            boolean looksLikeTag = value.length() <= 12
-                    && !value.matches("(?s).*(的|把|让|改成|调整|变得|一些|一点).*")
-                    && !value.matches("(?s).*(和|与|及|、|，|,).*");
-            String repair = looksLikeTag ? ".prompt add " + value : ".infix " + value;
+            // 像词条的短取值用字面 add（不会被改写模型"顺"成别的词）；整句要求的、含中文的一律走 .infix。
+            boolean negative = negativeContext(message, value);
+            String repair = hasHan(value)
+                    ? ".infix " + (negative ? "反向" : "正向") + "提示词里加上：" + value
+                    : looksLikeTag(value) ? ".prompt add " + value : ".infix " + value;
             if (generation >= 0) commands.add(generation, repair); else commands.add(repair);
             changed = true;
-            Log.info("用户要求加入「" + value + "」，计划里没有落实：已补 .infix（只增不删）");
+            Log.info("用户要求加入「" + value + "」，计划里没有落实：已补 " + repair + "（只增不删）");
+        }
+        return changed ? plan.copy(plan.reply(), commands, plan.searchQuery()) : plan;
+    }
+    /** 像词条的短取值（会被字面 add）；像整句要求的（含"的/把/让/改成…"或并列）走 .infix。 */
+    static boolean looksLikeTag(String value) {
+        return value.length() <= 12
+                && !value.matches("(?s).*(的|把|让|改成|调整|变得|一些|一点).*")
+                && !value.matches("(?s).*(和|与|及|、|，|,).*");
+    }
+    /** 这段文本里有没有汉字：SD 只认英文词条，含汉字的取值一律走 .infix（本类不查中文词库）。 */
+    static boolean hasHan(String text) {
+        if (text == null || text.isEmpty()) return false;
+        return text.codePoints().anyMatch(value -> Character.UnicodeScript.of(value) == Character.UnicodeScript.HAN);
+    }
+    /** 用户原话里这个新增项的语境：紧挨它前面的"反向/负面/negative"算反向，其余（含找不到位置）算正向。 */
+    static boolean negativeContext(String message, String value) {
+        if (message == null || value == null) return false;
+        int at = message.indexOf(value);
+        if (at < 0) return false;
+        String before = message.substring(Math.max(0, at - 16), at);
+        return before.matches("(?s).*(反向|负面|负向|negative|promptR).*");
+    }
+    /**
+     * 提示词取值类指令：`.prompt add/set <取值>` 与 `.promptR add/set <取值>`（大小写不敏感）。
+     * 取值可能是一串逗号分隔的词条（含权重、LoRA 语法），所以只认头部三段，整条取值原样交给 .infix。
+     */
+    static final Pattern PROMPT_TAG_COMMAND = Pattern.compile("(?is)^[./](promptR?)\\s+(add|set)\\s+(.+)$");
+    /**
+     * 计划级兜底（**必须**，模型实测不听话）：SD 只认英文词条，中文被原样写进反向提示词等于乱码。
+     *
+     * <p>实测 bug：「通过反向提示词禁止不存在的手。然后加入 from above；……，生成」被计划成
+     * `{@code .promptR add 不存在的手}`——中文原封不动进了反向提示词。提示词里写规则不够，这里再过滤一遍模型给的计划：
+     * 凡是形如 {@link #PROMPT_TAG_COMMAND} 的指令，取值**只要含汉字**就把整条指令替换成 .infix，交给改写模型在
+     * 上下文里处理——这里**不做任何中文词条替换、不查任何词库**：
+     * <ul>
+     *   <li>{@code .prompt add X} → {@code .infix 正向提示词里加上：X}；{@code .promptR add X} → {@code .infix 反向提示词里加上：X}；</li>
+     *   <li>{@code .prompt set X} → {@code .infix 正向提示词里改为：X}；{@code .promptR set X} → {@code .infix 反向提示词里改为：X}；</li>
+     *   <li>取值不含汉字 → 原样保留（英文词条、权重 {@code (smile:1.2)}、{@code <lora:…>} 一律不碰）。</li>
+     * </ul>
+     *
+     * <p>顺序：跑在 {@code withRequestedAdditions/withRequestedEdits/withListCommand} 之后（见 {@code chatPlan}）。
+     * 理由是它必须看到**最终**的指令列表：计划里模型自己写的 add/set 与合成出来的 `.prompt add <中文>` 都要被它兜住，
+     * 而它只碰 add/set 的整条取值，不破坏 .infix 语义、加载指令、互斥替换与"没要求删的绝不动"这些既有守卫。
+     */
+    public static ChatActions.Plan withChineseTagGuard(ChatActions.Plan plan) {
+        if (plan == null || plan.commands() == null || plan.commands().isEmpty()) return plan;
+        List<String> commands = new ArrayList<>();
+        boolean changed = false;
+        for (String command : plan.commands()) {
+            String text = command == null ? "" : command.strip();
+            Matcher matcher = PROMPT_TAG_COMMAND.matcher(text);
+            if (!matcher.matches() || !hasHan(matcher.group(3))) { commands.add(command); continue; }
+            // promptR → 反向；prompt → 正向（大小写不敏感）。set 用"改为"，add 用"加上"。
+            boolean negative = matcher.group(1).equalsIgnoreCase("promptR");
+            boolean assignment = matcher.group(2).equalsIgnoreCase("set");
+            String value = matcher.group(3).strip();
+            String infix = ".infix " + (negative ? "反向" : "正向") + "提示词里"
+                    + (assignment ? "改为：" : "加上：") + value;
+            commands.add(infix);
+            changed = true;
+            Log.warn("计划里的「" + Log.text(text) + "」含中文（SD 只认英文词条），已改成「" + Log.text(infix) + "」");
         }
         return changed ? plan.copy(plan.reply(), commands, plan.searchQuery()) : plan;
     }
@@ -1673,6 +1746,13 @@ public final class DeepSeekPrompts {
             只安排用户明确要求的操作：不要顺手改尺寸、步数、CFG、种子、模型、采样器、图片数量上限或开关，
             也不要为了"看起来完整"补上用户没提的步骤。
             只有用户明确给出原始标签并指定 add/set/remove/clear 时才使用对应 .prompt 指令。
+            提示词类指令（.prompt add、.prompt set、.promptR add、.promptR set）的参数**只能是标准英文 Danbooru 词条**
+            （例如 extra_hands、from_above、multiple_views）：SD 只认英文词条，**绝对不能把中文原样写进参数**——
+            `.promptR add 不存在的手` 是错的，SD 收到中文只会当成无法识别的乱码。
+            用户用中文提要求时，**不要自己音译、也不要硬翻成英文词条**，直接改用 .infix <用户那句中文原话>，
+            把中文原话原样交给改写模型在上下文里处理（例如 `.infix 反向提示词里加上"不存在的手"`、
+            `.infix 正向提示词里改为"微笑"`），需要出图再加 .gen。
+            仍然遵守上面的既有规则：不许凭空重写没读过的当前 prompt，用户要求加的词绝不能变成 remove。
             若用户只询问“怎样修改”或讨论方案而未要求执行，reply 引导其使用 .infix，commands=[]。
             用户当前消息明确要求撤销、回退或恢复上一次正反向提示词时，使用且只使用 .prompt undo；
             不需要编号，不得把历史中其他人的“撤销”当作当前用户授权。

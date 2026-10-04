@@ -1504,6 +1504,18 @@ public final class Bot implements AutoCloseable {
                         if (!promptTerms(negative ? current.negative() : current.positive()).contains(value))
                             throw new IllegalArgumentException("编号对应的提示词已变化，请重新 /prompt 或 /promptR 查看后移除。");
                     }
+                    // SD 认不得中文：add/set/remove 的取值里只要有汉字，就不把中文写进 prompt，
+                    // 改成转一条等价的中文要求交给 .infix（见 infix(...)：由改写模型换成标准英文词条并应用）。
+                    // clear/undo/classify/keep/drop 不走这里（它们的取值不是要写进 prompt 的词条）。
+                    if (hasHan(value) && (op.equals("add") || op.equals("set") || op.equals("remove"))) {
+                        String request = (negative ? "反向提示词" : "正向提示词")
+                                + (op.equals("add") ? "里加上：" : op.equals("set") ? "里改为：" : "里删掉：") + value;
+                        Log.info("prompt 指令里的中文已转交改写（" + describeConversation(event) + "）：" + request);
+                        reply(event, "prompt 指令只认英文词条：这条中文要求已交给改写处理（等价于 .infix " + request
+                                + "），由改写模型给出标准英文词条，不会把中文写进 prompt。");
+                        infix(event, request);
+                        return;
+                    }
                     boolean wholeField = op.equals("set") || op.equals("clear");
                     if (wholeField) op = "edit";
                     SdClient.PromptChange change = userPrompts.change(scope, negative, op, value, userPrompts.vocabulary(styleTerms()));
@@ -4991,6 +5003,14 @@ public final class Bot implements AutoCloseable {
             for (SdClient.StylePrompt style : sd.stylePrompts()) { terms.add(style.positive()); terms.add(style.negative()); }
             return terms;
         } catch (Exception e) { return List.of(); }
+    }
+    /**
+     * 这段文本里有没有汉字。prompt 里只允许标准英文词条，所以 `.prompt`/`.promptR` 的 add/set/remove
+     * 取值一旦含汉字就不走直接写入，改成交给 .infix 让改写模型处理（见 {@link #infix}）。
+     */
+    private static boolean hasHan(String text) {
+        if (text == null || text.isEmpty()) return false;
+        return text.codePoints().anyMatch(value -> Character.UnicodeScript.of(value) == Character.UnicodeScript.HAN);
     }
     private static long millis(long startedNanos) { return Math.round((System.nanoTime() - startedNanos) / 1_000_000.0); }
     // ---------------------------------------------------------------------------------------------

@@ -689,13 +689,18 @@ a.image-link img:hover { border-color: rgba(120, 160, 220, .55); }
   /* 每条回执不被压扁：给足最小高度与内边距（不设 height / max-height，内容多就自己撑开） */
   min-height: 68px; padding: 10px 12px; box-sizing: border-box;
   font-weight: 450; cursor: pointer;
-  transition: background .2s var(--ease), border-color .2s var(--ease), transform .15s var(--ease);
+  /* 朴素样式：全局 button 那层蓝色投影在这一类行上太花，这里一律去掉（只留 1px 边框 + 未读左色条）。 */
+  box-shadow: none;
+  transition: background .2s var(--ease), border-color .2s var(--ease);
 }
-.quest-row:hover { background: rgba(120, 160, 220, .14); transform: translateY(-1px); }
+/* hover 只做很轻的背景变化：不抬起、不发光、不调亮度。 */
+.quest-row:hover { background: rgba(120, 160, 220, .1); box-shadow: none; transform: none; filter: none; }
+.quest-row:active { box-shadow: none; transform: none; filter: none; }
 .quest-row.unread {
   border-left-color: var(--accent);
   background: rgba(90, 162, 255, .14);
 }
+.quest-row.unread:hover { background: rgba(90, 162, 255, .2); }   /* 未读行 hover：只把底色提亮一点点 */
 .quest-row.unread .quest-row-cmd { font-weight: 700; color: #eaf3ff; }
 .quest-row.current { border-color: rgba(90, 162, 255, .55); }
 .quest-row.expired { opacity: .78; }
@@ -722,16 +727,17 @@ a.image-link img:hover { border-color: rgba(120, 160, 220, .55); }
   overflow: hidden; overflow-wrap: anywhere; word-break: break-word;
 }
 
-/* 回执列表行里的未读条数徽标（数字 pill）：与页签上的 .tab-badge 同风格、自带底色。
-   窄屏不换行、不参与收缩，保证指令文字不被它挤掉。 */
+/* 回执列表行里的未读条数徽标（纯数字）：钉在行内最右侧 —— 不收缩、不换行、不裁剪，
+   父级的 overflow:hidden（比如带省略号的 .quest-row-cmd）裁不到它。 */
 .quest-unread-count {
-  flex: 0 0 auto; align-self: center;
+  flex: 0 0 auto; align-self: center; order: 9;
   display: inline-flex; align-items: center; justify-content: center;
   min-width: 20px; height: 18px; padding: 0 6px; margin-left: 2px;
   border: 1px solid var(--line); border-radius: 999px;
   background: var(--accent); color: #04101f;
   font-size: 11.5px; font-weight: 700; line-height: 1;
   font-variant-numeric: tabular-nums; white-space: nowrap;
+  overflow: visible;
 }
 .quest-row.expired .quest-unread-count { background: var(--muted); }
 

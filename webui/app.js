@@ -424,15 +424,56 @@
     if (value > 0) storeSet(QUEST_CURRENT_KEY, value);
   }
 
+  /** 列表里最新一条回执的号（number 最大）；列表还没读出来就退回服务端给的最新号（/api/status、/api/quest）。 */
+  function questLatestNumber() {
+    let max = 0;
+    if (Array.isArray(state.questList)) {
+      state.questList.forEach((item) => {
+        const value = Number(item && item.number);
+        if (Number.isFinite(value) && value > max) max = value;
+      });
+    }
+    if (max > 0) return Math.floor(max);
+    const server = Math.max(Number(state.quests.latest) || 0, Number(questLive.latest) || 0);
+    return server > 0 ? Math.floor(server) : 0;
+  }
+
+  /**
+   * 生成类指令：含 `.gen`、`.get`、`.rg` 或中文「生成」。
+   * 只有这一类回执才配有进度卡与实时图集；`.help`、`.style list` 这种与生成无关的回执一条都不画。
+   */
+  function questIsGeneratingCommand(command) {
+    const text = String(command || '');
+    return text.includes('.gen') || text.includes('.get') || text.includes('.rg') || text.includes('生成');
+  }
+
+  /**
+   * 没指定看哪一条回执（地址里没有 #N、会话里也没记住）时的右栏：只给一句提示。
+   * **绝不自动打开最新那条**：`POST /api/quest` 在服务端会把打开过的那条标成已读，
+   * 自动打开等于把未读数白白吃掉（列表行的未读数字就永远是 0 了）。
+   */
+  function renderQuestHint() {
+    setText('quest-state', '未选择回执');
+    setText('quest-command', '');
+    setText('quest-progress', '');
+    questLiveReset(0);
+    const body = $('quest-body');
+    if (!body) return;
+    body.innerHTML = '';
+    body.appendChild(el('div', 'quest-empty', '从左边选一条回执看执行结果。'));
+  }
+
   /**
    * 回执页：跟着一条回执实时刷新（指令结果 + 生成图片都在里面）。
    * 跑完就停表；换任务号（点另一条云）会重新开始跟。
-   * 没带 hash 时恢复会话里记住的那条（切页面回来不会掉回「最新一条」）。
+   * 只有「地址里的 #N / 会话里记住的那条 / 点列表行 / 点回执云」才打开正文（也因此才标为已读）；
+   * 都没有时右栏只给提示，连一次 /api/quest 都不发。
    */
   async function loadQuest(number) {
     clearInterval(questWatch.timer);
     questWatch.number = Number(number) || questNumberFromLocation() || questStoredNumber() || 0;
-    if (questWatch.number > 0) questStoreNumber(questWatch.number);
+    if (!questWatch.number) { renderQuestHint(); return; }
+    questStoreNumber(questWatch.number);
     const tick = async () => {
       let data;
       try { data = await api('/api/quest', { body: { id: questWatch.number } }); }
@@ -460,6 +501,10 @@
     if (number > 0) questStoreNumber(number);          // 记住当前这条：下次回到 /quest 还是它
     // 换了一条回执（或压根没有回执号）：上一张的进度卡、图集、去重集合全部作废（提前重置，下面才好重建）。
     if (questLive.number !== number) questLiveReset(number);
+    // 实时视图（进度卡 + 生成期间的图集预览）只认两件事：这条回执的指令是不是生成类，以及服务端给的最新号。
+    const listedNow = Array.isArray(state.questList) ? state.questList.find((item) => item && Number(item.number) === Number(number)) : null;
+    questLive.command = String(data.command || (listedNow && listedNow.command) || '');
+    questLive.latest = Math.max(0, Math.floor(Number(data.latest) || 0));
     setText('quest-state', data.error ? data.error : '#' + number + (running ? '（进行中…）' : '（已完成）'));
     setText('quest-command', data.command ? '指令：' + data.command : '');
     setText('quest-progress', data.latest ? '最新一条是 #' + data.latest : '');
@@ -535,11 +580,34 @@
    */
   const questLive = {
     number: 0, timer: null, ticked: false, openAt: 0,
-    questRunning: false, tasksRunning: false,
+    questRunning: false, tasksRunning: false, progressRunning: false,
+    command: '', latest: 0, dir: '',
     card: null, head: null, fill: null, note: null,
     gallery: null, single: null, singleFile: '', base: '',
     files: new Set(), extras: [], baseline: null, startedAt: 0,
   };
+
+  /**
+   * 图像级任务是不是还在跑：`/api/tasks` 里有 running 的任务，或 SD 自己说 running。
+   * 进度卡的「已完成」与图集表头的「生成中…」都看它——**不看**这条回执自己的 busy，
+   * 因为回执 busy 也包括「正在写文字」这种与出图无关的收尾。
+   */
+  function questGenerating() {
+    return !!(questLive.tasksRunning || questLive.progressRunning);
+  }
+
+  /**
+   * 当前这条回执够不够格显示「生成中」的实时视图（进度卡 + 实时图集）。
+   * 三个条件缺一不可：**它就是列表里最新的一条**、**它的指令是生成类**、**队列里真有 running 的任务**
+   * （第三个条件在 {@link questLiveTick} 里问过 /api/tasks 之后才判）。
+   * 打开旧回执（不是最新那条）或 `.help` 这种与生成无关的回执时，一律没有进度卡与实时图。
+   */
+  function questLiveCandidate(number) {
+    const value = Number(number) || 0;
+    if (value <= 0) return false;
+    if (questLatestNumber() !== value) return false;
+    return questIsGeneratingCommand(questLive.command);
+  }
 
   /** 图片去重键：正反斜杠、绝对/相对都归一，回执正文里的 file 与 /api/images 的 path 能对上。 */
   function questFileKey(file) {
@@ -564,13 +632,13 @@
     return 0;
   }
 
-  /** 队列里该盯哪一条：优先当前这条回执（在跑，或队列里只有它），否则队列里正在跑的那条。 */
+  /** 队列里该盯哪一条：**正在跑的那个**（号对得上就优先它），没有 running 再退回号对得上的那个。 */
   function questTaskOf(tasks, number) {
     const list = Array.isArray(tasks) ? tasks.filter(Boolean) : (tasks && tasks.number !== undefined ? [tasks] : []);
     if (!list.length) return null;
-    const mine = list.find((task) => Number(task.number) === Number(number));
-    if (mine && (mine.running || list.length === 1)) return mine;
-    return list.find((task) => task.running) || mine || (list.length === 1 ? list[0] : null);
+    const running = list.filter((task) => task && task.running);
+    const mine = running.find((task) => Number(task.number) === Number(number));
+    return mine || running[0] || list.find((task) => Number(task.number) === Number(number)) || (list.length === 1 ? list[0] : null);
   }
 
   /** 进度卡：一条回执只建一次，之后就地改文字与宽度（不重建 #quest-body，不打断正在播的图集）。 */
@@ -614,7 +682,7 @@
     const card = questLive.card, head = questLive.head, fill = questLive.fill, note = questLive.note;
     if (!card || !head || !fill || !note) return;
     const number = questLive.number;
-    const running = questLive.questRunning || questLive.tasksRunning;
+    const running = questGenerating();
     const done = task ? questCount(task.done) : 0;
     const total = task ? questCount(task.total) : 0;
     let percent = task && Number.isFinite(Number(task.percent)) ? Number(task.percent) : (total ? Math.round(100 * done / total) : 0);
@@ -648,7 +716,7 @@
     const gallery = questLive.gallery;
     if (!gallery || !gallery.head) return;
     const count = gallery.items.length;
-    gallery.head.textContent = (questLive.questRunning || questLive.tasksRunning)
+    gallery.head.textContent = questGenerating()
       ? '图集 · 已生成 ' + count + ' 张（生成中…）'
       : '图集 · 共 ' + count + ' 张';
   }
@@ -667,6 +735,24 @@
     const card = questLive.card && questLive.card.parentNode === body ? questLive.card : null;
     if (card) body.insertBefore(node, card.nextSibling || null);
     else body.insertBefore(node, body.firstChild || null);
+  }
+
+  /** 图片路径里的任务目录：`data/generated/task-<uuid>/` 这一段；不是任务目录（如 webui/ 临时内嵌图）返回空串。 */
+  function questTaskDirOf(path) {
+    const match = String(path == null ? '' : path).replace(/\\/g, '/').match(/data\/generated\/(task-[^/]+)\//i);
+    return match ? 'data/generated/' + match[1] + '/' : '';
+  }
+
+  /**
+   * 「当前运行中任务」的目录：/api/images 是最新在前，取最新那张**任务图**所在的 `task-<uuid>/` 目录。
+   * `data/generated/webui/` 下的临时内嵌图不是任务图，直接跳过；一张任务图都没有就返回空串（这一轮什么都不追加）。
+   */
+  function questRunningDir(list) {
+    for (const image of (list || [])) {
+      const dir = questTaskDirOf(image && image.path);
+      if (dir) return dir;
+    }
+    return '';
   }
 
   /** 这张新图属于当前这条回执吗：modified 晚于回执开始时间；拿不到开始时间就退化成「本次打开后新出现的」。 */
@@ -707,15 +793,23 @@
     questGalleryHead();
   }
 
-  /** /api/images 里属于这条回执、还没画过的图 → 增量追加（按 path 去重，绝不出现重复项）。 */
+  /**
+   * /api/images 里属于**这条正在跑的任务自己的目录**、还没画过的图 → 增量追加（按 path 去重，绝不出现重复项）。
+   * /api/images 是全局的（别的任务、webui/ 下的临时内嵌图都在里面），所以先认目录再收图：
+   * 跨目录与 webui/ 临时图一律不进这个预览；仍然只追加，不重建 #quest-body、不动滚动位置。
+   */
   function questAppendImages(payload) {
     const list = payload && Array.isArray(payload.images) ? payload.images : null;
     if (!list) return;
     if (!questLive.baseline) questLive.baseline = new Set(list.map((image) => String((image && image.path) || '')));
+    const dir = questRunningDir(list);                                       // 最新那张任务图的所在目录＝运行中任务的目录
+    if (!dir) return;
+    questLive.dir = dir;
     const fresh = [];
     list.forEach((image) => {
       const path = String((image && image.path) || '');
       if (!path) return;
+      if (questTaskDirOf(path) !== dir) return;                              // 别的任务目录 / webui/ 临时图：都不进
       const fileKey = questFileKey(path);
       if (questLive.files.has(fileKey)) return;                              // 回执正文里已经有这张
       if (fresh.some((item) => questFileKey(item) === fileKey)) return;      // 这一批里重复的
@@ -726,10 +820,16 @@
     fresh.forEach((path) => { questLive.extras.push(path); questAddImage(path); });
   }
 
-  /** 生成期间的一轮：进度（/api/progress + /api/tasks）与提前预览（/api/images）。 */
+  /**
+   * 生成期间的一轮：进度（/api/progress + /api/tasks）与提前预览（/api/images）。
+   * 严格门槛：只有「最新一条 + 生成类指令 + 队列里真有 running 的任务」才建卡、才追加实时图；
+   * 缺一条就把之前建过的卡撤掉（实时图不再追加），队列空了就把卡就地标「已完成」并停表。
+   */
   async function questLiveTick() {
     const number = questLive.number;
     if (!number) { questLiveStop(); return; }
+    // 不是「最新一条 + 生成类指令」：连 /api/tasks 都不问，进度卡与实时图一律没有。
+    if (!questLiveCandidate(number)) { questLiveDrop(); return; }
     const [progress, tasks, images] = await Promise.all([
       api('/api/progress').catch(() => null),
       api('/api/tasks').catch(() => null),
@@ -738,11 +838,22 @@
     if (questLive.number !== number) return;                                 // 期间切到别的回执：这一轮作废
     const list = Array.isArray(tasks) ? tasks : (tasks && tasks.number !== undefined ? [tasks] : []);
     questLive.tasksRunning = list.some((task) => task && task.running);
-    if ((questLive.questRunning || questLive.tasksRunning) && !questLive.card) { questBuildCard(); questMountCard(); }
-    questPaintCard(questTaskOf(list, number), progress);
-    questAppendImages(images);
-    questGalleryHead();
-    if (!questLive.questRunning && !questLive.tasksRunning) questLiveStop();  // 空闲：卡片留在原地标「已完成」，表停掉
+    questLive.progressRunning = !!(progress && progress.running);
+    const running = questGenerating();
+    if (running && questLiveCandidate(number)) {
+      if (!questLive.card) { questBuildCard(); questMountCard(); }
+      questPaintCard(questTaskOf(list, number), progress);
+      questAppendImages(images);
+      questGalleryHead();
+    } else if (questLive.card && running) {
+      questDropCard();                                                        // 跑到一半不再是「最新 + 生成类」：撤卡
+    } else if (questLive.card) {
+      questPaintCard(questTaskOf(list, number), progress);                    // 收尾：卡片留在原地标「已完成」
+      questGalleryHead();
+    } else {
+      questDropCard();                                                       // 没建过卡也没在跑：确保页面上没有残留的卡
+    }
+    if (!running) questLiveStop();                                            // 空闲：卡片留在原地标「已完成」，表停掉
   }
 
   function questLiveStart() {
@@ -756,6 +867,21 @@
     if (questLive.timer !== null) { clearInterval(questLive.timer); questLive.timer = null; }
   }
 
+  /** 撤掉进度卡：这条回执不再是「最新 + 生成类」时，之前画过的卡不能留在页面上。 */
+  function questDropCard() {
+    const card = questLive.card;
+    if (card && card.parentNode) card.parentNode.removeChild(card);
+    questLive.card = null; questLive.head = null; questLive.fill = null; questLive.note = null;
+  }
+
+  /** 不合格的实时视图：进度卡撤掉、表停掉，实时图也不再追加。 */
+  function questLiveDrop() {
+    questDropCard();
+    questLive.tasksRunning = false;
+    questLive.progressRunning = false;
+    questLiveStop();
+  }
+
   /** 换了一条回执：上一张的进度、图集、去重集合全部作废重来。 */
   function questLiveReset(number) {
     questLiveStop();
@@ -764,6 +890,10 @@
     questLive.openAt = Date.now();
     questLive.questRunning = false;
     questLive.tasksRunning = false;
+    questLive.progressRunning = false;
+    questLive.command = '';
+    questLive.latest = 0;
+    questLive.dir = '';
     questLive.card = null; questLive.head = null; questLive.fill = null; questLive.note = null;
     questLive.gallery = null; questLive.single = null; questLive.singleFile = '';
     questLive.files = new Set();
@@ -773,14 +903,16 @@
   }
 
   /**
-   * 每次重画回执后同步一次：换了回执就整个重来；这条在跑（或这一条还没问过一轮）就把表起上，
-   * 空闲就让这一轮自己收尾。`ticked` 保证「跑完停表」之后不会每 900ms 又白问一轮。
+   * 每次重画回执后同步一次：换了回执就整个重来；**只有「最新一条 + 生成类指令」才起表**
+   * （别的回执一轮都不问、也不会建进度卡）；空闲就让这一轮自己收尾。
+   * `ticked` 保证「跑完停表」之后不会每 900ms 又白问一轮。
    */
   function questLiveSync(number, questRunning) {
     if (!number) { questLiveStop(); return; }
     if (questLive.number !== number) questLiveReset(number);
     questLive.questRunning = !!questRunning;
     if (questLive.timer !== null) return;
+    if (!questLiveCandidate(number)) { questLiveDrop(); return; }
     if (questRunning || !questLive.ticked) questLiveStart();
   }
 
@@ -1074,6 +1206,9 @@
       if (!item) return;
       const number = Number(item.number);
       const running = !item.done || item.busy;
+      // 未读条目的消息条数（文字 + 图片）以纯数字呈现；0 条就不显示（后端只有 texts>0 才算未读）。
+      const unreadMessages = Math.max(0, (Number(item.texts) || 0) + (Number(item.images) || 0));
+      const showUnreadCount = !!item.unread && unreadMessages > 0;
       // 「过期」不再是一个界面分支：后端马上会取消过期（正文落盘、expired 永远 false），
       // 就算旧后端仍给 expired:true，这里也按普通行渲染，不再显示「已过期」。
       const row = el('button', 'quest-row' + (item.unread ? ' unread' : '') + (running ? ' running' : '')
@@ -1082,23 +1217,23 @@
       row.setAttribute('role', 'listitem');
       row.setAttribute('data-number', String(number));
       row.setAttribute('aria-label', '回执 #' + number + '：' + (item.command || '（无指令）')
-        + '，' + (running ? '进行中' : relativeTime(item.ageMillis)) + (item.unread ? '，未读' : ''));
+        + '，' + (running ? '进行中' : relativeTime(item.ageMillis))
+        + (showUnreadCount ? '，未读 ' + unreadMessages + ' 条消息' : (item.unread ? '，未读' : '')));
       if (number === current) row.setAttribute('aria-current', 'true');
       row.appendChild(el('span', 'quest-dot', item.unread ? '' : null));   // 未读圆点（已读时保持占位，行高不跳）
       const main = el('div', 'quest-row-main');
       const line = el('div', 'quest-row-line');
       line.appendChild(el('span', 'quest-row-num', '#' + number));
       line.appendChild(el('span', 'quest-row-cmd', item.command || '（无指令）'));
-      // 未读条目的消息条数（文字 + 图片）以数字呈现；0 条就不占位（后端只有 texts>0 才算未读）。
-      const unreadMessages = Math.max(0, (Number(item.texts) || 0) + (Number(item.images) || 0));
-      if (item.unread && unreadMessages > 0) {
+      line.appendChild(el('span', 'quest-row-state', running ? '进行中…' : relativeTime(item.ageMillis)));
+      if (running) line.appendChild(el('span', 'spin quest-row-spin'));
+      // 未读数徽标钉在行内最右侧（CSS 里 flex:0 0 auto + 白色空间不换行）：数字就是 texts + images。
+      if (showUnreadCount) {
         const pill = el('span', 'quest-unread-count', String(unreadMessages));
         pill.title = '未读 ' + unreadMessages + ' 条消息';
         pill.setAttribute('aria-label', '未读 ' + unreadMessages + ' 条消息');
         line.appendChild(pill);
       }
-      line.appendChild(el('span', 'quest-row-state', running ? '进行中…' : relativeTime(item.ageMillis)));
-      if (running) line.appendChild(el('span', 'spin quest-row-spin'));
       main.appendChild(line);
       main.appendChild(el('div', 'quest-row-summary', item.summary || (running ? '（还在跑，暂无摘要）' : '（没有摘要）')));
       row.appendChild(main);

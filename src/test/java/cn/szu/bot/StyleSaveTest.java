@@ -49,8 +49,8 @@ public final class StyleSaveTest {
                 String name = "中文 风格 " + type;
                 f.setPrompts("风景, {prompt}\n细节", "模糊, bad anatomy");
                 // 先有个人提示词（保存取的就是它），这样也能确认保存过程完全不碰 WebUI。
-                f.command(type, ".prompt set 本机内容, red hair");
-                f.command(type, ".promptR set 本机反向");
+                f.command(type, ".prompt set local content, red hair");
+                f.command(type, ".promptR set local negative");
                 JsonObject before = f.stateCopy();
                 int reads = f.promptReads.get(), saves = f.saveCalls.get();
                 String response = f.command(type, ".style save " + name);
@@ -60,7 +60,7 @@ public final class StyleSaveTest {
                 equal(reads, f.promptReads.get(), type + " local save never reads the WebUI prompt");
                 equal(saves, f.saveCalls.get(), type + " local save never posts to the WebUI");
                 equal(before, f.stateCopy(), type + " local save leaves WebUI state untouched");
-                check(f.command(type, ".style prompt " + name).contains("本机内容, red hair"), type + " local style stores the personal prompt");
+                check(f.command(type, ".style prompt " + name).contains("local content, red hair"), type + " local style stores the personal prompt");
                 check(f.command(type, ".style list").contains(name), type + " saved style is listed");
                 String duplicate = f.command(type, ".style save " + name);
                 check(duplicate.startsWith("操作失败：") && duplicate.contains("已有同名样式") && duplicate.contains(".style overwrite"),
@@ -123,8 +123,8 @@ public final class StyleSaveTest {
     private static void snapshotsEmptyPromptsAndFailures() throws Exception {
         try (Fixture f = new Fixture()) {
             f.setPrompts("captured +", "captured -");
-            f.command("group", ".prompt set 快照内容");
-            f.command("group", ".promptR set 快照反向");
+            f.command("group", ".prompt set snapshot content");
+            f.command("group", ".promptR set snapshot negative");
             f.changeAfterRead = true;
             int reads = f.promptReads.get(), saves = f.saveCalls.get();
             check(f.command("group", ".style save 快照 本地").contains("样式已保存"), "local save ignores WebUI state changes");

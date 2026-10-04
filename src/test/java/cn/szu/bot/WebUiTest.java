@@ -652,7 +652,7 @@ public final class WebUiTest {
     /** 网页编辑提示词：命令真的执行、回执能取回、回退可用，而且写的是网页自己的那份提示词。 */
     private static void promptEditing(String base, Path root) throws Exception {
         String token = "test-token-123456";
-        JsonObject capture = post(base, "/api/command", token, body(".prompt set 网页端, 红发"));
+        JsonObject capture = post(base, "/api/command", token, body(".prompt set console prompt, red hair"));
         String id = capture.get("id").getAsString();
         check(capture.has("quest") && capture.get("quest").getAsInt() > 0,
                 "每条任务回执都带任务号（/quest/#N 用它定位）：" + capture.get("quest"));
@@ -675,7 +675,7 @@ public final class WebUiTest {
         check(expired.has("error") && expired.get("error").getAsString().contains("999999"),
                 "过期的任务号要明确指出，不假装还在跑：" + expired);
         JsonObject prompt = post(base, "/api/prompt", token, body(null));
-        check(prompt.get("positive").getAsString().equals("网页端, 红发"), "提示词已写入：" + prompt.get("positive").getAsString());
+        check(prompt.get("positive").getAsString().equals("console prompt, red hair"), "提示词已写入：" + prompt.get("positive").getAsString());
         // 词条带中文释义（词库里查得到才有），网页的提示词面板按词条原文移除。
         JsonArray items = prompt.getAsJsonArray("positiveItems");
         check(items != null && items.size() == prompt.getAsJsonArray("positiveTerms").size(),
@@ -691,11 +691,11 @@ public final class WebUiTest {
         String undone = waitCapture(base, token, undo.get("id").getAsString());
         check(undone.contains("已回退到上一次 prompt"), "网页可以回退：" + undone);
         JsonObject after = post(base, "/api/prompt", token, body(null));
-        check(!after.get("positive").getAsString().equals("网页端, 红发"), "回退真的生效：" + after.get("positive").getAsString());
+        check(!after.get("positive").getAsString().equals("console prompt, red hair"), "回退真的生效：" + after.get("positive").getAsString());
 
         // 网页控制台已经用访问令牌鉴权过，因此不再要求 QQ 的 owner/admin 身份：
         // 这里用一个不存在的 QQ 号派发的网页事件也应当照常执行（旧行为会报「仅 owner 可用」）。
-        JsonObject noQqIdentity = post(base, "/api/command", token, body(".prompt add 网页追加"));
+        JsonObject noQqIdentity = post(base, "/api/command", token, body(".prompt add console extra"));
         String appended = waitCapture(base, token, noQqIdentity.get("id").getAsString());
         check(appended.contains("已添加") && !appended.contains("仅 owner"),
                 "网页指令不需要 QQ owner 身份：" + appended);
