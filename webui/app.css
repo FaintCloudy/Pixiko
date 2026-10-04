@@ -167,41 +167,125 @@ code { background: rgba(120, 160, 220, .14); padding: 1px 5px; border-radius: 6p
 .composer textarea { flex: 1; }
 .composer button { flex: 0 0 auto; min-width: 78px; }
 
-/* ---------------------------------------------------------------- 对话面板：铺满可视高度，输入框常驻面板底部
-   以前 .messages 有 min-height:40vh，输入框排在对话历史下面，得把整页滚到底才看得见。
-   现在：#panel-chat 撑满「页头 .bar + 页签 .tabs」以下的可视高度（.panel 本来就是 flex 纵向布局），
-   #chat-log 吃掉剩下的高度并**自己滚动**（它仍是唯一的内部滚动容器 —— app.js 里的
-   scrollTop / scrollHeight / nodeAtBottom 语义一个字没变），#chat-form 与它下面那一行
-   （允许执行指令 / 清空对话 / 兴趣度）固定在面板底部、不收缩、始终可见。
-   只作用于 #panel-chat：.composer 还被「系统」栏目的 #console-form 复用，
-   所以这里的选择器一律带 #panel-chat 前缀，通用类 .messages / .composer 一个字没改。 */
-#panel-chat {
-  /* 页头 .bar（实测 62.25px：上下各 10px 内边距 + 1px 下边框）+ 页签 .tabs（实测 55.25px）
-     + .tabs 的 6px 下外边距 + #app 上内边距 12px ≈ 135.5px，这里取 140px 留约 4px 余量：
-     页头文案/字体一变，上面这一串就会高几个像素。宁可多减 —— 面板略矮只是对话区矮几像素；
-     少减了，底部那一行（允许执行指令 / 清空对话）就会被屏幕底边裁掉。
-     再让出 env(safe-area-inset-*)：.bar 的上内边距本身就带 safe-area-inset-top，
-     有刘海/小白条的机器上页头会更高、底边也会被占一条，两个都减掉才准。 */
-  --chat-chrome: 140px;
-  height: calc(100vh - var(--chat-chrome) - env(safe-area-inset-top, 0px) - env(safe-area-inset-bottom, 0px));
-  /* 地址栏伸缩时跟着变；不认 dvh 的浏览器用上面那行 100vh */
-  height: calc(100dvh - var(--chat-chrome) - env(safe-area-inset-top, 0px) - env(safe-area-inset-bottom, 0px));
-  min-height: 0;
+/* ---------------------------------------------------------------- 两栏外壳：左 workspace（栏目）+ 右 agent-rail（全局对话栏，宽屏**固定**）
+   对话栏是**外壳**的一部分（不在任何面板块的标记里），所以每条路由的页面都带着 .agent-rail。
+   （对话面板这一个栏目已经不存在了；下面这套规则从它原来的样式迁移过来，语义照旧：输入框常驻右栏底部。）
+
+   布局：左栏 2 份、右栏 1 份 → 正好 2/3 : 1/3。
+   右栏在宽屏用 **position: fixed** —— 真正钉在视口右侧，页面怎么滚都不动。
+   （**不用 sticky**：/loras、/functions、/chatcfg、/system、/setup、/quest、/help 这些左栏比右栏矮的
+   路由上，.shell 没有可吸顶的余量，sticky 的右栏只能跟着页面一起滚上去、顶栏被切掉。）
+   宽度不再靠 grid 分列，而是左右两边用同一套变量算出来：
+
+     内容宽 = min(#app 的 max-width, 视口宽) - 2 × #app 左右内边距
+     右栏宽 = (内容宽 - 栏间距) / 3        左栏宽 = 内容宽 - 右栏宽 - 栏间距（= 右栏宽的 2 倍）
+     右栏右边距 = #app 的居中留白 + #app 左右内边距  →  右栏内容框与 #app 内容右边缘对齐
+
+   注意百分比：fixed 元素上的 `100%` = **视口宽**（不含滚动条），而 .workspace 上的 `100%` = 它的包含块
+   （.shell 内容框）—— 两者不是一回事，所以变量分成 --rail-w-flow（在流内）与 --rail-w-fixed（固定右栏）
+   两个写，别混用。
+
+   祖先链上**不能**有 transform / filter / backdrop-filter / perspective / will-change / contain：
+   有的话 fixed 会以那一层为包含块、右栏直接跑偏。实测这条链（html → body → main#app → .shell）
+   只有背景与间距，没有这些属性（自测里有断言盯着）。
+   `main#app[hidden]` 的语义不受影响：display:none 的祖先会把整棵子树（含 fixed 的右栏）一起隐藏。
+
+   高度吃满可视区：100vh - 吸顶位置(62px) - 底部留白(14px)，再减 env(safe-area-inset-bottom)；
+   内部**只有 #chat-log 滚动**（flex:1 + min-height:0 + overflow-y:auto），输入区常驻右栏底部。
+
+   自包含变量（唯一出处；@media 的条件里不能用 var()，所以窄屏断点写在下面的 @media 里，数值是 1000px）：
+     --rail-gap:       14px     两栏之间的间距（窄屏堆叠时也是上下间距）
+     --rail-stick-top: 62px     页头 .bar 的实测高度（右栏顶边贴页头下沿，与 .tabs 的 top:62px 同口径）
+     --rail-bottom:    14px     右栏底边与视口底边的留白
+     --rail-page:      1120px   #app 的 max-width（右栏要跟它对齐；改 #app 的宽度这里也要改）
+     --rail-pad:       12px     #app 的左右内边距（宽屏 12px）
+     --rail-w-flow:    在流内的右栏宽（.workspace 的右留白基准）
+     --rail-w-fixed:   固定右栏的宽
+     --rail-right:     固定右栏的右边距（与 #app 内容右边缘对齐）
+   窄屏断点：**1000px**（<=1000px 单列堆叠、static，见下面的 @media）。 */
+body {
+  --rail-gap: 14px;
+  --rail-stick-top: 62px;
+  --rail-bottom: 14px;
+  --rail-page: 1120px;
+  --rail-pad: 12px;
+  /* 在流内用：百分比按使用处的包含块解析（.workspace 的包含块 = .shell 内容框） */
+  --rail-w-flow: calc((100% - var(--rail-gap)) / 3);
+  /* 固定右栏用：fixed 的百分比按视口解析，所以 #app 的 1120px 与左右内边距要自己写进来 */
+  --rail-w-fixed: calc((min(var(--rail-page) - 2 * var(--rail-pad), 100% - 2 * var(--rail-pad)) - var(--rail-gap)) / 3);
+  --rail-right: calc((100% - min(var(--rail-page), 100%)) / 2 + var(--rail-pad));
 }
-#panel-chat #chat-log {
+.workspace {
+  min-width: 0;                                   /* 长内容/窄屏不许把整页顶出横向滚动 */
+  margin-right: calc(var(--rail-w-flow) + var(--rail-gap));   /* 给固定右栏让出右 1/3 + 间距 */
+}
+.agent-rail {
+  position: fixed;               /* 宽屏：真正固定（取舍见上面的注释） */
+  top: var(--rail-stick-top);
+  right: var(--rail-right);
+  width: var(--rail-w-fixed);
+  height: calc(100vh - var(--rail-stick-top) - var(--rail-bottom) - env(safe-area-inset-bottom, 0px));
+  /* 地址栏伸缩时跟着变；不认 dvh 的浏览器用上面那行 100vh */
+  height: calc(100dvh - var(--rail-stick-top) - var(--rail-bottom) - env(safe-area-inset-bottom, 0px));
+  min-width: 0;                  /* 窄屏/长内容不许把它顶宽 */
+  min-height: 0;
+  display: flex;                 /* 纵向：栏头 / #chat-log（唯一滚动容器）/ 输入框 / 底部那行 */
+  flex-direction: column;
+  gap: 10px;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: linear-gradient(180deg, rgba(15, 23, 39, .86), rgba(11, 18, 32, .78));
+  box-shadow: var(--shadow);
+  backdrop-filter: blur(10px) saturate(130%);
+}
+.agent-rail-head {
+  flex: 0 0 auto;
+  display: flex; flex-direction: column; gap: 2px;
+  padding-bottom: 8px; border-bottom: 1px solid var(--line);
+}
+.agent-rail-head b { font-size: 15px; }
+.agent-rail-head .muted { font-size: 11.5px; line-height: 1.35; }
+/* #chat-log 是右栏**唯一**的内部滚动容器：app.js 的 scrollTop / scrollHeight / nodeAtBottom 语义一个字没变 */
+.agent-rail #chat-log {
   flex: 1 1 auto;
-  min-height: 0;                 /* 盖掉通用 .messages 的 min-height:40vh：否则面板又被撑高、输入框又跑到屏幕外 */
-  overflow-y: auto;              /* 对话历史自己滚：滚动位置记忆（scrollTop）照旧 */
+  min-height: 0;                 /* 盖掉通用 .messages 的 min-height:40vh：否则右栏被撑高、输入框跑出可视区 */
+  overflow-y: auto;
   overflow-x: hidden;
   overscroll-behavior: contain;  /* 滚到尽头不要把整页带着一起滚 */
   padding-right: 2px;            /* 给滚动条留一条缝，气泡不贴滚动条 */
 }
-/* 输入框与它下面那一行：固定高度、不收缩，永远留在面板底部 */
-#panel-chat #chat-form,
-#panel-chat > .row { flex: 0 0 auto; }
-@media (max-width: 620px) {
-  /* 窄屏 #app 的上内边距是 8px（见下面 620px 的断点），页头/页签高度不变 */
-  #panel-chat { --chat-chrome: 136px; }
+/* 输入框与底部那一行（允许执行指令 / 清空对话 / 兴趣度）：定高、不收缩，永远贴住右栏底部 */
+.agent-rail #chat-form,
+.agent-rail > .row { flex: 0 0 auto; }
+
+/* 控制台（/logs）的真 CLI 终端原来靠 100vw + 负外边距占满**整页**宽度。现在 #app 里多了固定右栏，
+   100vw 会横着溢出压住右栏：让它占满**左栏**那一列即可（全屏模式见下面 body.console-full 那几条）。 */
+.shell .terminal { width: auto; margin-left: 0; }
+
+/* 宽屏：固定右栏占住了右下角，会盖住**页脚文字**与**任务信息云**（两者都在 .shell 之外）：
+   页脚给同样的右边留白（+ --rail-pad：页脚盒子与 #app 盒子同宽同起点，但两边内边距是 16px vs 12px，
+   补上这 12px，#app 内容右边缘减掉右栏与间距就正好等于页脚内容的右边缘）；
+   信息云整体挪到左栏那一列的右下角。用 `body > …` 提高一级优先级，免得被文件后面那两条基础规则盖回去。 */
+@media (min-width: 1001px) {
+  body > .footer { padding-right: calc(var(--rail-w-fixed) + var(--rail-gap) + var(--rail-pad)); }
+  body > .quest-clouds { right: calc(var(--rail-w-fixed) + var(--rail-gap) + var(--rail-pad) + 6px); }
+}
+
+/* 窄屏（<= 1000px）：单列堆叠 —— 右栏放到左栏**下面**（左栏是主角、先看栏目；DOM 顺序本来就是
+   左先右后，不用 order 反转，键盘 Tab / 朗读顺序也自然）。右栏给 min(60vh, 520px) 的高度、自己滚动，
+   此时**不能再 fixed**（会浮在栏目上面挡住内容），改回流内的普通块；宽度跟着单列走，
+   390px 宽也不出横向滚动。 */
+@media (max-width: 1000px) {
+  .workspace { margin-right: 0; }
+  .agent-rail {
+    position: static;
+    top: auto;
+    right: auto;
+    width: auto;
+    height: min(60vh, 520px);
+    margin-top: var(--rail-gap);   /* 与 grid 版 gap:14px 同样的上下间距 */
+  }
 }
 
 .receipts { display: flex; flex-direction: column; gap: 8px; }
@@ -266,10 +350,8 @@ code { background: rgba(120, 160, 220, .14); padding: 1px 5px; border-radius: 6p
 }
 .list li.cat-group.collapsed .group-head .group-arrow { transform: rotate(-90deg); }
 .list li.cat-group.collapsed .group-rows { display: none; }
-/* 样式行的分类徽标：手动设过的实心，按默认规则归类的描边；点一下就地改分类 */
-.list li .tag.cat { cursor: pointer; }
-.list li .tag.cat:hover { border-color: rgba(120, 160, 220, .5); }
-.list li .tag.cat .rename-input { min-width: 120px; }
+/* 样式行的分类徽标：手动设过的实心，按默认规则归类的描边。**只读**——换分类靠把整行拖到别的组头上 */
+.list li .tag.cat { cursor: default; }
 .list li .name { flex: 1; word-break: break-word; }
 .list li .sub { color: var(--muted); font-size: 12px; word-break: break-word; }
 .list li .star { color: var(--accent-2); }
@@ -286,6 +368,29 @@ code { background: rgba(120, 160, 220, .14); padding: 1px 5px; border-radius: 6p
   width: 48px; aspect-ratio: 832 / 1216; height: auto; border-radius: 8px; border: 1px dashed var(--line);
   display: flex; align-items: center; justify-content: center; color: var(--muted); font-size: 11px; text-align: center;
 }
+/* 样式面板：整行可拖（拖到分类组头/组内列表就换分类）。抓手给手势，拖起来的那行半透明，放置目标整组淡描边 */
+.list li.draggable { cursor: grab; }
+.list li.draggable:active { cursor: grabbing; }
+.list li.draggable .drag-handle {
+  flex: 0 0 auto; color: var(--muted); font-size: 13px; line-height: 1; letter-spacing: -2px;
+  cursor: grab; user-select: none;
+}
+/* 拖起来的那行：必须把 `.fresh` 的入场动画压掉 —— slide-in 带 fill-mode: both，
+   动画层会一直把 opacity 钉在 1，盖住这里的 .45（真机实测过）。animation: none 之后 opacity 才生效。 */
+.list li.is-dragging { animation: none; opacity: .45; }
+.list li.cat-group.is-drop-target {
+  border-radius: 12px; background: rgba(120, 160, 220, .1);
+  box-shadow: inset 0 0 0 1px rgba(120, 160, 220, .45);
+}
+.list li.cat-group.is-drop-target .group-head .group-name { color: var(--accent); }
+/* 保存样式的封面：下拉 + 60×60 小预览（取不到图就藏起来）+ 一句说明，插在「保存样式」按钮前面 */
+.cover-pick { display: flex; align-items: center; gap: 8px; }
+.cover-pick select { max-width: 230px; }
+.cover-pick img.cover-preview {
+  width: 60px; height: 60px; object-fit: cover; border-radius: 8px;
+  border: 1px solid var(--line); background: rgba(6, 11, 20, .6);
+}
+.cover-pick .cover-hint { font-size: 12px; }
 /* LoRA 下载进度：有字节数就按百分比，没有（读信息/加载中）就走不确定态的来回滚动 */
 .lora-progress { margin-top: 10px; display: flex; flex-direction: column; gap: 6px; }
 .lora-progress-track {
@@ -395,8 +500,18 @@ body.console-full .aurora { display: none !important; }
 body.console-full { overflow: hidden; }
 body.console-full #app { max-width: none; margin: 0; padding: 0; }
 body.console-full .panel.active { gap: 0; }
+/* 控制台全屏（/logs 默认）：**右栏照旧在右边 1/3**（用户要「无论哪个栏目都能对话」）。
+   这里只把右栏几何换成「满宽、无页头」：--rail-page:100% + --rail-pad:0 → 右栏仍是内容宽的 1/3、
+   贴住视口右边；--rail-stick-top:0 → 这条模式没有页头，右栏从视口顶开始。终端占左 2/3 那一列（见下）。
+   于是「全屏」的语义 = **终端占满它那一列的高度**（不再是 100vw/100vh 独占整个窗口）。 */
+body.console-full { --rail-page: 100%; --rail-pad: 0px; --rail-stick-top: 0px; }
 body.console-full .terminal {
-  height: 100vh; width: 100vw; margin: 0; border: 0; border-radius: 0; box-shadow: none;
+  height: 100vh; width: auto; margin: 0; border: 0; border-radius: 0; box-shadow: none;
+}
+/* 窄屏（<=1000px）+ 控制台全屏：终端与右栏一上一下，一起塞进视口（body 此刻 overflow:hidden，
+   不会有滚动条，谁都不会被推到看不见的地方）。min-height 只是别让终端矮到不可用。 */
+@media (max-width: 1000px) {
+  body.console-full .terminal { height: calc(100vh - min(60vh, 520px) - var(--rail-gap)); min-height: 240px; }
 }
 .terminal-head {
   display: flex; flex-wrap: wrap; align-items: center; gap: 8px;
@@ -446,7 +561,7 @@ body.console-full .terminal {
 .prompt-line input:focus { box-shadow: none; background: transparent; border: 0; }
 @media (max-width: 620px) {
   .terminal { height: calc(100vh - 148px); min-height: 360px; width: calc(100vw - 16px); margin-left: calc(50% - 50vw + 8px); border-radius: 12px; }
-  body.console-full .terminal { height: 100vh; width: 100vw; margin: 0; border-radius: 0; }
+  body.console-full .terminal { border-radius: 0; }   /* 宽/高由上面 body.console-full 与窄屏那条管（不再 100vw 独占） */
   .terminal-head { font-size: 13px; }
   .terminal-tail { height: min(58vh, 420px); }
 }

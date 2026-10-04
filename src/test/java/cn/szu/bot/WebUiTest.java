@@ -127,6 +127,7 @@ public final class WebUiTest {
                     String base = "http://127.0.0.1:" + port;
                     authentication(base);
                     staticFiles(base);
+                    agentRail(base);
                     statusAndLists(base, root);
                     promptEditing(base, root);
                     internalPanelEndpoints(base, root);
@@ -135,7 +136,7 @@ public final class WebUiTest {
                     consoleCommands(base, root);
                     imageGuard(base, root);
                     configEndpoints(base, root, sd.getAddress().getPort());
-                    System.out.println("WebUiTest: " + checks + " assertions passed：鉴权、静态页、状态、列表、提示词编辑、内部面板接口、生成参数即时生效、控制台并发指令、图片路径校验、网页端配置");
+                    System.out.println("WebUiTest: " + checks + " assertions passed：鉴权、静态页、全局对话栏、状态、列表、提示词编辑、内部面板接口、生成参数即时生效、控制台并发指令、图片路径校验、网页端配置");
                 }
             }
         } finally {
@@ -200,14 +201,14 @@ public final class WebUiTest {
         check(index.statusCode() == 200 && index.body().contains("神户小鸟") && index.body().contains("Pixiko"),
                 "首页可访问，标题是项目名 Pixiko、品牌位是机器人名");
         check(index.body().contains("viewport"), "页面包含移动端 viewport");
-        // 每个栏目是一个独立页面：首页只有对话面板，其它栏目的 DOM 不在这一页上；
-        // 同时每个栏目都能用自己的 URL 打开（见 columnPages）。
-        check(index.body().contains("id=\"panel-chat\"") && !index.body().contains("id=\"panel-styles\""),
-                "首页只有对话栏目自己的面板（不是把所有栏目塞进一页）");
-        check(countOf(index.body(), "role=\"tab\"") == 12 && index.body().contains("href=\"/styles\"")
-                        && index.body().contains("href=\"/quest\"") && index.body().contains("href=\"/setup\"")
-                        && index.body().contains("href=\"/\""),
-                "页签是十一个真链接（每个栏目一个 URL，含 Setup）");
+        // 每个栏目是一个独立页面：首页（＝出图页）只有出图面板，其它栏目的 DOM 不在这一页上；
+        // 对话栏已经全局化，它是外壳的一部分（见 agentRail），不再是栏目、也不在左栏里。
+        check(index.body().contains("id=\"panel-gen\"") && !index.body().contains("id=\"panel-styles\""),
+                "首页只有出图栏目自己的面板（不是把所有栏目塞进一页）");
+        check(countOf(index.body(), "role=\"tab\"") == 11 && index.body().contains("href=\"/gen\"")
+                        && index.body().contains("href=\"/styles\"") && index.body().contains("href=\"/quest\"")
+                        && index.body().contains("href=\"/setup\""),
+                "页签是十一个真链接（每个栏目一个 URL，含 Setup；对话不再占页签）");
         check(index.body().contains("id=\"viewer\"") && index.body().contains("id=\"viewer-image\"")
                         && index.body().contains("id=\"viewer-stage\""),
                 "页面带图片查看器（点图放大，不再跳新标签页）");
@@ -279,6 +280,24 @@ public final class WebUiTest {
                 "对话里的图片条目不再有「（一张图片）」占位文字（只发图的那条只有图）");
         check(script.body().contains("chat-gallery-entry") && css.body().contains(".messages .msg.chat-gallery-entry"),
                 "带图集的气泡有确定宽度（chat-gallery-entry + align-self:stretch），网格才能排成一行多格");
+        // 对话栏全局化（外壳）+ 服务端正文存档：右栏在每条路由都在，历史照常铺；存档走 /api/chat/log（读）
+        // 与 /api/chat/log/save（整份覆盖写），本地变化后防抖 800ms 推一次，PAGE 兜底不再是 'chat'。
+        check(script.body().contains("'/api/chat/log'") && script.body().contains("'/api/chat/log/save'")
+                        && script.body().contains("CHAT_LOG_PUSH_DELAY = 800")
+                        && script.body().contains("const PAGE = window.PIXIKO_PAGE || 'gen';"),
+                "对话正文存档接在 /api/chat/log 与 /api/chat/log/save 上（防抖 800ms），PAGE 兜底是出图页");
+        check(!script.body().contains("PAGE === 'chat'")
+                        && countOf(script.body(), "await loadChatHistory()") == 1
+                        && script.body().contains("await chatArchiveMerge(log, saved)"),
+                "前端不再有 'chat' 栏目语义：loadChatHistory 在 loadPage 里每个栏目都调（含服务端存档的合并）");
+        check(css.body().contains(".agent-rail #chat-log") && !css.body().contains("#panel-chat")
+                        && css.body().contains("--rail-w-fixed: calc((min(var(--rail-page) - 2 * var(--rail-pad), 100% - 2 * var(--rail-pad)) - var(--rail-gap)) / 3);")
+                        && css.body().contains("margin-right: calc(var(--rail-w-flow) + var(--rail-gap));")
+                        && css.body().contains("height: min(60vh, 520px)")
+                        && css.body().contains("body.console-full { --rail-page: 100%; --rail-pad: 0px; --rail-stick-top: 0px; }")
+                        && css.body().contains(".shell .terminal { width: auto; margin-left: 0; }"),
+                "右栏样式挂在 .agent-rail 上（旧的 #panel-chat 死规则已迁走）：宽屏固定右栏宽 = (内容宽-间距)/3、"
+                        + "左栏留白对称、窄屏单列 60vh/520px、console-full 仍保持两栏");
         check(script.body().contains("openViewer(src, caption)") && script.body().contains("点击放大（Esc 关闭）"),
                 "点图直接调查看器，链接上只留提示不再跳转");
         check(script.body().contains("applyGeneration(true)"), "点「开始生成」前先把面板里没提交的改动发出去");
@@ -360,6 +379,59 @@ public final class WebUiTest {
         HttpResponse<String> unknown = HTTP.send(HttpRequest.newBuilder(URI.create(base + "/nope.js")).GET().build(),
                 HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
         check(unknown.statusCode() == 404 && unknown.body().contains("error"), "未知静态路径返回 404 JSON：" + unknown.statusCode());
+    }
+
+    /**
+     * 对话栏全局化：对话不再是栏目页，而是外壳的一部分——左 2/3 是栏目、右 1/3 固定是对话，
+     * 所以每条路由（含首页＝出图页）的正文里都带同一套 #chat-* 控件，而且都不再有 panel-chat。
+     */
+    private static void agentRail(String base) throws Exception {
+        String[] routes = {"/", "/chat", "/gen", "/styles", "/logs"};
+        String home = null, alias = null;
+        for (String route : routes) {
+            HttpResponse<String> page = HTTP.send(HttpRequest.newBuilder(URI.create(base + route)).GET().build(),
+                    HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+            check(page.statusCode() == 200, route + " 页面可访问（" + page.statusCode() + "）");
+            // 右栏（对话）在每个栏目都在：三个关键控件一个都不少。
+            check(page.body().contains("id=\"chat-log\"") && page.body().contains("id=\"chat-form\"")
+                            && page.body().contains("id=\"chat-send\""),
+                    route + " 页面带着全局对话栏（chat-log / chat-form / chat-send）");
+            // 对话不再是栏目：任何一页都不再有它的面板与面板块标记。
+            check(!page.body().contains("id=\"panel-chat\"") && !page.body().contains("<!--#panel:chat-->"),
+                    route + " 页面上对话不是栏目（没有 panel-chat）");
+            // 页签里也没有对话入口，其余页签照旧。
+            check(!page.body().contains("data-tab=\"chat\"") && page.body().contains("data-tab=\"gen\"")
+                            && page.body().contains("data-tab=\"styles\""),
+                    route + " 页签里没有对话入口，其余页签仍在");
+            // 两栏骨架：左 workspace（栏目）、右 agent-rail（对话）。
+            check(page.body().contains("id=\"workspace\"") && page.body().contains("id=\"agent-rail\""),
+                    route + " 页面是「左栏目 + 右对话栏」的两栏骨架");
+            // 对话栏在 app.js 之前解析：脚本跑起来时它的 DOM 已经在了。
+            check(page.body().indexOf("id=\"chat-log\"") < page.body().indexOf("/app.js"),
+                    route + " 的对话栏在 app.js 之前");
+            if (route.equals("/")) home = page.body();
+            if (route.equals("/chat")) alias = page.body();
+        }
+        // 出图页才是首页：/ 与 /chat 注入的页面标记都是 gen（对话栏不参与栏目切换）。
+        check(home != null && home.contains("window.PIXIKO_PAGE = \"gen\""), "首页注入的面板标记是 gen（出图页）");
+        check(alias != null && alias.contains("window.PIXIKO_PAGE = \"gen\""), "/chat 注入的面板标记也是 gen");
+        check(home != null && home.contains("class=\"tab active\" data-tab=\"gen\""), "首页的当前页签是「出图」");
+        // 页面标记只出现一次，而且真的紧贴在 app.js 的 <script> 之前：脚本标签带 ?v= 查询串也要认出来，
+        // 不能再落到 </head> 兜底（兜底留着救"脚本标签形式又变了"的情况）。
+        check(home != null && countOf(home, "window.PIXIKO_PAGE") == 1
+                        && java.util.regex.Pattern.compile("<script>window\\.PIXIKO_PAGE = \"gen\";</script>\\s*<script src=\"/app\\.js")
+                                .matcher(home).find(),
+                "首页的 window.PIXIKO_PAGE 只出现一次，且紧贴在 app.js 之前（不是 </head> 兜底）");
+        check(alias != null && countOf(alias, "window.PIXIKO_PAGE") == 1
+                        && java.util.regex.Pattern.compile("<script>window\\.PIXIKO_PAGE = \"gen\";</script>\\s*<script src=\"/app\\.js")
+                                .matcher(alias).find(),
+                "/chat 的 window.PIXIKO_PAGE 只出现一次，且紧贴在 app.js 之前");
+        // 旧链接别名：/chat 与 / 渲染同一页（对话栏是外壳，两条路径都是出图页）。
+        check(home != null && home.equals(alias), "/chat 与 / 渲染的是同一页（旧链接不 404、也不换成别的栏目）");
+        HttpResponse<String> slash = HTTP.send(HttpRequest.newBuilder(URI.create(base + "/chat/")).GET().build(),
+                HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+        check(slash.statusCode() == 200, "/chat/（尾斜杠）也返回 200：" + slash.statusCode());
+        check(slash.body().equals(alias), "/chat/ 与 /chat 同构（尾斜杠不 404）");
     }
 
     private static void statusAndLists(String base, Path root) throws Exception {
@@ -479,7 +551,8 @@ public final class WebUiTest {
         HttpResponse<String> page = HTTP.send(HttpRequest.newBuilder(URI.create(base + "/")).GET().build(),
                 HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
         Map<String, String[]> expected = new LinkedHashMap<>();
-        expected.put("/", new String[]{"panel-chat", "chat-log", "chat-send", "chat-reset"});
+        // 首页＝出图页：对话栏已经全局化（见 agentRail），它不再是栏目，首页的面板就是 gen。
+        expected.put("/", new String[]{"panel-gen", "gen-btn", "chat-log", "chat-send", "chat-reset"});
         expected.put("/gen", new String[]{"panel-gen", "set-width", "set-sampler", "gen-applied", "gen-progress-bar",
                 "preset-save", "infix-filter", "task-list", "task-summary", "image-grid", "image-note"});
         expected.put("/prompt", new String[]{"panel-prompt", "prompt-positive", "prompt-add-btn", "usage-body", "undo-btn",
@@ -501,7 +574,8 @@ public final class WebUiTest {
             for (String anchor : entry.getValue())
                 check(column.body().contains(anchor), entry.getKey() + " 页面包含控件 " + anchor);
             check(column.body().contains("window.PIXIKO_PAGE"), entry.getKey() + " 页面带页面标记（前端据此只加载本栏目数据）");
-            String tab = entry.getKey().equals("/") ? "chat" : entry.getKey().substring(1);
+            // 首页渲染的是出图页（对话栏是全局外壳、不占页签），所以它的当前页签是 gen。
+            String tab = entry.getKey().equals("/") ? "gen" : entry.getKey().substring(1);
             check(column.body().contains("class=\"tab active\" data-tab=\"" + tab + "\""),
                     entry.getKey() + " 页面的当前页签是高亮的");
             // 面板自己也必须 active：.panel 默认 display:none，漏了 active 整页尺寸都是 0（终端布局会塌）。
@@ -510,16 +584,18 @@ public final class WebUiTest {
                             .matcher(column.body()).find(),
                     entry.getKey() + " 页面的面板是 active（不是 display:none）");
         }
-        // 每个页面只包含自己的那一个面板（其它栏目的 DOM 不参与）
-        for (String other : new String[]{"panel-chat", "panel-gen", "panel-prompt", "panel-styles", "panel-loras",
-                "panel-functions", "panel-chatcfg", "panel-system", "panel-logs", "panel-help"}) {
+        // 每个页面只包含自己的那一个面板（其它栏目的 DOM 不参与）。对话栏已经全局化、不再是面板，
+        // 所以这里没有 panel-chat；首页与 /gen 是同一次渲染（都是出图页），panel-gen 出现在这两条路径上。
+        for (String other : new String[]{"panel-gen", "panel-prompt", "panel-styles", "panel-loras",
+                "panel-functions", "panel-chatcfg", "panel-system", "panel-setup", "panel-logs", "panel-help"}) {
             int seen = 0;
             for (String path : expected.keySet()) {
                 HttpResponse<String> column = HTTP.send(HttpRequest.newBuilder(URI.create(base + path)).GET().build(),
                         HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
                 if (column.body().contains("id=\"" + other + "\"")) seen++;
             }
-            check(seen == 1, "面板 " + other + " 只出现在一个页面上（实际 " + seen + " 页）");
+            check(seen == (other.equals("panel-gen") ? 2 : 1),
+                    "面板 " + other + " 只出现在自己的页面上（实际 " + seen + " 页）");
         }
         check(page.body().contains("id=\"viewer\"") && page.body().contains("id=\"viewer-image\"")
                         && page.body().contains("id=\"viewer-stage\""),

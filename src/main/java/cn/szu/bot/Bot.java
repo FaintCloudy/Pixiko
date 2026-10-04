@@ -6266,7 +6266,7 @@ public final class Bot implements AutoCloseable {
      */
     public JsonObject webStylesEdit(String scope, String action, String name, String newName,
                                     boolean overwrite, boolean noLora) throws Exception {
-        return webStylesEdit(scope, action, name, newName, overwrite, noLora, "");
+        return webStylesEdit(scope, action, name, newName, overwrite, noLora, "", "");
     }
 
     /**
@@ -6275,12 +6275,25 @@ public final class Bot implements AutoCloseable {
      */
     public JsonObject webStylesEdit(String scope, String action, String name, String newName,
                                     boolean overwrite, boolean noLora, String category) throws Exception {
+        return webStylesEdit(scope, action, name, newName, overwrite, noLora, category, "");
+    }
+
+    /**
+     * @param cover 只给 {@code action=save/overwrite} 用：这次保存的封面图。
+     *              空串＝默认用**最近一次生成的图**；{@code -}/{@code none}/{@code 清除}/{@code 不设}＝本次不设封面；
+     *              其余当成 {@code data/generated} 里的图片路径（控制台 /api/images 给的就是这种相对路径）。
+     *              封面是独立文件（{@code data/style-previews}），不动 {@code data/local-styles.json} 的结构。
+     */
+    public JsonObject webStylesEdit(String scope, String action, String name, String newName,
+                                    boolean overwrite, boolean noLora, String category, String cover) throws Exception {
         String op = String.valueOf(action == null ? "" : action).strip().toLowerCase(Locale.ROOT);
         JsonObject event = webEvent(scope, op);
         String message;
         switch (op) {
             case "save", "overwrite" -> {
                 String target = SdClient.styleSaveName(stripQuotes(name == null ? "" : name));
+                // 封面先解析、后保存：指定的路径不合法就在这里报错，不会出现"样式存进去了、封面没设成"的半截结果。
+                StyleCoverPlan coverPlan = planStyleCover(cover);
                 // 保存的是调用者真正出图用的那份提示词；WebUI 读不到时退回已有的个人提示词（本机样式库不被别的程序拖住）。
                 SdClient.Prompts current;
                 boolean inherited = false;
@@ -6290,7 +6303,8 @@ public final class Bot implements AutoCloseable {
                         overwrite || op.equals("overwrite"), modelParamsOrNull());
                 message = "样式已" + (op.equals("overwrite") ? "覆盖保存" : "保存") + "：" + saved.name()
                         + (inherited ? "（WebUI 提示词读取失败，本次用你已有的个人提示词保存）" : "（含 LoRA 标签）")
-                        + (saved.hasModel() ? "；已记下模型参数：" + saved.modelSummary() : "");
+                        + (saved.hasModel() ? "；已记下模型参数：" + saved.modelSummary() : "")
+                        + "；" + applyStyleCover(saved.name(), coverPlan);
             }
             case "rename" -> {
                 List<String> targets = styleTargets(event, name == null ? "" : name);
@@ -6367,6 +6381,150 @@ public final class Bot implements AutoCloseable {
         JsonObject result = webStyles();
         result.addProperty("message", message);
         return result;
+    }
+
+    /**
+     * 网页「把这张图设成这个样式的封面」：只写 {@code data/style-previews} 里那张图，
+     * 样式本身、{@code data/local-styles.json} 的结构一个字都不动。
+     *
+     * @param name 目标样式名（不存在就报错，并列出可用的名字）
+     * @param path {@code data/generated} 里的图片路径，校验规则与保存样式时的封面完全一样（见 {@link #generatedCover}）
+     */
+    public JsonObject webStyleCover(String name, String path) throws Exception {
+        String requested = stripQuotes(name == null ? "" : name.strip());
+        LocalStyles.Style style = localStyles.get(requested);
+        if (style == null)
+            throw new IllegalArgumentException("没有这个样式：" + requested + "。用 .style list 查看全部样式" + styleNamesNotice());
+        Path image = generatedCover(path);
+        byte[] bytes = readCoverImage(image, true);
+        cn.szu.bot.sd.StylePreviews.save(settings.root, style.name(), bytes);
+        JsonObject result = webStyles();
+        result.addProperty("message", "样式封面已更新：" + style.name() + " ← " + image.getFileName());
+        return result;
+    }
+
+    /** 保存样式时的封面决定：{@code mode} = {@code default}（最近生成图）/ {@code none}（本次不设）/ {@code file}（指定的图）。 */
+    private record StyleCoverPlan(String mode, Path image, byte[] bytes) { }
+
+    /**
+     * 解析保存样式时控制台给的封面参数（在样式真正落盘**之前**跑，坏路径当场报错）：
+     * <ul>
+     *   <li>空串（前端没给）：<b>默认用最近一次生成的图</b>（跳过 {@code data/generated/webui} 里的回执内嵌图），
+     *       没有可用图 / 读不出来 / 超过 20MB 就不设封面，也不报错；</li>
+     *   <li>{@code -} / {@code none} / {@code 清除} / {@code 不设}（大小写与全角空格都认）：这次不设封面，原有封面保留；</li>
+     *   <li>其余：{@code data/generated} 里的图片路径，越界 / 不存在 / 读不出来都抛 {@link IllegalArgumentException}。</li>
+     * </ul>
+     */
+    private StyleCoverPlan planStyleCover(String cover) {
+        String value = coverValue(cover);
+        if (isNoCover(value)) return new StyleCoverPlan("none", null, null);
+        if (!value.isEmpty()) {
+            Path image = generatedCover(value);
+            return new StyleCoverPlan("file", image, readCoverImage(image, true));
+        }
+        Path image = latestGeneratedImage();
+        return new StyleCoverPlan("default", image, image == null ? null : readCoverImage(image, false));
+    }
+
+    /** 前后空白、引号、全角空格都清掉（前端可能把 {@code -} 写成 {@code 　-　}）。 */
+    private static String coverValue(String cover) {
+        String value = cover == null ? "" : cover.replace('\u3000', ' ').strip();
+        return value.isEmpty() ? "" : stripQuotes(value);
+    }
+
+    /** 「这次不设封面」的几种写法（大小写不敏感）。 */
+    private static boolean isNoCover(String value) {
+        String lower = value == null ? "" : value.strip().toLowerCase(Locale.ROOT);
+        return lower.equals("-") || lower.equals("none") || lower.equals("no") || lower.equals("off")
+                || lower.equals("不设") || lower.equals("清除") || lower.equals("清空") || lower.equals("无");
+    }
+
+    /**
+     * 最近一次**生成的作品**；没有可用的图、目录读不出来都返回 null（封面不是保存样式的必要条件）。
+     *
+     * <p>{@code data/generated/webui} 是回执里的内嵌图（地图、Civitai 封面这类临时图），出图面板
+     * {@code webImages} 也把它排除在外——它不该被当成"最近一次生成的图"顶掉用户真正的那张作品。
+     * 所以按 mtime 从新到旧多看几张，跳过内嵌目录后的第一张才是默认封面。
+     */
+    private Path latestGeneratedImage() {
+        try {
+            Path embedded = settings.root.toAbsolutePath().normalize().resolve("data/generated/webui");
+            for (Path image : sd.recentImages(60)) {
+                Path normalized = image.toAbsolutePath().normalize();
+                if (normalized.startsWith(embedded)) continue;
+                return normalized;
+            }
+            return null;
+        } catch (Exception error) {
+            Log.warn("读最近生成图失败（样式封面跳过）：" + error(error));
+            return null;
+        }
+    }
+
+    /**
+     * 控制台给的封面路径 → {@code data/generated} 里的一张真实图片。
+     *
+     * <p>只认 {@code data/generated} 目录树内的路径：绝对路径按原样算，相对路径按机器人根目录算
+     * （{@code /api/images} 给的就是 {@code data/generated/…} 这种相对路径）。先
+     * {@code toAbsolutePath().normalize()} 再用 {@code startsWith} 判越界——{@code ../} 拼出来的路径
+     * normalize 之后必然落到目录外，所以抛错时一个字节都还没写。
+     * 和 LoRA 展示图那一套一致，这里不做 {@code toRealPath()}：目录里指出去的符号链接按"目录内的图"对待。
+     */
+    private Path generatedCover(String path) {
+        String value = coverValue(path);
+        if (value.isEmpty())
+            throw new IllegalArgumentException("请给一张封面图：data/generated 里的图片路径（出图面板里能看到）。");
+        Path base = settings.root.toAbsolutePath().normalize().resolve("data/generated");
+        Path candidate;
+        try { candidate = Path.of(value); }
+        catch (RuntimeException invalid) { throw new IllegalArgumentException("封面图片路径看不懂：" + value); }
+        Path image = (candidate.isAbsolute() ? candidate : settings.root.resolve(candidate)).toAbsolutePath().normalize();
+        if (!image.startsWith(base))
+            throw new IllegalArgumentException("封面只能是 data/generated 里的图片：" + value + "（用出图面板里的那张图）。");
+        if (!Files.isRegularFile(image))
+            throw new IllegalArgumentException("data/generated 里没有这张图片：" + value + "。");
+        return image;
+    }
+
+    /**
+     * 读封面字节：上限 20MB（和网页回执里的内嵌图一个规格）；连 32 字节都不到的不算图片
+     * （{@code StylePreviews.save} 本来也会忽略这种）。{@code required=false} 的那一路
+     * （默认取最近生成图）读不到就返回 null，绝不打断保存。
+     */
+    private byte[] readCoverImage(Path image, boolean required) {
+        try {
+            if (Files.size(image) > 20L * 1024 * 1024) throw new IOException("图片超过 20MB");
+            byte[] bytes = Files.readAllBytes(image);
+            if (bytes.length < 32) throw new IOException("不是有效的图片（只有 " + bytes.length + " 字节）");
+            return bytes;
+        } catch (Exception error) {
+            if (required)
+                throw new IllegalArgumentException("读不出这张封面图：" + image.getFileName() + "（" + error(error) + "）。");
+            Log.warn("样式封面跳过：最近生成图读不出来（" + image.getFileName() + "）：" + error(error));
+            return null;
+        }
+    }
+
+    /** 样式存好之后真正落盘封面，返回回复文案里的那一句（短句，和别处一个风格）。 */
+    private String applyStyleCover(String styleName, StyleCoverPlan plan) {
+        if ("none".equals(plan.mode()))
+            return "本次不设封面" + (cn.szu.bot.sd.StylePreviews.has(settings.root, styleName) ? "（保留原有的封面）" : "");
+        if (plan.bytes() == null) return "（没有可用的最近生成图，本次未设封面）";
+        try { cn.szu.bot.sd.StylePreviews.save(settings.root, styleName, plan.bytes()); }
+        catch (Exception error) {
+            Log.warn("样式封面落盘失败（" + styleName + "）：" + error(error));
+            return "（封面没写进磁盘：" + error(error) + "）";
+        }
+        return ("file".equals(plan.mode()) ? "已记下封面：" : "封面：最近生成的 ") + plan.image().getFileName();
+    }
+
+    /** 样式名对不上时列一下可用的名字（太多只列前 20 个）。 */
+    private String styleNamesNotice() {
+        List<String> names = localStyles.names();
+        if (names.isEmpty()) return "（样式库现在是空的，先用 .style save <名称> 存一个）。";
+        int shown = Math.min(20, names.size());
+        return "（可用：" + String.join("、", names.subList(0, shown))
+                + (names.size() > shown ? " 等 " + names.size() + " 个" : "") + "）。";
     }
 
     /** 参数预设面板：保存/覆盖/删除（预设就是一份本机快照；「加载」会改 SD 参数，仍走指令通道）。 */

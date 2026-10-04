@@ -80,12 +80,22 @@ final class WebPages {
         }
         matcher.appendTail(withActive);
         page = withActive.toString();
-        // 页面标记要在 app.js 之前：前端据此只加载本栏目的数据
-        page = page.replace("<script src=\"/app.js\"></script>",
-                "<script>window.PIXIKO_PAGE = " + Json.GSON.toJson(panel) + ";</script>\n<script src=\"/app.js\"></script>");
+        // 页面标记要在 app.js 之前：前端据此只加载本栏目的数据。
+        // 脚本标签带版本查询串（<script src="/app.js?v=X.Y.Z"></script>），所以这里用正则容忍 ?…，
+        // 并且只在第一处插入一次（整页出现多次 app.js 也不会重复注入）。
+        String mark = "<script>window.PIXIKO_PAGE = " + Json.GSON.toJson(panel) + ";</script>\n";
+        java.util.regex.Matcher appScript = java.util.regex.Pattern
+                .compile("<script src=\"/app\\.js(\\?[^\"]*)?\"></script>")
+                .matcher(page);
+        if (appScript.find()) {
+            StringBuilder marked = new StringBuilder();
+            appScript.appendReplacement(marked, java.util.regex.Matcher.quoteReplacement(mark + appScript.group()));
+            appScript.appendTail(marked);
+            page = marked.toString();
+        }
         if (!page.contains("window.PIXIKO_PAGE")) {
             // 兜底：脚本标签形式变了也要能标出页面
-            page = page.replace("</head>", "<script>window.PIXIKO_PAGE = " + Json.GSON.toJson(panel) + ";</script>\n</head>");
+            page = page.replace("</head>", mark + "</head>");
         }
         return page;
     }

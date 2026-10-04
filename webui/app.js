@@ -1,8 +1,14 @@
 /* Pixiko 控制台：无构建步骤。每个栏目是一个独立页面（/gen、/prompt…），前端只加载本栏目的数据。 */
 (() => {
   const TOKEN_KEY = 'kotori-webui-token';
-  /** 当前页面属于哪个栏目：由服务端在页面里注入（见 WebPages.render）。 */
-  const PAGE = window.PIXIKO_PAGE || 'chat';
+  /**
+   * 当前页面属于哪个栏目：由服务端在页面里注入（见 WebPages.render）。
+   *
+   * <p>对话栏现在是**外壳**的一部分（每条路由的页面都带着右栏 `aside.agent-rail`），
+   * 所以 `'chat'` 这个栏目已经不存在了：这里兜底取宿主实际会用的值（出图页），
+   * 下面任何逻辑都不再依赖「当前栏目是 chat」这种判断。
+   */
+  const PAGE = window.PIXIKO_PAGE || 'gen';
   const state = { token: localStorage.getItem(TOKEN_KEY) || '', status: null, options: null, pollTimer: null, followTimer: null, busy: 0,
     seenImages: new Map(), seenGroups: new Map(), followUntil: 0, receiptKey: '', receiptTexts: 0, receiptImages: 0,
     receiptCount: 0, receiptBox: null, receiptToasted: '',
@@ -1810,11 +1816,12 @@
         toast(texts[texts.length - 1].split('\n')[0]);
       }
     }
-    // 对话页：图片还必须落进 #chat-log —— 对话页底部的回执栏已经取消（HTML 里没有 #chat-receipts），
-    // 这里再不管，图片在对话页就没有任何落点了。文字配图的那条消息由 appendMessage 画进消息里
-    // （并已记进快照），这里靠快照去重，同一张图不会画两回：只补「聊天那边还没画过」的图。
-    // **只动对话页**：其它面板底部的 receipts 行为一个字没改（见上面的循环）。
-    if (PAGE === 'chat' && images.length) {
+    // 图片还必须落进 #chat-log（右栏）：对话栏现在是外壳的一部分，**每条路由的页面都带着它**，
+    // 所以这里不再判栏目，只看右栏在不在。当前页面轮询到的回执**都镜像进对话栏** ——
+    // /gen 点开始生成、/loras 搜 LoRA 都会在右栏出现一条，右栏因此是「与机器人的对话」完整的一条线。
+    // 面板自己的回执栏（上面的循环）与右栏是两个区域，同一条回执在两边各出现一次是**有意**的，不算重复；
+    // 右栏内部靠快照去重（chatSnapshotImages），同一张图在对话栏里绝不会画两遍。
+    if (images.length && $('chat-log')) {
       const seen = chatSnapshotImages();
       const missing = [];
       images.forEach((image) => {
@@ -2100,9 +2107,13 @@
     }
   }
 
-  /** 追加消息/图片后调它：节流最多每 400ms 写一次；页面隐藏或卸载时用 {@link chatSnapshotFlush} 补一次。 */
+  /**
+   * 追加消息/图片后调它：节流最多每 400ms 写一次会话存储；页面隐藏或卸载时用 {@link chatSnapshotFlush} 补一次。
+   * 同时给服务端存档标一次脏（{@link chatArchiveSchedule}，防抖 800ms）。
+   */
   function chatSnapshotSchedule() {
     chatSnapshot.dirty = true;
+    chatArchiveSchedule();
     if (chatSnapshot.timer) return;
     chatSnapshot.timer = setTimeout(() => {
       chatSnapshot.timer = null;
@@ -2111,15 +2122,23 @@
     }, CHAT_LOG_THROTTLE);
   }
 
-  /** 把节流窗口里还没写完的那次立刻写掉（pagehide / 页面隐藏时调）。 */
+  /** 把节流窗口里还没写完的那次立刻写掉（pagehide / 页面隐藏时调）；服务端存档也在同一次补掉。 */
   function chatSnapshotFlush() {
     if (chatSnapshot.timer) { clearTimeout(chatSnapshot.timer); chatSnapshot.timer = null; }
-    if (!chatSnapshot.dirty) return;
-    chatSnapshot.dirty = false;
-    chatSnapshotWrite();
+    if (chatSnapshot.dirty) {
+      chatSnapshot.dirty = false;
+      chatSnapshotWrite();
+    }
+    return chatArchiveFlush();
   }
 
-  /** 清空对话：DOM、内存快照、会话存储一起删（不然清空后又「复活」）。 */
+  /**
+   * 清空对话：DOM、内存快照、会话存储一起删（不然清空后又「复活」）。
+   *
+   * <p>服务端那份由「清空对话」按钮先 POST `/api/chat/reset` 清掉（顺序：**先 reset 再丢本地**），
+   * 这里顺手把**待推**的存档也丢掉（{@link chatArchiveDrop}）—— 清空之后**绝不回推空内容**，
+   * 否则刚清完的服务端那份又被本地的空列表写回去（虽然结果一样，但白写一次、还可能与新消息赛跑）。
+   */
   function chatSnapshotClear() {
     if (chatSnapshot.timer) { clearTimeout(chatSnapshot.timer); chatSnapshot.timer = null; }
     chatSnapshot.scope = chatScopeName();
@@ -2127,8 +2146,108 @@
     chatSnapshot.server = 0;
     chatSnapshot.dirty = false;
     state.chatImageRun = null;         // 快照清了：图集游标指向的那条已经不存在（#chat-log 也空了）
+    chatArchiveDrop();
     try { sessionStorage.removeItem(chatLogKey(chatSnapshot.scope)); }
     catch (error) { console.warn('对话快照未删除（不影响聊天）：' + (error && error.message ? error.message : error)); }
+  }
+
+  // ---------------------------------------------------------------- 对话正文的服务端存档
+  //
+  // 两份东西各管各的：
+  //   · 会话存储（sessionStorage，CHAT_LOG_PREFIX）—— 本地快照，打开页面**秒开**用；
+  //   · 服务端存档（/api/chat/log 读、/api/chat/log/save 写，整份覆盖）—— 换浏览器/清缓存也在，
+  //     打开页面时按条数合并（见 loadChatHistory 里的 chatArchiveMerge）。
+  // 本地每有变化就走 chatSnapshotSchedule() → 防抖 800ms 推一份**完整 entries**（不用增量），
+  // 页面隐藏/卸载时 chatSnapshotFlush() 再补一次。
+  //
+  // 容错：老后端没有这两个接口（404/500）时**一次**失败就把 chatArchive.disabled 置上，
+  // 本次会话退化成「只用本地快照」（和 sessionStorage 不可用时一个路子）：不 toast、不抛异常、
+  // 绝不中断聊天，也不会每个变化都失败一次把控制台刷满。
+
+  /** 服务端存档的防抖时长：本地变化后最多 800ms 推一次（同一次变化只推一份）。 */
+  const CHAT_LOG_PUSH_DELAY = 800;
+  /** 存档状态：`timer` 防抖表、`dirty` 有内容待推、`disabled` 本次会话不再尝试（接口不可用）。 */
+  const chatArchive = { timer: null, dirty: false, disabled: false };
+
+  /** 本地有变化 → 800ms 后推一份（防抖窗口里再变化只刷新时间，不叠加请求）。 */
+  function chatArchiveSchedule() {
+    if (chatArchive.disabled) return;
+    chatArchive.dirty = true;
+    if (chatArchive.timer) return;
+    chatArchive.timer = setTimeout(() => {
+      chatArchive.timer = null;
+      chatArchiveFlush();
+    }, CHAT_LOG_PUSH_DELAY);
+  }
+
+  /** 丢掉待推的那份（清空对话、采用服务端那一份之后用：服务端已经是对的，别回推）。 */
+  function chatArchiveDrop() {
+    if (chatArchive.timer) { clearTimeout(chatArchive.timer); chatArchive.timer = null; }
+    chatArchive.dirty = false;
+  }
+
+  /**
+   * 把待推的那份立刻推掉（pagehide / 页面隐藏时调）。没有待推的就什么都不发。
+   * @returns {Promise<object|null>} 推完了（或没得推）就 resolve，调用方不用等它
+   */
+  function chatArchiveFlush() {
+    if (chatArchive.timer) { clearTimeout(chatArchive.timer); chatArchive.timer = null; }
+    if (!chatArchive.dirty) return Promise.resolve(null);
+    chatArchive.dirty = false;
+    return chatArchiveSend();
+  }
+
+  /**
+   * 整份覆盖写服务端（`POST /api/chat/log/save {scope, entries}`）。
+   *
+   * <p>空内容**不推**：服务端那份由 `/api/chat/reset` 负责清（见 {@link chatSnapshotClear}）。
+   * 失败（老后端 404/500、网络抖动）只记一次 console.warn 并关掉本次会话的存档，
+   * 本地快照与聊天链路完全不受影响。
+   */
+  function chatArchiveSend() {
+    if (chatArchive.disabled) return Promise.resolve(null);
+    const entries = chatSnapshot.entries.slice();
+    if (!entries.length) return Promise.resolve(null);
+    return api('/api/chat/log/save', { body: { scope: scope(), entries } }).catch((error) => {
+      chatArchive.disabled = true;
+      console.warn('对话存档不可用（本次会话只用本地快照，不影响聊天）：' + (error && error.message ? error.message : error));
+      return null;
+    });
+  }
+
+  /**
+   * 读服务端那份正文存档，并和本地快照按**条数**合并（规则冻结）：
+   *   服务端条数 > 本地条数 → 采用服务端那一份（重建 #chat-log 与快照；服务端已是权威，不回推）；
+   *   本地条数 > 服务端条数 → 保留本地这一份，立刻整份推给服务端（含图片与指令回执）；
+   *   条数相等            → 以本地为准，**不推**（省一次写）。
+   *
+   * <p>`chatSnapshot.server`（服务端 LLM 历史条数的基准）不归这里管，原样保留 —— 合并之后
+   * loadChatHistory 还会照旧用 /api/chat/history 补文字，两条线各算各的。
+   * 读不到（老后端 404/500）就静默关掉本次会话的存档，聊天照常、只用本地快照。
+   */
+  async function chatArchiveMerge(log, saved) {
+    if (chatArchive.disabled || !log) return;
+    let list;
+    try {
+      const payload = await api('/api/chat/log', { body: { scope: scope() } });
+      list = (Array.isArray(payload.entries) ? payload.entries : []).map(chatEntryClean).filter(Boolean);
+    } catch (error) {
+      chatArchive.disabled = true;
+      console.warn('对话存档不可用（本次会话只用本地快照，不影响聊天）：' + (error && error.message ? error.message : error));
+      return;
+    }
+    if (list.length > chatSnapshot.entries.length) {
+      // 采用服务端那一份：重建快照与 #chat-log；滚动位置照 chatScrollRestore 的老规矩恢复。
+      chatSnapshot.entries = chatSnapshotTrim(list);
+      state.chatImageRun = null;                 // 整块重建之前丢掉图集游标：旧节点马上就没了
+      log.innerHTML = '';
+      chatSnapshot.entries.forEach((entry) => chatEntryAppend(entry));
+      chatSnapshotWrite();                       // 只重写本地这份；服务端已经是它，不用回推
+      chatArchiveDrop();
+      chatScrollRestore(log, saved);
+      return;
+    }
+    if (chatSnapshot.entries.length > list.length) chatArchiveSend();   // 本地更全：整份推给服务端
   }
 
   /**
@@ -2284,15 +2403,17 @@
   }
 
   /**
-   * 打开对话页：先把**上次渲染过的内容**（指令回执的文字与图片都在里面）从会话存储里铺回来，
-   * 再拉服务端历史，只补「比本地基准多出来的那一段」。
+   * 打开页面（右栏在**每一条路由**的页面里都有，所以每个栏目都会调它）：
+   * 先把**上次渲染过的内容**（指令回执的文字与图片都在里面）从会话存储里铺回来（秒开），
+   * 再用服务端那份正文存档按条数合并（见 {@link chatArchiveMerge}），
+   * 最后拉服务端 LLM 历史，只补「比本地基准多出来的那一段」。
    *
    * <p>服务端历史里只有文字，图片与指令回执都不在里面 —— 只按它渲染，
    * 切一下栏目回来回执文字与图片就全没了（这就是这个函数以前的样子）。
    */
   async function loadChatHistory() {
     const log = $('chat-log');
-    if (!log) return;                           // 只有对话页面有消息区
+    if (!log) return;                           // 极端情况：宿主里没有右栏（`#chat-log`）：什么都不做
     // 切换会话回来时接回原来的滚动位置（按 scope 各记一份，互不污染）。
     const saved = chatScrollRead();
     // 1) 先铺上次的快照：文字、指令回执、图片都在，顺序也照旧。
@@ -2307,6 +2428,10 @@
     state.chatImageRun = null;                  // 重建 #chat-log 之前丢掉游标：旧节点马上就没了
     log.innerHTML = '';
     chatSnapshot.entries.forEach((entry) => chatEntryAppend(entry));
+    // 1.5) 服务端正文存档（/api/chat/log）：本地这份已经秒开在上面了，这里按条数合并
+    //      （服务端更多就采用服务端并重建，#chat-log 的滚动位置由收尾那次 chatScrollRestore 恢复；
+    //        本地更多就把本地整份推上去；一样多以本地为准不推）。
+    await chatArchiveMerge(log, saved);
     // 2) 再拉服务端历史，只追加比基准多出来的那部分。
     try {
       const history = await api('/api/chat/history', { body: { scope: scope() } });
@@ -2752,10 +2877,39 @@
     return [...buckets.values()];
   }
 
-  /** 一条样式的分类 key：新后端直接给 categoryKey；缺了就按分类名回查，再不行用 name:<分类名> 兜住。 */
+  /**
+   * 「未分类」的显示名。手动分类名正好叫它时，只在**下拉/摘要**里并进 none 那一项；
+   * 分组（styleBuckets）与拖拽（styleAlreadyInBucket / bucketCategoryValue）语义一个字不改。
+   */
+  const UNCATEGORIZED = '未分类';
+
+  /**
+   * 手动分类名撞上同名自动组时该并进哪个 key：后端收到的是**分类名**，把样式拖到 LoRA/栈 组头上
+   * 发出去的就是那个组的显示名，后端于是存成 `manual:<显示名>` —— 前端按名字把它并回那个自动组，
+   * 不然列表里会出现两个同名分组、行还被拆开。
+   * 排除 none（未分类）：它代表"没有手动分类"，手动分类名恰好叫「未分类」不该被它吃掉
+   * （下拉/摘要那一侧的并归在 categoryBucketKey 里单独显式处理）；
+   * 也排除其它 manual，免得手动组之间互相吞并。
+   */
+  function autoBucketKeyByName(name) {
+    const wanted = String(name || '');
+    if (!wanted || wanted === UNCATEGORIZED) return '';
+    const hit = styleCategories.find((entry) => entry.kind !== 'manual' && entry.kind !== 'none' && entry.name === wanted);
+    return hit ? hit.key : '';
+  }
+
+  /**
+   * 一条样式的分类 key：新后端直接给 categoryKey，但**手动 key（manual:/name:）先按名字并进同名自动组**；
+   * 没有同名自动组时才用它自己的 key。缺 key 就按分类名回查，再不行用 name:<分类名> 兜住。
+   */
   function styleCategoryKey(item) {
-    const key = item && item.categoryKey;
-    if (typeof key === 'string' && key) return key;
+    const raw = item && typeof item.categoryKey === 'string' ? item.categoryKey : '';
+    const manualish = !raw || raw.startsWith('manual:') || raw.startsWith('name:');
+    if (manualish) {
+      const auto = autoBucketKeyByName(styleCategory(item));
+      if (auto) return auto;
+    }
+    if (raw) return raw;
     const name = styleCategory(item);
     const known = styleCategories.find((entry) => entry.name === name);
     return known ? known.key : 'name:' + name;
@@ -2824,6 +2978,7 @@
 
   function renderStyles(data) {
     if (!data) return;
+    ensureCoverPicker();          // 保存样式的封面选择器（动态建，index.html 不动）
     lastStyles = data;
     $('style-loaded').textContent = '载入即替换，之后 prompt 由你自己改';
     $('style-pageselected').textContent = '样式库 ' + (data.library ?? (data.styles || []).length) + ' 个（只属于机器人，与 WebUI 的样式互不影响）';
@@ -2832,7 +2987,8 @@
     if (groups.length) $('style-pageselected').textContent += '；底模：' + groups.join('、');
     styleCategories = normalizeCategories(data);
     // 分类多了（一个 LoRA 一类）会很长：只列前几个，其余折成「等 N 类」。
-    const categories = styleCategories.map((entry) => entry.name + ' ' + entry.count);
+    // 用合并后的清单：`manual:<同名>` 已并进自动组，摘要行里也不会出现两个同名分类。
+    const categories = mergedCategories().map((entry) => entry.name + ' ' + entry.count);
     if (categories.length) {
       const head = categories.slice(0, 8).join('、');
       $('style-pageselected').textContent += '；分类：' + head + (categories.length > 8 ? ' …（共 ' + categories.length + ' 类）' : '');
@@ -2842,7 +2998,9 @@
     const select = $('style-category-filter');
     const only = select ? select.value : '';
     const items = (data.styles || []).filter((item) => {
-      if (only && styleCategoryKey(item) !== only) return false;
+      // 分类筛选比的是**下拉里那个归组 key**（styleFilterKey），不是分组用的 styleCategoryKey：
+      // `manual:未分类` 在下拉里并进了「未分类」那一项，选它时这一行就该跟着出来。
+      if (only && styleFilterKey(item) !== only) return false;
       if (!filter) return true;
       return item.name.toLowerCase().includes(filter)
         || styleCategory(item).toLowerCase().includes(filter)
@@ -2856,11 +3014,71 @@
   }
 
   /**
+   * 这条分类清单项是不是"手动分类"：看 key 前缀最稳 —— 后端漏给 kind 时，名字叫「未分类」的手动项
+   * 会被 normalizeCategories 按名字误判成 none，只有 key（manual:/name:）能把它认出来。
+   */
+  function manualCategoryEntry(entry) {
+    const key = String((entry && entry.key) || '');
+    return !key || String((entry && entry.kind) || '') === 'manual' || key.startsWith('manual:') || key.startsWith('name:');
+  }
+
+  /** 恒返回的「未分类」组（none）的 key：手动项不算（否则会自己并到自己身上）。没有就是空串。 */
+  function noneBucketKey() {
+    const none = styleCategories.find((entry) => entry.kind === 'none' && !manualCategoryEntry(entry));
+    return none ? String(none.key || '') : '';
+  }
+
+  /**
+   * 分类清单里的一项该归到哪个组：
+   *  - 手动分类名撞上同名**自动组**（lora:/stack:…）→ 并进那个组（与 styleCategoryKey 同一套规则）；
+   *  - 手动分类名正好叫「未分类」→ 并进 none 那一项（条数相加）。**这只影响下拉与摘要**：
+   *    styleCategoryKey() 一个字没改，所以 `manual:未分类` 还是它自己的分组 key、拖拽语义也不变。
+   */
+  function categoryBucketKey(entry) {
+    const key = String((entry && entry.key) || '');
+    const name = String((entry && entry.name) || '');
+    if (manualCategoryEntry(entry)) {
+      // 显式按名字判，别把 autoBucketKeyByName 的"没有同名自动组"（空串）当成"并进 none"的信号。
+      if (name === UNCATEGORIZED) return noneBucketKey() || key || ('name:' + name);
+      const auto = autoBucketKeyByName(name);
+      if (auto) return auto;
+    }
+    return key || ('name:' + name);
+  }
+
+  /**
+   * 一条样式在**筛选下拉**里算哪一类：下拉的归组 key 的"条目版"，只服务筛选。
+   * 分组与拖拽仍然走 styleCategoryKey()（一个字没改）；这样选「未分类（1）」时那一行真的筛得出来，
+   * 不会出现"下拉写着 1 条、点下去一条都没有"。
+   */
+  function styleFilterKey(item) {
+    if (styleCategory(item) === UNCATEGORIZED) return noneBucketKey() || styleCategoryKey(item);
+    return styleCategoryKey(item);
+  }
+
+  /**
+   * 分类清单按"归组 key"合并：`manual:<同名>` 并进同名自动组、`manual:未分类` 并进 none 项、条数相加。
+   * 筛选下拉按它建，免得出现两个同名分类、选到手动那条还一条都筛不出来（分组与组头计数走 styleBuckets）。
+   */
+  function mergedCategories() {
+    const merged = new Map();
+    styleCategories.forEach((entry) => {
+      const key = categoryBucketKey(entry);
+      const at = merged.get(key);
+      if (at) { at.count += entry.count; return; }
+      merged.set(key, { key, name: entry.name, kind: entry.kind, count: entry.count });
+    });
+    return [...merged.values()];
+  }
+
+  /**
    * 分类筛选下拉 + 改分类的候选（datalist）：保留当前选择，选项顺序与组头一致。
-   * 下拉的 value 用分类 key（同名不同类不会串），显示文字用分类名；改分类的候选仍发分类名（接口要的是名字，不能改）。
+   * 下拉的 value 用**归组 key**（同名不同类不会串，`manual:<同名>` 已并进自动组），显示文字用分类名；
+   * 改分类的候选仍发分类名（接口要的是名字，不能改）。
    */
   function fillCategoryFilter() {
-    const signature = styleCategories.map((entry) => entry.key + ':' + entry.name + ':' + entry.count).join('|');
+    const merged = mergedCategories();
+    const signature = merged.map((entry) => entry.key + ':' + entry.name + ':' + entry.count).join('|');
     if (signature === categorySignature) return;      // 筛选框里打字时不必反复重建下拉
     categorySignature = signature;
     const select = $('style-category-filter');
@@ -2868,13 +3086,13 @@
       const current = select.value;
       select.innerHTML = '';
       select.appendChild(new Option('全部分类', ''));
-      styleCategories.forEach((entry) => select.appendChild(new Option(entry.name + '（' + entry.count + '）', entry.key)));
+      merged.forEach((entry) => select.appendChild(new Option(entry.name + '（' + entry.count + '）', entry.key)));
       select.value = [...select.options].some((option) => option.value === current) ? current : '';
     }
     const datalist = $('style-category-options');
     if (datalist) {
       datalist.innerHTML = '';
-      styleCategories.forEach((entry) => datalist.appendChild(new Option(entry.name, entry.name)));
+      merged.forEach((entry) => datalist.appendChild(new Option(entry.name, entry.name)));
     }
   }
 
@@ -2905,8 +3123,12 @@
       const holder = el('li', 'cat-group');
       holder.dataset.key = bucket.key;
       holder.dataset.name = bucket.name;
-      holder.appendChild(groupHead(bucket, holder));
+      const head = groupHead(bucket, holder);
+      holder.appendChild(head);
       const rows = el('ul', 'list group-rows');
+      // 放置目标：组头（含「未分类」组）+ 这一组的行列表区域；高亮打在整组 li.cat-group 上。
+      wireDropTarget(head, holder, bucket);
+      wireDropTarget(rows, holder, bucket);
       bucket.items.forEach((item) => {
         let row = styleRows.get(item.name);
         if (row && row.dataset.categoryKey !== styleCategoryKey(item)) { row.remove(); styleRows.delete(item.name); row = null; }
@@ -2930,6 +3152,9 @@
     head.setAttribute('role', 'button');
     head.setAttribute('tabindex', '0');
     head.setAttribute('aria-expanded', 'true');
+    head.dataset.categoryKey = bucket.key;        // 拖拽放下时要用的组信息：分类 key / 分类名 / 类型
+    head.dataset.categoryName = bucket.name;
+    head.dataset.categoryKind = bucket.kind || '';
     head.appendChild(el('span', 'group-arrow', '▾'));
     head.appendChild(el('span', 'group-name', bucket.name + '（' + bucket.items.length + '）'));
     head.appendChild(el('span', 'tag' + (bucket.lora ? ' on' : ''), groupKindText(bucket)));
@@ -2951,23 +3176,125 @@
     return '手动分类';
   }
 
+  // ---------------------------------------------------------- 拖拽换分类（原生 HTML5 DnD，不引第三方库）
+
+  /** 正在拖的样式名：dataTransfer 有些环境读不到（也可能被别的拖拽源占着），模块变量做兜底。 */
+  let draggingStyle = '';
+  /** 当前高亮的放置目标（整组 li.cat-group），同一时刻最多一个。 */
+  let styleDropTarget = null;
+  /** 拖过之后浏览器可能补一个 click：捕获阶段吃掉它，下一次 mousedown 再解锁（不用定时器）。 */
+  let styleDragClickGuard = false;
+
+  /** 从事件里取被拖的样式名：优先 dataTransfer，读不到就用模块变量。 */
+  function styleDragName(event) {
+    const transfer = event && event.dataTransfer;
+    let carried = '';
+    try { carried = transfer && typeof transfer.getData === 'function' ? String(transfer.getData('text/plain') || '') : ''; }
+    catch (error) { carried = ''; }
+    return carried || draggingStyle;
+  }
+
+  /** dragstart：记名字、写 dataTransfer、给行加半透明；同时竖起 click 抑制标记。 */
+  function startStyleDrag(event, li) {
+    const name = (li && li.dataset.name) || '';
+    if (!name) return;
+    draggingStyle = name;
+    styleDragClickGuard = true;
+    if (li && li.classList) li.classList.add('is-dragging');
+    const transfer = event && event.dataTransfer;
+    if (!transfer) return;
+    try { transfer.setData('text/plain', name); } catch (error) { /* 写不进去就靠模块变量 */ }
+    try { transfer.effectAllowed = 'move'; } catch (error) { /* 只读属性，写不动就算了 */ }
+  }
+
+  /** dragend / 放下之后：清掉"正在拖"和高亮，并把被拖行的半透明去掉。 */
+  function endStyleDrag(source) {
+    draggingStyle = '';
+    clearDropTarget();
+    if (source && source.classList) source.classList.remove('is-dragging');
+  }
+
+  function highlightDropTarget(node) {
+    if (styleDropTarget === node) return;
+    clearDropTarget();
+    styleDropTarget = node;
+    if (node && node.classList) node.classList.add('is-drop-target');
+  }
+
+  function clearDropTarget() {
+    if (styleDropTarget && styleDropTarget.classList) styleDropTarget.classList.remove('is-drop-target');
+    styleDropTarget = null;
+  }
+
+  /**
+   * 一个放置目标：分类组头 + 这一组的行列表区域（两处都算，手感宽一点；高亮都打在整组 li.cat-group 上）。
+   * dragleave 只在真正离开这一组时才清高亮——组头↔行之间挪动会一路冒 dragleave，不判就会狂闪。
+   */
+  function wireDropTarget(node, holder, bucket) {
+    node.addEventListener('dragover', (event) => {
+      if (!draggingStyle) return;                      // 拖的不是样式行（拖文件/选中文字），不认
+      if (event.preventDefault) event.preventDefault();
+      const transfer = event.dataTransfer;
+      if (transfer) { try { transfer.dropEffect = 'move'; } catch (error) { /* 只读属性 */ } }
+      highlightDropTarget(holder);
+    });
+    node.addEventListener('dragleave', (event) => {
+      const to = event && event.relatedTarget;
+      if (to && holder.contains && holder.contains(to)) return;
+      if (styleDropTarget === holder) clearDropTarget();
+    });
+    node.addEventListener('drop', (event) => onStyleDrop(event, holder, bucket));
+  }
+
+  /** 这一组对应的分类值：未分类（kind=none，或名字就叫「未分类」）发空串＝回到自动规则。 */
+  function bucketCategoryValue(bucket) {
+    const name = String((bucket && bucket.name) || '');
+    const kind = String((bucket && bucket.kind) || '');
+    return (kind === 'none' || !name || name === '未分类') ? '' : name;
+  }
+
+  /**
+   * 拖到的这组是不是它现在就在的那组：优先比分类 key（同名不同类不串），退化时比分类名。
+   * **手动指到同名自动组**也算"已经在里面"——`styleCategoryKey` 已把 `manual:<同名>` 并进自动组，
+   * 所以拖到那个组头上时 key 相同、直接不发请求。
+   */
+  function styleAlreadyInBucket(source, holder, bucket) {
+    const item = styleItems.get(source);
+    if (!item) return false;
+    const key = (holder && holder.dataset && holder.dataset.key) || '';
+    if (key && key === styleCategoryKey(item)) return true;
+    return styleCategory(item) === String((bucket && bucket.name) || '');
+  }
+
+  /**
+   * 放下：把被拖的样式改到这一组的分类（未分类组发空串）。原地放回不发请求；
+   * 成功/失败后的刷新与提示都交给 editStyles 自己收尾（与列表里其它动作同一条路径）。
+   */
+  function onStyleDrop(event, holder, bucket) {
+    if (event && event.preventDefault) event.preventDefault();
+    const source = styleDragName(event);
+    endStyleDrag(styleRows.get(source) || null);
+    if (!source) return;
+    if (styleAlreadyInBucket(source, holder, bucket)) return;    // 拖回自己已经在的那组：不发请求
+    editStyles('category', source, { category: bucketCategoryValue(bucket) });
+  }
+
   /** 一行样式：按钮都从 dataset 读当前名称/编号，编号前移时不需要重建这一行。 */
   function styleRow(item) {
-    const li = el('li', 'fresh');
+    const li = el('li', 'fresh draggable');
+    li.draggable = true;                     // 整行可拖：拖到分类组头上就换分类（见 startStyleDrag）
+    const handle = el('span', 'drag-handle', '⋮⋮');
+    handle.title = '按住这一行拖到别的分类组头上，就能把它挪过去';
+    li.appendChild(handle);
     li.appendChild(el('span', 'num', '#' + (item.number || '')));
     li.appendChild(previewThumb(item.preview ? stylePreviewUrl(item.name) : '', item.name));
     const name = el('span', 'name');
     name.appendChild(el('span', 'tag on', '样式'));
-    const label = el('span', 'editable', ' ' + item.name);
-    label.title = '点一下直接改名';
-    const startRename = () => {
-      const current = li.dataset.name || item.name;
-      inlineRename(label, current, (next) => { editStyles('rename', current, { newName: next }); }, loadStyles);
-    };
-    label.onclick = startRename;
+    // 名字只读：行内不再改名（要改名去上面的「批量操作」卡片），换分类靠把整行拖到别的组头上。
+    const label = el('span', 'style-name', ' ' + item.name);
     name.appendChild(label);
     name.appendChild(el('div', 'sub', '载入时替换你的个人提示词，之后 prompt 就是你自己的文本'));
-    // 分类徽标（点一下就改）+ 尺寸：展示图样式记的是展示图自己的像素，单独标出来。
+    // 分类徽标（只读，换分类靠拖拽）+ 尺寸：展示图样式记的是展示图自己的像素，单独标出来。
     const meta = el('div', 'sub');
     const chip = categoryChip(item);
     meta.appendChild(chip);
@@ -2995,12 +3322,7 @@
       const noLora = $('style-load-nolora') && $('style-load-nolora').checked;
       editStyles('load', current, { noLora: !!noLora });
     }));
-    const rename = actionButton('改名', startRename, 'ghost');
-    rename.title = '重命名这条样式（只改样式库里的名字，已生成的图片不受影响）';
-    acts.appendChild(rename);
-    const recategorize = actionButton('改分类', () => startCategoryEdit(chip, item), 'ghost');
-    recategorize.title = '改这条样式的分类（可选已有分类，也可以直接输入新的分类名）';
-    acts.appendChild(recategorize);
+    // 「改名」「改分类」两个按钮已删：改名走上面的「批量操作」，换分类靠把整行拖到别的分类组头上。
     acts.appendChild(actionButton('查看原文', () => {
       const current = li.dataset.name || item.name;
       const data = styleItems.get(current) || item;
@@ -3027,49 +3349,27 @@
       loadStyles().catch(() => {});   // 后台对齐一次编号
     }, 'danger'));
     li.appendChild(acts);
+    // 拖拽换分类：dragstart 记名字 + 写 dataTransfer，dragend 清高亮与半透明；
+    // 拖完浏览器偶尔补的那个 click 由 styleDragClickGuard 在捕获阶段吃掉（下一次 mousedown 再解锁）。
+    li.addEventListener('dragstart', (event) => startStyleDrag(event, li));
+    li.addEventListener('dragend', () => endStyleDrag(li));
+    li.addEventListener('mousedown', () => { styleDragClickGuard = false; });
+    li.addEventListener('click', (event) => {
+      if (!styleDragClickGuard) return;
+      if (event.preventDefault) event.preventDefault();
+      if (event.stopPropagation) event.stopPropagation();
+    }, true);
     return li;
   }
 
-  /** 行里的分类徽标：手动设过的实心、按规则自动的描边，点一下就地改。 */
+  /** 行里的分类徽标：手动设过的实心、按规则自动的描边。**只读**——换分类靠把整行拖到别的组头上。 */
   function categoryChip(item) {
     const current = styleCategory(item);
     const chip = el('span', 'tag cat' + (item.categoryAuto ? '' : ' on'), '分类：' + current);
     chip.title = item.categoryAuto
-      ? '按默认规则归类（' + current + '）：点一下手动指定分类'
-      : '手动分类（' + current + '）：点一下改；留空或输入 - 恢复按规则自动分类';
-    chip.onclick = () => startCategoryEdit(chip, item);
+      ? '按默认规则归类（' + current + '）：把这一行拖到别的分类组头上就能改'
+      : '手动分类（' + current + '）：把这一行拖到别的分类组头上就能改；拖到「未分类」恢复按规则自动归类';
     return chip;
-  }
-
-  /**
-   * 就地改分类：输入框 + 已有分类候选（datalist），回车提交、Esc/失焦取消；留空或输入 - 恢复自动分类。
-   * 不弹浏览器的 prompt 框（和改名同一套交互）。
-   */
-  function startCategoryEdit(chip, item) {
-    if (!chip || chip.querySelector('input')) return;
-    const current = chip.textContent;
-    const input = el('input', 'rename-input');
-    input.value = item.categoryAuto ? '' : styleCategory(item);
-    input.placeholder = item.categoryAuto ? '留空＝自动（' + styleCategory(item) + '）' : '分类名（留空＝自动）';
-    input.setAttribute('list', 'style-category-options');
-    input.title = '回车保存；留空或输入 - 恢复按规则自动分类';
-    chip.textContent = '';
-    chip.appendChild(input);
-    input.focus();
-    input.select();
-    let finished = false;
-    const finish = (save) => {
-      if (finished) return;
-      finished = true;
-      const value = input.value.trim();
-      chip.textContent = current;        // 列表随后会按新分类重画这一行，这里先把徽标文字还原
-      if (save) editStyles('category', item.name, { category: value });
-    };
-    input.onkeydown = (event) => {
-      if (event.key === 'Enter') { event.preventDefault(); finish(true); }
-      else if (event.key === 'Escape') { event.preventDefault(); finish(false); }
-    };
-    input.onblur = () => finish(true);
   }
 
   /** 就地改名：把名字变成输入框，回车提交、Esc 取消，不再弹浏览器的 prompt 框。 */
@@ -3105,6 +3405,109 @@
     const button = el('button', cls || null, label);
     button.onclick = handler;
     return button;
+  }
+
+  // ---------------------------------------------------------- 保存样式的封面选择
+
+  /** 封面下拉里最多列几张最近生成的图（「默认」「不设封面」两档永远在）。 */
+  const STYLE_COVER_RECENT = 8;
+
+  /** 藏起小预览（顺手把 src 摘掉，免得浏览器留着坏图重试）。 */
+  function hideCoverPreview() {
+    const preview = $('style-cover-preview');
+    if (!preview) return;
+    preview.hidden = true;
+    preview.removeAttribute('src');
+  }
+
+  /**
+   * 封面控件是**动态创建**的（index.html 不动）：插在「保存样式」按钮前面，同一个 .row 里。
+   * 三档取值：`''`＝默认（后端取最近一次生成图）、`'-'`＝不设封面、其它＝/api/images 给的相对路径。
+   */
+  function ensureCoverPicker() {
+    const save = $('style-save');
+    if (!save || !save.parentNode) return $('style-cover');
+    const existing = $('style-cover');
+    if (existing) return existing;
+    const box = el('div', 'cover-pick');
+    box.id = 'style-cover-pick';
+    const select = el('select');
+    select.id = 'style-cover';
+    select.title = '保存/覆盖时用哪张图做样式封面';
+    select.appendChild(new Option('默认（最近一次生成图）', ''));
+    select.appendChild(new Option('不设封面', '-'));
+    select.onchange = () => {
+      const value = styleCoverValue();
+      const preview = $('style-cover-preview');
+      if (!preview) return;
+      if (!value || value === '-') { hideCoverPreview(); return; }   // 默认/不设两档等保存成功后再说
+      preview.hidden = false;
+      preview.src = imageUrl(value);                                  // 选了具体图就先给她看一眼
+    };
+    const preview = el('img', 'cover-preview');
+    preview.id = 'style-cover-preview';
+    preview.alt = '封面预览';
+    preview.hidden = true;
+    preview.onerror = () => hideCoverPreview();                       // 取不到就藏起来，不弹错、不留坏图
+    box.appendChild(select);
+    box.appendChild(preview);
+    box.appendChild(el('span', 'muted cover-hint', '封面：默认用最近一次生成的图片'));
+    save.parentNode.insertBefore(box, save);
+    return select;
+  }
+
+  /** 下拉当前的选择（控件不在就按「默认」处理，body 里发空串）。 */
+  function styleCoverValue() {
+    const select = $('style-cover');
+    return select ? String(select.value || '') : '';
+  }
+
+  /** 拉最近几张生成图填进下拉：顺序照后端给的「新 → 旧」；选中项还在就留着，不在就回「默认」。 */
+  async function refreshCoverOptions() {
+    const select = ensureCoverPicker();
+    if (!select) return null;
+    const data = await api('/api/images', { body: { limit: STYLE_COVER_RECENT } });
+    const images = ((data && data.images) || []).slice(0, STYLE_COVER_RECENT);
+    const keep = String(select.value || '');
+    select.innerHTML = '';
+    select.appendChild(new Option('默认（最近一次生成图）', ''));
+    select.appendChild(new Option('不设封面', '-'));
+    images.forEach((image, index) => {
+      const path = String((image && image.path) || '');
+      if (!path) return;
+      select.appendChild(new Option((index + 1) + '. ' + (image.name || shortName(path)), path));
+    });
+    select.value = [...select.options].some((option) => option.value === keep) ? keep : '';
+    return images;
+  }
+
+  /** 保存成功后把预览换成刚存的封面（加时间戳破缓存）；不设封面或拿不到就藏起来，不报错。 */
+  function updateCoverPreview(name, cover) {
+    const preview = $('style-cover-preview');
+    if (!preview) return;
+    if (!name || cover === '-') { hideCoverPreview(); return; }
+    preview.hidden = false;
+    preview.src = stylePreviewUrl(name) + '&t=' + Date.now();
+  }
+
+  /**
+   * 保存/覆盖共用：封面随 body 一起发（`''` 默认 / `'-'` 不设 / 具体路径）。
+   * 默认档在**点保存这一刻**重新拉一次最近生成图（别用打开面板时的旧值）；后端把空串解析成"最近一次生成图"。
+   */
+  function saveStyle(action) {
+    const box = $('style-save-name');
+    const name = box ? String(box.value || '').trim() : '';
+    if (!name) return;
+    const cover = styleCoverValue();
+    if (!cover) refreshCoverOptions().catch(() => {});
+    const pending = editStyles(action, name, { cover });
+    if (pending && typeof pending.then === 'function') {
+      // 后端还没上线 cover 时，响应里没有这个字段 —— 那就按本地选的档更新预览，不抛错。
+      pending.then((data) => {
+        if (!data) return;                                            // 失败：editStyles 已经提示过，别动预览
+        updateCoverPreview(name, data.cover === undefined ? cover : String(data.cover || ''));
+      }).catch(() => { /* 只是这一步没更新预览，不往外抛 */ });
+    }
   }
 
   // ---------------------------------------------------------------- LoRA
@@ -4477,6 +4880,8 @@
     on('chat-form', 'submit', sendChat);
     on('chat-input', 'keydown', (event) => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); sendChat(event); } });
     on('chat-reset', 'click', async () => {
+      // 顺序很重要：**先** reset（服务端那份正文存档一起清掉），**再**丢本地这份；
+      // chatSnapshotClear() 会把待推的存档一起作废，清空后的空内容绝不回推（服务端不会「复活」）。
       await api('/api/chat/reset', { body: { scope: scope() } });
       $('chat-log').innerHTML = '';
       state.chatImageRun = null;         // 清空对话：图集游标作废（下一次发送重新起一条）
@@ -4550,14 +4955,8 @@
           + '\n\n正向：\n' + (data.positive || '（空）') + '\n\n反向：\n' + (data.negative || '（空）'),
         { text: '这是一份固定模板：载入会把这两段原样写进你个人的提示词。' });
     });
-    on('style-save', 'click', () => {
-      const name = $('style-save-name').value.trim();
-      if (name) editStyles('save', name);
-    });
-    on('style-overwrite', 'click', () => {
-      const name = $('style-save-name').value.trim();
-      if (name) editStyles('overwrite', name);
-    });
+    on('style-save', 'click', () => saveStyle('save'));
+    on('style-overwrite', 'click', () => saveStyle('overwrite'));
     on('style-import', 'click', async () => {
       if (await askConfirm('把 WebUI 里已有的预设样式一次性搬进机器人样式库？\n同名默认跳过，不会覆盖机器人已有的样式。',
           { title: '导入 WebUI 样式', confirmText: '导入' })) {
@@ -4779,16 +5178,23 @@
   /**
    * 加载本栏目要用的数据。页签现在是真链接（每个栏目一个 URL），切栏目＝换页面，
    * 所以这里只按 {@link PAGE} 拉这一栏的接口，不再像以前那样每个页面都把整套数据拉一遍。
+   *
+   * <p>例外：右栏（对话）是外壳的一部分，**每一条路由的页面**都要把历史铺出来，所以
+   * {@link loadChatHistory} 不再挂在 `'chat'` 栏目上，而是每个栏目都调（`'setup'` 除外 —— 见下）。
    */
   async function loadPage() {
     try {
       // Setup 栏目要能在「还没有令牌」的首次配置阶段打开（那些接口对本机免令牌），所以不走 loadStatus。
+      // 也因此**不铺对话历史**：Setup 页还没有令牌，任何令牌接口（/api/chat/log 等）都会 401 并把锁屏弹出来。
       if (PAGE === 'setup') { await loadSetup(); banner(''); return; }
       await loadStatus();                      // 顶栏、健康点、共享状态（约 15ms）
-      if (PAGE === 'chat') await loadChatHistory();
-      else if (PAGE === 'gen') await Promise.all([loadOptions(), loadPresets(), loadForgePresets(), loadImages(), loadTasks()]);
+      await loadChatHistory();                 // 右栏在每一页都铺历史（含服务端正文存档的合并）
+      if (PAGE === 'gen') await Promise.all([loadOptions(), loadPresets(), loadForgePresets(), loadImages(), loadTasks()]);
       else if (PAGE === 'prompt') await loadPrompt();
-      else if (PAGE === 'styles') await loadStyles();
+      else if (PAGE === 'styles') {
+        await loadStyles();
+        refreshCoverOptions().catch(() => {});   // 打开样式面板时拉一次最近生成图（拉不到就只留「默认/不设」两档）
+      }
       else if (PAGE === 'loras') {
         await loadLoras();
         renderCivitai([]);                     // 搜索结果区先给占位（结果由「搜索」按钮填）

@@ -46,7 +46,12 @@ public final class LocalStyles {
     /** 判不出归属栈时的默认分类。 */
     public static final String OTHER_CATEGORY = "未分类";
     /** 分类名的长度上限（回执与网页都按字符数算）。 */
-    public static final int MAX_CATEGORY = 40;
+    /** 分类名的长度上限（回执与网页都按字符数算）。 */
+    /**
+     * 手动分类名的长度上限。**必须容得下最长的 LoRA 分类名**：控制台是把样式行拖到分类组头上来换分类，
+     * 组名就是 LoRA 名（本地见过的 LoRA 名有 60 多字的），上限太小会让"拖进那个分类"直接失败。
+     */
+    public static final int MAX_CATEGORY = 200;
 
     /** 分类种类（{@code /api/styles} 的 kind 与 categorySource 都用这一份词表）。 */
     public static final String KIND_LORA = "lora";

@@ -26,17 +26,25 @@ import java.util.Map;
  * 页面与静态资源：<b>每个栏目一个独立页面</b>。
  *
  * <p>{@code /}、{@code /gen}、{@code /prompt}… 各自返回一份 HTML：公共外壳（顶栏、页签、页脚、
- * 弹窗与查看器）加上<b>只属于该栏目</b>的面板标记，页面上不会出现别的栏目的 DOM，前端也只加载
- * 这个栏目要用的数据（见 {@link WebPages}）。静态文件（app.js / app.css / 图标）仍从 {@code webui/}
- * 目录按需读取、一律 {@code no-store}，改完刷新即可，不用重新打包。
+ * 弹窗与查看器，以及固定在右侧的<b>全局对话栏</b>）加上<b>只属于该栏目</b>的面板标记，左栏里不会出现
+ * 别的栏目的 DOM，前端也只加载这个栏目要用的数据（见 {@link WebPages}）。静态文件（app.js / app.css /
+ * 图标）仍从 {@code webui/} 目录按需读取、一律 {@code no-store}，改完刷新即可，不用重新打包。
  */
 @RestController
 public class WebPageController {
 
-    /** 栏目页：路径 → 面板 id。chat 用根路径，其余一个栏目一个路径。 */
+    /**
+     * 栏目页：路径 → 面板 id。
+     *
+     * <p>对话栏已经全局化（它是外壳的一部分，固定在每个页面的右 1/3，见 {@code webui/index.html}），
+     * 因此它不再是一个栏目、也没有自己的面板 id：首页与 {@code /chat} 都渲染出图页（右侧照样有对话栏）。
+     */
     static final Map<String, String> PAGES = new LinkedHashMap<>();
     static {
-        PAGES.put("/", "chat");
+        PAGES.put("/", "gen");
+        // 旧链接别名：对话以前是首页栏目，收藏/书签里的 /chat 不能 404。
+        // 现在 /chat 与 / 渲染同一页（出图 + 右侧对话栏），对话栏本来就在。
+        PAGES.put("/chat", "gen");
         PAGES.put("/gen", "gen");
         PAGES.put("/prompt", "prompt");
         PAGES.put("/styles", "styles");
@@ -97,7 +105,7 @@ public class WebPageController {
      * <p>注意：这里的路径列表是编译期常量，**新增栏目要同时改这里和上面的 PAGES**
      * （只加 PAGES 会 404：PAGES 负责"路径→面板"，这里负责放行路由）。
      */
-    @RequestMapping(value = {"/", "/gen", "/prompt", "/styles", "/loras", "/functions", "/chatcfg", "/system",
+    @RequestMapping(value = {"/", "/chat", "/gen", "/prompt", "/styles", "/loras", "/functions", "/chatcfg", "/system",
             "/quest", "/setup", "/logs", "/help"}, method = RequestMethod.GET)
     public ResponseEntity<byte[]> page(HttpServletRequest request) {
         return renderPage(request.getRequestURI());
@@ -106,7 +114,8 @@ public class WebPageController {
     private ResponseEntity<byte[]> renderPage(String path) {
         // 容忍尾部斜杠：/quest/ 与 /quest 是同一个页面（任务回执链接以前写成 /quest/#N，落地成 /quest/ 就 404）。
         while (path.length() > 1 && path.endsWith("/")) path = path.substring(0, path.length() - 1);
-        String panel = PAGES.getOrDefault(path, "chat");
+        // 兜底用 gen：不存在的路径走上面的 404 分支，这里只是保证永远不会落到一个不存在的面板名上。
+        String panel = PAGES.getOrDefault(path, "gen");
         try {
             String html = WebPages.render(webRoot, panel);
             return WebJson.bytes(HttpStatus.OK, html.getBytes(StandardCharsets.UTF_8), "text/html; charset=utf-8", "no-store");
@@ -117,7 +126,9 @@ public class WebPageController {
         }
     }
 
-    /** 其它路径：{@code /index.html} 当对话页，其余如实 404（不返回 Boot 默认错误页）。 */
+    /**
+     * 其它路径：{@code /index.html} 当首页（＝出图页，右侧对话栏一直在），其余如实 404（不返回 Boot 默认错误页）。
+     */
     @RequestMapping(value = "/**", method = {RequestMethod.GET, RequestMethod.POST})
     public ResponseEntity<?> fallback(HttpServletRequest request) {
         String path = request.getRequestURI();

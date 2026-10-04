@@ -36,10 +36,13 @@ public class WebApiController {
 
     private final Settings settings;
     private final Bot bot;
+    /** 对话页正文的持久化存档（完整正文：文字 + 图片路径 + 指令回执）；纯文字那份 LLM 历史仍走 chatFile。 */
+    private final ChatLogStore chatLog;
 
     public WebApiController(Settings settings, Bot bot) {
         this.settings = settings;
         this.bot = bot;
+        this.chatLog = new ChatLogStore(settings.root);
     }
 
     @RequestMapping(value = "/api/**", method = {RequestMethod.POST, RequestMethod.GET})
@@ -101,11 +104,17 @@ public class WebApiController {
             }
             case "/api/styles/edit": {
                 requirePost(method);
-                // category 只给 action=category 用（改分类）；其余动作忽略它。
+                // category 只给 action=category 用（改分类）；cover 只给 save/overwrite 用（封面图：
+                // 空串＝默认取最近一次的生成图，- / none / 清除＝本次不设封面）。其余动作忽略这两个字段。
                 return WebJson.ok(bot.webStylesEdit(scope, Json.str(body, "action", ""),
                         Json.str(body, "name", ""), Json.str(body, "newName", ""),
                         Json.bool(body, "overwrite", false), Json.bool(body, "noLora", false),
-                        Json.str(body, "category", "")));
+                        Json.str(body, "category", ""), Json.str(body, "cover", "")));
+            }
+            case "/api/styles/cover": {
+                requirePost(method);
+                // 单独换某条样式的封面（必须是 data/generated 里的图片）。
+                return WebJson.ok(bot.webStyleCover(Json.str(body, "name", ""), Json.str(body, "path", "")));
             }
             case "/api/presets/edit": {
                 requirePost(method);
@@ -187,8 +196,30 @@ public class WebApiController {
                 return WebJson.ok(result);
             }
             case "/api/chat/history": return WebJson.ok(chatHistory(scope));
+            // 对话页正文的持久化存档：控制台打开对话栏读它（服务端为准），有新内容再回写。
+            // 与上面那份只给模型用的纯文字历史（chatHistory）各存各的，互不影响。
+            case "/api/chat/log": {
+                requirePost(method);
+                JsonArray entries = chatLog.load(scope);
+                JsonObject result = new JsonObject();
+                result.add("entries", entries);
+                result.addProperty("count", entries.size());
+                return WebJson.ok(result);
+            }
+            case "/api/chat/log/save": {
+                requirePost(method);
+                JsonElement stored = body.get("entries");
+                if (stored == null || !stored.isJsonArray()) throw new IllegalArgumentException("entries 必须是数组。");
+                chatLog.save(scope, stored.getAsJsonArray());
+                JsonObject result = new JsonObject();
+                result.addProperty("ok", true);
+                result.addProperty("count", chatLog.load(scope).size());
+                return WebJson.ok(result);
+            }
             case "/api/chat/reset": {
                 writeChat(scope, new JsonArray());
+                // 「清空对话」要连服务端那份完整正文一起清，不然刷新页面历史又回来了。
+                chatLog.save(scope, new JsonArray());
                 return WebJson.ok(new JsonObject());
             }
             case "/api/settings": {
