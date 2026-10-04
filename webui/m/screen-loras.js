@@ -13,11 +13,17 @@
  *   · 桌面一行四个常驻按钮（加载/改名/删除/…）；手机一行只留一个「⋯」，四个动作全收进底部 sheet
  *     （触摸目标 ≥44px，不会误触）。
  *   · 桌面「筛选本地 LoRA」是行内输入框 + 整表重画；手机用同一套过滤逻辑，但结果实时重画并显示条数。
- *   · 桌面把「Civitai 搜索/下载」铺成一张大卡片常驻在列表上面；手机折进「下载 LoRA」折叠块，
- *     默认收起，不占列表空间。
- *   · 桌面的下载进度条挂在卡片里；手机同源数据，进度块固定在列表顶部，结束后自动收起来。
+ *   · 桌面把「Civitai 搜索/下载」铺成一张大卡片常驻在列表上面；手机改成**顶部「本地 / Civitai」分段**：
+ *     默认「本地」（列表 + 折叠的下载表单），切到「Civitai」才是搜索框 + 结果列表；两块内容各自保留，
+ *     来回切不丢状态（搜索词、页码、结果都留着）。
+ *   · 桌面的下载进度条挂在卡片里；手机同源数据，进度块固定在**分段之上**（两种模式下都看得见），
+ *     结束后自动收起来。进度卡上比桌面多出的东西：**「暂停 / 继续」「取消」**（取消前二次确认）。
+ *
+ * 新建的两个接口（`/api/lora/cancel`、`/api/lora/pause`、`/api/lora/resume`）**可能还没部署**：
+ * 这里一律"先乐观、撞上 404 再置灰"，并把一句人话写在进度卡下面 —— 不白屏、不弹错误框。
  *
  * 纪律：本文件不写任何用户数据（不改 LoRA 目录、不下载），下载/补图/改名/删除都由用户主动点。
+ * 全程只用 PixikoM 的 sheet/confirm/prompt/toast，**不碰原生 alert/confirm/prompt**（Android WebView 里不可靠）。
  */
 (function () {
   'use strict';
@@ -93,6 +99,33 @@
     'overflow-wrap:anywhere;word-break:break-word;}',
     '.lo-loading{color:#93a4c4;font-size:15px;line-height:1.5;padding:20px 4px;text-align:center;}',
     '.lo-count{font-size:13px;line-height:1.45;color:#93a4c4;padding:0 4px;font-variant-numeric:tabular-nums;}',
+    '/* ── 本地 / Civitai 分段（本轮新增）：分段控件、Civitai 结果卡、进度卡上的控制键 ── */',
+    '.lo-seg{display:flex;gap:6px;background:#131c2e;border:1px solid #1d2942;border-radius:12px;padding:4px;}',
+    '.lo-seg-btn{flex:1;min-height:44px;min-width:44px;padding:0 10px;border:0;border-radius:9px;background:none;',
+    'color:#93a4c4;font-size:15px;font-weight:600;font-family:inherit;cursor:pointer;}',
+    '.lo-seg-btn.lo-on{background:#26324c;color:#e8eefc;}',
+    '.lo-seg-btn:active{color:#5aa2ff;}',
+    /* 分段切换的两块内容：hidden 必须显式吃掉 display（.lo-local 自己是 flex，UA 的 [hidden] 赢不了） */
+    '.lo-local,.lo-civ{display:flex;flex-direction:column;gap:12px;}',
+    '.lo-local[hidden],.lo-civ[hidden],.lo-ctrl[hidden],.lo-stat[hidden]{display:none;}',
+    '.lo-card{display:flex;gap:10px;width:100%;min-height:88px;padding:10px;align-items:flex-start;text-align:left;',
+    'background:#131c2e;border:1px solid #1d2942;border-radius:14px;color:#e8eefc;font-family:inherit;cursor:pointer;}',
+    '.lo-card:active{background:#1a2540;}',
+    '.lo-cthumb{flex:none;width:64px;height:64px;border-radius:10px;overflow:hidden;background:#0b1220;',
+    'display:flex;align-items:center;justify-content:center;border:1px solid #26324c;}',
+    '.lo-cthumb img{width:100%;height:100%;object-fit:cover;display:block;}',
+    '.lo-cmeta{flex:1;min-width:0;display:flex;flex-direction:column;gap:3px;}',
+    '.lo-cname{font-size:15px;line-height:1.5;font-weight:600;overflow-wrap:anywhere;word-break:break-word;}',
+    '.lo-cfacts{font-size:13px;line-height:1.45;color:#93a4c4;overflow-wrap:anywhere;word-break:break-word;}',
+    '.lo-words{font-size:12px;line-height:1.45;color:#7f8fb0;overflow-wrap:anywhere;word-break:break-word;}',
+    '.lo-facts{display:flex;flex-wrap:wrap;gap:6px;}',
+    '.lo-badge{font-size:12px;line-height:1.45;padding:2px 8px;border-radius:8px;background:#1b2540;color:#93a4c4;',
+    'border:1px solid #2a3a5c;overflow-wrap:anywhere;word-break:break-word;}',
+    '.lo-badge.lo-warn{background:#3a1c22;color:#ff8f8f;border-color:#5c2a30;}',
+    /* 进度卡上的「暂停 / 继续」「取消」：各占一半，触摸目标 ≥44px */
+    '.lo-ctrl{display:flex;gap:8px;margin-top:10px;}',
+    '.lo-ctrl .lo-btn{flex:1;}',
+    '.lo-stat{font-size:13px;line-height:1.45;color:#93a4c4;padding:4px 0 0;overflow-wrap:anywhere;word-break:break-word;}',
     '/* 外壳把 body 设成 user-select:none；输入框必须能选中文本。 */',
     '.lo-search,.lo-input{user-select:text;-webkit-user-select:text;}'
   ].join('');
@@ -104,6 +137,9 @@
     style.textContent = CSS;
     document.head.appendChild(style);
   }
+
+  /** Civitai 封面缩略图的长边（与 `/m/app.js` 的 IMAGE_THUMB_W=320 同档：列表里只要小图）。 */
+  var CIVITAI_THUMB_W = 320;
 
   /* 契约里写了 PixikoM.el / clear / esc / fmtTime / fmtBytes，但核心这一版只挂了
      register/go/current/api/token/scope/toast/sheet/confirm/prompt/imageUrl/openViewer/
@@ -144,7 +180,22 @@
       inflight: null,
       progress: null,      // pollWhileVisible 的 stop()
       hideTimer: null,     // 下载结束后把进度块收起来用的定时器
-      nodes: {}
+      nodes: {},
+      /* —— 分段与 Civitai 搜索 —— */
+      mode: 'local',       // 'local' | 'civitai'
+      civQuery: '',        // 上一次的搜索词（翻页时不用重敲）
+      civPage: 0,          // 已经画出来的最后一页（0 = 还没搜过）
+      civHasMore: false,
+      civItems: [],        // 已加载的结果（翻页是 append，不是 replace）
+      civBusy: false,      // 搜索在飞
+      civSeq: 0,
+      civStatus: null,     // /api/civitai/status 的读数
+      civStatusLoaded: false,
+      scrollBound: false,
+      /* —— 进度卡上的控制键 —— */
+      lastData: null,
+      lastRunning: false,
+      ctrlDead: false      // 撞上 404：这个机器人还没有暂停/取消接口
     };
 
     /* ---------- DOM 骨架 ---------- */
@@ -160,18 +211,14 @@
       state.nodes.status = status;
       wrap.appendChild(status);
 
-      var progress = el('div', 'lo-progress');
-      progress.hidden = true;
-      var track = el('div', 'lo-track');
-      var fill = el('div', 'lo-fill');
-      track.appendChild(fill);
-      progress.appendChild(track);
-      var ptext = el('div', 'lo-ptext', '');
-      progress.appendChild(ptext);
-      state.nodes.progress = progress;
-      state.nodes.fill = fill;
-      state.nodes.ptext = ptext;
-      wrap.appendChild(progress);
+      // 进度卡在分段**之上**：两种模式下都看得见（Civitai 里点了下载，不会一切分段就"进度消失了"）。
+      wrap.appendChild(buildProgress());
+
+      // 「本地 / Civitai」分段：默认本地，切过去不重画、不丢状态。
+      wrap.appendChild(buildSegments());
+
+      var local = el('div', 'lo-local');
+      state.nodes.local = local;
 
       // 搜索 + 刷新
       var toolbar = el('div', 'lo-toolbar');
@@ -188,22 +235,131 @@
       reload.addEventListener('click', function () { load(); });
       toolbar.appendChild(search);
       toolbar.appendChild(reload);
-      wrap.appendChild(toolbar);
+      local.appendChild(toolbar);
       state.nodes.search = search;
       state.nodes.reload = reload;
 
       // 下载 LoRA（折叠）
-      wrap.appendChild(buildDownload());
+      local.appendChild(buildDownload());
 
       var count = el('div', 'lo-count');
       state.nodes.count = count;
-      wrap.appendChild(count);
+      local.appendChild(count);
 
       var groups = el('div', 'lo-groups');
       state.nodes.groups = groups;
-      wrap.appendChild(groups);
+      local.appendChild(groups);
+
+      wrap.appendChild(local);
+      wrap.appendChild(buildCivitai());
 
       return wrap;
+    }
+
+    /**
+     * 进度卡（M3 原样 + 两个控制键）。
+     *
+     * <p>「暂停 / 继续」「取消」是**动态建**在这张卡里的 —— `webui/m/app.css` 与 `index.html` 都不归本文件改。
+     * 取消按钮点下去先过 `PixikoM.confirm`（说明会删掉已下载的部分），确认了才发请求。
+     */
+    function buildProgress() {
+      var progress = el('div', 'lo-progress');
+      progress.hidden = true;
+      var track = el('div', 'lo-track');
+      var fill = el('div', 'lo-fill');
+      track.appendChild(fill);
+      progress.appendChild(track);
+      var ptext = el('div', 'lo-ptext', '');
+      progress.appendChild(ptext);
+      var hint = el('div', 'lo-stat lo-ctrlhint');
+      hint.hidden = true;
+      progress.appendChild(hint);
+
+      var ctrl = el('div', 'lo-ctrl');
+      ctrl.hidden = true;
+      var pause = el('button', 'lo-btn lo-ghost lo-pause', '暂停');
+      pause.type = 'button';
+      pause.addEventListener('click', function () { togglePause(pause); });
+      var cancel = el('button', 'lo-btn lo-danger lo-cancel', '取消');
+      cancel.type = 'button';
+      cancel.addEventListener('click', function () { cancelDownload(cancel); });
+      ctrl.appendChild(pause);
+      ctrl.appendChild(cancel);
+      progress.appendChild(ctrl);
+
+      state.nodes.progress = progress;
+      state.nodes.fill = fill;
+      state.nodes.ptext = ptext;
+      state.nodes.ctrl = ctrl;
+      state.nodes.pause = pause;
+      state.nodes.cancel = cancel;
+      state.nodes.ctrlHint = hint;
+      return progress;
+    }
+
+    /** 顶部「本地 / Civitai」两个分段（等价于 tab，两个按钮各自 ≥44px）。 */
+    function buildSegments() {
+      var seg = el('div', 'lo-seg');
+      seg.setAttribute('role', 'tablist');
+      var buttons = {};
+      [['local', '本地'], ['civitai', 'Civitai']].forEach(function (pair) {
+        var button = el('button', 'lo-seg-btn', pair[1]);
+        button.type = 'button';
+        button.setAttribute('role', 'tab');
+        button.setAttribute('data-seg', pair[0]);
+        button.addEventListener('click', function () { setMode(pair[0]); });
+        seg.appendChild(button);
+        buttons[pair[0]] = button;
+      });
+      state.nodes.seg = seg;
+      state.nodes.segButtons = buttons;
+      return seg;
+    }
+
+    /** Civitai 一块：搜索行 + Cookie 提示 + 结果区 + 「加载更多」。 */
+    function buildCivitai() {
+      var box = el('div', 'lo-civ');
+      box.hidden = true;
+      state.nodes.civ = box;
+
+      var toolbar = el('div', 'lo-toolbar');
+      var input = el('input', 'lo-search lo-civq');
+      input.type = 'search';
+      input.placeholder = '搜索 Civitai 上的 LoRA';
+      input.setAttribute('autocomplete', 'off');
+      input.addEventListener('keydown', function (event) {
+        if (event.key === 'Enter') { event.preventDefault(); searchCivitai(1); }
+      });
+      var go = el('button', 'lo-btn lo-civgo', '搜索');
+      go.type = 'button';
+      go.addEventListener('click', function () { searchCivitai(1); });
+      toolbar.appendChild(input);
+      toolbar.appendChild(go);
+      box.appendChild(toolbar);
+      state.nodes.civQuery = input;
+      state.nodes.civGo = go;
+
+      var stat = el('div', 'lo-stat lo-civstat');
+      box.appendChild(stat);
+      state.nodes.civStat = stat;
+
+      // 翻页/条数另起一行：**不能和上面的 Cookie 提示共用一个节点** —— 一搜索就把提示冲掉了
+      // （第一版就是这么写的，探针 H2 当场抓到：搜完之后 Cookie 提示不见了）。
+      var pageLine = el('div', 'lo-stat lo-civpage');
+      box.appendChild(pageLine);
+      state.nodes.civPageLine = pageLine;
+
+      var list = el('div', 'lo-civlist');
+      box.appendChild(list);
+      state.nodes.civList = list;
+
+      var more = el('button', 'lo-btn lo-ghost lo-civmore', '加载更多');
+      more.type = 'button';
+      more.hidden = true;
+      more.addEventListener('click', function () { searchCivitai(state.civPage + 1); });
+      box.appendChild(more);
+      state.nodes.civMore = more;
+      return box;
     }
 
     function buildDownload() {
@@ -255,6 +411,347 @@
       return block;
     }
 
+    /* ---------- 分段：本地 / Civitai ---------- */
+
+    /**
+     * 切分段。**不重画**任何一块：两块 DOM 都在，只是 `hidden` 切换 —— 搜索词、页码、结果、
+     * 本地筛选都留着，来回切是"零成本"的（也顺带保证 hash 路由与返回键完全不受影响）。
+     */
+    function setMode(mode) {
+      state.mode = mode === 'civitai' ? 'civitai' : 'local';
+      var nodes = state.nodes;
+      if (nodes.local) nodes.local.hidden = state.mode !== 'local';
+      if (nodes.civ) nodes.civ.hidden = state.mode !== 'civitai';
+      if (nodes.segButtons) {
+        for (var key in nodes.segButtons) {
+          if (!Object.prototype.hasOwnProperty.call(nodes.segButtons, key)) continue;
+          var on = key === state.mode;
+          nodes.segButtons[key].classList.toggle('lo-on', on);
+          nodes.segButtons[key].setAttribute('aria-selected', on ? 'true' : 'false');
+        }
+      }
+      if (state.mode === 'civitai') {
+        bindCivScroll();
+        loadCivitaiStatus();
+      }
+    }
+
+    /** 滚到底自动加载下一页：监听的是滚动容器 `#m-main`（不是 window）。 */
+    function bindCivScroll() {
+      if (state.scrollBound) return;
+      var scroller = document.getElementById('m-main');
+      if (!scroller) return;
+      state.scrollBound = true;
+      state.scroller = scroller;
+      scroller.addEventListener('scroll', onCivScroll, { passive: true });
+    }
+
+    function onCivScroll() {
+      if (state.mode !== 'civitai' || !state.civHasMore || state.civBusy) return;
+      var box = state.scroller;
+      if (!box) return;
+      if (box.scrollTop + box.clientHeight >= box.scrollHeight - 200) searchCivitai(state.civPage + 1);
+    }
+
+    /* ---------- Civitai：Cookie 状态 ---------- */
+
+    /**
+     * `/api/civitai/status` → 一句人话。
+     *
+     * <p>**host 用服务端给的**（线上是镜像站 civitai.red），不在界面里写死 civitai.com：
+     * 写死就会把人指到一个实际没在用的域名上。没配 Cookie 时按契约提示"成人内容可能不可见"，
+     * 并指路桌面控制台 —— 手机端不做 Cookie 输入（服务端没有这个接口，不自己造）。
+     */
+    function loadCivitaiStatus(force) {
+      if (state.civStatusLoaded && !force) { renderCivitaiStatus(); return; }
+      state.civStatusLoaded = true;
+      P.api('/api/civitai/status', { body: {} }).then(function (data) {
+        state.civStatus = data || {};
+        renderCivitaiStatus();
+      }, function (error) {
+        state.civStatus = { error: message(error) };
+        renderCivitaiStatus();
+      });
+    }
+
+    function renderCivitaiStatus() {
+      var node = state.nodes.civStat;
+      if (!node) return;
+      var data = state.civStatus || {};
+      if (data.error) {
+        node.textContent = '读不到 Civitai 状态：' + data.error;
+        return;
+      }
+      var host = String(data.host || '').replace(/^https?:\/\//, '') || 'civitai.com';
+      if (data.hasCookie) {
+        node.textContent = 'Civitai：' + host + '（已保存登录 Cookie'
+          + (data.cookieHint ? ' ' + data.cookieHint : '') + '）。搜索与下载都走这个站。';
+        return;
+      }
+      node.textContent = 'Civitai：' + host + '。未保存登录 Cookie：搜索与下载会用 '
+        + host + '，成人内容与部分模型不可见。到桌面控制台「LoRA → Civitai 账号」粘一条登录链接即可，'
+        + '手机端不填 Cookie。';
+    }
+
+    /* ---------- Civitai：搜索 ---------- */
+
+    /**
+     * 搜一页。`page > 1` 是**追加**（滚动到底 /「加载更多」），`page === 1` 是重来。
+     *
+     * <p>响应契约（照桌面控制台 `searchCivitai` 的调用抄）：
+     * `{query, results[{number,name,baseModel,url,cover,downloads,sizeKb,nsfw,trainedWords[]}],
+     *   count, page, pageSize, hasMore, totalPages, totalPagesKnown, nextPage, note?}`
+     */
+    function searchCivitai(page) {
+      if (state.civBusy) return null;
+      var input = state.nodes.civQuery;
+      var typed = input ? String(input.value || '').trim() : '';
+      var query = typed || state.civQuery;
+      if (!query) { P.toast('请先填搜索词'); return null; }
+      var wanted = page > 0 ? page : 1;
+      state.civQuery = query;
+      state.civBusy = true;
+      var seq = ++state.civSeq;
+      if (state.nodes.civGo) state.nodes.civGo.disabled = true;
+      if (wanted === 1) renderCivitai([], { loading: '正在搜索 Civitai：' + query + '…' });
+      else if (state.nodes.civMore) state.nodes.civMore.textContent = '正在加载…';
+
+      return P.api('/api/civitai/search', { body: { query: query, page: wanted, scope: P.scope() } })
+        .then(function (data) {
+          if (seq !== state.civSeq) return data;
+          state.civBusy = false;
+          if (state.nodes.civGo) state.nodes.civGo.disabled = false;
+          data = data || {};
+          state.civQuery = data.query || query;
+          state.civPage = Number(data.page) || wanted;
+          state.civHasMore = !!data.hasMore;
+          var items = Array.isArray(data.results) ? data.results : [];
+          if (state.civPage > 1) state.civItems = state.civItems.concat(items);
+          else state.civItems = items.slice();
+          renderCivitai(state.civItems, items.length ? {} : {
+            empty: data.note || ('没有找到「' + state.civQuery + '」的 LoRA。')
+          });
+          renderCivitaiPager(data, items.length);
+          return data;
+        }, function (error) {
+          if (seq !== state.civSeq) return null;
+          state.civBusy = false;
+          if (state.nodes.civGo) state.nodes.civGo.disabled = false;
+          if (state.nodes.civMore) state.nodes.civMore.textContent = '加载更多';
+          renderCivitai([], { empty: '搜索失败：' + message(error) + hintForCivitai(error) });
+          if (state.nodes.civMore) state.nodes.civMore.hidden = true;
+          return null;
+        });
+    }
+
+    /** 接口没就绪（404 / 未知接口）时补一句人话，别让人以为是网络问题。 */
+    function hintForCivitai(error) {
+      return isMissingEndpoint(error) ? '\n（这个机器人还没有 Civitai 搜索接口，需要更新服务端。）' : '';
+    }
+
+    /** 结果区三态：加载中 / 空（或错误）/ 卡片列表。 */
+    function renderCivitai(items, options) {
+      var box = state.nodes.civList;
+      if (!box) return;
+      clear(box);
+      var list = Array.isArray(items) ? items : [];
+      if (options && options.loading) {
+        box.appendChild(el('div', 'lo-loading', options.loading));
+        return;
+      }
+      if (!list.length) {
+        box.appendChild(el('div', 'lo-empty', (options && options.empty) || '输入关键词后点「搜索」。'));
+        return;
+      }
+      list.forEach(function (item) { box.appendChild(civitaiCard(item)); });
+    }
+
+    function renderCivitaiPager(data, added) {
+      var more = state.nodes.civMore;
+      var line = state.nodes.civPageLine;
+      if (more) {
+        more.hidden = !state.civHasMore;
+        more.textContent = '加载更多';
+        // 已经加载过一页但这次是空的（翻过头）：按钮收起来更诚实。
+        if (!added) more.hidden = true;
+      }
+      if (line && state.civQuery) {
+        var total = Number(data && data.totalPages);
+        var page = Number((data && data.page) || state.civPage) || 1;
+        var pages = (data && data.totalPagesKnown && total > 0) ? ' / 共 ' + total + ' 页' : '';
+        line.textContent = '「' + state.civQuery + '」第 ' + page + ' 页' + pages + '：本页 '
+          + (Number(data && data.count) || 0) + ' 项，已加载 ' + state.civItems.length + ' 项'
+          + (state.civHasMore ? '（还有下一页，滚到底会自动加载）' : '（已经是最后一页）');
+      }
+    }
+
+    /**
+     * 一张结果卡。封面走 `/api/civitai/thumb`（机器人带登录态代取，浏览器不直连图床），
+     * 并**在 Civitai 图床地址上带缩略图参数 `width`** —— 和 `/m` 其它图片"列表只拿小图"的约定一致
+     * （`PixikoM.imageUrl` 对 `/api/...` 是直通的，所以这里自己拼绝对路径）。
+     */
+    function civitaiCard(item) {
+      var card = el('button', 'lo-card lo-civcard');
+      card.type = 'button';
+      card.setAttribute('data-civ-name', String(item.name || ''));
+
+      var thumb = el('div', 'lo-cthumb');
+      var cover = civitaiThumbUrl(item.cover);
+      if (cover) {
+        var image = document.createElement('img');
+        image.alt = '';
+        image.loading = 'lazy';
+        image.src = cover;
+        image.addEventListener('error', function () {
+          clear(thumb);
+          thumb.appendChild(el('span', 'lo-nocover', '无图'));
+        });
+        thumb.appendChild(image);
+      } else {
+        thumb.appendChild(el('span', 'lo-nocover', '无图'));
+      }
+      card.appendChild(thumb);
+
+      var meta = el('div', 'lo-cmeta');
+      meta.appendChild(el('div', 'lo-cname', String(item.name || '未命名')));
+      var facts = [];
+      if (item.baseModel) facts.push(String(item.baseModel));
+      facts.push('LoRA');
+      var downloads = Number(item.downloads);
+      if (isFinite(downloads) && downloads > 0) facts.push('下载 ' + formatCount(downloads));
+      var kb = Number(item.sizeKb);
+      if (isFinite(kb) && kb > 0) facts.push(fmtBytes(kb * 1024));
+      meta.appendChild(el('div', 'lo-cfacts', facts.join(' · ')));
+      if (item.nsfw) {
+        var badges = el('div', 'lo-facts');
+        badges.appendChild(el('span', 'lo-badge lo-warn', 'NSFW'));
+        meta.appendChild(badges);
+      }
+      var words = Array.isArray(item.trainedWords) ? item.trainedWords : [];
+      if (words.length) {
+        meta.appendChild(el('div', 'lo-words', '触发词：' + clip(words.join('、'), 90)));
+      }
+      card.appendChild(meta);
+
+      card.addEventListener('click', function () { civitaiDetail(item); });
+      return card;
+    }
+
+    /**
+     * 点结果卡 → 详情 sheet（沿用 `/m` 既有的底部 sheet 语言，不自己造二级屏）。
+     *
+     * <p>合同里没有作者字段，所以这里只给：底模 / 类型 / 文件大小 / NSFW / 触发词。
+     * 每一行点一下就是"复制这一行的值"（信息行也不是死按钮）。
+     */
+    function civitaiDetail(item) {
+      var words = Array.isArray(item.trainedWords) ? item.trainedWords : [];
+      var kb = Number(item.sizeKb);
+      var downloads = Number(item.downloads);
+      var host = String((state.civStatus && state.civStatus.host) || 'civitai.com').replace(/^https?:\/\//, '');
+      var items = [
+        {
+          text: '触发词', sub: words.length ? clip(words.join('、'), 120) : '这个模型没给触发词',
+          onSelect: function () {
+            if (!words.length) { P.toast('这个模型没给触发词'); return; }
+            copyText(words.join('、'), '已复制触发词');
+          }
+        },
+        {
+          text: '底模 / 类型', sub: (item.baseModel || '底模未标注') + ' · LoRA',
+          onSelect: function () { copyText(String(item.baseModel || ''), '已复制底模'); }
+        },
+        {
+          text: '文件大小 / 分级',
+          sub: (isFinite(kb) && kb > 0 ? '约 ' + fmtBytes(kb * 1024) : '大小未知')
+            + ' · ' + (item.nsfw ? '标注为 NSFW' : '未标注为 NSFW')
+            + (isFinite(downloads) && downloads > 0 ? ' · 下载 ' + formatCount(downloads) + '次' : ''),
+          onSelect: function () { copyText(String(item.name || ''), '已复制模型名'); }
+        },
+        {
+          text: '下载到本机', sub: '权重 1.0（要别的权重下载后在列表里调）',
+          onSelect: function () { downloadItem(item); }
+        },
+        {
+          text: '打开模型页', sub: host + ' 上的模型页（在浏览器里打开）',
+          onSelect: function () {
+            if (!item.url) { P.toast('这条结果没有模型页地址'); return; }
+            try { window.open(String(item.url), '_blank', 'noopener'); }
+            catch (error) { P.toast(String(item.url)); }
+          }
+        }
+      ];
+      P.sheet({ title: String(item.name || '未命名') + (item.nsfw ? '（NSFW）' : ''), items: items });
+    }
+
+    /** 从结果卡直接下载：和桌面控制台一致，权重固定 1.0，发完立刻挂进度轮询。 */
+    function downloadItem(item) {
+      if (!item || !item.url) { P.toast('这条结果没有下载地址'); return; }
+      P.api('/api/lora/download', { body: { url: String(item.url), weight: 1, scope: P.scope() } })
+        .then(function (started) {
+          if (started && started.quest) P.toast('任务 #' + started.quest + ' 已下达');
+          else P.toast('已开始下载：' + String(item.name || ''));
+          watchProgress(true);
+        }, function (error) { P.toast('下载失败：' + message(error)); });
+    }
+
+    /**
+     * 封面代取地址。
+     *
+     * <p>`width` 只加在 **Civitai 图床**的地址上（机器人那侧原样转发这次 GET，图床按参数回缩略图）；
+     * 不是图床的地址一个参数都不动，免得把别人的签名 URL 搞坏。
+     */
+    function civitaiThumbUrl(cover) {
+      var url = String(cover == null ? '' : cover).trim();
+      if (!url || !/^https?:\/\//i.test(url)) return '';
+      var host = '';
+      try { host = new URL(url).hostname.toLowerCase(); } catch (error) { return ''; }
+      if (!/(^|\.)civitai\.(com|red|net)$/.test(host)) return '';
+      var thumb = url + (url.indexOf('?') >= 0 ? '&' : '?') + 'width=' + CIVITAI_THUMB_W;
+      var token = typeof P.token === 'function' ? P.token() : '';
+      return location.origin + '/api/civitai/thumb?url=' + encodeURIComponent(thumb)
+        + (token ? '&token=' + encodeURIComponent(token) : '');
+    }
+
+    /** 复制一段文本（触发词 / 底模）：优先 clipboard，退回 execCommand，失败就把原文 toast 出来。 */
+    function copyText(text, okText) {
+      var value = String(text == null ? '' : text);
+      if (!value) { P.toast('这条没有可复制的内容'); return; }
+      var fallback = function () {
+        try {
+          var area = document.createElement('textarea');
+          area.value = value;
+          area.setAttribute('readonly', 'readonly');
+          area.style.position = 'fixed';
+          area.style.opacity = '0';
+          document.body.appendChild(area);
+          area.select();
+          var ok = document.execCommand('copy');
+          document.body.removeChild(area);
+          P.toast(ok ? (okText || '已复制') : value);
+        } catch (error) { P.toast(value); }
+      };
+      try {
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+          navigator.clipboard.writeText(value).then(function () { P.toast(okText || '已复制'); }, fallback);
+          return;
+        }
+      } catch (error) { /* 落到兜底 */ }
+      fallback();
+    }
+
+    /** 长文本截断（卡片/详情用；触发词可能是一整段示例 prompt）。 */
+    function clip(text, max) {
+      var value = String(text == null ? '' : text);
+      return value.length > max ? value.slice(0, max) + '…' : value;
+    }
+
+    /** 下载数按中文习惯加千分位（1,234,567 → 123.5 万）。 */
+    function formatCount(value) {
+      var number = Number(value) || 0;
+      if (number >= 10000) return (number / 10000).toFixed(1).replace(/\.0$/, '') + ' 万';
+      return number.toLocaleString('zh-CN');
+    }
+
     /* ---------- 状态 ---------- */
 
     function message(error) {
@@ -283,7 +780,7 @@
         renderGroups();
         // 进屏时后台可能正在下载（甚至刚刷新过页面）：接着把进度条挂上，不然进度就"看不见了"。
         var download = state.data.download;
-        if (download && (download.busy || download.downloading)) watchProgress(false);
+        if (jobActive(download)) watchProgress(false);
         return data;
       }, function (error) {
         state.inflight = null;
@@ -591,6 +1088,25 @@
     }
 
     /**
+     * 这次任务算不算"正在进行"。
+     *
+     * <p>新字段 `active` **有就用它**（服务端代理本轮追加的），没有就退回 M3 就在用的
+     * `busy || downloading` —— 老机器人上照样跑，新机器人上语义更准（暂停时 active 仍是 true）。
+     */
+    function jobActive(data) {
+      if (!data) return false;
+      if (typeof data.active === 'boolean') return data.active;
+      return !!(data.busy || data.downloading);
+    }
+
+    /** 服务端还没这个接口：404（`error.status`）或回一段"未知接口"。 */
+    function isMissingEndpoint(error) {
+      if (!error) return false;
+      if (Number(error.status) === 404) return true;
+      return /未知接口|未知的接口|HTTP 404|not found/i.test(String(error.message || ''));
+    }
+
+    /**
      * 轮询 /api/lora/progress 画进度：有 metered/percent 就画百分比，没有（正在读模型信息/正在加载）
      * 就退回不确定态——不能显示成 0%，那会让人以为卡死了。
      */
@@ -600,7 +1116,7 @@
       state.progress = P.pollWhileVisible(function () {
         return P.api('/api/lora/progress', { body: { scope: P.scope() } }).then(function (data) {
           misses = 0;
-          var running = !!(data && (data.busy || data.downloading));
+          var running = jobActive(data);
           if (running) { seenRunning = true; grace = 0; }
           else if (!seenRunning && ++grace <= 20) return data;   // 空窗期：先不画也不收手
           paint(data, running);
@@ -620,6 +1136,7 @@
       var box = state.nodes.progress;
       if (state.hideTimer) { clearTimeout(state.hideTimer); state.hideTimer = null; }
       var hasPercent = data && typeof data.percent === 'number' && isFinite(data.percent);
+      var paused = !!(data && data.paused);
       box.hidden = false;
       if (hasPercent) {
         box.classList.remove('lo-indeterminate');
@@ -632,18 +1149,110 @@
       if (hasPercent) {
         line = data.percent.toFixed(1) + '%';
         if (data.done && data.total) line += '（' + fmtBytes(data.done) + ' / ' + fmtBytes(data.total) + '）';
+        if (data.speed > 0) line += ' · ' + fmtBytes(data.speed) + '/s';
+        if (data.etaSeconds > 0) line += ' · 剩余约 ' + Math.round(data.etaSeconds) + ' 秒';
       }
       var stage = String((data && (data.stage || data.status)) || (running ? '正在处理…' : '已结束')).trim();
       var first = stage.split('\n')[0].trim();
-      state.nodes.ptext.textContent = (line ? line + ' · ' : '') + first;
+      state.nodes.ptext.textContent = (line ? line + ' · ' : '') + first + (paused ? '（已暂停）' : '');
+      renderControls(data, running);
       // 结束后让最后一行（"下载成功…"）停一会儿再收起来，别一闪而过（和桌面版同一套脾气）。
       if (!running) {
         state.hideTimer = setTimeout(function () {
           state.hideTimer = null;
           box.hidden = true;
           box.classList.remove('lo-indeterminate');
+          if (state.nodes.ctrl) state.nodes.ctrl.hidden = true;
         }, 6000);
       }
+    }
+
+    /**
+     * 「暂停 / 继续」「取消」的可用性。三档：
+     *   ① 撞过 404（`state.ctrlDead`）→ 全部置灰 + 一句人话（服务端没就绪）；
+     *   ② 这次 progress 里**一个新字段都没有**（老机器人）→ 同样置灰，但话不一样（不敢乱猜状态）；
+     *   ③ 有新字段 → 按钮可用；`cancellable === false` 时单独灰掉「取消」（例如取消会拖很久）。
+     * 只有真的在跑（`running`）时才露出来，跑完就收 —— 免得用户对着一个"能点的取消"发呆。
+     */
+    function renderControls(data, running) {
+      var nodes = state.nodes;
+      if (!nodes.ctrl) return;
+      state.lastData = data;
+      state.lastRunning = !!running;
+      if (!running) {
+        nodes.ctrl.hidden = true;
+        if (nodes.ctrlHint) nodes.ctrlHint.hidden = true;
+        return;
+      }
+      nodes.ctrl.hidden = false;
+      var paused = !!(data && data.paused);
+      nodes.pause.textContent = paused ? '继续' : '暂停';
+      var knowsFields = !!(data && (typeof data.active === 'boolean' || typeof data.paused === 'boolean'
+        || typeof data.cancellable === 'boolean'));
+      var usable = !state.ctrlDead && knowsFields;
+      nodes.pause.disabled = !usable;
+      nodes.cancel.disabled = !usable || (data && data.cancellable === false);
+      var hint = '';
+      if (state.ctrlDead) hint = '这个机器人还没有暂停/取消接口（HTTP 404），按钮先置灰；下载照常跑完。';
+      else if (!knowsFields) hint = '当前进度里没有「暂停/取消」信息（服务端未就绪），按钮先置灰。';
+      else if (data && data.cancellable === false) hint = '这次任务报的是不可取消（可能已经写进 LoRA 目录了）。';
+      if (nodes.ctrlHint) {
+        nodes.ctrlHint.hidden = !hint;
+        nodes.ctrlHint.textContent = hint;
+      }
+    }
+
+    /** 暂停 / 继续：发 `/api/lora/pause` 或 `/api/lora/resume`，两边都回一份 progress 形状的 JSON。 */
+    function togglePause(button) {
+      var paused = !!(state.lastData && state.lastData.paused);
+      var path = paused ? '/api/lora/resume' : '/api/lora/pause';
+      button.disabled = true;
+      P.api(path, { body: { scope: P.scope() } }).then(function (data) {
+        button.disabled = false;
+        if (data && data.message) P.toast(String(data.message));
+        else P.toast(paused ? '已继续下载' : '已暂停下载');
+        if (data) paint(data, jobActive(data));
+        watchProgress(true);
+      }, function (error) {
+        button.disabled = false;
+        controlFailed(error, paused ? '继续' : '暂停');
+      });
+    }
+
+    /**
+     * 取消：**先二次确认**（说清楚"会删掉已下载的部分"），确认了才发请求。
+     * 取消前一个字节都不发 —— 和本地删除/清空是同一套纪律。
+     */
+    function cancelDownload(button) {
+      P.confirm({
+        title: '取消这次下载',
+        text: '取消这次 LoRA 下载？已经下载的部分会被删掉，下次要从头再来。',
+        ok: '取消下载',
+        danger: true
+      }).then(function (yes) {
+        if (!yes) return;
+        button.disabled = true;
+        P.api('/api/lora/cancel', { body: { scope: P.scope() } }).then(function (data) {
+          button.disabled = false;
+          P.toast(data && data.message ? String(data.message) : '已取消下载');
+          if (data) paint(data, jobActive(data));
+          watchProgress(true);
+        }, function (error) {
+          button.disabled = false;
+          controlFailed(error, '取消');
+        });
+      });
+    }
+
+    /** 控制键失败：404 就置灰 + 说人话（不弹错误框、不白屏），别的错照实报。 */
+    function controlFailed(error, what) {
+      if (isMissingEndpoint(error)) {
+        state.ctrlDead = true;
+        P.toast('这个机器人还没有「' + what + '」接口（服务端未就绪），按钮先置灰。');
+        renderControls(state.lastData, state.lastRunning);
+        return;
+      }
+      P.toast(what + '失败：' + message(error));
     }
 
     /* ---------- 契约入口 ---------- */
@@ -675,14 +1284,26 @@
         state.seq++;
         state.inflight = null;
         state.filter = '';
+        state.civSeq++;                       // 作废在飞的搜索
+        state.civBusy = false;
+        state.civItems = [];
+        state.civPage = 0;
+        state.civHasMore = false;
+        state.scrollBound = false;
+        state.ctrlDead = false;               // 重新挂载时再给服务端一次机会
         if (state.hideTimer) { clearTimeout(state.hideTimer); state.hideTimer = null; }
         clear(root);
         root.appendChild(build());
+        setMode('local');                     // 默认本地：M3 的老路径一点没动
         load();
         takeOverRoute(root);
       },
       refresh: function () {
         if (!state.mounted) return null;
+        if (state.mode === 'civitai' && state.civQuery) {
+          loadCivitaiStatus(true);            // 刷新时把 Cookie 状态也重读一遍（这是实时读数，不该缓存）
+          return searchCivitai(1);
+        }
         return load();
       }
     };

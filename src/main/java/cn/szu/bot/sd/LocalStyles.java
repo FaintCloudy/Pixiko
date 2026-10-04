@@ -159,12 +159,20 @@ public final class LocalStyles {
             double distilled = Json.decimal(model, "distilledCfg", 0);
             if (distilled > 0) parts.add("Shift " + trim(distilled));
             int width = Json.num(model, "width", 0), height = Json.num(model, "height", 0);
-            if (width > 0 && height > 0) parts.add(width + "×" + height + sizeNote(Json.str(model, "sizeSource", "")));
+            if (width > 0 && height > 0) parts.add(width + "×" + height + sizeNote(model));
             return String.join("，", parts);
         }
-        /** 尺寸来源的中文括号注（展示图尺寸跟预设/当前设置不是一回事，要看得出来）。 */
-        private static String sizeNote(String source) {
-            return "preview".equals(source) ? "（展示图尺寸）" : "";
+        /**
+         * 尺寸来源的中文括号注。展示图样式记的 {@code width/height} 是**换算后的生成尺寸**，
+         * 展示图自己的像素在 {@code previewWidth/previewHeight}：两者不同就说清是缩放来的，
+         * 免得把"能出图的尺寸"当成"这张图本身多大"。
+         */
+        private static String sizeNote(JsonObject model) {
+            int width = Json.num(model, "width", 0), height = Json.num(model, "height", 0);
+            int previewWidth = Json.num(model, "previewWidth", 0), previewHeight = Json.num(model, "previewHeight", 0);
+            if (previewWidth > 0 && previewHeight > 0 && (previewWidth != width || previewHeight != height))
+                return "（由展示图 " + previewWidth + "×" + previewHeight + " 同比例缩放）";
+            return "preview".equals(Json.str(model, "sizeSource", "")) ? "（展示图尺寸）" : "";
         }
         /** 底模来源的中文括号注（与 SdClient.BaseModel.sourceLabel 同一个词表）。 */
         private static String sourceNote(String source) {
@@ -489,11 +497,44 @@ public final class LocalStyles {
         String kept = at >= 0 ? styles.get(at).category() : (category == null ? "" : categoryName(category));
         Style saved = new Style(at >= 0 ? styles.get(at).name() : requested,
                 Objects.requireNonNullElse(positive, ""), Objects.requireNonNullElse(negative, ""), Instant.now().toString(),
-                model == null ? null : model.deepCopy(), kept);
+                generationModel(model), kept);
         // 覆盖时保持原位置：编号与批量操作（#6-#9）依靠列表顺序稳定，改名/覆盖不该把后面的项整体挪位。
         if (at >= 0) styles.set(at, saved); else styles.add(saved);
         write(styles);
         return saved;
+    }
+
+    /**
+     * 落盘前把样式记着的尺寸换成**能直接用于生成的**尺寸（展示图样式的关键一处）。
+     *
+     * <p>展示图的真实像素动辄 2400×3744，以前原样记进 {@code width/height}，载入时被
+     * {@code validateSize}（64–2048 且 8 的倍数）拒掉，于是"尺寸不跟着样式走"：
+     * <ul>
+     *   <li>{@code width/height}：按 {@link SdClient#fitGenerationSize} 换算后的**生成尺寸**
+     *       （本来就合法的值原样保留，用户特意设的 768×512 不会被改）；</li>
+     *   <li>{@code previewWidth/previewHeight}：展示图的**真实像素**，只在 {@code sizeSource=preview}
+     *       时记，留给界面显示"这张图本身多大"；{@code sizeSource} 一个字都不动，界面照旧标「展示图尺寸」。</li>
+     * </ul>
+     * 老文件里已经存了超限值也不用迁移：载入侧会现算（{@code SdClient.applyModelParams}）。
+     *
+     * @return 一份新的 model（不改调用方对象）；model 为 null 时返回 null
+     */
+    public static JsonObject generationModel(JsonObject model) {
+        if (model == null) return null;
+        JsonObject result = model.deepCopy();
+        int width = Json.num(result, "width", 0), height = Json.num(result, "height", 0);
+        if (width <= 0 || height <= 0) return result;
+        int[] fitted = SdClient.fitGenerationSize(width, height);
+        if (fitted == null) return result;
+        if ("preview".equals(Json.str(result, "sizeSource", ""))) {
+            // 真实像素只记一次：覆盖保存时进来的 model 可能已经带着换算过的值，
+            // 不能被生成尺寸顶替掉（那样界面上就再也看不到展示图本身多大了）。
+            if (!result.has("previewWidth")) result.addProperty("previewWidth", width);
+            if (!result.has("previewHeight")) result.addProperty("previewHeight", height);
+        }
+        result.addProperty("width", fitted[0]);
+        result.addProperty("height", fitted[1]);
+        return result;
     }
 
     /**

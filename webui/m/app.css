@@ -507,13 +507,33 @@ input[type="range"]::-webkit-slider-thumb {
   color: var(--muted); font-size: var(--m-fs-sm); line-height: var(--m-lh-sm);
 }
 .bubble.imgs { padding: 6px; }
-.bubble .bubble-imgs { display: grid; grid-template-columns: repeat(2, 1fr); gap: 6px; margin-top: 6px; }
-.bubble .bubble-imgs.one { grid-template-columns: 1fr; }
-.bubble .bubble-imgs img {
-  width: 100%; height: 120px; object-fit: cover; border-radius: 10px;
-  background: #0e1727; display: block;
+/*
+ * 气泡图集（修「图片在预览界面被异常压缩」）：
+ *   旧写法 `.bubble .bubble-imgs img{height:120px;object-fit:cover}` 是"先把图片钉进一个固定高度
+ *   的盒子、再裁掉两头"——横图只剩中间一条，竖图被挤成小方块。现在改成**按图片自身宽高比**：
+ *     · 每张图外面套一层 `.bubble-img` 当宽高比宿主，CSS 先给中性 `aspect-ratio: 4 / 3` 占位
+ *       （图没到之前不塌成 0 高、不跳版）；
+ *     · 图片 load 之后由 app.js 的 `applyNaturalRatio()` 把宿主的 aspect-ratio 换成
+ *       `naturalWidth / naturalHeight`；
+ *     · `<img>` 只写 `width:100%; height:auto`，渲染宽高比 == 原图宽高比：不变形、不裁切、
+ *       也不留 `object-fit:contain` 那种一大片空白。
+ *   单图那条旧的 `.one img{max-height:46vh;object-fit:contain}` 一并删掉：max-height 配上
+ *   `width:100%` 要么把图压变形（fill）要么两侧留空（contain），按真实比例显示之后不再需要它。
+ */
+.bubble .bubble-imgs {
+  display: grid; grid-template-columns: repeat(2, 1fr); grid-auto-rows: auto;
+  gap: 6px; margin-top: 6px; align-items: start;
 }
-.bubble .bubble-imgs.one img { height: auto; max-height: 46vh; object-fit: contain; }
+.bubble .bubble-imgs.one { grid-template-columns: 1fr; }
+.bubble .bubble-imgs .bubble-img {
+  aspect-ratio: 4 / 3;                  /* 中性初始比例：图片 load 后由 JS 换成真实比例 */
+  border-radius: 10px;
+  overflow: hidden;
+  background: #0e1727;
+}
+.bubble .bubble-imgs img {
+  width: 100%; height: auto; object-fit: fill; display: block;
+}
 .bubble .bubble-text + .bubble-imgs { margin-top: 8px; }
 
 .composer {
@@ -574,19 +594,34 @@ input[type="range"]::-webkit-slider-thumb {
 .queue-row .stepper-btn { width: var(--m-tap); height: var(--m-tap); font-size: 16px; }
 
 /*
- * 图集网格：每格 = 一个正方形缩略图（.thumb，带边框/圆角/裁切） + 底下一行文件名（.cap）。
+ * 图集网格：每格 = 一个缩略图（.thumb，带边框/圆角） + 底下一行文件名（.cap）。
  *
  * 为什么把 .cap 从"压在图上的一行省略号"改成"图底下的可换行整行"：
  *   原来 .cap 是 position:absolute + nowrap + ellipsis，30 个字符的文件名只看得见前 8 个，
- *   用户要的就是"完整看到"。文件名现在完整换行显示；缩略图本身仍然 1:1 铺满格子。
+ *   用户要的就是"完整看到"。文件名现在完整换行显示。
  *   （.thumb 是后加的一层：.cell 自己不再画边框和裁切，否则 .cap 会被 overflow:hidden 吃掉。）
+ *
+ * 缩略图尺寸（修「图片在预览界面被异常压缩」）：
+ *   旧写法是 `.thumb{aspect-ratio:1/1}` + `img{width:100%;height:100%;object-fit:cover}`：
+ *   1:1 的方块 + 缩略图模式 = 横图的两头被裁掉，最近生成/图集里"看起来被挤成一条"。
+ *   现在**格子跟着图片自己的宽高比走**：
+ *     · .thumb 先给中性 `aspect-ratio: 4 / 3` —— 图还没解码时格子就占住位置，不塌成 0 高再跳；
+ *     · 图片 load 之后 app.js 的 `applyNaturalRatio()` 把 .thumb 的 aspect-ratio 换成
+ *       `naturalWidth / naturalHeight`；
+ *     · `<img>` 只写 `width:100%;height:auto`（`object-fit:fill` 只是把默认值写明），
+ *       于是渲染宽高比 == 原图宽高比：不变形、不裁切、也不留 contain 那种一大片空白。
+ *   列数由 3 列改成 2 列（`repeat(2, 1fr)`）：不同高度的图各按各的比例撑开行高，
+ *   `grid-auto-rows: auto` 让每一行都跟着这一行里最高的那张图，排出来是照片墙而不是方格阵。
  */
 .grid-imgs {
   display: grid;
-  grid-template-columns: repeat(3, 1fr);
+  grid-template-columns: repeat(2, 1fr);
+  grid-auto-rows: auto;
   gap: 8px;
   align-items: start;
 }
+/* 只有一张图时别留半边空列（单图 = 整行宽度，跟单图气泡 .bubble-imgs.one 一个道理） */
+.grid-imgs:has(> .cell:only-child) { grid-template-columns: 1fr; }
 .grid-imgs .cell {
   position: relative;
   display: flex;
@@ -596,7 +631,7 @@ input[type="range"]::-webkit-slider-thumb {
 }
 .grid-imgs .cell .thumb {
   position: relative;
-  aspect-ratio: 1 / 1;
+  aspect-ratio: 4 / 3;                 /* 中性初始比例：图片 load 后由 JS 换成真实比例 */
   border-radius: 10px;
   overflow: hidden;
   background: #0e1727;
@@ -604,7 +639,31 @@ input[type="range"]::-webkit-slider-thumb {
   display: grid;
   place-items: center;
 }
-.grid-imgs .cell .thumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.grid-imgs .cell .thumb img { width: 100%; height: auto; object-fit: fill; display: block; }
+/*
+ * 缩略图还没到时的**明确加载态**（骨架灰条 + 一行「加载中…」）。
+ *
+ * 为什么要有它：出图屏每 1.5 秒轮询一次，刚生成的那张图缩略图服务端要现解码（1216×1664 → 320px），
+ * 往往要等一两拍才回来。这段时间里如果只画一个深色空盒子，用户看到的就是"冒出一个幽灵占位、很快
+ * 又消失"。现在盒子**已经有正确的 aspect-ratio**（来自生成参数或这张图已知的真实比例，见 app.js
+ * 的 genPresetRatio），并且带 `loading`（骨架 + 「加载中…」），一眼就是"在加载"而不是"空了"。
+ *
+ * 用 `::after` 而不是插一个 `<div>`：不产生任何真实 DOM 节点，也就没有"占位节点出现又消失"。
+ */
+.grid-imgs .cell .thumb.loading {
+  background-image: linear-gradient(100deg, #0e1727 35%, #1c2941 50%, #0e1727 65%);
+  background-size: 220% 100%;
+  animation: thumb-sk 1.3s linear infinite;
+}
+.grid-imgs .cell .thumb.loading::after {
+  content: '加载中…';
+  position: absolute; left: 0; right: 0; bottom: 6px;
+  text-align: center; font-size: var(--m-fs-xs); color: var(--muted);
+  pointer-events: none;
+}
+/* 连生成参数都拿不到时的兜底：中性 4:3（= .thumb 默认值）+ 同样的明确加载态 */
+.grid-imgs .cell .thumb.ratio-unknown { aspect-ratio: 4 / 3; }
+@keyframes thumb-sk { 0% { background-position: 130% 0; } 100% { background-position: -30% 0; } }
 .grid-imgs .cell.tap .thumb:active { transform: scale(.97); }
 .grid-imgs .cell.tap:active { transform: none; }
 .grid-imgs .cell .ring { width: 34px; height: 34px; }

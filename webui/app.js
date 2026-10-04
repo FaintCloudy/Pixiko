@@ -200,7 +200,8 @@
    *  <ul>
    *    <li>`full`  **原图**地址：`src` 是带 `&w=` 的缩略图时必传，查看器与 `<a href>`（中键/右键复制地址）用它；</li>
    *    <li>`eager` 首屏可见的那几张用 `loading="eager"`（其余仍 lazy：屏幕外的不一进来就拉）；</li>
-   *    <li>`size`  已知的原图尺寸 `[w,h]`，只用于加载前占位（见下面 width/height 属性那两行）。</li>
+   *    <li>`size`  已知的**真实原图尺寸** `[w,h]`：从第一帧起就按这个比例占位（见 {@link imageHintSync}）。
+   *                不知道就别传 —— 那时会用中性比例 + `.is-loading` 骨架（明确的加载态，不是空盒子）。</li>
    *  </ul>
    */
   function imageNode(src, caption, className, list, index, options) {
@@ -211,14 +212,11 @@
     link.href = link._viewerFull;
     link.title = (caption ? caption + ' · ' : '') + '点击放大（Esc 关闭）';
     const img = el('img', className || null);
-    // 图没到时的占位比例：`width`/`height` **属性**在加载前给一个比例，加载后浏览器按真实比例画（不变形）。
-    // 实测（320px 容器）：不设 → 2×2 再突然撑到 186；设 1664×1216 → 先占 297×186，加载完横图 297×186、
-    // 竖图 297×433，都不变形。注意**不能**用内联 aspect-ratio：那会把已加载的 1024×640 压成 4:3（297×223）。
-    if (String(src).indexOf('/api/image?') === 0) {
-      const hint = Array.isArray(opts.size) ? opts.size : [IMAGE_HINT_WIDTH, IMAGE_HINT_HEIGHT];
-      img.width = hint[0];
-      img.height = hint[1];
-    }
+    // 图没到时的占位比例走 **CSS `aspect-ratio`**（见 imageHintSync），**不再给 `width`/`height` 属性**：
+    // 属性的 `height="1216"` 在「列宽被 CSS 定死、又没有 CSS 高度」的格子里会被当成实际像素高度用
+    // （实测 `#image-grid .grid img`：380×520 的图被画成 141×1216，偏差 -84%），CSS `aspect-ratio` 只会影响
+    // 盒子比例，宽高的最终归属仍在 CSS（`width:100%; height:auto`）。加载完立刻换成真实比例，不留空白也不变形。
+    imageHintSync(img, opts.size);
     img.loading = opts.eager ? 'eager' : 'lazy';
     img.src = src;
     img.alt = caption || '图片';
@@ -250,6 +248,38 @@
       openViewer(link._viewerFull || img.getAttribute('src'), caption, link._viewerList, link._viewerIndex);
     });
     return link;
+  }
+
+  /**
+   * 图片加载前后的**比例占位**，全部走 CSS `aspect-ratio`：
+   * <ul>
+   *   <li>`size` 给了已知的**真实原图尺寸** `[w,h]`（调用方知道这张图一定是什么比例时，
+   *       比如刚生成完的任务）→ 从第一帧起就用真实比例，连"中性占位"这一帧都不要；</li>
+   *   <li>没给 `size` 时：`src` 赋值前 `aspect-ratio: auto`（<img> 在 src 赋值前会被当成 300×150，
+   *       若这时就带上 4/3 会先占一块再回到 300×150，闪一下），开始加载后才给中性比例
+   *       `IMAGE_HINT_RATIO`，并且**贴一个 `.is-loading` 骨架**（有底色 + 流光），
+   *       所以"图还没到"是一个**明确的加载态**，不是一个空盒子；</li>
+   *   <li>`load` 后按 `naturalWidth/naturalHeight` 换成真实比例并摘掉骨架；
+   *       `complete && naturalWidth > 0`（缓存命中）时立刻换，不等事件。</li>
+   * </ul>
+   * 用**内联 `aspect-ratio` 而不是 `width`/`height` 属性**：属性在「列宽定死、没有 CSS 高度」的格子里
+   * 会被当成实际像素高度（实测 380×520 的图被画成 141×1216），内联 `aspect-ratio` 只接管比例，
+   * 宽度仍由 CSS 决定（见 app.css 里 `.grid img` / `.gallery-grid img` 的 `width:100%; height:auto`）。
+   */
+  function imageHintSync(img, size) {
+    if (!img) return;
+    const real = Array.isArray(size) && Number(size[0]) > 0 && Number(size[1]) > 0;
+    const known = real ? Number(size[0]) + ' / ' + Number(size[1]) : '';
+    img.style.aspectRatio = real ? known : (img.getAttribute('src') ? IMAGE_HINT_RATIO : 'auto');
+    if (!real) img.classList.add('is-loading');
+    const setReal = () => {
+      if (!img.naturalWidth || !img.naturalHeight) return;
+      img.style.aspectRatio = img.naturalWidth + ' / ' + img.naturalHeight;
+      img.classList.remove('is-loading');
+    };
+    img.addEventListener('load', setReal);
+    img.addEventListener('error', () => img.classList.remove('is-loading'));
+    if (img.complete) setReal();
   }
 
   // ---------------------------------------------------------------- 同风格确认框
@@ -969,9 +999,11 @@
 
   // ---------------------------------------------------------------- 图集占位格（还没轮到 / 正在生成 / 生成失败）
 
-  /** 图集里的一格：真实缩略图与占位格都包一层 .gallery-tile（CSS 按这一层量出固定方形的一格）。 */
-  function galleryTile(child) {
-    const tile = el('div', 'gallery-tile');
+  /** 图集里的一格：真实缩略图与占位格都包一层 .gallery-tile（CSS 按这一层量出一格）。
+   *  `isPhoto` 为真（格子里是真图）时加 `.is-photo`：那一格的高度**由图片按自身比例撑开**，
+   *  不再钉成正方形，也不会 `object-fit: cover` 裁一半（占位格仍是正方形，见 app.css）。 */
+  function galleryTile(child, isPhoto) {
+    const tile = el('div', 'gallery-tile' + (isPhoto ? ' is-photo' : ''));
     if (child) tile.appendChild(child);
     return tile;
   }
@@ -1874,9 +1906,10 @@
   const THUMB_ROW = 160;
   /** 一个图集里前几格算「首屏」：这几张用 `loading="eager"`，后面的仍交给懒加载。 */
   const EAGER_TILES = 4;
-  /** 图没到时的占位比例（本机出图的常见尺寸 1664×1216 = 4:3）：只影响加载前那一下，加载后按真实比例。 */
-  const IMAGE_HINT_WIDTH = 1664;
-  const IMAGE_HINT_HEIGHT = 1216;
+  /** 图没到时的**中性占位比例**（本机出图的常见尺寸 1664×1216 = 4:3）：只影响加载前那一下，
+   *  加载完由 {@link imageHintSync} 换成 `naturalWidth/naturalHeight` 的真实比例。用 CSS `aspect-ratio`
+   *  表达（上一轮那套 `width`/`height` 属性已删：它们会变成实际像素高度，实测把 380×520 的图撑成 141×1216）。 */
+  const IMAGE_HINT_RATIO = '4 / 3';
 
   /**
    * 服务端 /api/image 只认 `data/generated/…` 的相对路径。存档里实测只有两种形态
@@ -1992,7 +2025,7 @@
           link.classList.add('gallery-thumb');
         }
         link.title = caption + ' · 点击看大图';
-        const tile = galleryTile(link);                     // 每一格都包一层 .gallery-tile（与占位格同一套格子）
+        const tile = galleryTile(link, true);               // 每一格都包一层 .gallery-tile（真图那格是 .is-photo）
         if (before && before.parentNode === grid) grid.insertBefore(tile, before);
         else grid.appendChild(tile);
         syncHead();
@@ -2990,6 +3023,25 @@
   }
 
   /**
+   * 「查看原文」里的尺寸注脚。
+   *
+   * `width/height` 是**载入样式时会套用的生成尺寸**（v1.5.4 起保存侧就这么记）；如果它是从展示图
+   * 缩放来的，接口会另给 `previewWidth/previewHeight`，这时要把展示图原始尺寸也写出来，免得出现
+   * 「尺寸：1192×1536（展示图尺寸）」这种自相矛盾的标注。老机器人没有那两个字段，就退回 `sizeSource` 文案。
+   */
+  function styleSizeNote(item) {
+    const data = item || {};
+    const previewW = Number(data.previewWidth) || 0;
+    const previewH = Number(data.previewHeight) || 0;
+    if (previewW > 0 && previewH > 0 && (previewW !== data.width || previewH !== data.height))
+      return '（由展示图 ' + previewW + '×' + previewH + ' 同比例缩放）';
+    // 老样式（v1.5.3 以前保存的）只记了展示图尺寸、没有 previewWidth/previewHeight：载入时会按同比例
+    // 缩到 64–2048 且 8 的倍数再用，所以这里必须提一句"载入会缩放"，否则用户会以为载入后就是 1808×2336。
+    if (data.sizeSource === 'preview') return '（展示图尺寸；载入时按同比例缩到可用尺寸）';
+    return '（保存时的模型参数）';
+  }
+
+  /**
    * 分类清单：新后端直接给 key（一个 LoRA 一个分类，key 形如 {@code lora:<显示名>}，另有 stack:/manual:/none）；
    * 旧后端只给 name/count/lora，甚至完全没有 categories —— 那就按 style.category 现场聚合，行为与改造前一致（不白屏）。
    */
@@ -3468,7 +3520,7 @@
       showInfo('样式原文：' + current,
         '分类：' + styleCategory(data) + (data.categoryAuto ? '（按规则自动）' : '（手动设置）')
           + (data.width > 0 && data.height > 0 ? '\n尺寸：' + data.width + '×' + data.height
-              + (data.sizeSource === 'preview' ? '（展示图尺寸）' : '（保存时的模型参数）') : '')
+              + styleSizeNote(data) : '')
           + (data.previewImage ? '\n展示图：' + data.previewImage : '')
           + (data.loraName ? '\n所属 LoRA：' + data.loraName : '')
           + '\n\n正向：\n' + (data.positive || '（空）') + '\n\n反向：\n' + (data.negative || '（空）')
@@ -3683,12 +3735,130 @@
     $('lora-status').textContent = data.status || ('本机 ' + state.loras.length + ' 个 LoRA');
     if (count) count.textContent = '共 ' + state.loras.length + ' 个' + (data.directory ? '（' + data.directory + '）' : '');
     // 进面板时后台可能正在下载（甚至刷新过页面）：接着把进度条挂上，不然进度就"看不见了"。
-    if (data.download && (data.download.busy || data.download.downloading)) watchLoraProgress();
+    if (data.download && loraJobActive(data.download)) watchLoraProgress();
   }
 
   // ------------------------------------------------- LoRA 下载实时进度
 
-  const loraWatch = { timer: null, hideTimer: null };
+  const loraWatch = { timer: null, hideTimer: null, ctrl: null, ctrlDead: false, last: null, lastRunning: false };
+
+  /**
+   * 这次 LoRA 任务算不算"正在进行"。
+   *
+   * <p>新字段 `active` **有就用它**（本轮服务端追加的 `active / cancellable / paused`），
+   * 没有就退回老字段 `busy || downloading` —— 旧机器人上照常，新机器人上暂停时 active 仍然是 true，
+   * 进度卡不会因为"暂停"就整块收起来。
+   */
+  function loraJobActive(data) {
+    if (!data) return false;
+    if (typeof data.active === 'boolean') return data.active;
+    return !!(data.busy || data.downloading);
+  }
+
+  /** 服务端还没这个接口：404 → api() 抛的是 '未知接口：…'（WebApiController 的 default 分支）。 */
+  function isMissingLoraEndpoint(error) {
+    return /未知接口|未知的接口|HTTP 404|not found/i.test(String((error && error.message) || ''));
+  }
+
+  /**
+   * 「暂停 / 继续」「取消」两个按钮**动态建**在进度卡里（index.html 不动：那是别的代理的地盘）。
+   * `.row`（flex + gap 8）是现成的类，按钮自己的 min-height 就是 44px —— 不用改 app.css。
+   */
+  function ensureLoraControls() {
+    const box = $('lora-progress');
+    if (!box) return null;
+    // 判"已经建过"要看**控制行**挂在谁身上：按钮自己的 parentNode 是那一行，不是进度卡。
+    // （第一版写成 `ctrl.pause.parentNode === box`，恒为假 —— 每画一次就再建一行，
+    //  旧的留在 DOM 里，于是"暂停/继续"改的是新按钮、页面上第一个按钮却永远显示旧文案。探针 B2/D5/E2 抓到的就是这个。）
+    if (loraWatch.ctrl && loraWatch.ctrl.row.parentNode === box) return loraWatch.ctrl;
+    const row = el('div', 'row lora-progress-acts');
+    row.style.marginTop = '2px';
+    const pause = el('button', 'ghost lora-pause', '暂停');
+    const cancel = el('button', 'danger lora-cancel', '取消');
+    pause.type = 'button';
+    cancel.type = 'button';
+    pause.onclick = () => toggleLoraPause(pause);
+    cancel.onclick = () => cancelLoraDownload(cancel);
+    row.appendChild(pause);
+    row.appendChild(cancel);
+    box.appendChild(row);
+    loraWatch.ctrl = { row, pause, cancel };
+    row.hidden = true;
+    return loraWatch.ctrl;
+  }
+
+  /**
+   * 控制键的可用性（三档，和服务端是否就绪对得上）：
+   *   ① `loraWatch.ctrlDead`（撞过 404）→ 全灰 + 一句人话；
+   *   ② 这次 progress 一个新字段都没有（老机器人）→ 也灰，但话不一样；
+   *   ③ 有新字段 → 可用；`cancellable === false` 时单独灰掉「取消」。
+   */
+  function renderLoraControls(data, running) {
+    const ctrl = ensureLoraControls();
+    if (!ctrl) return;
+    loraWatch.last = data;
+    loraWatch.lastRunning = !!running;
+    if (!running) { ctrl.row.hidden = true; return; }
+    ctrl.row.hidden = false;
+    ctrl.pause.textContent = (data && data.paused) ? '继续' : '暂停';
+    const knowsFields = !!(data && (typeof data.active === 'boolean' || typeof data.paused === 'boolean'
+      || typeof data.cancellable === 'boolean'));
+    const usable = !loraWatch.ctrlDead && knowsFields;
+    ctrl.pause.disabled = !usable;
+    ctrl.cancel.disabled = !usable || (data && data.cancellable === false);
+    let hint = '';
+    if (loraWatch.ctrlDead) hint = '这个机器人还没有暂停/取消接口（HTTP 404），按钮先置灰；下载照常跑完。';
+    else if (!knowsFields) hint = '当前进度里没有「暂停/取消」信息（服务端未就绪），按钮先置灰。';
+    else if (data && data.cancellable === false) hint = '这次任务报的是不可取消。';
+    ctrl.row.title = hint;
+  }
+
+  /** 暂停 / 继续：`/api/lora/pause` 与 `/api/lora/resume` 都回一份 progress 形状的 JSON。 */
+  async function toggleLoraPause(button) {
+    const paused = !!(loraWatch.last && loraWatch.last.paused);
+    button.disabled = true;
+    try {
+      const data = await api(paused ? '/api/lora/resume' : '/api/lora/pause', { body: { scope: scope() } });
+      toast(data && data.message ? String(data.message) : (paused ? '已继续下载' : '已暂停下载'));
+      if (data) renderLoraProgress(data);
+      watchLoraProgress();
+    } catch (error) {
+      if (String(error.message) !== 'unauthorized') loraControlFailed(error, paused ? '继续' : '暂停');
+      else return;
+    }
+    button.disabled = false;
+  }
+
+  /**
+   * 取消：**先二次确认**（说清楚"会删掉已下载的部分"），确认了才发请求 —— 和删除 LoRA 同一条纪律。
+   */
+  async function cancelLoraDownload(button) {
+    const yes = await askConfirm('取消这次 LoRA 下载？\n已经下载的部分会被删掉，下次要从头再来。',
+      { title: '取消下载', confirmText: '取消下载', danger: true });
+    if (!yes) return;
+    button.disabled = true;
+    try {
+      const data = await api('/api/lora/cancel', { body: { scope: scope() } });
+      toast(data && data.message ? String(data.message) : '已取消下载');
+      if (data) renderLoraProgress(data);
+      watchLoraProgress();
+    } catch (error) {
+      if (String(error.message) !== 'unauthorized') loraControlFailed(error, '取消');
+      else return;
+    }
+    button.disabled = false;
+  }
+
+  /** 控制键失败：404 就置灰 + 说人话（不弹错误框），别的错照实报。 */
+  function loraControlFailed(error, what) {
+    if (isMissingLoraEndpoint(error)) {
+      loraWatch.ctrlDead = true;
+      toast('这个机器人还没有「' + what + '」接口（服务端未就绪），按钮先置灰。');
+      renderLoraControls(loraWatch.last, loraWatch.lastRunning);
+      return;
+    }
+    toast(what + '失败：' + error.message);
+  }
 
   /**
    * 控制台的 LoRA 写操作（下载 / 补展示图）：走内部接口，<b>不</b>借道指令通道——
@@ -3718,13 +3888,18 @@
   /**
    * 画一次进度：机器人给字节数就按百分比画，没给（正在读模型信息/正在加载到 WebUI/正在补图）
    * 就退回不确定态——不能显示成 0%，那会让人以为卡死了。
+   *
+   * <p>老字段（busy/downloading/metered/stage/percent/done/total/speed/etaSeconds）的渲染一个字没动；
+   * 只是**补上**：新字段 `paused` 在文案后加「（已暂停）」，并且按 `active/cancellable` 决定
+   * 「暂停 / 继续」「取消」是否可用。
    */
   function renderLoraProgress(data) {
     const box = $('lora-progress'), fill = $('lora-progress-fill'), text = $('lora-progress-text');
     if (!box || !fill || !text) return;
     clearTimeout(loraWatch.hideTimer);
     box.hidden = false;
-    const running = !!(data && (data.busy || data.downloading));
+    const running = loraJobActive(data);
+    const paused = !!(data && data.paused);
     if (data && data.metered) {
       box.classList.remove('indeterminate');
       fill.style.width = Math.max(0, Math.min(100, data.percent)).toFixed(1) + '%';
@@ -3732,17 +3907,22 @@
       let line = (data.done / mib).toFixed(1) + ' / ' + (data.total / mib).toFixed(1) + ' MiB（' + data.percent.toFixed(1) + '%）';
       if (data.speed > 0) line += ' · ' + (data.speed / mib).toFixed(2) + ' MiB/s';
       if (data.etaSeconds > 0) line += ' · 剩余约 ' + describeEta(data.etaSeconds);
-      text.textContent = line;
+      text.textContent = paused ? line + ' · 已暂停' : line;
     } else {
       box.classList.add('indeterminate');
       fill.style.width = '';
       // 结束后的完整报告很长（触发词、展示图清单十几行）：进度条上只留第一行，细节看下面/控制台。
       const stage = String((data && data.stage) || (running ? '正在处理…' : '已结束')).trim();
       const first = stage.split('\n')[0].trim();
-      text.textContent = stage === first ? first : first + ' …';
+      text.textContent = (stage === first ? first : first + ' …') + (paused ? '（已暂停）' : '');
     }
+    renderLoraControls(data, running);
     // 结束后让最后一行（"展示图已保存…"/"下载成功…"）停一会儿再收起来，别一闪而过。
-    if (!running) loraWatch.hideTimer = setTimeout(() => { box.hidden = true; box.classList.remove('indeterminate'); }, 6000);
+    if (!running) loraWatch.hideTimer = setTimeout(() => {
+      box.hidden = true;
+      box.classList.remove('indeterminate');
+      if (loraWatch.ctrl) loraWatch.ctrl.row.hidden = true;
+    }, 6000);
   }
 
   /**
@@ -3764,7 +3944,7 @@
         return;
       }
       misses = 0;
-      const running = !!(data.busy || data.downloading);
+      const running = loraJobActive(data);
       if (running) { seenRunning = true; grace = 0; }
       else if (!seenRunning && ++grace <= 20) return;            // 空窗期：先不画也不收手
       renderLoraProgress(data);
@@ -4207,6 +4387,9 @@
       if (note && data.notice) { note.textContent = data.notice; note.className = 'ok'; }
       toast(data.notice || '已切换预设');
       await Promise.all([loadStatus().catch(() => {}), loadOptions().catch(() => {})]);
+      // 切栈最容易留下上一栈的额外模块（anima→SDXL 就是出灰图那次事故）：立刻重读 VAE 与冲突检测，
+      // 别让冲突提示停留在上一栈的结论上。
+      loadVae({ quiet: true }).catch(() => {});
     } catch (error) {
       if (String(error.message) !== 'unauthorized' && note) { note.textContent = '切换失败：' + error.message; note.className = 'bad'; }
     }
@@ -4290,6 +4473,266 @@
       gen.model ? '模型 ' + gen.model : null].filter(Boolean).join(' · ');
   }
 
+  // ---------------------------------------------------------------- VAE 与栈冲突（防呆）
+
+  /**
+   * VAE 一行 + 栈冲突提示。服务端契约（别的代理实现，字段已冻结）：
+   *
+   * <pre>
+   * POST /api/sd/vae       → {vae, vaeAuto, modules[], checkpoint, choices[],
+   *                           conflict:{level:'OK|WARN|BLOCK', reason, suggestion, culprits[]}}
+   * POST /api/sd/vae/list  → {choices:[…]}
+   * POST /api/sd/vae/set   {name} → 同一份快照 + message
+   * POST /api/sd/vae/fix   → 同一份快照 + message + actions[]
+   * </pre>
+   *
+   * 这一行**动态建在「生成参数」卡里**（尺寸/步数/CFG 同一区；index.html 一个字都不动 ——
+   * 那是别的代理的地盘）。老机器人还没这四个接口时优雅降级：整行置灰 + 一句人话，
+   * 不弹错误框、不白屏、不影响出图面板其它部分。
+   *
+   * 事故背景：切 Forge 预设后 anima 的额外模块（qwen_image_vae + qwen_3_06b_base）留在栈里，
+   * SDXL 底模配上 Qwen 的 VAE → 出图纯灰。所以 BLOCK 必须是**红横幅 + 一键修复**，不是一行小字。
+   */
+  const vae = { ready: true, missing: false, last: null, busy: false,
+    row: null, select: null, reloadBtn: null, modulesBox: null, hint: null, conflictBox: null };
+
+  /** 额外模块名多长算"长"：超过就折叠成「共 N 个」。 */
+  const VAE_MODULE_SHORT = 34;
+
+  function vaeNames(payload) {
+    const list = (payload && payload.modules) || [];
+    return (Array.isArray(list) ? list : []).map((item) => String(item || '')).filter(Boolean);
+  }
+
+  /** 冲突块：只认 WARN / BLOCK（OK 与字段缺失都返回 null，界面上一点占位都没有）。 */
+  function vaeConflict(payload) {
+    const raw = (payload && payload.conflict) || null;
+    if (!raw || typeof raw !== 'object') return null;
+    const level = String(raw.level || '').toUpperCase();
+    if (level !== 'WARN' && level !== 'BLOCK') return null;
+    return { level, reason: String(raw.reason || ''), suggestion: String(raw.suggestion || ''),
+      culprits: (Array.isArray(raw.culprits) ? raw.culprits : []).map((item) => String(item || '')).filter(Boolean) };
+  }
+
+  /** 服务端还没这个接口：与 LoRA 那套同一条判据（WebApiController 的 default 分支回 404 +「未知接口」）。 */
+  function isMissingVaeEndpoint(error) {
+    return /未知接口|未知的接口|HTTP 404|not found/i.test(String((error && error.message) || ''));
+  }
+
+  /**
+   * 把 VAE 那一块塞进「生成参数」卡的 `.grid-2` 后面（与尺寸/步数/CFG 同一区）。
+   * 幂等：已经建过就直接返回（刷新只改内容不重建，select 的焦点与展开状态不会丢）。
+   */
+  function ensureVaePanel() {
+    const card = $('panel-gen');
+    if (!card) { vae.row = null; return null; }
+    // 已经建过就复用：**判据要包含"还在参数卡里"**，被别处搬走/摘掉时重建并搬回去。
+    if (vae.row && vae.row.isConnected && card.contains(vae.row)) return vae.row;
+
+    // 定位「生成参数」卡里那个 `.grid-2`（尺寸/步数/CFG 那一格）。插入点**以 `.grid-2` 的父节点为准**：
+    // 那一层就是参数卡本身（实测 `DIV.grid-2 < DIV.card`），比 $('panel-gen') 更准 —— 页面结构里
+    // 面板下有好几张 .card，靠"面板的子节点"猜会把这一行放到面板末尾（离参数区很远）。
+    const grid = card.querySelector('.grid-2');
+    const host = (grid && grid.parentNode && card.contains(grid.parentNode)) ? grid.parentNode : card;
+
+    const row = el('div', 'vae-row');
+    row.id = 'vae-row';
+
+    const field = el('label', 'field vae-field');
+    field.appendChild(el('span', null, 'VAE'));
+    const select = el('select');
+    select.id = 'vae-select';
+    select.setAttribute('aria-label', 'VAE');
+    select.disabled = true;
+    field.appendChild(select);
+    row.appendChild(field);
+
+    const reload = el('button', 'ghost vae-reload', '重读');
+    reload.id = 'vae-reload';
+    reload.type = 'button';
+    reload.title = '重新读取 VAE 列表与栈冲突检测结果';
+    reload.addEventListener('click', () => { loadVae({ quiet: false }).catch(() => {}); });
+    row.appendChild(reload);
+
+    const modulesBox = el('div', 'muted vae-modules');
+    modulesBox.id = 'vae-modules';
+    row.appendChild(modulesBox);
+
+    const hint = el('div', 'vae-hint');
+    hint.id = 'vae-hint';
+    hint.hidden = true;
+    row.appendChild(hint);
+
+    const conflictBox = el('div', 'vae-conflict');
+    conflictBox.id = 'vae-conflict';
+    conflictBox.hidden = true;
+    row.appendChild(conflictBox);
+
+    if (grid && grid.parentNode === host) host.insertBefore(row, grid.nextSibling);
+    else host.appendChild(row);
+    vae.row = row; vae.select = select; vae.reloadBtn = reload;
+    vae.modulesBox = modulesBox; vae.hint = hint; vae.conflictBox = conflictBox;
+    select.addEventListener('change', () => { setVae(select.value).catch(() => {}); });
+    return row;
+  }
+
+  /**
+   * 拉一次快照。`choices` / `conflict` 缺字段也能降级：先试 `/api/sd/vae/list` 补选项，
+   * 两边都没有就退回「当前值一个选项」，界面照旧可用（缺字段不是错误）。
+   */
+  async function loadVae(options = {}) {
+    if (!ensureVaePanel()) return null;
+    try {
+      const data = await api('/api/sd/vae', { body: {} });
+      let payload = data;
+      if (!Array.isArray(payload && payload.choices) || !(payload.choices || []).length) {
+        try {
+          const extra = await api('/api/sd/vae/list', { body: {} });
+          if (Array.isArray(extra && extra.choices) && extra.choices.length) {
+            payload = Object.assign({}, payload, { choices: extra.choices });
+          }
+        } catch { /* 补不上就照旧：一个选项也能用，不报错 */ }
+      }
+      vae.ready = true; vae.missing = false; vae.last = payload;
+      renderVae(payload);
+      return payload;
+    } catch (error) {
+      if (String(error.message) === 'unauthorized') return null;
+      vae.ready = false; vae.last = null;
+      if (isMissingVaeEndpoint(error)) {
+        vae.missing = true;
+        renderVae(null);
+        return null;
+      }
+      renderVae(null, '读取 VAE 失败：' + error.message);
+      if (!options.quiet) toast('读取 VAE 失败：' + error.message);
+      return null;
+    }
+  }
+
+  /** 画 VAE 一行 + 冲突区。`payload` 为 null = 没读到（降级态或读失败）。 */
+  function renderVae(payload, errorText) {
+    if (!ensureVaePanel()) return;
+    const choices = ((payload && payload.choices) || []).map((item) => String(item || '')).filter(Boolean);
+    const current = payload ? String(payload.vae || '') : '';
+    if (current && choices.indexOf(current) < 0) choices.push(current);
+    const usable = !!(payload && choices.length);
+    vae.select.innerHTML = '';
+    choices.forEach((name) => {
+      const option = el('option', null, name);
+      option.value = name;
+      if (name === current) option.selected = true;
+      vae.select.appendChild(option);
+    });
+    if (current) vae.select.value = current;
+    vae.select.disabled = !usable;
+
+    // 额外模块：一个短名字就直接列出来；多个或很长就折叠成「共 N 个」（全名放 title）
+    const modules = vaeNames(payload);
+    const shortAll = modules.every((item) => item.length <= VAE_MODULE_SHORT);
+    vae.modulesBox.textContent = !modules.length ? ''
+      : (modules.length === 1 && shortAll ? '额外模块：' + modules[0]
+        : '额外模块：共 ' + modules.length + ' 个' + (shortAll ? '（' + modules.join('、') + '）' : ''));
+    vae.modulesBox.title = modules.join('、');
+
+    let hint = errorText || '';
+    if (!vae.ready) hint = '这个机器人还没有 VAE 接口（服务端未就绪），这一行先不能用。';
+    else if (payload && payload.vaeAuto && /automatic/i.test(current)) hint = 'VAE 跟随当前基础模型自动选。';
+    vae.hint.textContent = hint;
+    vae.hint.hidden = !hint;
+    vae.hint.className = 'vae-hint' + (vae.ready ? '' : ' vae-hint-off');
+
+    // 冲突提示：OK / 缺字段一律**不占位**（连边框都不画）
+    const conflict = vaeConflict(payload);
+    vae.conflictBox.innerHTML = '';
+    vae.conflictBox.className = 'vae-conflict';
+    vae.conflictBox.removeAttribute('data-vae-level');
+    if (!conflict) { vae.conflictBox.hidden = true; return; }
+    vae.conflictBox.hidden = false;
+    vae.conflictBox.setAttribute('data-vae-level', conflict.level);
+    vae.conflictBox.classList.add(conflict.level === 'BLOCK' ? 'vae-block' : 'vae-warn');
+    vae.conflictBox.appendChild(el('div', 'vae-line',
+      (conflict.level === 'BLOCK' ? '⛔ 栈冲突（会出灰图）：' : '⚠ 可能有冲突：')
+      + (conflict.reason || '检测到额外模块与当前底模不匹配')));
+    if (conflict.suggestion) vae.conflictBox.appendChild(el('div', 'vae-line vae-suggestion', '建议：' + conflict.suggestion));
+    if (conflict.culprits.length) vae.conflictBox.appendChild(el('div', 'vae-line vae-culprits', '可疑项：' + conflict.culprits.join('、')));
+    if (conflict.level === 'BLOCK') {
+      const fix = el('button', 'danger vae-fix', '一键修复');
+      fix.id = 'vae-fix';
+      fix.type = 'button';
+      fix.addEventListener('click', () => { fixVae(fix).catch(() => {}); });
+      vae.conflictBox.appendChild(fix);
+    }
+  }
+
+  /** 改选 VAE：`POST /api/sd/vae/set {name}`，成功后 toast 服务端的 message 并刷新快照。 */
+  async function setVae(name) {
+    const wanted = String(name == null ? '' : name);
+    if (!wanted || vae.busy) return;
+    vae.busy = true;
+    vae.select.disabled = true;
+    try {
+      const data = await api('/api/sd/vae/set', { body: { name: wanted } });
+      vae.last = data; vae.ready = true; vae.missing = false;
+      renderVae(data);
+      toast((data && data.message) ? String(data.message) : ('VAE 已切到 ' + wanted));
+      loadVae({ quiet: true }).catch(() => {});
+    } catch (error) {
+      if (String(error.message) === 'unauthorized') { vae.busy = false; return; }
+      if (isMissingVaeEndpoint(error)) {
+        vae.ready = false; vae.missing = true;
+        toast('这个机器人还没有 VAE 接口（服务端未就绪），改不了。');
+        renderVae(null);
+      } else {
+        toast('切换 VAE 失败：' + error.message);
+        loadVae({ quiet: true }).catch(() => {});
+      }
+    }
+    vae.busy = false;
+  }
+
+  /**
+   * 一键修复：**先 askConfirm 二次确认**（不是浏览器原生 confirm），确认了才发
+   * `POST /api/sd/vae/fix`；返回的 actions 是英文键，翻成人话 toast 出来。
+   */
+  async function fixVae(button) {
+    const conflict = vaeConflict(vae.last);
+    const yes = await askConfirm('一键修复会清掉与当前底模不匹配的额外模块（VAE / 文本编码器），'
+      + '并把 VAE 设回 Automatic，修复完立刻生效。\n\n'
+      + ((conflict && conflict.reason) || '检测到栈冲突'),
+      { title: '一键修复栈冲突', confirmText: '修复', danger: true });
+    if (!yes) return;
+    if (button) button.disabled = true;
+    try {
+      const data = await api('/api/sd/vae/fix', { body: {} });
+      vae.last = data; vae.ready = true; vae.missing = false;
+      renderVae(data);
+      const actions = ((data && Array.isArray(data.actions)) ? data.actions : []).map(vaeActionText).filter(Boolean);
+      toast((data && data.message) ? String(data.message) : '已修复栈冲突');
+      if (actions.length) toast('已执行：' + actions.join('；'));
+    } catch (error) {
+      if (String(error.message) === 'unauthorized') { if (button) button.disabled = false; return; }
+      if (isMissingVaeEndpoint(error)) {
+        vae.ready = false; vae.missing = true;
+        toast('这个机器人还没有一键修复接口（服务端未就绪）。');
+        renderVae(null);
+      } else {
+        toast('修复失败：' + error.message);
+        if (button) button.disabled = false;
+      }
+    }
+  }
+
+  /** 修复动作的英文键 → 人话；认不出来就原样显示（别把信息吞掉）。 */
+  function vaeActionText(action) {
+    const text = String(action == null ? '' : action);
+    const LABELS = { clear_modules: '已清空额外模块', clear_extra_modules: '已清空额外模块',
+      set_vae_auto: 'VAE 已设为 Automatic', set_vae_automatic: 'VAE 已设为 Automatic',
+      reload_checkpoint: '已重载底模', reload_model: '已重载底模', reset_vae: 'VAE 已重置',
+      clear_vae: '已清空 VAE 选择', refresh: '已刷新', apply_preset: '已重新应用预设' };
+    return LABELS[text] || text;
+  }
+
   // ---------------------------------------------------------------- SD 生成进度
 
   let progressTimer = null;
@@ -4348,34 +4791,113 @@
 
   // ---------------------------------------------------------------- 图片与日志
 
+  /**
+   * 「最近生成」网格的增量同步状态：图片路径 → 已经建好的格子。
+   *
+   * <p>为什么不能整块重建：`loadImages()` 每轮轮询（生成完成那条路 `pollCapture → loadImages`，
+   * 约 0.9s 一轮）都会把网格 `innerHTML = ''` 清掉再铺 60 个新 `<a>/<img>` —— 刚生成的图浏览器还没
+   * 缓存缩略图，新节点于是先画成一个**中性比例的空盒子**，图到了才被替换；用户看到的就是
+   * "幽灵占位闪一下"。同一个 `<img>` 不换（`src` 不变就不动它）就完全不会闪：不清 DOM、
+   * 不重新发请求、也不会有"插入后又移除"的空盒子。
+   *
+   * <p>键是**归一化后的图片路径**（{@link normalizedImagePath}），不是下标：列表顺序变了
+   * （新图插到最前）也能认出"这就是上一轮那一张"。
+   */
+  const imageGridSync = new Map();          // 归一化路径 → { link, img, key, signature, pending }
+
+  /**
+   * 这一批新图**确定**的生成尺寸 `[w,h]`（用于第一帧就按真实比例占位）。
+   *
+   * <p>从 `/api/status` 的 `generation.width/height` 拿：它跟 SD 当前生效尺寸同源（本机 1216×1664）。
+   * 只有在"确实没缓存过"时才敢当占位比例用（见 {@link loadImages}：`pending` 且没加载过的那几张），
+   * 拿不到 → 返回 null，调用方退回中性比例 + 骨架。
+   */
+  function generationSizeHint() {
+    const generation = state.status && state.status.generation;
+    const width = Number(generation && generation.width) || 0;
+    const height = Number(generation && generation.height) || 0;
+    return width > 0 && height > 0 ? [width, height] : null;
+  }
+
+  /** 图片是否已经有解码后的位图（有就说明这个 `<img>` 其实并不需要占位）。 */
+  function imageDecoded(img) {
+    return !!(img && img.complete && img.naturalWidth > 0);
+  }
+
+  /**
+   * 把 `#image-grid` 同步成 `images` 这一份列表 —— **按下标就位、按下标移除，但绝不重建已有的格子**。
+   *
+   * <p>已存在且 `src` 没变的格子：原对象原地复用（不动 `src`、不重新加载）；新出现的图片：
+   * 交给 {@link imageNode} 建一个新格子，按 {@link generationSizeHint} 给的比例占位；
+   * 已经不在列表里的（超出 `limit` 或换了来源）：从 DOM 与缓存里一起摘掉。
+   * 顺序与下标用 `insertBefore(link, grid.children[index])` 对齐 —— 每次只挪动真正变位的那个。
+   */
+  function syncImageGrid(grid, images) {
+    // 缓存里的格子要是已经不在这个网格里（换页/整页重建过），先整体作废：接着从空缓存重建一次。
+    const staleEntry = [...imageGridSync.values()].find((entry) => entry.link.parentNode !== grid);
+    if (staleEntry) imageGridSync.clear();
+    const present = new Set();
+    images.forEach((image, index) => {
+      const file = image.path;
+      if (!file) return;
+      const key = normalizedImagePath(file);
+      // 缩略图地址 = 缓存的判据：地址一样就说明"还是同一张缩略图"，绝不动它（不动 = 不闪、不重发请求）。
+      const thumb = imageUrl(file, THUMB_TILE);
+      const caption = image.name + '（' + Math.round(image.size / 1024) + ' KB）'
+        + (image.pending ? '\n待领取' : '');
+      present.add(key);
+      let entry = imageGridSync.get(key);
+      if (entry && entry.signature !== thumb) entry = null;            // 地址变了（例如换了缩略图尺寸）→ 重建这一格
+      if (!entry) {
+        // 新出现的图片：刚生成、还没解码过的那几张用**已知生成尺寸**占位（第一帧比例就是对的）。
+        const hint = image.pending && generationSizeHint();
+        const link = imageNode(thumb, image.name + '（' + Math.round(image.size / 1024) + ' KB）',
+          null, null, 0, { eager: index < EAGER_TILES, full: imageUrl(file), size: hint || undefined });
+        const img = link.querySelector('img');
+        const meta = el('div', 'meta', caption);
+        link.appendChild(meta);
+        entry = { link, img, key, signature: thumb, pending: !!image.pending };
+        imageGridSync.set(key, entry);
+        if (hint) imageHintSync(img, hint);        // 双保险：imageNode 之后仍然再同步一次（缓存命中时立刻定比例）
+        else if (imageDecoded(img)) img.classList.remove('is-loading');
+      } else {
+        entry.pending = !!image.pending;
+        const meta = entry.link.querySelector('.meta');
+        if (meta) meta.textContent = caption;                          // 领取状态变了，只改这一行文字
+      }
+      // 只挪动真正不在这个位置上的那一个（其余原地不动，滚动位置与已加载的图都不受影响）
+      const at = grid.children[index];
+      if (at !== entry.link) grid.insertBefore(entry.link, at || null);
+    });
+    // 掉出列表的：连 DOM 一起摘掉（`innerHTML=''` 那种整块清空是上一版的病根）
+    Array.from(grid.children).forEach((child) => {
+      const stale = [...imageGridSync.values()].find((entry) => entry.link === child);
+      if (stale && !present.has(stale.key)) { imageGridSync.delete(stale.key); child.remove(); }
+    });
+  }
+
   async function loadImages() {
     const grid = $('image-grid');
     if (!grid) return null;                     // 图片网格只在出图页面
     const data = await api('/api/images', { body: { limit: 60 } });
-    grid.innerHTML = '';
-    // 后端已按「新 → 旧」给：最近生成的图片 + 还没领取的；不再反过来排。
-    const images = data.images || [];
+    // **不整块重建**（见 imageGridSync 的注释：整块重建正是"幽灵占位"的成因）——
+    // 按下标增量同步：已存在的那一格复用同一个 <a>/<img>，只有新图才建新节点。
+    const images = (data.images || []).filter((image) => image && image.path);
     const note = $('image-note');
     if (!images.length) {
       if (note) note.textContent = '还没有生成过图片。';
-      grid.appendChild(el('div', 'muted', '生成完成后图片会留在这里，刷新、重启都不会丢。'));
+      syncImageGrid(grid, []);                  // 清掉列表里已经没有的格子（有缓存才动，没缓存不新建空态）
+      if (!grid.children.length && !grid.querySelector('.muted')) {
+        grid.appendChild(el('div', 'muted', '生成完成后图片会留在这里，刷新、重启都不会丢。'));
+      }
       return images;
     }
     const pending = images.filter((image) => image.pending).length;
     if (note) note.textContent = '最近生成 ' + images.length + ' 张'
       + (pending ? '，其中 ' + pending + ' 张待领取' : '（都已领取）');
-    images.forEach((image, index) => {
-      // 缩略图点开进查看器放大（列表本身不再跳新标签页）。
-      // 网格格子 136px（app.css 的 `.grid img` 已经给了 aspect-ratio:1，不会塌）→ 缩略图 w=520；
-      // 首屏那几格 eager，其余 lazy（最多 60 张，不能一进来全拉）。
-      const link = imageNode(imageUrl(image.path, THUMB_TILE),
-        image.name + '（' + Math.round(image.size / 1024) + ' KB）', null, null, 0,
-        { eager: index < EAGER_TILES, full: imageUrl(image.path) });
-      const meta = el('div', 'meta', image.name + '\n' + Math.round(image.size / 1024) + ' KB'
-        + (image.pending ? '\n待领取' : ''));
-      link.appendChild(meta);
-      grid.appendChild(link);
-    });
+    const empty = grid.querySelector('.muted');
+    if (empty) empty.remove();                  // 之前那条空态提示：有图了就让位
+    syncImageGrid(grid, images);
     return images;
   }
 
@@ -5032,6 +5554,7 @@
     // 内容变多就长高（Shift+回车换行、粘贴整段要求都算），到 40vh 停下自己在框内滚。
     on('chat-input', 'input', () => growChatInput());
     window.addEventListener('resize', () => growChatInput());
+    window.addEventListener('resize', () => syncRailSpacing());
     on('chat-reset', 'click', async () => {
       // 顺序很重要：**先** reset（服务端那份正文存档一起清掉），**再**丢本地这份；
       // chatSnapshotClear() 会把待推的存档一起作废，清空后的空内容绝不回推（服务端不会「复活」）。
@@ -5104,7 +5627,7 @@
       showInfo('样式原文：' + name,
         '分类：' + styleCategory(data) + (data.categoryAuto ? '（按规则自动）' : '（手动设置）')
           + (data.width > 0 && data.height > 0 ? '\n尺寸：' + data.width + '×' + data.height
-              + (data.sizeSource === 'preview' ? '（展示图尺寸）' : '（保存时的模型参数）') : '')
+              + styleSizeNote(data) : '')
           + '\n\n正向：\n' + (data.positive || '（空）') + '\n\n反向：\n' + (data.negative || '（空）'),
         { text: '这是一份固定模板：载入会把这两段原样写进你个人的提示词。' });
     });
@@ -5326,7 +5849,11 @@
       if (PAGE === 'setup') { await loadSetup(); banner(''); return; }
       await loadStatus();                      // 顶栏、健康点、共享状态（约 15ms）
       await loadChatHistory();                 // 右栏在每一页都铺历史（含服务端正文存档的合并）
-      if (PAGE === 'gen') await Promise.all([loadOptions(), loadPresets(), loadForgePresets(), loadImages(), loadTasks()]);
+      if (PAGE === 'gen') {
+        await Promise.all([loadOptions(), loadPresets(), loadForgePresets(), loadImages(), loadTasks()]);
+        // VAE 那一行动态建在「生成参数」卡里；接口不在（老的机器人）时自己降级，不往外抛、不影响上面那五项。
+        await loadVae({ quiet: true });
+      }
       else if (PAGE === 'prompt') await loadPrompt();
       else if (PAGE === 'styles') {
         await loadStyles();
@@ -5361,6 +5888,66 @@
     }
   }
 
+  /**
+   * 右栏（全局对话栏）的**上边界与下边界**：
+   * 上边 = 左侧导航栏 `<nav class="tabs">` 的**上边界**（两条栏的上边界在同一条水平线上，±1px）；
+   * 下边 = 视口底 - `--rail-bottom`(24px) —— 下边与左右（`--rail-gutter`）都是同一个 24px 外留白。
+   *
+   * <p>为什么要在 JS 里量导航栏的上边界，而不是在 CSS 里写死常数：
+   * `.bar`/`.tabs` 的实际高度是 **62.25px / 55.25px**（`offsetHeight` 才 62/55）—— Chrome 在 layout 单位
+   * 与设备像素之间做亚像素取整，写死 `62 + 55 + 24 = 141` 时右栏顶边落在 141，而导航栏上边界在 74.25：
+   * 画面上就是一个低了 55px 的错位。量出来的真实值写回 `--rail-top`，两条栏的上边界才齐平。
+   *
+   * <p>顺带把**回执页两栏**（左「回执列表」/ 右「执行结果」）的高度也定在这里：用户要求这两栏的**底边
+   * 与右栏「对话」的底边齐平**，所以 `--quest-pane-h` 直接由**右栏的真实 rect** 反推：
+   * `railRect.bottom - splitRect.top - 20`（20 = `.quest-split` 上下各 10px 呼吸）。
+   * 全程只有这一处来源 —— 不再另写一份 `calc(100dvh - top - bottom)`（那种两份独立声明上一轮漂过），
+   * 也不再用 `min(76vh, 760px)` 这种跟视口走的自造上限（那会让两栏比对话栏短）。
+   * resize 也走这里（下面 bind 里已经挂了 resize），所以窗高变了照样齐平。
+   *
+   * <p>两个坑（都踩过）：
+   * ① 一定要**在页顶量**：`.tabs` 是 `position: sticky`，页面滚过之后它的位置会变（`scrollY=42` 时整体下移 42），
+   *    拿那一帧去算就会得出假结论；② 量不到（元素不在这一页、还没布局、或者 `#app` 还 hidden）就什么都不做，
+   *    CSS 里那组默认值继续生效 —— 这个函数在 `boot()` 里要**在 `loadPage()` 之后**再调一次
+   *    （那时 `#app` 已经可见、布局也落定了）。
+   */
+  function syncRailSpacing() {
+    const root = document.body;
+    if (!root) return null;
+    const bar = document.querySelector('.bar');
+    const tabs = document.querySelector('.tabs');
+    const rail = $('agent-rail');
+    const scrolled = window.scrollY || document.documentElement.scrollTop || 0;
+    if (scrolled > 0) window.scrollTo(0, 0);
+    const height = (node) => (node ? node.getBoundingClientRect().height : 0);
+    const barH = height(bar);
+    const tabsH = height(tabs);
+    // 导航栏（nav.tabs）**上边界**：右栏顶边就对齐这一条线
+    const tabsTop = tabs ? tabs.getBoundingClientRect().top : 0;
+    // 右栏**下边界**：回执页两栏要延长到这一条线（读的是真实 rect，不是第二份算式）
+    const railBottom = rail ? rail.getBoundingClientRect().bottom : 0;
+    // 回执页两栏的起点（面板顶部）：两栏的高度 = 右栏底边 - 这个起点 - 20（上下各 10 呼吸）
+    const split = document.querySelector('.quest-split');
+    const splitTop = split && rail ? split.getBoundingClientRect().top : 0;
+    if (scrolled > 0) window.scrollTo(0, scrolled);
+    if (barH > 0) root.style.setProperty('--rail-bar', Math.round(barH * 100) / 100 + 'px');
+    if (tabsH > 0) root.style.setProperty('--rail-tabs', Math.round(tabsH * 100) / 100 + 'px');
+    if (barH > 0 && tabsH > 0) {
+      // 控制台全屏（body.console-full）没有页头也没有导航栏：右栏从视口顶开始，
+      // 与那条 `body.console-full { --rail-stick-top: 0px }` 同一个口径。
+      const fullscreen = document.body.classList.contains('console-full');
+      const top = fullscreen ? 0 : tabsTop;
+      root.style.setProperty('--rail-top', Math.round(top * 100) / 100 + 'px');
+    }
+    // 回执页两栏延到「对话」底边。窄屏（<=860px）是竖排，"底边齐平"不适用：
+    // 那边 CSS 用 `--quest-pane-h: 0px` + `height: auto` 关掉它，这里不写（否则会盖掉那条规则）。
+    if (rail && split && railBottom > 0 && splitTop > 0 && !window.matchMedia('(max-width: 860px)').matches) {
+      const paneH = Math.round((railBottom - splitTop - 20) * 100) / 100;
+      if (paneH > 0) root.style.setProperty('--quest-pane-h', paneH + 'px');
+    }
+    return rail ? Math.round(rail.getBoundingClientRect().top) : null;
+  }
+
   async function boot() {
     banner('');
     syncConsoleFullscreen(PAGE);               // 控制台栏目默认全屏（跟着页面走）
@@ -5377,6 +5964,11 @@
     // 先起表再 loadPage：列表万一没读出来也不会把这条轮询一起丢掉（poll 里自己会判空跳过）。
     startQuestUnreadWatch();
     await loadPage();
+    // 页面铺完再校正一次上下间距：字体/布局落定后的真实高度才是准的（见 syncRailSpacing）。
+    // 连调两次是有意的：第一次把 `--rail-top` 写下去（右栏高度跟着它算），第二次才读到**已经落定**的
+    // 右栏底边，回执页两栏的 `--quest-pane-h` 因此第一帧就是准的（不靠"下一次 resize 才对齐"）。
+    syncRailSpacing();
+    syncRailSpacing();
   }
 
   bind();

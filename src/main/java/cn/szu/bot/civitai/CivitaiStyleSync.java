@@ -39,7 +39,9 @@ public final class CivitaiStyleSync {
     /** 展示图样式统一的大类（与本机样式库的默认规则同一个词）。 */
     public static final String LORA_CATEGORY = cn.szu.bot.sd.LocalStyles.LORA_CATEGORY;
     /** 这几个键只是「LoRA 附带」的标注，不是模型参数：比"要不要补写"时忽略（否则永远算"变了"）。 */
-    private static final Set<String> ANNOTATION_KEYS = Set.of("lora", "origin", "previewImage", "sizeSource");
+    private static final Set<String> ANNOTATION_KEYS = Set.of("lora", "origin", "previewImage", "sizeSource",
+            // 展示图自己的真实像素（width/height 记的是能直接用于生成的换算尺寸）：只是显示用的标注。
+            "previewWidth", "previewHeight");
     private static final Pattern LORA = Pattern.compile("<lora:[^<>]*>", Pattern.CASE_INSENSITIVE);
     /** 展示图样式写进机器人自己的样式库（data/local-styles.json），不再写 WebUI 的预设样式。 */
     private static Store store(Path root) {
@@ -344,22 +346,33 @@ public final class CivitaiStyleSync {
      * <p>尺寸优先级：**展示图自己的像素**（{@code sizeSource=preview}）＞ 预设栈/机器人当前设置——
      * 后者已经在 {@code model} 里了，这里只在读得到展示图尺寸时覆盖；读不到就原样留着，
      * **绝不编一个尺寸**。{@code lora} / {@code previewImage} 只是标注，不参与"要不要补写"的比较。
+     *
+     * <p>展示图的像素（Civitai 预览图动辄 2400×3744）**不能直接当生成尺寸**（会被 64–2048 的校验拒掉，
+     * 尺寸就"不跟着样式走"了）：{@code width/height} 记
+     * {@link SdClient#fitGenerationSize 同比例换算后能直接用于生成}的尺寸，
+     * 展示图自己的真实像素另记 {@code previewWidth/previewHeight} 供界面显示；{@code sizeSource} 照旧。
      */
     public static JsonObject applyPreview(JsonObject model, String loraStem, int[] size, String previewPath) {
         JsonObject result = model == null ? new JsonObject() : model.deepCopy();
         if (loraStem != null && !loraStem.isBlank()) result.addProperty("lora", loraStem);
         if (previewPath != null && !previewPath.isBlank()) result.addProperty("previewImage", previewPath);
         if (size != null && size.length == 2 && size[0] > 0 && size[1] > 0) {
-            result.addProperty("width", size[0]);
-            result.addProperty("height", size[1]);
+            int[] generation = SdClient.fitGenerationSize(size[0], size[1]);
+            result.addProperty("width", generation[0]);
+            result.addProperty("height", generation[1]);
+            result.addProperty("previewWidth", size[0]);
+            result.addProperty("previewHeight", size[1]);
             result.addProperty("sizeSource", PREVIEW_SIZE_SOURCE);
         }
         return result;
     }
 
-    /** 样式里记着的尺寸是不是就是这张展示图的尺寸。 */
+    /** 样式里记着的**展示图尺寸**是不是就是这张展示图的尺寸（换算后的生成尺寸在 width/height）。 */
     private static boolean sameSize(JsonObject previous, int[] size) {
-        return previous != null && Json.num(previous, "width", 0) == size[0] && Json.num(previous, "height", 0) == size[1];
+        if (previous == null) return false;
+        int width = Json.num(previous, "previewWidth", Json.num(previous, "width", 0));
+        int height = Json.num(previous, "previewHeight", Json.num(previous, "height", 0));
+        return width == size[0] && height == size[1];
     }
 
     /** 两份模型参数是不是一样（有一边为空就按"空"比；只看键值，不比顺序；标注键不参与比较）。 */

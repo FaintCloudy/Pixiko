@@ -1,6 +1,7 @@
 package cn.szu.bot;
 
 import com.google.gson.*;
+import java.awt.image.BufferedImage;
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.nio.charset.StandardCharsets;
@@ -13,6 +14,7 @@ import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Consumer;
 import java.util.regex.*;
+import javax.imageio.ImageIO;
 import cn.szu.bot.chat.ChatActions;
 import cn.szu.bot.chat.ChatService;
 import cn.szu.bot.chat.DeepSeekPrompts;
@@ -20,6 +22,7 @@ import cn.szu.bot.chat.SceneDecomposer;
 import cn.szu.bot.civitai.CivitaiClient;
 import cn.szu.bot.civitai.CivitaiLinkLogin;
 import cn.szu.bot.civitai.CivitaiStyleSync;
+import cn.szu.bot.civitai.DownloadControl;
 import cn.szu.bot.prompt.PromptEditor;
 import cn.szu.bot.prompt.PromptFunctions;
 import cn.szu.bot.prompt.PromptUsage;
@@ -29,6 +32,7 @@ import cn.szu.bot.sd.GenerationPreset;
 import cn.szu.bot.sd.LocalStyles;
 import cn.szu.bot.sd.SdClient;
 import cn.szu.bot.sd.UserPromptStore;
+import cn.szu.bot.sd.VaeGuard;
 
 public final class Bot implements AutoCloseable {
     @FunctionalInterface public interface Sender {
@@ -65,12 +69,26 @@ public final class Bot implements AutoCloseable {
         default CivitaiClient.DownloadedLora download(String url, Consumer<String> stage) throws Exception {
             return download(url, stage, null);
         }
+        /**
+         * 带下载控制（暂停/取消）的重载：真实实现（{@link CivitaiClient#download}）在拷贝循环里查它，
+         * 真实路径下取消会抛 {@link DownloadControl.CancelledException}。默认实现忽略控制对象，
+         * 这样既有的替身下载器与 lambda 不用改（既不暂停也不取消，语义等于"控制不可用"）。
+         */
+        default CivitaiClient.DownloadedLora download(String url, Consumer<String> stage, CivitaiClient.Progress meter,
+                                                     DownloadControl control) throws Exception {
+            return download(url, stage, meter);
+        }
     }
     private record LoraResult(String text,boolean success) {}
     @FunctionalInterface private interface LoraAction { LoraResult run() throws Exception; }
     private final Settings settings;
     private final ChatService chat;
     private final SdClient sd;
+    /**
+     * VAE 的读写入口（默认就是 {@link #sd}）。做成可替换的一层是因为 {@link SdClient} 是 final 的，
+     * 测试没法用子类打桩——`.vae`、出图前防呆与灰图补救必须在假 SD 桩上也能完整跑一遍。
+     */
+    private VaeSupport vae;
     private final Sender sender;
     /** 传输层真的会发合并转发时才把多张图合成一条（见 {@link Sender#supportsRecord()}）。 */
     private final boolean forwardRecords;
@@ -108,6 +126,13 @@ public final class Bot implements AutoCloseable {
     private volatile long loraDownloaded, loraTotal = -1, loraStartedNanos;
     /** 正在下载（而不是加载）——控制台据此决定要不要显示进度条。 */
     private volatile boolean loraDownloading;
+    /**
+     * 当前下载的暂停/取消开关：只有下载任务（{@code downloading=true}）会新建一个，
+     * 任务一结束就作废（置 null），所以下一次下载拿到的一定是**新**对象，不会被上次的取消标记污染。
+     */
+    private volatile DownloadControl loraControl;
+    /** 当前 LoRA 任务的完成信号：/api/lora/cancel 据此等到下载线程真的退出（半截文件已清理）才回执。 */
+    private volatile CountDownLatch loraJobDone = new CountDownLatch(0);
     /** 当前 LoRA 任务的回执（网页接口触发的才有）：进度与结果都要能进 /quest/#N。 */
     private volatile WebCapture loraReceipt;
     private final Map<String, List<CivitaiClient.SearchResult>> loraSearches = new ConcurrentHashMap<>();
@@ -152,6 +177,7 @@ public final class Bot implements AutoCloseable {
             case "function" -> "提示词集";
             case "preset" -> "参数预设";
             case "sampler" -> "采样方法";
+            case "vae" -> "VAE";
             case "model" -> "基础模型";
             case "usage" -> "提示词分类与词条";
             case "char" -> "角色候选";
@@ -169,6 +195,7 @@ public final class Bot implements AutoCloseable {
             case "function" -> ".function load #N";
             case "preset" -> ".preset load #N";
             case "sampler" -> ".sampler set #N";
+            case "vae" -> ".vae set #N";
             case "model" -> ".model set #N";
             case "usage" -> ".usage #N";
             case "char" -> ".char apply #N";
@@ -498,6 +525,8 @@ public final class Bot implements AutoCloseable {
                 case "style" -> { return styleCatalog(); }
                 case "lora" -> { return sd.loras().stream().map(SdClient.Lora::name).toList(); }
                 case "function" -> { return new PromptFunctions(settings.root).names(); }
+                // VAE 也按实时列表解析：`.vae set #2` 与 `.vae list` 看到的编号一致。
+                case "vae" -> { return vae.vaeList(); }
                 // 提示词词条也按实时内容解析：网页上点某个词条的 #编号 不会再报"编号无效"。
                 case "prompt" -> {
                     String positive = userPrompts.prompts(promptScope(event)).positive();
@@ -520,6 +549,7 @@ public final class Bot implements AutoCloseable {
             case "style": return styleCatalog();
             case "lora": return sd.loras().stream().map(SdClient.Lora::name).toList();
             case "function": return new PromptFunctions(settings.root).names();
+            case "vae": return vae.vaeList();
             default: return List.of();
         }
     }
@@ -1060,15 +1090,17 @@ public final class Bot implements AutoCloseable {
     private static final Pattern PROMPT = Pattern.compile("^/(promptR|prompt)(?:\\s+(add|remove|set|clear|undo|classify|keep|drop)(?:\\s+([\\s\\S]*))?)?$", Pattern.CASE_INSENSITIVE);
     private static final Pattern USAGE = Pattern.compile("^/usage(?:\\s+([\\s\\S]*))?$", Pattern.CASE_INSENSITIVE);
     private static final Pattern PROGEN = Pattern.compile("^/progen(?:\\s+([\\s\\S]*))?$", Pattern.CASE_INSENSITIVE);
-    private static final Pattern SD_SETTINGS = Pattern.compile("^/(settings|sampler|style|size|preset|steps|cfg|seed|model|function)(?:\\s+([\\s\\S]*))?$", Pattern.CASE_INSENSITIVE);
+    private static final Pattern SD_SETTINGS = Pattern.compile("^/(settings|sampler|style|size|preset|steps|cfg|seed|model|function|vae)(?:\\s+([\\s\\S]*))?$", Pattern.CASE_INSENSITIVE);
     private static final Pattern SET_VALUE = Pattern.compile("^set(?:\\s+([\\s\\S]*))?$", Pattern.CASE_INSENSITIVE);
     private static final Pattern SAVE_STYLE = Pattern.compile("^(save|overwrite)(?:\\s+([\\s\\S]*))?$", Pattern.CASE_INSENSITIVE);
     private static final Pattern STYLE_CONTENT = Pattern.compile("^(prompt|load)(?:\\s+([\\s\\S]*))?$", Pattern.CASE_INSENSITIVE);
     private static final Pattern GENERATE_COMMAND = Pattern.compile("^/gen(?:\\s+([\\s\\S]*))?$", Pattern.CASE_INSENSITIVE);
+    /** .imgmode：出图是否合成「聊天记录」（QQ 合并转发），按会话保存。 */
+    private static final Pattern IMAGE_MODE_COMMAND = Pattern.compile("^/imgmode(?:\\s+([\\s\\S]*))?$", Pattern.CASE_INSENSITIVE);
     private static final Pattern LORA_COMMAND = Pattern.compile("^/lora(?:\\s+([\\s\\S]*))?$", Pattern.CASE_INSENSITIVE);
     private static final Pattern QUOTED_LORA = Pattern.compile("^(\"(?:[^\"\\\\]|\\\\.)*\")(?:\\s+(\\S+))?$");
     private static final Gson STRICT_JSON = new GsonBuilder().setStrictness(Strictness.STRICT).create();
-    private static final Pattern PUBLIC_COMMAND_PREFIX=Pattern.compile("(?<![\\p{L}\\p{N}_:/])/(help|yh|liv|get|settings|chat|admin|char|batch|sampler|style|size|steps|cfg|seed|model|promptR|prompt|preset|function|lora|gen|rg|imgcnt|usage|map|progen|infix|progress|sd)(?![\\p{L}\\p{N}_-])",Pattern.CASE_INSENSITIVE);
+    private static final Pattern PUBLIC_COMMAND_PREFIX=Pattern.compile("(?<![\\p{L}\\p{N}_:/])/(help|yh|liv|get|settings|chat|admin|char|batch|sampler|style|size|steps|cfg|seed|model|promptR|prompt|preset|function|lora|gen|rg|imgcnt|imgmode|usage|map|progen|infix|progress|vae|sd)(?![\\p{L}\\p{N}_-])",Pattern.CASE_INSENSITIVE);
     public static final String HELP = publicCommands("""
         神户小鸟 · Pixiko（SD 生图机器人）　群聊、私聊均可
         群聊先用 @机器人或小鸟名字唤醒；同一用户此后 30 分钟内可连续对话并滚动续期。私聊无需唤名，指令仍直接响应。
@@ -1114,11 +1146,12 @@ public final class Bot implements AutoCloseable {
         /promptR clear — 清空反向 prompt
         /gen toggle — 开关每个任务完成后自动领取，默认开启，重启保留
         /char <角色名或关键词> — 在本机 LoRA 与 WebUI 样式中查找该角色，列出候选并询问是否应用
-        /lora query <模型搜索词> [页码] — 搜索 Civitai，显示本页编号及封面（/lora search 是同一个命令）
+        /lora query <模型搜索词> [页码] — 搜索 Civitai，结果合并成一条聊天记录（每个节点带本页编号、封面与信息；/lora search 是同一个命令）
         /lora download #编号 [权重] — 下载最近搜索中**本页**的模型（#N 指本页第 N 条）
         /rg <数量> — 回溯最近的图片，按任务和图片上限分批，不改变待领取列表
         /progress — 查看 SD WebUI 当前生成进度（第几步／百分比／预计剩余时间）与机器人队列状态
         /imgcnt <数量> — 每条聊天记录图片上限，默认 300，按任务分开发送
+        /imgmode [record|single|auto] — 出图是否合成聊天记录（合并转发）：record 一律合并（一张也合并）、single 一律逐张普通发送、auto 自动（默认：多张合并、单张普通），按会话保存
         /jrlp — 今日老婆：随机抽一位群友，回执带群名、昵称、QQ 与头像（每群数据独立）
         /结婚 <@某人|QQ号|群名片> — 向未婚配的群友求婚，对方须在 180 秒内回复 /同意 才成立
         /同意 — 同意最近一次向你的求婚（超过 180 秒失效，须重新求婚）
@@ -1153,6 +1186,7 @@ public final class Bot implements AutoCloseable {
         /model set auto — 不固定底模，每次提交任务时用 WebUI 当前模型（Forge Neo 的预设栈用这个）
         /model preset — 列出 Forge／Forge Neo 的预设（底模 + VAE + 文本编码器一栈一栈）
         /model preset <名字> — 切到某个预设，并采纳它自己的采样方法、调度器、尺寸、步数、CFG
+        /vae [status|list|set <名字>|auto|none|check|fix] — VAE 可选设置：查看当前 VAE 与冲突判定，check 只检测（列出修复动作），fix 清掉冲突的额外模块并把 VAE 设回 Automatic
         /preset list — 查看已保存的参数预设
         /preset save <名称> — 保存当前尺寸、采样方法、步数、CFG、种子和基础模型
         /preset overwrite <名称> — 覆盖同名参数预设
@@ -1208,10 +1242,19 @@ public final class Bot implements AutoCloseable {
         """.strip());
 
     public Bot(Settings settings, SdClient sd, Sender sender) {
-        this(settings, sd, sender, (url, stage, meter) -> new CivitaiClient(settings.root,
-                Json.obj(settings.snapshot(), "civitai")).download(url, stage, meter));
+        this(settings, sd, sender, new LoraDownloader() {
+            public CivitaiClient.DownloadedLora download(String url, Consumer<String> stage, CivitaiClient.Progress meter) throws Exception {
+                return new CivitaiClient(settings.root, Json.obj(settings.snapshot(), "civitai")).download(url, stage, meter);
+            }
+            @Override public CivitaiClient.DownloadedLora download(String url, Consumer<String> stage, CivitaiClient.Progress meter,
+                                                                   DownloadControl control) throws Exception {
+                return new CivitaiClient(settings.root, Json.obj(settings.snapshot(), "civitai")).download(url, stage, meter, control);
+            }
+        });
     }
     public Bot(Settings settings, SdClient sd, Sender sender, LoraDownloader loraDownloader) {        this.settings = settings; this.sd = sd; this.sender = muteAware(webAware(sender)); this.loraDownloader = Objects.requireNonNull(loraDownloader);
+        // VAE 的读写统一走这一层：生产环境就是 SdClient 本身，测试可以换成假 SD 桩（SdClient 是 final，没法用子类打桩）。
+        this.vae = sdVaeSupport(sd);
         // 传输层是否真的实现了合并转发（要在包装之前问原始传输层：包装器自己会转发 sendRecord）。
         this.forwardRecords = sender.supportsRecord();
         // 回执正文落盘目录（data/quests/<number>.json）：回执不再过期，正文随时读得回来。
@@ -1405,6 +1448,8 @@ public final class Bot implements AutoCloseable {
                 }
                 reply(event, "每条聊天记录图片上限：" + settings.imageCount() + " 张（已保存，按生成任务分别发送）。"); return;
             }
+            Matcher imageMode = IMAGE_MODE_COMMAND.matcher(text);
+            if (imageMode.matches()) { imageMode(event, Objects.requireNonNullElse(imageMode.group(1), "").strip()); return; }
             Matcher progress = Pattern.compile("^/(progress|进度)(?:\\s+.*)?$", Pattern.CASE_INSENSITIVE).matcher(text);
             if (progress.matches()) {
                 // 进度直接来自 SD WebUI（GET /sdapi/v1/progress），队列来自机器人自己。
@@ -1731,8 +1776,13 @@ public final class Bot implements AutoCloseable {
         String scope = promptScope(event);
         try { progenIO.execute(() -> {
             String message; boolean succeeded=false;
+            // A（InfixIntent）：先做一次纯程序的祈使句解析——"改为 X"/"加入 X"/"删掉 X"/"把 X 改成 Y"。
+            // 认不出来就是 null，整条仍然交给模型；认出来但**要写入的内容含中文**时也不能直接落地（见下）。
+            InfixIntent.Intent intent = InfixIntent.parse(instruction);
             try {
                 SdClient.Prompts original = effectivePrompts(scope);
+                // 词库约束只在会话显式开启时生效；确定性与模型两条路共用这一个开关。
+                boolean strictDictionary = settings.infixFilterEnabled(ChatService.conversationKey(event));
                 // 纯"按类别筛选"的改写要求（"仅保留人物和服饰，其余清空"）：程序按分类直接执行，
                 // 不花模型额度、也不会因为模型自由发挥而漏删词条。分类清单与投喂给模型的是同一份。
                 CategorySurgery surgery = parseCategorySurgery(instruction);
@@ -1741,52 +1791,262 @@ public final class Bot implements AutoCloseable {
                             String.join(" ", surgery.keepOnly() ? surgery.keep() : surgery.remove()));
                     succeeded = true;
                 } else {
-                    // 提示词改写走生图频道：与聊天频道的模型/密钥/额度完全分开。
-                    DeepSeekPrompts client = DeepSeekPrompts.of(settings, DeepSeekPrompts.Channel.IMAGE);
-                    boolean strictDictionary = settings.infixFilterEnabled(ChatService.conversationKey(event));
-                    // 自由改写：不做拆解、不喂候选词，模型按自己的判断改写；词库约束只在显式开启时生效。
-                    // 同时把当前 prompt 的**分类清单**交给模型，让它能理解"按类别"的要求（只保留人物和服饰）。
-                    DeepSeekPrompts.Result rewritten = client.edit(instruction, original, TermCategories.describe(usageIndex(), original.positive()));
-                    InfixFilter filtered = strictDictionary
-                            ? filterInfixVocabulary(settings.root, original, rewritten)
-                            : new InfixFilter(rewritten, List.of());
-                    synchronized (userPrompts) {
-                        SdClient.Prompts current=userPrompts.prompts(scope);
-                        if(!current.positive().equals(original.positive()) || !current.negative().equals(original.negative()))
-                            throw new IllegalStateException("等待 DeepSeek 时提示词已被修改，本次结果未覆盖新内容，请重新 /infix。");
-                        if(filtered.result().positive().equals(original.positive()) && filtered.result().negative().equals(original.negative())) {
-                            message="智能修改没有可应用的有效变化，当前 prompt 保持不变。"+formatRejected(filtered.rejected());
-                        } else {
-                            PromptFunctions functions = new PromptFunctions(settings.root); functions.recover(() -> userPrompts.prompts(scope), scope);
-                            SdClient.Prompts updated = applyPersonalInfix(userPrompts, scope, original, filtered.result());
-                            functions.forget(scope, false, List.of(), true); functions.forget(scope, true, List.of(), true);
-                            // 冲突自检保留：只解决互斥词条（性交类补 1boy、day/night 只留新的），不限制写法。
-                            String fixed = selfCheckPrompts(scope);
-                            if (!fixed.isEmpty()) updated = userPrompts.prompts(scope);
-                            // 互斥原则还要"以本次要求为准"：用户这次改的槽位（地点/姿势/视角/载具/时段），
-                            // 旧值必须让位——光靠"后出现的胜"会因为模型把新词写在前面而留下旧的。
-                            List<String> replaced = new ArrayList<>();
-                            String enforced = enforceRequestedFamilies(userPrompts.prompts(scope).positive(), instruction, replaced);
-                            if (!enforced.isBlank() && !replaced.isEmpty()
-                                    && !enforced.equals(userPrompts.prompts(scope).positive())) {
-                                userPrompts.replace(scope, new SdClient.Prompts(enforced, userPrompts.prompts(scope).negative(), UserPromptStore.PERSONAL_SOURCE));
-                                updated = userPrompts.prompts(scope);
-                            }
-                            message = "智能修改已应用，本次变化：\n" + formatPromptDiff(original, updated)
-                                    + formatRejected(filtered.rejected())
-                                    + (fixed.isEmpty() ? "" : "\n自检修正：" + fixed)
-                                    + (replaced.isEmpty() ? "" : "\n互斥替换：" + String.join("、", replaced))
-                                    + "（用 .prompt 查看完整提示词）";
-                        }
+                    // A 为什么没落地（null = 能直接落地）。失败回执要说清是哪一步没懂，所以原因在这里就算好。
+                    String blocked = infixIntentBlocked(intent, original, strictDictionary);
+                    if (intent != null && blocked == null) {
+                        // 确定性快速路径：句式清楚、内容也是能直接写进 prompt 的英文词条/模型标签。
+                        // 不花模型额度，也不会再出现"模型没给出可执行指令"那种什么都没发生的结果。
+                        message = applyInfixIntent(scope, original, intent, instruction);
+                        succeeded = true;
+                    } else {
+                        ModelOutcome outcome = infixByModel(scope, original, instruction, intent, blocked, strictDictionary);
+                        message = outcome.message();
+                        // 改写调用本身失败时仍然算这一步没成功（链式指令的后续步骤必须停下，
+                        // 否则会拿着没改过的 prompt 继续 .gen）——与改动前的外层 catch 语义一致。
+                        succeeded = outcome.succeeded();
                     }
                 }
-                succeeded=true;
             } catch (Exception e) { message = "智能修改未完成：" + error(e); }
             finally { progenBusy.set(false); }
             Log.info(message);
             reply(context, message);
             completeChatWorkflowStep(context,succeeded);
         }); } catch (RejectedExecutionException e) { progenBusy.set(false);completeChatWorkflowStep(event,false);throw new IllegalStateException("机器人正在关闭。"); }
+    }
+    /**
+     * A（{@link InfixIntent}）识别出的祈使句**能不能由程序直接落地**；能落地返回 {@code null}，
+     * 不能落地返回一句"为什么不能"的中文说明（失败回执要原样告诉用户是哪一步没懂）。
+     *
+     * <p>三条判据：
+     * 1. **要写入的内容必须是能直接进 prompt 的英文词条/模型标签**：含汉字（等 SD 读不了的脚本）的
+     *    <b>新内容</b>一律不算，必须交给模型翻译——prompt 里不许出现中文词条；只有本来就已经在 prompt 里的
+     *    中文词条才允许继续使用/删除（历史遗留的个人提示词）；
+     * 2. 会话开启了标准词库约束（{@code .infix filter on}）时，新词条还必须在词库里；不在就交给模型+词库过滤，
+     *    保持"约束开启时新词必须是标准词条"这条既有行为；
+     * 3. 词级替换（SWAP）的来源必须在**指定那一侧**里找得到对应词条，找不到就不猜
+     *    （例如「把画面从肛门插入改成…」——"画面从肛门插入"不是词条，只有模型能对上）。
+     */
+    private String infixIntentBlocked(InfixIntent.Intent intent, SdClient.Prompts original, boolean strictDictionary) {
+        if (intent == null) return null;
+        boolean negative = intent.side() == InfixIntent.Side.NEGATIVE;
+        String side = negative ? original.negative() : original.positive();
+        String label = negative ? "反向" : "正向";
+        try {
+            PromptEditor.parts(side);   // 提示词本身写坏了（括号不匹配）时不接管，交给模型去修
+        } catch (IllegalArgumentException broken) {
+            return label + " prompt 的括号/转义不完整，程序不敢直接改它（" + broken.getMessage() + "）。";
+        }
+        if (intent.kind() == InfixIntent.Kind.SWAP)
+            for (String from : intent.from())
+                if (!InfixIntent.matchesAny(side, from))
+                    return "词级替换的来源「" + from + "」在" + label + " prompt 里找不到对应词条，我不猜该动哪一个。";
+        for (String term : intent.terms()) {
+            if (!InfixIntent.hasCjk(term) || TermCategories.isLoraOrEmbedding(term)) continue;
+            if (InfixIntent.matchesAny(side, term)) continue;
+            return "要写入的内容「" + term + "」是中文描述：prompt 里不许出现中文词条，"
+                    + "得让模型翻译成标准英文词条（写成英文我就能直接改）。";
+        }
+        if (strictDictionary && !dictionaryAllows(original, intent.terms()))
+            return "标准词库约束已开启（.infix filter on），而新词条" + InfixIntent.brief(intent.terms())
+                    + "不在词库 data/prompt-tags.txt 里，所以交给模型+词库过滤处理。";
+        return null;
+    }
+    /** 标准词库约束开启时，确定性路径也要过同一道词库关（新词必须是词库或现有 prompt 里的词条）。 */
+    private boolean dictionaryAllows(SdClient.Prompts original, List<String> terms) {
+        if (terms.isEmpty()) return true;
+        try {
+            Set<String> allowed = vocabulary(settings.root, original);
+            for (String term : terms) if (!allowedContains(allowed, term)) return false;
+            return true;
+        } catch (Exception unavailable) {
+            Log.warn("标准词库读取失败，这次改写交给模型：" + error(unavailable));
+            return false;
+        }
+    }
+    /**
+     * 模型改写路径（默认链路）。
+     *
+     * <p>注意：A 的落地判断**不在模型失败之后才做**，而是在调用模型之前就做（见 {@link #infix}）——
+     * 能确定性执行的要求根本走不到这里，所以"模型没给出指令"对这类要求不会再发生。走到这里的只剩两类：
+     * 句式认不出来（{@code intent == null}）与认出来了但不能直接落地（中文描述型等，{@code blocked != null}）。
+     * 后者第一次改写没给出可应用的变化时，会用更严格的指令再问一次（见 {@link #infixTranslationRetry}）。
+     */
+    private ModelOutcome infixByModel(String scope, SdClient.Prompts original, String instruction, InfixIntent.Intent intent,
+                                      String blocked, boolean strictDictionary) throws Exception {
+        // 提示词改写走生图频道：与聊天频道的模型/密钥/额度完全分开。
+        DeepSeekPrompts client = DeepSeekPrompts.of(settings, DeepSeekPrompts.Channel.IMAGE);
+        // 自由改写：不做拆解、不喂候选词，模型按自己的判断改写；词库约束只在显式开启时生效。
+        // 同时把当前 prompt 的**分类清单**交给模型，让它能理解"按类别"的要求（只保留人物和服饰）。
+        DeepSeekPrompts.Result rewritten = null;
+        String modelError = null;
+        try { rewritten = client.edit(instruction, original, TermCategories.describe(usageIndex(), original.positive())); }
+        catch (Exception model) { modelError = error(model); Log.warn("提示词改写调用没有成功：" + modelError); }
+        if (rewritten == null)   // 调用失败：这一步不算成功（链式指令的后续步骤要停下）
+            return new ModelOutcome(infixIntentFallback(scope, original, instruction, intent, blocked, List.of(), modelError, strictDictionary), false);
+        InfixFilter filtered = strictDictionary
+                ? filterInfixVocabulary(settings.root, original, rewritten)
+                : new InfixFilter(rewritten, List.of());
+        String applied = applyModelRewrite(scope, original, filtered.result(), filtered.rejected(), instruction);
+        if (applied != null) return new ModelOutcome(applied, true);
+        // 模型结果与当前提示词一致（没有可应用的变化）→ 走兜底：中文描述型再严格重试一次，否则如实说明。
+        // 调用本身是成功的，所以这一步仍算成功（与改动前"没有可应用的变化"回执的语义一致）。
+        return new ModelOutcome(infixIntentFallback(scope, original, instruction, intent, blocked, filtered.rejected(), null, strictDictionary), true);
+    }
+    /** 一次模型改写路径的结果：给用户的回执 + 这一步算不算成功（链式指令据此决定要不要往下走）。 */
+    private record ModelOutcome(String message, boolean succeeded) { }
+    /**
+     * 应用模型给出的改写，返回回执；模型结果与当前提示词完全一致（没有可应用的变化）时返回 {@code null}，
+     * 由调用方走兜底。这一段与原来的实现逐行一致：并发保护、函数集归属、冲突自检与互斥替换都保持原样。
+     */
+    private String applyModelRewrite(String scope, SdClient.Prompts original, DeepSeekPrompts.Result result,
+                                     List<String> rejected, String instruction) throws Exception {
+        synchronized (userPrompts) {
+            SdClient.Prompts current=userPrompts.prompts(scope);
+            if(!current.positive().equals(original.positive()) || !current.negative().equals(original.negative()))
+                throw new IllegalStateException("等待 DeepSeek 时提示词已被修改，本次结果未覆盖新内容，请重新 /infix。");
+            if(result.positive().equals(original.positive()) && result.negative().equals(original.negative())) return null;
+            PromptFunctions functions = new PromptFunctions(settings.root); functions.recover(() -> userPrompts.prompts(scope), scope);
+            SdClient.Prompts updated = applyPersonalInfix(userPrompts, scope, original, result);
+            functions.forget(scope, false, List.of(), true); functions.forget(scope, true, List.of(), true);
+            // 冲突自检保留：只解决互斥词条（性交类补 1boy、day/night 只留新的），不限制写法。
+            String fixed = selfCheckPrompts(scope);
+            if (!fixed.isEmpty()) updated = userPrompts.prompts(scope);
+            // 互斥原则还要"以本次要求为准"：用户这次改的槽位（地点/姿势/视角/载具/时段），
+            // 旧值必须让位——光靠"后出现的胜"会因为模型把新词写在前面而留下旧的。
+            List<String> replaced = new ArrayList<>();
+            String enforced = enforceRequestedFamilies(userPrompts.prompts(scope).positive(), instruction, replaced);
+            if (!enforced.isBlank() && !replaced.isEmpty()
+                    && !enforced.equals(userPrompts.prompts(scope).positive())) {
+                userPrompts.replace(scope, new SdClient.Prompts(enforced, userPrompts.prompts(scope).negative(), UserPromptStore.PERSONAL_SOURCE));
+                updated = userPrompts.prompts(scope);
+            }
+            return "智能修改已应用，本次变化：\n" + formatPromptDiff(original, updated)
+                    + formatRejected(rejected)
+                    + (fixed.isEmpty() ? "" : "\n自检修正：" + fixed)
+                    + (replaced.isEmpty() ? "" : "\n互斥替换：" + String.join("、", replaced))
+                    + "（用 .prompt 查看完整提示词）";
+        }
+    }
+    /**
+     * 模型没给出可应用改动时的兜底：要求里有中文描述（A 认得出句式、但内容必须由模型翻译成英文词条）时，
+     * 用更严格的指令再问一次；仍然不行就如实说明是哪一步没懂。
+     */
+    private String infixIntentFallback(String scope, SdClient.Prompts original, String instruction, InfixIntent.Intent intent,
+                                       String blocked, List<String> rejected, String modelError, boolean strictDictionary) throws Exception {
+        if (modelError == null && InfixIntent.hasCjk(instruction)) {
+            String retry = infixTranslationRetry(scope, original, instruction, strictDictionary);
+            if (retry != null) return retry;
+        }
+        return infixNothingUnderstood(intent, instruction, rejected, modelError, blocked);
+    }
+    /**
+     * 中文描述型的第二次尝试：第一次改写没产出变化时，明确要求它"只返回改好的完整提示词 JSON"，
+     * 并把中文必须翻译成英文词条这条硬规矩再写一遍。成功返回回执，失败返回 {@code null}（由调用方报失败）。
+     */
+    private String infixTranslationRetry(String scope, SdClient.Prompts original, String instruction, boolean strictDictionary) {
+        String nudge = "【重试】这条要求里有中文描述，必须由你翻译成标准英文词条后落实；"
+                + "只返回 JSON：{\"positive\":\"...\",\"negative\":\"...\"}（改好后的完整提示词），"
+                + "不要解释、不要 Markdown、不要把任何中文写进 positive/negative。原要求：";
+        if (instruction.length() + nudge.length() > 8000) return null;
+        try {
+            DeepSeekPrompts.Result again = DeepSeekPrompts.of(settings, DeepSeekPrompts.Channel.IMAGE)
+                    .edit(nudge + instruction, original, TermCategories.describe(usageIndex(), original.positive()));
+            InfixFilter filtered = strictDictionary
+                    ? filterInfixVocabulary(settings.root, original, again)
+                    : new InfixFilter(again, List.of());
+            String applied = applyModelRewrite(scope, original, filtered.result(), filtered.rejected(), instruction);
+            if (applied == null) { Log.info("中文描述型要求严格重试后仍无有效变化（" + scope + "）"); return null; }
+            Log.info("中文描述型要求严格重试后已应用（" + scope + "）");
+            return "（第一次改写没有给出可应用的修改，用更严格的要求重试后成功）\n" + applied;
+        } catch (Exception failed) {
+            Log.warn("中文描述型改写的严格重试没有成功：" + error(failed));
+            return null;
+        }
+    }
+    /**
+     * 失败回执：说清是**哪一步**没懂/没落地，并列出我认得的形式（旧的"我没有解析出可执行的指令"太笼统，
+     * 用户不知道该改哪里，线上这类回执出现过 65 次）。
+     */
+    private String infixNothingUnderstood(InfixIntent.Intent intent, String instruction, List<String> rejected,
+                                          String modelError, String blocked) {
+        StringBuilder out = new StringBuilder();
+        if (modelError != null) out.append("智能修改未完成：").append(modelError).append('\n');
+        else out.append("这次没有改动任何词条：改写模型没有给出可应用的修改。\n");
+        if (intent == null) {
+            out.append(InfixIntent.hasCjk(instruction)
+                    ? "这条要求里有中文画面描述，我不把它当词条直接写进 prompt（SD 只认英文词条），需要模型翻译成标准英文词条，"
+                        + "但它这次没有给出可用的结果。\n"
+                    : "我也没能从这条要求里认出「要改哪一步」：它不像单条祈使句（可能是多步、带条件，或只是一句画面描述），"
+                        + "所以一个字都没改。\n");
+        } else {
+            out.append("我认出了这是「").append(intent.note()).append("」，但没有落地：")
+                    .append(blocked == null ? "改写模型没有给出可用的结果。" : blocked).append('\n');
+        }
+        out.append(InfixIntent.formsHelp());
+        out.append(formatRejected(rejected));
+        return out.toString();
+    }
+    /**
+     * 把 A 解析出的祈使句直接落到个人提示词上。文本变换在 {@link InfixIntent#apply}（纯函数、可单测）里，
+     * 这里负责落盘、函数集归属、与模型路径相同的两道互斥自检、以及回执；
+     * **只动指令指定的那一侧**，另一侧一个字符都不碰。
+     */
+    private String applyInfixIntent(String scope, SdClient.Prompts original, InfixIntent.Intent intent, String instruction) throws Exception {
+        boolean negative = intent.side() == InfixIntent.Side.NEGATIVE;
+        String before = negative ? original.negative() : original.positive();
+        String label = negative ? "反向" : "正向";
+        String other = negative ? original.positive() : original.negative();
+        InfixIntent.Change change = InfixIntent.apply(before, intent);
+        if (change.prompt().equals(before))
+            return "这次没有改动任何词条：识别为「" + intent.note() + "」，但" + label + " prompt 里没有"
+                    + InfixIntent.brief(change.missing().isEmpty() ? intent.terms() : change.missing())
+                    + otherSideHint(other, intent) + "\n（用 .prompt 查看完整提示词）";
+        synchronized (userPrompts) {
+            SdClient.Prompts current = userPrompts.prompts(scope);
+            if (!current.positive().equals(original.positive()) || !current.negative().equals(original.negative()))
+                throw new IllegalStateException("提示词已被修改，本次结果未覆盖新内容，请重新 /infix。");
+            PromptFunctions functions = new PromptFunctions(settings.root);
+            functions.recover(() -> userPrompts.prompts(scope), scope);
+            SdClient.Prompts updated = userPrompts.replace(scope, new SdClient.Prompts(
+                    negative ? original.positive() : change.prompt(),
+                    negative ? change.prompt() : original.negative(), UserPromptStore.PERSONAL_SOURCE));
+            // 函数集归属：整体替换等于这一侧不再由函数集拥有；增/删/换只放弃动过的那几个词条。
+            if (intent.kind() == InfixIntent.Kind.REPLACE) functions.forget(scope, negative, List.of(), true);
+            else functions.forget(scope, negative, change.changed(), false);
+            // 与模型改写路径相同的那两道程序侧自检：它们本来就是"任何改写都不许在 prompt 里留下矛盾"的
+            // 全局硬规矩（性交类补 1boy、同族词条让位），确定性路径不能因为"没经过模型"就跳过。
+            String fixed = selfCheckPrompts(scope);
+            if (!fixed.isEmpty()) updated = userPrompts.prompts(scope);
+            List<String> replaced = new ArrayList<>();
+            String enforced = enforceRequestedFamilies(userPrompts.prompts(scope).positive(), instruction, replaced);
+            if (!enforced.isBlank() && !replaced.isEmpty()
+                    && !enforced.equals(userPrompts.prompts(scope).positive())) {
+                userPrompts.replace(scope, new SdClient.Prompts(enforced, userPrompts.prompts(scope).negative(), UserPromptStore.PERSONAL_SOURCE));
+                updated = userPrompts.prompts(scope);
+            }
+            return "已按祈使句直接修改（没有使用模型，也没有花 DeepSeek 额度）：\n" + formatPromptDiff(original, updated)
+                    + "\n识别为：" + intent.note()
+                    + (fixed.isEmpty() ? "" : "\n自检修正：" + fixed)
+                    + (replaced.isEmpty() ? "" : "\n互斥替换：" + String.join("、", replaced))
+                    + (intent.kind() == InfixIntent.Kind.REPLACE && !change.unchanged().isEmpty()
+                        ? "\nLoRA/嵌入标签原样保留：" + InfixIntent.brief(change.unchanged()) : "")
+                    + (intent.kind() != InfixIntent.Kind.REPLACE && !change.unchanged().isEmpty()
+                        ? "\n已存在，未重复加：" + InfixIntent.brief(change.unchanged()) : "")
+                    + (change.missing().isEmpty() ? "" : "\n没找到这些词条：" + InfixIntent.brief(change.missing()))
+                    + "\n（用 .prompt 查看完整提示词）";
+        }
+    }
+    /**
+     * 正向没找到、另一侧里却有时，提示用户"要删那边请说反向删掉 …"——
+     * 删哪一侧由用户说了算，程序不替他猜着去动另一侧。
+     */
+    private String otherSideHint(String other, InfixIntent.Intent intent) {
+        if (intent.kind() != InfixIntent.Kind.REMOVE) return "";
+        List<String> found = new ArrayList<>();
+        for (String term : intent.terms()) if (InfixIntent.matchesAny(other, term)) found.add(term);
+        if (found.isEmpty()) return "";
+        return "（" + InfixIntent.brief(found) + " 在另一侧 prompt 里；要删那边请说「反向删掉 …」——"
+                + "我只动你指定的那一侧，不去猜）";
     }
     /**
      * 在 LoRA 目录里定位一个 LoRA 文件：优先用 WebUI 官方列表给的路径（名称/别名/文件名都能认），
@@ -2759,6 +3019,109 @@ public final class Bot implements AutoCloseable {
                 + "\n回到第一页：.lora search " + quoteLoraSearchWords(page.query()) + " 1"
                 + "\n（你上一次看到的本页编号没有被改动）";
     }
+    /**
+     * 把一次搜索的一页结果发出去：能发合并转发时只发**一条**聊天记录（每条结果一个节点），
+     * 传输层不支持时保持它原来的发法（逐条，并如实说明原因），合并转发失败也回退成逐条发送——
+     * 不管走哪条路，结果一条都不能丢。
+     *
+     * <p>节点正文就是用户在手机上看到的那段纯文本（编号、模型名、底模、下载量、触发词、大小、页面地址），
+     * 编号与 {@code .lora download #N} 用的是同一份"本页"列表，所以两边永远对得上。
+     */
+    void sendLoraSearchResults(JsonObject event, CivitaiClient.SearchPage page) {
+        List<CivitaiClient.SearchResult> results = page.results();
+        if (results.isEmpty()) return;
+        if (!forwardRecords) {
+            Log.info("LoRA 搜索结果发送方式（" + describeConversation(event) + "）：普通发送 " + results.size() + " 条（传输层不支持合并转发）");
+            reply(event, "这个传输层不支持合并转发，已逐条发送。");
+            sendLoraSearchResultsOneByOne(event, results);
+            return;
+        }
+        List<JsonArray> nodes = new ArrayList<>(results.size());
+        for (int at = 0; at < results.size(); at++) nodes.add(loraSearchNode(at + 1, results.get(at)));
+        Log.info("LoRA 搜索结果发送方式（" + describeConversation(event) + "）：合并转发 " + nodes.size() + " 条");
+        // 合并转发失败（NapCat 不支持 send_group_forward_msg、节点格式被拒……）绝不能把结果丢了：
+        // 回退成逐条发送（逐条那条路自己还有"封面发不出去就改用文字"的兜底），这里只回退一次、不重试。
+        CompletableFuture<Void> sent;
+        try {
+            sent = sender.sendRecord(event, nodes).handle((ignored, failure) -> {
+                if (failure == null) return CompletableFuture.<Void>completedFuture(null);
+                Log.warn("LoRA 搜索结果的合并转发失败，已改为逐条发送 " + results.size() + " 条（" + describeConversation(event) + "）：" + error(failure));
+                reply(event, "合并转发失败，已逐条发送（搜索结果一条不少）。");
+                return sendLoraSearchResultsOneByOne(event, results);
+            }).thenCompose(future -> future);
+        } catch (Exception refused) {
+            // 传输层同步拒绝（没连上 QQ 之类）：同样回退，别让搜索结果凭空消失。
+            Log.warn("LoRA 搜索结果的合并转发未被接受，已改为逐条发送 " + results.size() + " 条（" + describeConversation(event) + "）：" + error(refused));
+            reply(event, "合并转发失败，已逐条发送（搜索结果一条不少）。");
+            sendLoraSearchResultsOneByOne(event, results);
+            return;
+        }
+        // 等这条聊天记录确认之后再回"搜索完成，共 N 项"的总回执：顺序与逐条发送时一致，
+        // 回执不会排在它描述的那些结果前面（原实现是逐条 .get()，同样是发完才回执）。
+        try { sent.get(); }
+        catch (InterruptedException interrupted) { Thread.currentThread().interrupt(); Log.warn("等待 LoRA 搜索结果的合并转发时被中断（" + describeConversation(event) + "）"); }
+        catch (ExecutionException failed) { Log.warn("LoRA 搜索结果发送失败（" + describeConversation(event) + "）：" + error(failed)); }
+    }
+    /**
+     * 逐条发送一页搜索结果（传输层不支持合并转发，或合并转发失败后的回退）。
+     *
+     * <p>从发不出去的那一条起（常见：图床被墙或超时）改用一条纯文本把余下条目一次给出，编号保持不变，
+     * 所以"封面发不出去"最多丢封面，绝不丢结果。
+     */
+    private CompletableFuture<Void> sendLoraSearchResultsOneByOne(JsonObject event, List<CivitaiClient.SearchResult> results) {
+        for (int at = 0; at < results.size(); at++) {
+            CivitaiClient.SearchResult result = results.get(at);
+            try { sender.send(event.deepCopy(), loraSearchNode(at + 1, result)).get(); }
+            catch (Exception failure) {
+                Log.warn("LoRA 搜索结果第 " + (at + 1) + " 条发送失败，余下改用文字：" + error(failure));
+                StringBuilder fallback = new StringBuilder("封面发送失败，余下条目以文字给出：\n");
+                for (int rest = at; rest < results.size(); rest++) {
+                    CivitaiClient.SearchResult item = results.get(rest);
+                    fallback.append("#").append(rest + 1).append(' ').append(item.name()).append('\n').append(item.url()).append('\n');
+                }
+                reply(event, fallback.toString());
+                break;
+            }
+        }
+        return CompletableFuture.completedFuture(null);
+    }
+    /**
+     * 一条搜索结果的出站消息，也就是合并转发里的一个节点：正文是一段人能读的纯文本，有封面就再带一张封面。
+     */
+    static JsonArray loraSearchNode(int number, CivitaiClient.SearchResult result) {
+        JsonArray message = new JsonArray();
+        message.addAll(Maps.text(loraSearchNodeText(number, result)));
+        if (result.cover() != null && !result.cover().isEmpty()) {
+            JsonObject image = new JsonObject(), data = new JsonObject();
+            image.addProperty("type", "image");
+            data.addProperty("file", result.cover());
+            image.add("data", data);
+            message.add(image);
+        }
+        return message;
+    }
+    /**
+     * 上面那个节点的正文：编号、模型名（不截断）、底模、下载量、触发词、大小、页面地址。
+     * 纯文本逐行写，不塞 JSON/表格——QQ 的聊天记录节点在手机上就是这段文字。
+     */
+    static String loraSearchNodeText(int number, CivitaiClient.SearchResult result) {
+        StringBuilder text = new StringBuilder("#").append(number).append(' ').append(result.name());
+        String base = result.baseModel() == null ? "" : result.baseModel().strip();
+        text.append("\n底模：").append(base.isEmpty() ? "未标注" : base);
+        if (result.nsfw()) text.append("（NSFW 标记）");
+        if (result.downloads() > 0) text.append("\n下载量：").append(String.format(Locale.ROOT, "%,d", result.downloads()));
+        List<String> words = result.trainedWords() == null ? List.of() : result.trainedWords();
+        if (!words.isEmpty()) text.append("\n触发词（").append(words.size()).append(" 条）：").append(String.join("、", words));
+        String size = loraSearchSize(result.sizeKb());
+        if (!size.isEmpty()) text.append("\n大小：").append(size);
+        text.append("\n页面：").append(result.url());
+        return text.toString();
+    }
+    /** 文件大小：1 MB 以下写 KB，以上写 MB（一位小数）；未知（0 / 负数）就不写这一行。 */
+    static String loraSearchSize(double sizeKb) {
+        if (!(sizeKb > 0)) return "";
+        return sizeKb >= 1024 ? String.format(Locale.ROOT, "%.1f MB", sizeKb / 1024) : String.format(Locale.ROOT, "%.0f KB", sizeKb);
+    }
     private void lora(JsonObject event, String arguments) throws Exception {
         String loraScope = promptScope(event);
         Matcher searching = Pattern.compile("(?i)^(query|search)(?:\\s+([\\s\\S]*))?$").matcher(arguments);
@@ -2771,35 +3134,29 @@ public final class Bot implements AutoCloseable {
                 if (page.results().isEmpty())
                     return new LoraResult(parsed.page() == 1 ? "未找到匹配的 LoRA。" : searchPageOutOfRange(page), false);
                 registerLoraSearch(event, page);
-                // 一条 LoRA 一条消息：封面配着它自己的编号/名称/链接发出去，不把十条挤成一条
-                // （回执按出站消息分组渲染，所以控制台里也是一条一项、图文同条）。
-                for (int at = 0; at < page.count(); at++) {
-                    var result = page.results().get(at);
-                    JsonArray message = new JsonArray();
-                    message.addAll(Maps.text("#" + (at + 1) + " " + result.name() + "\n基础模型：" + result.baseModel() + "\n" + result.url()));
-                    if (!result.cover().isEmpty()) {
-                        JsonObject image = new JsonObject(), data = new JsonObject(); image.addProperty("type", "image");
-                        data.addProperty("file", result.cover()); image.add("data", data); message.add(image);
-                    } else message.addAll(Maps.text("（该结果暂无可用封面）"));
-                    try { sender.send(event.deepCopy(), message).get(); }
-                    catch (Exception error) {
-                        // 从这一条起发不出去（常见：图床被墙或超时）：余下条目改成纯文本一次给出，编号保持不变。
-                        Log.warn("LoRA 搜索结果第 " + (at + 1) + " 条发送失败，余下改用文字：" + error(error));
-                        StringBuilder fallback = new StringBuilder("封面发送失败，余下条目以文字给出：\n");
-                        for (int rest = at; rest < page.count(); rest++) {
-                            var item = page.results().get(rest);
-                            fallback.append("#").append(rest + 1).append(' ').append(item.name()).append('\n').append(item.url()).append('\n');
-                        }
-                        reply(event, fallback.toString());
-                        break;
-                    }
-                }
+                // 一次搜索的结果只发**一条**聊天记录（合并转发），每条结果一个节点；传输层不支持或
+                // 合并转发失败时由它回退成逐条发送（并如实说明），结果一条不少。
+                sendLoraSearchResults(event, page);
                 return new LoraResult("搜索完成，共 " + page.count() + " 项。使用 /lora download #编号 [权重] 下载；"
                         + "编号属于你在本会话最近一次搜索的**本页**（只保存在内存里，重启后必须重新搜索）。\n"
                         + searchPageLines(page), true);
             }); return;
         }
-        if (arguments.equalsIgnoreCase("status")) { reply(event, "最近 LoRA 下载状态：\n" + loraStatus + "\n" + loraProgressLine()); return; }
+        if (arguments.equalsIgnoreCase("status")) {
+            DownloadControl watching = loraControl;   // 先取一次：任务随时可能结束并把控制对象作废
+            reply(event, "最近 LoRA 下载状态：\n" + loraStatus + "\n" + loraProgressLine()
+                    + (watching != null && watching.isPaused() ? "\n当前状态：已暂停" : "")
+                    + "\n可用命令：.lora cancel 取消当前下载、.lora pause 暂停、.lora resume 继续（控制台对应 /api/lora/cancel、pause、resume）。");
+            return;
+        }
+        if (arguments.equalsIgnoreCase("cancel") || arguments.equalsIgnoreCase("pause") || arguments.equalsIgnoreCase("resume")) {
+            // 取消/暂停/继续下载：和 .lora download 同一条权限规则（admin_only 时仅管理员）。
+            requireLoraPermission(event);
+            String action = arguments.toLowerCase(Locale.ROOT);
+            JsonObject outcome = action.equals("cancel") ? loraCancelJson() : action.equals("pause") ? loraPauseJson() : loraResumeJson();
+            reply(event, "LoRA 下载：" + Json.str(outcome, "message", "") + "\n" + loraProgressLine());
+            return;
+        }
         if (arguments.equalsIgnoreCase("list")) {
             startLora(event, "正在读取 WebUI 本地 LoRA 列表。", false, () -> {
                 List<SdClient.Lora> values = sd.loras();
@@ -2915,6 +3272,7 @@ public final class Bot implements AutoCloseable {
         Matcher command = Pattern.compile("^(download|load)(?:\\s+([\\s\\S]*))?$", Pattern.CASE_INSENSITIVE).matcher(arguments);
         if (!command.matches() || command.group(2) == null || command.group(2).isBlank())
             throw new IllegalArgumentException("用法：/lora download <Civitai链接> [权重]、/lora status、/lora list、/lora detail <名称|#编号>、"
+                    + "/lora cancel（取消当前下载）、/lora pause（暂停）、/lora resume（继续）、"
                     + "/lora load <完整本地名称> [权重] 或 /lora delete <名称|#编号>。权重默认 1，范围 0–2。");
         JsonObject civitai = Json.obj(settings.snapshot(), "civitai");
         if (Json.bool(civitai, "admin_only", false) && !settings.isAdmin(Json.str(event, "user_id", "")))
@@ -2933,7 +3291,8 @@ public final class Bot implements AutoCloseable {
                 parts[0] = results.get(index).url();
             }
             double weight = parts.length == 2 ? loraWeight(parts[1]) : 1.0;
-            startLora(event, "开始下载 LoRA，完成后自动保存展示图样式并加载模型；使用 /lora status 查看状态。", true,
+            startLora(event, "开始下载 LoRA，完成后自动保存展示图样式并加载模型；使用 /lora status 查看状态，"
+                    + ".lora pause/resume 暂停或继续，.lora cancel 取消。", true, true,
                     () -> downloadAndLoad(parts[0], weight));
         } else {
             LoraSelection parsed = loraSelection(value);
@@ -2959,14 +3318,32 @@ public final class Bot implements AutoCloseable {
      * <p>QQ 指令（{@code .lora download}）和控制台内部接口（{@code /api/lora/download}）走的是同一段。
      */
     private LoraResult downloadAndLoad(String link, double weight) throws Exception {
+        DownloadControl control = loraControl;
         loraStartedNanos = System.nanoTime(); loraDownloaded = 0; loraTotal = -1;
         CivitaiClient.DownloadedLora downloaded;
         try {
             downloaded = loraDownloader.download(link,
                     this::loraStage,
-                    (done, size) -> { loraDownloaded = done; loraTotal = size; });
-        } finally { loraTotal = -1; }
+                    (done, size) -> { loraDownloaded = done; loraTotal = size; },
+                    control);
+        } catch (DownloadControl.CancelledException cancelled) {
+            // 取消：下载端已经停流并删掉半截临时文件（见 CivitaiClient 的 finally），这里只管如实回执。
+            Log.info("LoRA 下载已取消：" + Log.text(link));
+            loraStatus = safeLoraText("LoRA 下载已取消：传输已停止，半截文件已清理，没有登记进 LoRA 列表。");
+            return new LoraResult(loraStatus, false);
+        } finally {
+            loraTotal = -1;
+            // 传输阶段到此结束：之后是"加载模型/抓展示图"，取消下载已经没有意义了（取消接口据此如实说明）。
+            if (control != null) control.markFinished();
+        }
         String filename = downloaded.path().getFileName().toString();
+        if (control != null && control.isCancelled()) {
+            // 取消来晚了：文件已经完整下载并通过校验（不是半截），但后面的刷新/展示图/加载一律不做。
+            loraStatus = safeLoraText("LoRA 文件已完整下载：" + filename + "；取消请求到得太晚——下载已经完成（文件保留在 LoRA 目录），"
+                    + "之后的刷新/展示图/加载阶段已跳过。要用请点本机列表的「加载」。");
+            Log.info("LoRA 下载已完成但收到取消请求（文件保留）：" + filename);
+            return new LoraResult(loraStatus, false);
+        }
         Path previewFile = CivitaiClient.previewPath(downloaded.path());
         boolean hasPreview = Files.isRegularFile(previewFile);
         String showcaseReport = "展示图样式尚未处理：须先确认本机 LoRA 标签。";
@@ -3058,7 +3435,7 @@ public final class Bot implements AutoCloseable {
         if (Double.isNaN(weight) || weight < 0 || weight > 2) throw new IllegalArgumentException("权重范围 0–2，默认 1。");
         requireLoraPermission(webEvent(scope == null ? "" : scope, "lora download"));
         WebCapture receipt = newCapture(".lora download " + link);
-        if (!startLoraJob(null, receipt, "正在下载 LoRA，完成后自动保存展示图样式并加载模型。", true, () -> downloadAndLoad(link, weight))) {
+        if (!startLoraJob(null, receipt, "正在下载 LoRA，完成后自动保存展示图样式并加载模型。", true, true, () -> downloadAndLoad(link, weight))) {
             webCaptures.remove(receipt.id());
             return loraBusyJson();
         }
@@ -3083,6 +3460,86 @@ public final class Bot implements AutoCloseable {
         started.addProperty("quest", receipt.number());
         started.addProperty("captureId", receipt.id());
         return started;
+    }
+    /**
+     * 控制台「取消」按钮：{@code POST /api/lora/cancel}。
+     *
+     * <p>马上停传输、删掉半截文件（临时 .part 由下载端的 finally 清），并且**等到下载线程真的退出**
+     * 才回执——回执里那句"已取消"必须是既成事实，不是"正在取消"。等不到的极端情况（下载器压根不看
+     * 控制对象、或卡在网络读取）也如实说明，不假装成功。
+     *
+     * <p>没有任务在跑、或取消发生在"文件已下完、正在加载/抓展示图"阶段时，一样返回 200 + 一句人话
+     * （幂等，不报错）：后者会明说这个阶段取消不了。
+     */
+    public JsonObject webLoraCancel(String scope) {
+        requireLoraPermission(webEvent(scope == null ? "" : scope, "lora cancel"));
+        return loraCancelJson();
+    }
+    /** 控制台「暂停」按钮：{@code POST /api/lora/pause}（幂等：没任务、已暂停都只回一句话）。 */
+    public JsonObject webLoraPause(String scope) {
+        requireLoraPermission(webEvent(scope == null ? "" : scope, "lora pause"));
+        return loraPauseJson();
+    }
+    /** 控制台「继续」按钮：{@code POST /api/lora/resume}（幂等：没任务、没暂停都只回一句话）。 */
+    public JsonObject webLoraResume(String scope) {
+        requireLoraPermission(webEvent(scope == null ? "" : scope, "lora resume"));
+        return loraResumeJson();
+    }
+    /** 取消当前下载；返回值和 /api/lora/progress 同一份 JSON，外加一句 message 与 cancelled。 */
+    private JsonObject loraCancelJson() {
+        DownloadControl control = loraControl;
+        if (!loraBusy.get())
+            return loraControlJson("当前没有 LoRA 下载任务在跑，无需取消。", false);
+        if (control == null)
+            return loraControlJson("当前在跑的是 LoRA 加载/补展示图，没有可取消的下载。", false);
+        if (control.isFinished())
+            return loraControlJson("LoRA 文件已经下载完，正在加载模型/抓展示图，这个阶段无法取消（下载本身已经结束）。", false);
+        control.cancel();
+        boolean stopped = awaitLoraJob(5);
+        return loraControlJson(stopped
+                ? "已取消本次 LoRA 下载：传输已停止，半截文件已清理，没有登记进 LoRA 列表。"
+                : "取消请求已发出，但下载线程没有在 5 秒内停下（可能卡在网络读取）；它会尽快自行结束。", stopped);
+    }
+    /** 暂停当前下载：进度立刻不再前进（传输循环会在下一块 64 KB 处阻塞）。 */
+    private JsonObject loraPauseJson() {
+        DownloadControl control = loraControl;
+        if (!loraBusy.get())
+            return loraControlJson("当前没有 LoRA 下载在跑，无需暂停。", false);
+        if (control == null)
+            return loraControlJson("当前在跑的是 LoRA 加载/补展示图，不能暂停。", false);
+        if (control.isFinished())
+            return loraControlJson("LoRA 文件已经下载完，正在加载模型/抓展示图，这个阶段不能暂停。", false);
+        if (control.isPaused())
+            return loraControlJson("LoRA 下载已经处于暂停状态；用 resume 继续，或 cancel 取消。", false);
+        control.pause();
+        loraStage("LoRA 下载已暂停（用 .lora resume / /api/lora/resume 继续，.lora cancel / /api/lora/cancel 取消）。");
+        return loraControlJson("已暂停 LoRA 下载。", false);
+    }
+    /** 继续已暂停的下载。 */
+    private JsonObject loraResumeJson() {
+        DownloadControl control = loraControl;
+        if (!loraBusy.get())
+            return loraControlJson("当前没有 LoRA 下载在跑，无需继续。", false);
+        if (control == null || control.isFinished())
+            return loraControlJson("LoRA 下载已结束（正在加载模型/抓展示图），不需要继续。", false);
+        if (!control.isPaused())
+            return loraControlJson("LoRA 下载没有处于暂停状态，无需继续。", false);
+        control.resume();
+        loraStage("已继续下载 LoRA。");
+        return loraControlJson("已继续 LoRA 下载。", false);
+    }
+    /** 取消/暂停/继续的统一回应：和 loraProgress() 同一份 JSON（老字段齐全）+ message（+ cancelled）。 */
+    private JsonObject loraControlJson(String message, boolean cancelled) {
+        JsonObject result = loraProgress();
+        result.addProperty("message", message);
+        result.addProperty("cancelled", cancelled);
+        return result;
+    }
+    /** 等当前 LoRA 任务收尾（最多 seconds 秒）；true = 线程真的退出了（半截文件也已清理）。 */
+    private boolean awaitLoraJob(long seconds) {
+        CountDownLatch done = loraJobDone;
+        try { return done.await(seconds, TimeUnit.SECONDS); }
+        catch (InterruptedException interrupted) { Thread.currentThread().interrupt(); return false; }
     }
     /** 任务已经开跑：带上 started 让接口回 202，前端据此开始轮询进度。 */
     private JsonObject loraStartedJson() {
@@ -3138,9 +3595,17 @@ public final class Bot implements AutoCloseable {
     public JsonObject loraProgress() {
         JsonObject result = new JsonObject();
         boolean downloading = loraDownloading, busy = loraBusy.get();
+        DownloadControl control = loraControl;
         result.addProperty("busy", busy);
         result.addProperty("downloading", downloading);
         result.addProperty("stage", loraStatus == null ? "" : loraStatus);
+        // 控制台「取消/暂停」按钮的三个新字段（老字段一个都没动：桌面端的进度卡还在读 busy/downloading/stage/metered）。
+        // active：有任务在跑（下载、加载、补展示图都算），语义上等于 busy。
+        // cancellable：这**一阶段**能不能取消——只有传输还在进行时才算（进了加载/抓展示图就取消不了下载了）。
+        // paused：当前下载是否暂停（取消过的下载不算暂停）。
+        result.addProperty("active", busy);
+        result.addProperty("cancellable", control != null && !control.isFinished() && !control.isCancelled());
+        result.addProperty("paused", control != null && control.isPaused());
         long total = loraTotal, done = loraDownloaded;
         boolean metered = downloading && total > 0 && done >= 0;
         result.addProperty("metered", metered);
@@ -3157,7 +3622,14 @@ public final class Bot implements AutoCloseable {
         return result;
     }
     private void startLora(JsonObject event, String start, boolean downloading, LoraAction action) {
-        if (startLoraJob(event, start, downloading, action)) return;
+        startLora(event, start, downloading, false, action);
+    }
+    /**
+     * @param cancellable 这次任务带一个可暂停/取消的下载控制对象：只有真正下载文件的才传 true；
+     *                    「补展示图」这类虽然也标 downloading（面板照样显示进度条），但不该假装能暂停/取消。
+     */
+    private void startLora(JsonObject event, String start, boolean downloading, boolean cancellable, LoraAction action) {
+        if (startLoraJob(event, start, downloading, cancellable, action)) return;
         reply(event, "已有 LoRA 下载或加载操作正在处理，请稍后重试；/lora status 可查看最近下载状态。");
         completeChatWorkflowStep(event, false);
     }
@@ -3169,15 +3641,26 @@ public final class Bot implements AutoCloseable {
      * @return false 表示已经有任务在跑（调用方自己决定是回"稍后再试"还是回 409）
      */
     private boolean startLoraJob(JsonObject event, String start, boolean downloading, LoraAction action) {
-        return startLoraJob(event, null, start, downloading, action);
+        return startLoraJob(event, null, start, downloading, false, action);
+    }
+    private boolean startLoraJob(JsonObject event, String start, boolean downloading, boolean cancellable, LoraAction action) {
+        return startLoraJob(event, null, start, downloading, cancellable, action);
     }
     /**
-     * @param receipt 网页接口触发的任务带上自己的回执：进度与结果都会进 /quest/#N（QQ/聊天路径传 null）
+     * @param receipt     网页接口触发的任务带上自己的回执：进度与结果都会进 /quest/#N（QQ/聊天路径传 null）
+     * @param cancellable true 时新建一个 {@link DownloadControl} 串进下载链路（可暂停/可取消）
      */
     private boolean startLoraJob(JsonObject event, WebCapture receipt, String start, boolean downloading, LoraAction action) {
+        return startLoraJob(event, receipt, start, downloading, false, action);
+    }
+    private boolean startLoraJob(JsonObject event, WebCapture receipt, String start, boolean downloading, boolean cancellable, LoraAction action) {
         if (loraClosed.get()) throw new IllegalStateException("机器人正在关闭，请稍后重试。");
         if (!loraBusy.compareAndSet(false, true)) return false;
         JsonObject context = event == null ? null : event.deepCopy();
+        CountDownLatch done = new CountDownLatch(1);
+        loraJobDone = done;
+        // 每次下载都是**新**的控制对象：上一次下载的取消/暂停绝不会留到这一次。
+        loraControl = cancellable ? new DownloadControl() : null;
         loraReceipt = receipt;
         if (receipt != null) receipt.capture(Maps.text(start));
         if (downloading) { loraStatus = safeLoraText(start); loraDownloading = true; }
@@ -3190,7 +3673,13 @@ public final class Bot implements AutoCloseable {
                 catch (Exception e) {
                     result = new LoraResult(safeLoraText((downloading ? "LoRA 下载失败：" : "LoRA 操作失败：") + error(e)),false);
                     if (downloading) loraStatus = result.text();
-                } finally { if (downloading) loraDownloading = false; loraBusy.set(false); loraReceipt = null; }
+                } finally {
+                    if (downloading) loraDownloading = false;
+                    loraBusy.set(false);
+                    loraControl = null;     // 控制对象随任务一起作废
+                    loraReceipt = null;
+                    done.countDown();       // 取消接口据此确认"半截文件已清掉、下载线程真的退出了"
+                }
                 Log.info("LoRA 操作完成（成功=" + result.success() + "）：" + Log.text(result.text()));
                 if (context != null) reply(context, result.text());
                 // 控制台触发的任务没有 QQ 回执通道：把最终结论写进 loraStatus，进度条收起时显示的就是它。
@@ -3201,7 +3690,9 @@ public final class Bot implements AutoCloseable {
         } catch (RejectedExecutionException e) {
             loraBusy.set(false);
             loraDownloading = false;
+            loraControl = null;
             loraReceipt = null;
+            done.countDown();
             if (downloading) loraStatus = "操作未启动；机器人正在关闭，请稍后重试。";
             if (receipt != null) { receipt.capture(Maps.text("操作失败：机器人正在关闭，请稍后重试。")); receipt.finish(); observeQuest(receipt); }
             completeChatWorkflowStep(context, false);
@@ -3750,6 +4241,17 @@ public final class Bot implements AutoCloseable {
         catch (Exception error) { Log.warn("读取 SD 模型参数失败（样式只存提示词）：" + error(error)); return null; }
     }
 
+    /**
+     * 载入样式时切 Forge 预设：**复用 {@code .model preset} 那条路**——{@link SdClient#setForgePreset}
+     * 切栈（必要时连检查点与额外模块一起），再 {@link #adoptForgePreset} 把该栈的推荐参数采纳成机器人设置。
+     *
+     * <p>只把「实际采纳了什么」交回给 {@link SdClient#applyModelParams}：它会把这一行写进回执，
+     * 然后继续用样式自己记着的参数逐项覆盖（样式记的值优先）。这里不发 QQ 回执、不改样式。
+     */
+    private List<String> switchPresetForStyle(String preset) throws Exception {
+        return adoptForgePreset(sd.setForgePreset(preset));
+    }
+
     /** 网页「Forge 预设」卡片：当前预设 + 每个预设的底模与推荐参数（不是 Forge 就如实说）。 */
     public JsonObject webForgePresets() throws Exception {
         JsonObject result = new JsonObject();
@@ -3789,8 +4291,496 @@ public final class Bot implements AutoCloseable {
         return value == Math.rint(value) ? String.valueOf((long) value) : String.valueOf(value);
     }
 
+    // --------------------------------------------------------------- VAE：可选设置 + 冲突防呆 + 灰图补救
+
+    /**
+     * VAE 相关的 SD 操作。生产环境直接转发给 {@link SdClient}（{@link #sdVaeSupport}）；{@code SdClient}
+     * 是 final 的——测试没法用子类打桩——所以这里留一个注入点（{@link #useVaeSupport}），让 `.vae` 的判定、
+     * 出图前防呆与出图后灰图补救能在"假 SD 桩"上完整跑一遍。
+     */
+    interface VaeSupport {
+        boolean forge() throws Exception;
+        String forgePreset() throws Exception;
+        String vae() throws Exception;
+        List<String> vaeList() throws Exception;
+        List<String> presetModules(String preset) throws Exception;
+        JsonObject vaeSnapshot() throws Exception;
+        SdClient.GenerationSettings setVae(String name) throws Exception;
+        JsonObject setForgePreset(String preset) throws Exception;
+    }
+
+    static VaeSupport sdVaeSupport(SdClient sd) {
+        return new VaeSupport() {
+            @Override public boolean forge() { return sd.forge(); }
+            @Override public String forgePreset() throws Exception { return sd.forgePreset(); }
+            @Override public String vae() throws Exception { return sd.vae(); }
+            @Override public List<String> vaeList() throws Exception { return sd.vaeList(); }
+            @Override public List<String> presetModules(String preset) throws Exception { return sd.presetModules(preset); }
+            @Override public JsonObject vaeSnapshot() throws Exception { return sd.vaeSnapshot(); }
+            @Override public SdClient.GenerationSettings setVae(String name) throws Exception { return sd.setVae(name); }
+            @Override public JsonObject setForgePreset(String preset) throws Exception { return sd.setForgePreset(preset); }
+        };
+    }
+
+    /** 测试注入点（包内可见）：换成假 SD 桩，不改 SdClient。 */
+    void useVaeSupport(VaeSupport support) { this.vae = support; }
+
+    /** `.vae` 的用法（错误提示与状态回执共用一份说法）。 */
+    static final String VAE_USAGE = "用法：.vae（查看状态）、.vae list（全部可用 VAE）、.vae set <名字>、"
+            + ".vae auto（跟随当前模型）、.vae none（不用额外 VAE）、.vae check（只检测冲突，列出修复动作）、"
+            + ".vae fix（清掉冲突的额外模块并把 VAE 设回 Automatic）";
+    /** 状态里最多直接列几个 VAE 名字（太长只列前若干个 + "共 N 个"）。 */
+    static final int VAE_LIST_SHOWN = 8;
+    /**
+     * 灰图判定的双条件：像素亮度标准差 ≈ 0 **且** 颜色数极少。
+     *
+     * <p>实测（本次事故）：纯灰废图标准差 0.00、只有 1 种颜色、11 KB；修复后正常图标准差 10.40、318 色。
+     * 只满足一条不判废——"大面积纯色背景但画面正常"的图有渐变/噪点/细节，标准差远大于 0.5。
+     */
+    static final double BLANK_DEVIATION = 0.5;
+    static final int BLANK_COLORS = 4;
+    /** 最小可判定尺寸（生成允许的最小边长是 64）：更小的图（测试桩、缩略图）判不出画面，直接放过。 */
+    static final int BLANK_MIN_SIZE = 64;
+    /** 抽样上限：最多 128×128 个点均匀覆盖整幅图，不为一张图扫全像素。 */
+    static final int BLANK_SAMPLES = 128;
+
+    /**
+     * 这张图是不是"没画出来"的灰图/纯色废图。只抽样判断；读不出来（不是图片/文件坏了）按正常处理——
+     * 这道防线只负责灰图，别的错误交给原有的失败路径。
+     */
+    static boolean blankImage(Path path) {
+        if (path == null) return false;
+        try {
+            BufferedImage image = ImageIO.read(path.toFile());
+            return image != null && blankPixels(image);
+        } catch (Exception error) {
+            Log.warn("灰图自检读取失败（按正常图处理）：" + path.getFileName() + "：" + error(error));
+            return false;
+        }
+    }
+
+    /** 抽样判定：标准差 ≈ 0 且颜色数 ≤ {@link #BLANK_COLORS}。两个条件同时成立才算废图。 */
+    static boolean blankPixels(BufferedImage image) {
+        if (image == null) return false;
+        int width = image.getWidth(), height = image.getHeight();
+        if (width < BLANK_MIN_SIZE || height < BLANK_MIN_SIZE) return false;
+        int stepX = Math.max(1, width / BLANK_SAMPLES), stepY = Math.max(1, height / BLANK_SAMPLES);
+        long samples = 0;
+        double sum = 0, squares = 0;
+        Set<Integer> colors = new HashSet<>();
+        for (int y = 0; y < height; y += stepY)
+            for (int x = 0; x < width; x += stepX) {
+                int rgb = image.getRGB(x, y) & 0xFFFFFF;
+                double luma = 0.299 * ((rgb >> 16) & 0xFF) + 0.587 * ((rgb >> 8) & 0xFF) + 0.114 * (rgb & 0xFF);
+                sum += luma; squares += luma * luma; samples++;
+                if (colors.size() <= BLANK_COLORS) colors.add(rgb);
+            }
+        if (samples == 0) return false;
+        double mean = sum / samples;
+        double deviation = Math.sqrt(Math.max(0, squares / samples - mean * mean));
+        return deviation <= BLANK_DEVIATION && colors.size() <= BLANK_COLORS;
+    }
+
+    /** 冲突等级；缺字段/读不出来都当 OK——防呆宁可少报，也不误拦正常生成。 */
+    static String vaeLevel(JsonObject snapshot) {
+        if (snapshot == null || !snapshot.has("conflict")) return "OK";
+        String level = Json.str(Json.obj(snapshot, "conflict"), "level", "OK").strip().toUpperCase(Locale.ROOT);
+        return level.isEmpty() ? "OK" : level;
+    }
+
+    static String vaeLevelLabel(String level) {
+        return switch (level == null ? "" : level.toUpperCase(Locale.ROOT)) {
+            case "BLOCK" -> "冲突（BLOCK）——照这样出图会得到灰图，必须先修";
+            case "WARN" -> "提醒（WARN）——能出图，但 VAE/额外模块可能不对";
+            default -> "正常（OK）";
+        };
+    }
+
+    /** 读不到 SD 实时选项时的一句说明（`reachable=false`）；读到了就是空串。 */
+    static String vaeReachability(JsonObject snapshot) {
+        if (snapshot == null || Json.bool(snapshot, "reachable", true)) return "";
+        List<String> errors = jsonStrings(snapshot.get("errors"));
+        return "\n（读不到 SD 的实时状态，以下按机器人记住的值给出"
+                + (errors.isEmpty() ? "" : "：" + String.join("；", errors)) + "）";
+    }
+
+    /** 冲突判定的人话（等级 + 原因 + 建议 + 冲突的额外模块）。 */
+    static String vaeConflictText(JsonObject snapshot) {
+        if (snapshot == null || !snapshot.has("conflict"))
+            return "冲突检测：读不到 SD 的当前状态（SD WebUI 没在跑或地址不对）";
+        JsonObject conflict = Json.obj(snapshot, "conflict");
+        StringBuilder text = new StringBuilder("冲突检测：").append(vaeLevelLabel(vaeLevel(snapshot)));
+        String reason = Json.str(conflict, "reason", "");
+        if (!reason.isBlank()) text.append("\n原因：").append(reason);
+        List<String> culprits = jsonStrings(conflict.get("culprits"));
+        if (!culprits.isEmpty()) text.append("\n冲突的额外模块：").append(String.join("、", culprits));
+        String suggestion = Json.str(conflict, "suggestion", "");
+        if (!suggestion.isBlank()) text.append("\n建议：").append(suggestion);
+        return text.toString();
+    }
+
+    /** 用快照里的字段构一次 {@link VaeGuard} 输入（检查点 / sd_vae / forge_additional_modules）。 */
+    static VaeGuard.Facts vaeFacts(JsonObject snapshot) {
+        return new VaeGuard.Facts(Json.str(snapshot, "checkpoint", ""), Json.str(snapshot, "vae", ""),
+                jsonStrings(snapshot.get("modules")));
+    }
+
+    /** 修复动作清单：判定逻辑归 {@code VaeGuard.repairPlan}（`.vae check` 列出来，`.vae fix` 照着做）。 */
+    static List<String> vaePlan(JsonObject snapshot) {
+        if (snapshot == null) return List.of();
+        try { return VaeGuard.repairPlan(vaeFacts(snapshot)); }
+        catch (Exception error) { Log.warn("生成修复方案失败：" + error(error)); return List.of(); }
+    }
+
+    private static List<String> jsonStrings(JsonElement element) {
+        List<String> values = new ArrayList<>();
+        if (element == null || !element.isJsonArray()) return values;
+        for (JsonElement item : element.getAsJsonArray())
+            if (item != null && item.isJsonPrimitive()) values.add(item.getAsString());
+        return values;
+    }
+
+    /** `auto` / `none` 这类写法（QQ 与网页）统一成快照里用的名字。 */
+    static String vaeAlias(String name) {
+        String value = name == null ? "" : name.strip();
+        if (value.equalsIgnoreCase("auto") || value.equalsIgnoreCase("automatic")
+                || value.equals("自动") || value.equals("跟随")) return "Automatic";
+        if (value.equalsIgnoreCase("none") || value.equals("无") || value.equals("不用")) return "None";
+        return value;
+    }
+
+    /**
+     * 一次性 VAE 冲突快照；读不到（SD 没在跑 / 这个构建不支持）返回 null。
+     * 调用方据此决定"不拦"，绝不因为读不到状态就把生成挡住。
+     */
+    private JsonObject vaeSnapshotOrNull() {
+        try { return vae.vaeSnapshot(); }
+        catch (Exception error) { Log.warn("读取 VAE 状态失败：" + error(error)); return null; }
+    }
+
+    /** 可用 VAE：优先用快照里的 choices，没有就问一次列表接口。 */
+    private List<String> vaeChoices(JsonObject snapshot) {
+        List<String> choices = snapshot == null ? List.of() : jsonStrings(snapshot.get("choices"));
+        if (!choices.isEmpty()) return choices;
+        try { return vae.vaeList(); }
+        catch (Exception error) { Log.warn("读取 VAE 列表失败：" + error(error)); return List.of(); }
+    }
+
+    /** `.vae` 的全部子命令（QQ 侧；权限与 .sampler、.size 一致）。 */
+    private void vaeCommand(JsonObject event, String arguments) throws Exception {
+        String rest = arguments == null ? "" : arguments.strip();
+        String action = rest.isEmpty() ? "status" : rest.split("\\s+", 2)[0].toLowerCase(Locale.ROOT);
+        String value = rest.length() > action.length() ? rest.substring(action.length()).strip() : "";
+        switch (action) {
+            case "status", "状态", "查看" -> {
+                requireNoValue(value, action);
+                reply(event, vaeStatus(event));
+            }
+            case "list", "列表" -> {
+                requireNoValue(value, action);
+                List<String> names = vae.vaeList();
+                reply(event, "可用 VAE（共 " + names.size() + " 个）：" + numbered(event, "vae", names)
+                        + (names.isEmpty() ? "\n（读不到 VAE 列表：SD WebUI 没在跑或这个构建不支持；可用 .vae auto 或 .vae none）" : "")
+                        + "\n用 .vae set <名字> 指定，.vae auto 跟随当前模型。");
+            }
+            case "set", "设置" -> {
+                if (value.isBlank()) throw new IllegalArgumentException("用法：.vae set <名字>（.vae list 查看全部可用 VAE）。");
+                vaeAssign(event, vaeAlias(value), "设为「" + value + "」");
+            }
+            case "auto", "跟随" -> {
+                requireNoValue(value, action);
+                vaeAssign(event, "Automatic", "设为 Automatic（跟随当前模型）");
+            }
+            case "none", "无" -> {
+                requireNoValue(value, action);
+                vaeAssign(event, "None", "设为 None（不使用额外 VAE）");
+            }
+            case "check", "检测" -> {
+                requireNoValue(value, action);
+                reply(event, vaeCheckText(vaeSnapshotOrNull()));
+            }
+            case "fix", "修复" -> {
+                requireNoValue(value, action);
+                reply(event, vaeFixText());
+            }
+            default -> throw new IllegalArgumentException(VAE_USAGE);
+        }
+    }
+
+    private static void requireNoValue(String value, String action) {
+        if (!value.isBlank()) throw new IllegalArgumentException(".vae " + action + " 不带参数。" + VAE_USAGE);
+    }
+
+    /** 设置 VAE 并**立刻回读校验**；非法名字把可用列表原样交回用户。 */
+    private void vaeAssign(JsonObject event, String name, String headline) throws Exception {
+        JsonObject snapshot = vaeApply(name);
+        String level = vaeLevel(snapshot);
+        StringBuilder text = new StringBuilder("VAE 已" + headline
+                + (snapshot.has("vae") ? "，回读校验：" + Json.str(snapshot, "vae", name) : "（已保存，但读不到 SD 当前状态，出图前还会再检测一次）"));
+        text.append("\n").append(vaeConflictText(snapshot));
+        if (level.equals("BLOCK"))
+            text.append("\n⚠ 这个组合现在会出灰图：出图前的防呆会**拒绝**这次生成，"
+                    + "请先 .vae auto 或 .vae fix 把配置对齐。");
+        else if (level.equals("WARN"))
+            text.append("\n（只是提醒，不会拦住生成；不放心可以 .vae check 看修复动作）");
+        text.append("\n后续提交的生成任务生效。");
+        reply(event, text.toString());
+    }
+
+    /** 写入 VAE（返回回读到的快照 + 一句 message；QQ 与网页共用）。 */
+    private JsonObject vaeApply(String name) throws Exception {
+        String wanted = vaeAlias(name);
+        if (wanted.isBlank()) throw new IllegalArgumentException("请先给出 VAE 名字。" + VAE_USAGE);
+        try { vae.setVae(wanted); }
+        catch (Exception error) { throw new IllegalArgumentException(Bot.error(error) + "\n" + VAE_USAGE); }
+        JsonObject snapshot = vaeSnapshotOrNull();
+        if (snapshot == null) snapshot = new JsonObject();
+        snapshot.addProperty("message", "VAE 已设置为「" + Json.str(snapshot, "vae", wanted) + "」，后续生成任务生效。");
+        return snapshot;
+    }
+
+    /** `.vae` 的状态回执：当前 VAE、是否 Automatic、冲突判定、可用列表（太长只列前若干个）。 */
+    private String vaeStatus(JsonObject event) throws Exception {
+        JsonObject snapshot = vaeSnapshotOrNull();
+        if (snapshot == null)
+            return "读不到 VAE 状态：SD WebUI 没有在跑或地址不对。等它跑起来再用 .vae 查看。\n" + VAE_USAGE;
+        boolean auto = Json.bool(snapshot, "vaeAuto", false);
+        String current = Json.str(snapshot, "vae", "");
+        List<String> modules = jsonStrings(snapshot.get("modules"));
+        StringBuilder text = new StringBuilder("VAE：" + (current.isBlank() ? "（读不到）" : current)
+                + (auto ? "（Automatic＝跟随当前模型，推荐）" : "（手动指定）"));
+        String checkpoint = Json.str(snapshot, "checkpoint", "");
+        if (!checkpoint.isBlank()) text.append("\n底模：").append(checkpoint);
+        text.append("\n额外模块（Forge）：").append(modules.isEmpty() ? "（无）" : String.join("、", modules));
+        text.append(vaeReachability(snapshot));
+        text.append("\n").append(vaeConflictText(snapshot));
+        List<String> choices = vaeChoices(snapshot);
+        if (!choices.isEmpty()) {
+            int shown = Math.min(choices.size(), VAE_LIST_SHOWN);
+            text.append("\n可用 VAE（共 ").append(choices.size()).append(" 个）：")
+                    .append(String.join("、", choices.subList(0, shown)))
+                    .append(choices.size() > shown ? " …（.vae list 看全部）" : "");
+            numbered(event, "vae", choices);
+        } else {
+            text.append("\n可用 VAE：读不到列表（可用 .vae auto 或 .vae none）");
+        }
+        text.append("\n").append(VAE_USAGE);
+        return text.toString();
+    }
+
+    /** `.vae check`：只做冲突检测，不改任何设置；修复动作来自 {@link VaeGuard#repairPlan}。 */
+    private String vaeCheckText(JsonObject snapshot) {
+        if (snapshot == null) return "检测不了：读不到 SD 的 VAE/额外模块状态（SD WebUI 没在跑或地址不对）。";
+        StringBuilder text = new StringBuilder(vaeConflictText(snapshot));
+        text.append(vaeReachability(snapshot));
+        List<String> plan = vaePlan(snapshot);
+        if (vaeLevel(snapshot).equals("OK"))
+            text.append("\n修复动作：").append(plan.isEmpty() ? "无需修复。" : String.join("；", plan));
+        else
+            text.append("\n修复动作（.vae fix 会依次执行）：\n- ").append(String.join("\n- ", plan));
+        return text.toString();
+    }
+
+    /** `.vae fix`：执行修复并逐条回报做了什么，最后回读说明现状。 */
+    private String vaeFixText() {
+        JsonObject before = vaeSnapshotOrNull();
+        List<String> actions = vaeRepair();
+        JsonObject after = vaeSnapshotOrNull();
+        return "VAE 修复完成，实际做了：\n- " + String.join("\n- ", actions)
+                + "\n" + vaeStateLine(after)
+                + "\n" + vaeConflictText(after)
+                + (before == null || vaeLevel(before).equals("OK") ? ""
+                        : "\n（VaeGuard 修复方案：\n- " + String.join("\n- ", vaePlan(before)) + "）")
+                + (after == null ? "" : "\n后续生成任务按修复后的配置出图。");
+    }
+
+    private static String vaeStateLine(JsonObject snapshot) {
+        if (snapshot == null) return "修复后读不到 SD 的当前状态（SD WebUI 没在跑或地址不对）";
+        List<String> modules = jsonStrings(snapshot.get("modules"));
+        return "修复后：VAE=" + Json.str(snapshot, "vae", "（读不到）")
+                + (Json.bool(snapshot, "vaeAuto", false) ? "（Automatic＝跟随当前模型）" : "（手动指定）")
+                + "；额外模块=" + (modules.isEmpty() ? "无" : String.join("、", modules));
+    }
+
+    /**
+     * 执行修复：清掉冲突的额外模块（**重新套用当前 Forge 预设**——模块清单随预设一起回到这一栈自己的
+     * 配置，anima 残留的 qwen 模块就是这样清掉的）并回读校验，再把 VAE 设回 Automatic。
+     *
+     * @return 逐条人话的动作清单（含失败原因）；调用方直接写进回执
+     */
+    private List<String> vaeRepair() {
+        List<String> actions = new ArrayList<>();
+        JsonObject before = vaeSnapshotOrNull();
+        List<String> modules = before == null ? List.of() : jsonStrings(before.get("modules"));
+        boolean forge = false;
+        String preset = "";
+        try { forge = vae.forge(); } catch (Exception error) { Log.warn("判断是不是 Forge 失败：" + error(error)); }
+        if (forge) {
+            try { preset = vae.forgePreset(); }
+            catch (Exception error) { Log.warn("读取当前 Forge 预设失败：" + error(error)); }
+        }
+        if (!modules.isEmpty() && !preset.isBlank()) {
+            try {
+                vae.setForgePreset(preset);
+                List<String> expected = List.of();
+                try { expected = vae.presetModules(preset); } catch (Exception error) { Log.warn("读取预设模块清单失败：" + error(error)); }
+                JsonObject now = vaeSnapshotOrNull();
+                List<String> left = now == null ? List.of() : jsonStrings(now.get("modules"));
+                actions.add("已重新套用 Forge 预设「" + preset + "」，额外模块回到这一栈自己的清单"
+                        + (expected.isEmpty() ? "（该预设不需要额外模块，残留模块已清空）" : "：" + String.join("、", expected)));
+                if (!left.isEmpty() && !sameNames(left, expected))
+                    actions.add("⚠ 回读发现额外模块仍有：" + String.join("、", left)
+                            + "（这个 Forge 构建可能不接受 API 改模块，请在 Forge 页面「VAE / Text Encoder」里手工清空）");
+            } catch (Exception error) {
+                actions.add("重新套用 Forge 预设「" + preset + "」失败：" + error(error));
+            }
+        } else if (!modules.isEmpty()) {
+            actions.add("⚠ 当前不是 Forge 或读不到预设名：没法用切预设清掉额外模块（" + String.join("、", modules)
+                    + "），请在 SD 设置里手工清空 forge_additional_modules");
+        }
+        if (before == null || !Json.bool(before, "vaeAuto", false)) {
+            try { vae.setVae("Automatic"); actions.add("已把 VAE 设回 Automatic（跟随当前模型）"); }
+            catch (Exception error) { actions.add("设置 VAE 失败：" + error(error)); }
+        } else {
+            actions.add("VAE 本来就是 Automatic，无需改动");
+        }
+        if (actions.isEmpty()) actions.add("没有需要修复的项目（VAE 与额外模块和当前底模一致）");
+        return actions;
+    }
+
+    private static boolean sameNames(List<String> left, List<String> right) {
+        Set<String> wanted = new HashSet<>();
+        for (String item : right) wanted.add(item.toLowerCase(Locale.ROOT));
+        for (String item : left) if (!wanted.contains(item.toLowerCase(Locale.ROOT))) return false;
+        return left.size() == right.size();
+    }
+
+    /**
+     * **出图前的防呆**：生成任务开始时查一次 VAE/额外模块冲突。
+     *
+     * <ul>
+     *   <li>BLOCK 且用户的 VAE 是 Automatic（说明是残留模块造成的）→ 自动修复，并明确告诉用户；</li>
+     *   <li>BLOCK 但用户**显式指定**了那个冲突的 VAE → 返回拒绝理由（整条任务不再出图，绝不默默出灰图）；</li>
+     *   <li>WARN → 只提醒一句，不拦；读不到状态 → 不拦（出图后还有灰图自检兜底）。</li>
+     * </ul>
+     *
+     * @return 空串＝可以继续生成；非空＝拒绝这次生成的理由
+     */
+    private String vaePreflight(GenerationJob job) {
+        JsonObject snapshot = vaeSnapshotOrNull();
+        if (snapshot == null) return "";
+        // 读不到 WebUI 的实时选项（SD 没在跑/地址不对）：不提醒也不拦——出图后还有灰图自检兜底。
+        if (!Json.bool(snapshot, "reachable", true)) {
+            Log.warn("生成任务 #" + job.number + " 读不到 VAE 实时状态，本次跳过出图前检查（出图后仍会自检灰图）");
+            return "";
+        }
+        String level = vaeLevel(snapshot);
+        if (level.equals("OK")) return "";
+        JsonObject conflict = Json.obj(snapshot, "conflict");
+        String reason = Json.str(conflict, "reason", "");
+        String current = Json.str(snapshot, "vae", "");
+        if (level.equals("WARN")) {
+            Log.warn("生成任务 #" + job.number + " 出图前 VAE 提醒：" + reason);
+            reply(job.event, "⚠ VAE 提醒（不影响本次生成）：" + (reason.isBlank() ? vaeConflictText(snapshot) : reason)
+                    + "\n要确认配置：.vae check");
+            return "";
+        }
+        if (Json.bool(snapshot, "vaeAuto", false)) {
+            List<String> actions = vaeRepair();
+            Log.warn("生成任务 #" + job.number + " 出图前检测到 VAE/额外模块与当前模型冲突，已自动修复："
+                    + String.join("；", actions));
+            reply(job.event, "检测到 VAE/额外模块与当前模型冲突，已自动修复：\n- " + String.join("\n- ", actions)
+                    + "\n本次生成按修复后的配置继续。");
+            return "";
+        }
+        // 用户显式指定的 VAE 自己就冲突：拒绝这次生成，并说清怎么改，绝不默默出灰图。
+        String suggestion = Json.str(conflict, "suggestion", "");
+        Log.warn("生成任务 #" + job.number + " 因 VAE 冲突被拒绝：VAE=" + current + "，" + reason);
+        return "这次生成被拒绝：当前 VAE「" + current + "」与当前底模/额外模块冲突，"
+                + (reason.isBlank() ? "照这样出图只会得到灰图。" : reason + "。")
+                + "\n改法：.vae auto（跟随当前模型）或 .vae fix（清掉冲突的额外模块并把 VAE 设回 Automatic）"
+                + (suggestion.isBlank() ? "" : "\n建议：" + suggestion)
+                + "\n改完用 .vae check 确认，再重新发送 .gen。";
+    }
+
+    /** 灰图补救结果：可交付的图片 + 给用户的说明（空串＝一切正常，不必多话）。 */
+    private record GrayCheck(List<Path> images, String notice, boolean failed) {}
+
+    /**
+     * **出图后的最后一道防线**：对每张新生成的图做灰图自检。判为废图就记一条 WARN、自动修复一次、
+     * **只重试这一次**，成功就在回执里说明，仍失败如实报失败并附 `.vae check` 建议。
+     * 这道防线独立于冲突检测：哪怕上面没识别出冲突，灰图也照抓。
+     */
+    private GrayCheck grayCheck(GenerationJob job, List<Path> generated) throws Exception {
+        List<Path> blanks = generated.stream().filter(Bot::blankImage).toList();
+        if (blanks.isEmpty()) return new GrayCheck(generated, "", false);
+        List<Path> good = generated.stream().filter(path -> !blanks.contains(path)).toList();
+        Log.warn("生成任务 #" + job.number + " 第 " + job.done.add(BigInteger.ONE) + "/" + job.total
+                + " 次出图检测到灰图（纯色废图）" + blanks.size() + "/" + generated.size() + " 张："
+                + blanks.stream().map(path -> path.getFileName().toString()).toList() + "，自动修复 VAE/额外模块后重试一次");
+        List<String> actions = vaeRepair();
+        List<Path> retried = sd.generate(job.snapshot, job.taskId);
+        List<Path> stillBlank = retried.stream().filter(Bot::blankImage).toList();
+        List<Path> recovered = new ArrayList<>(good);
+        for (Path path : retried) if (!stillBlank.contains(path)) recovered.add(path);
+        List<Path> discarded = new ArrayList<>(blanks);
+        discarded.addAll(stillBlank);
+        discarded.removeAll(recovered);
+        if (!discarded.isEmpty()) discardImages(discarded);
+        if (stillBlank.isEmpty()) {
+            Log.info("生成任务 #" + job.number + " 灰图补救成功：重试 " + retried.size() + " 张全部正常（"
+                    + String.join("；", actions) + "）");
+            return new GrayCheck(recovered, "检测到灰图，已自动修复 VAE/额外模块并重试成功（" + String.join("；", actions) + "）。", false);
+        }
+        Log.warn("生成任务 #" + job.number + " 灰图补救失败：重试仍有 " + stillBlank.size() + " 张纯色废图");
+        return new GrayCheck(recovered, "检测到灰图，已自动修复 VAE/额外模块，但重试仍有 " + stillBlank.size()
+                + " 张是纯色废图，已丢弃。\n本次修复：" + String.join("；", actions)
+                + "\n请用 .vae check 查看冲突（也检查 Forge 页面里的 UI 预设 / 底模 / 额外模块是否同一栈）。",
+                recovered.isEmpty());
+    }
+
+    /**
+     * 废图不再进待领取列表：自动领取与 .get 都不会把它发给用户，文件仍留在磁盘上便于事后排查。
+     */
+    private void discardImages(List<Path> images) {
+        try {
+            sd.acknowledgeImages(images);
+            Log.warn("已丢弃 " + images.size() + " 张灰图（不再进入待领取列表）："
+                    + images.stream().map(path -> path.getFileName().toString()).toList());
+        } catch (Exception error) {
+            Log.warn("丢弃灰图失败（这些图仍可能在待领取列表里）：" + error(error));
+        }
+    }
+
+    /** 网页「VAE」卡：直接回 SdClient 的快照（当前 VAE、额外模块、底模、冲突判定、可用列表）。 */
+    public JsonObject webVae() throws Exception { return vae.vaeSnapshot(); }
+
+    /** 网页 VAE 下拉框的选项（第一个是 Automatic）。 */
+    public JsonObject webVaeList() throws Exception {
+        JsonObject result = new JsonObject();
+        result.add("choices", Json.GSON.toJsonTree(vae.vaeList()));
+        return result;
+    }
+
+    /** 网页设置 VAE：设置后回同一份快照 + 一句 message（auto/none 也认）。 */
+    public JsonObject webVaeSet(String name) throws Exception { return vaeApply(name); }
+
+    /** 网页一键修复：清掉冲突的额外模块 + 把 VAE 设回 Automatic，回同一份快照 + actions。 */
+    public JsonObject webVaeFix() {
+        List<String> actions = vaeRepair();
+        JsonObject snapshot = vaeSnapshotOrNull();
+        if (snapshot == null) snapshot = new JsonObject();
+        JsonArray done = new JsonArray();
+        for (String action : actions) done.add(action);
+        snapshot.add("actions", done);
+        snapshot.addProperty("message", "已执行修复：" + String.join("；", actions));
+        return snapshot;
+    }
+
     private void sdSettings(JsonObject event, String option, String arguments) throws Exception {
         arguments = selectedArguments(event, option, arguments);
+        // `.vae` 与 /sampler、/size 这类生成参数同一权限：不做 owner/admin 限制。
+        if (option.equals("vae")) { vaeCommand(event, arguments); return; }
         if (option.equals("function")) { function(event, arguments); return; }
         if (option.equals("preset")) { preset(event, arguments); return; }
         if (Set.of("steps", "cfg", "seed", "model").contains(option)) {
@@ -3901,8 +4891,10 @@ public final class Bot implements AutoCloseable {
                     SdClient.Prompts updated = userPrompts.replace(scope, composed);
                     new PromptFunctions(settings.root).reset(scope);
                     // 样式记着模型参数就一并套回来（Anima 这类一栈一栈的模型，光换提示词会出废图）。
+                    // 顺序由 applyModelParams 定：先按样式里的 forge_preset 切预设（复用 .model preset 那条路），
+                    // 再写底模/采样/调度器/步数/CFG/尺寸——栈不对时写别的栈的检查点会出全灰废图。
                     List<String> params = List.of();
-                    if (!noParams && local.hasModel()) params = sd.applyModelParams(local.model());
+                    if (!noParams && local.hasModel()) params = sd.applyModelParams(local.model(), this::switchPresetForStyle);
                     reply(event, "已用样式「" + canonical + "」替换你个人的正向、反向 prompt，本次变化：\n"
                             + formatPromptDiff(previous, updated)
                             + (skipped.isEmpty() ? "" : "\n（已按 nolora 跳过样式里的 " + String.join("、", skipped) + "）")
@@ -4457,6 +5449,10 @@ public final class Bot implements AutoCloseable {
         boolean suspended;
         /** 取消：跑完当前这张就结算（已生成的图片照常可领取）。 */
         boolean cancelled;
+        /** 出图前的 VAE 冲突检查只做一次（这一任务的第一张之前），不必每张都查。 */
+        boolean vaeChecked;
+        /** 出图前的防呆拒绝了这次生成：整条任务到此为止（剩余次数由结算统一清账）。 */
+        String refused;
         GenerationJob(JsonObject event, SdClient.GenerationRequest snapshot, BigInteger remaining) {
             this.event = event; this.snapshot = snapshot; this.remaining = remaining; this.total = remaining;
         }
@@ -4752,11 +5748,33 @@ public final class Bot implements AutoCloseable {
                     Log.info("生成任务 #" + job.number + "：" + autoStart);
                     reply(job.event, autoStart);
                 }
-                List<Path> result = sd.generate(job.snapshot, job.taskId);
-                job.completedImages.addAll(result);
-                synchronized (generationLock) { job.images = job.images.add(BigInteger.valueOf(result.size())); }
-                Log.info("生成任务 #"+job.number+" 第 "+job.done.add(BigInteger.ONE)+"/"+job.total+" 次成功："
-                        +result.size()+" 张，耗时 "+millis(started)+" ms");
+                // 出图前的防呆（只查一次）：残留的额外模块会被自动修掉，用户显式选错的 VAE 会被拒绝。
+                if (!job.vaeChecked) {
+                    job.vaeChecked = true;
+                    String refusal = vaePreflight(job);
+                    if (!refusal.isEmpty()) {
+                        job.refused = refusal;
+                        // 拒绝原因随结算回执一起发出（用户不必去翻日志）。
+                        synchronized (generationLock) { job.lastError = refusal; }
+                    }
+                }
+                if (job.refused != null) {
+                    // 拒绝：不调用 SD（绝不会默默出一张灰图），拒绝原因由下面的结算回执带出。
+                } else {
+                    List<Path> result = sd.generate(job.snapshot, job.taskId);
+                    // 出图后的最后一道防线：灰图自检 + 自动修复 + 只重试一次（独立于上面的冲突检测）。
+                    GrayCheck gray = grayCheck(job, result);
+                    if (!gray.notice().isEmpty()) reply(job.event, gray.notice());
+                    if (gray.failed()) synchronized (generationLock) {
+                        job.failed = job.failed.add(BigInteger.ONE);
+                        job.lastError = "出图全是灰图（纯色废图）：VAE/额外模块与当前模型冲突，自动修复后重试仍失败；用 .vae check 查看";
+                    }
+                    result = gray.images();
+                    job.completedImages.addAll(result);
+                    synchronized (generationLock) { job.images = job.images.add(BigInteger.valueOf(result.size())); }
+                    Log.info("生成任务 #"+job.number+" 第 "+job.done.add(BigInteger.ONE)+"/"+job.total+" 次成功："
+                            +result.size()+" 张，耗时 "+millis(started)+" ms");
+                }
             } catch (Exception e) {
                 synchronized (generationLock) { job.failed = job.failed.add(BigInteger.ONE); job.lastError = error(e); }
                 Log.error("生成任务 #"+job.number+" 第 "+job.done.add(BigInteger.ONE)+"/"+job.total
@@ -4767,7 +5785,8 @@ public final class Bot implements AutoCloseable {
                 job.done = job.done.add(BigInteger.ONE); generationRunning = false;
                 if (currentGeneration == job) currentGeneration = null;
                 // 取消优先：跑完手上这张就结算；挂起则留在队列里等 .gen resume。
-                if (job.cancelled) notice = settleGenerationJob(job, "已取消");
+                if (job.refused != null) notice = settleGenerationJob(job, "已拒绝");
+                else if (job.cancelled) notice = settleGenerationJob(job, "已取消");
                 else if (job.remaining.signum() == 0 || closed.get()) notice = settleGenerationJob(job, closed.get() ? "已停止" : "已完成");
             }
             if (notice != null) {
@@ -4802,9 +5821,11 @@ public final class Bot implements AutoCloseable {
         waitingGenerations = waitingGenerations.subtract(job.remaining);
         job.remaining = BigInteger.ZERO;
         finishedJobs.addFirst(job); while (finishedJobs.size() > 20) finishedJobs.removeLast();
+        // 被出图前防呆拒绝时没生成过任何图片：成功次数按 0 报（done 记的是"这次尝试"）。
+        BigInteger succeeded = job.refused != null ? BigInteger.ZERO : job.done.subtract(job.failed);
         return "任务 #" + job.number + " " + reason + "：" + job.done + "/" + job.total
-                + "，图片生成成功 " + job.done.subtract(job.failed) + " 次，生成失败 " + job.failed + " 次，共 " + job.images + " 张。"
-                + (job.lastError.isEmpty() ? "" : "\n最近失败原因：" + job.lastError)
+                + "，图片生成成功 " + succeeded + " 次，生成失败 " + job.failed + " 次，共 " + job.images + " 张。"
+                + (job.lastError.isEmpty() ? "" : (job.refused != null ? "\n拒绝原因：" : "\n最近失败原因：") + job.lastError)
                 + (settings.autoGet() ? "\n已生成的图片将自动领取。" : "\n发送 /get 领取已生成的图片。");
     }
     /** 回执 + 自动领取；reason 为 null 表示调用方已经自己回过执了。 */
@@ -4868,8 +5889,17 @@ public final class Bot implements AutoCloseable {
     /**
      * 一批图片的发送方式：多于一张时合成一条「合并转发」（每张图一个节点），单张图保持普通发送。
      * 返回的 future 在传输层确认之后才完成——调用方据此决定是否 acknowledge。
+     *
+     * <p>会话可以用 {@code .imgmode} 改掉这套默认规则：single 一律逐张普通发送、record 一律合并转发（一张也合并）。
+     * 没有设置过（含老配置）就是 auto，也就是下面这段原本的规则，行为一字未改。
      */
     private CompletableFuture<Void> sendBatch(JsonObject event, List<Path> batch) throws IOException {
+        Settings.ImageSendMode mode = settings.imageSendMode(ChatService.conversationKey(event));
+        if (mode == Settings.ImageSendMode.SINGLE) {
+            Log.info("图片发送方式（" + describeConversation(event) + "）：普通发送 " + batch.size() + " 张（按 .imgmode single）");
+            return sendGeneratedIndividually(event, batch);
+        }
+        if (mode == Settings.ImageSendMode.RECORD) return sendBatchAsRecord(event, batch);
         if (batch.size() <= 1) {
             Log.info("图片发送方式（" + describeConversation(event) + "）：单张普通发送");
             return sender.send(event, Maps.localImages(batch));
@@ -4891,6 +5921,71 @@ public final class Bot implements AutoCloseable {
             try { return sender.send(event, Maps.localImages(batch)); }
             catch (Exception fallbackFailure) { return CompletableFuture.<Void>failedFuture(fallbackFailure); }
         }).thenCompose(future -> future);
+    }
+    /**
+     * {@code .imgmode record}：一张也合成一条「合并转发」。
+     *
+     * <p>传输层没实现合并转发时如实回退普通发送——日志说明原因，绝不假装成功。回退语义与 auto 一致：
+     * 回退成功调用方照常 acknowledge（图确实发出去了），回退也失败才把失败抛给调用方（不 acknowledge）。
+     */
+    private CompletableFuture<Void> sendBatchAsRecord(JsonObject event, List<Path> batch) throws IOException {
+        if (!forwardRecords) {
+            Log.warn("图片发送方式（" + describeConversation(event) + "）：普通发送 " + batch.size()
+                    + " 张（传输层不支持合并转发，.imgmode record 无法生效，已如实回退）");
+            return sender.send(event, Maps.localImages(batch));
+        }
+        Log.info("图片发送方式（" + describeConversation(event) + "）：合并转发 " + batch.size() + " 张（按 .imgmode record）");
+        // 每个节点只含一张图；仍用本地文件引用（不把图片字节塞进 JSON），顺序与 batch 一致。
+        List<JsonArray> nodes = new ArrayList<>(batch.size());
+        for (Path path : batch) nodes.add(Maps.localImages(List.of(path)));
+        return sender.sendRecord(event, nodes).handle((ignored, failure) -> {
+            if (failure == null) return CompletableFuture.<Void>completedFuture(null);
+            Log.warn("合并转发失败，已改为普通发送 " + batch.size() + " 张（" + describeConversation(event) + "）：" + error(failure));
+            try { return sender.send(event, Maps.localImages(batch)); }
+            catch (Exception fallbackFailure) { return CompletableFuture.<Void>failedFuture(fallbackFailure); }
+        }).thenCompose(future -> future);
+    }
+    /** {@code .imgmode single}：多张也逐张普通发送（一张一条消息），读下一张要等前一张确认。 */
+    private CompletableFuture<Void> sendGeneratedIndividually(JsonObject event, List<Path> paths) {
+        CompletableFuture<Void> chain = CompletableFuture.completedFuture(null);
+        for (Path path : paths) chain = chain.thenCompose(ignored -> {
+            try { return sender.send(event, Maps.localImages(List.of(path))); }
+            catch (Exception failure) { return CompletableFuture.<Void>failedFuture(failure); }
+        });
+        return chain;
+    }
+    /**
+     * {@code .imgmode} —— 控制出图会不会以「聊天记录」（QQ 合并转发）的形式发出，按会话持久保存。
+     *
+     * <p>不带参数看当前设置；record/聊天记录/合并转发/转发 一律合并转发（一张也合并），
+     * single/普通/普通发送/单张/逐张 一律普通发送（多张也逐张），auto/自动/默认 回到默认自动规则。
+     * 权限与 {@code .imgcnt}、{@code .size} 这类生成参数一致：任何会话成员都能改自己会话的设置。
+     */
+    private void imageMode(JsonObject event, String argument) throws Exception {
+        String conversation = ChatService.conversationKey(event);
+        if (!argument.isEmpty()) {
+            Settings.ImageSendMode mode = Settings.ImageSendMode.parse(argument);
+            if (mode == null) throw new IllegalArgumentException(
+                    "用法：/imgmode、/imgmode record（聊天记录/合并转发/转发）、/imgmode single（普通/单张/逐张）、/imgmode auto（自动）");
+            settings.setImageSendMode(conversation, mode);
+            Log.info("图片发送形式（" + conversation + "）：" + mode.key());
+            reply(event, "本会话的图片发送形式已设为「" + mode.label() + "」：" + describeImageMode(mode));
+            return;
+        }
+        Settings.ImageSendMode mode = settings.imageSendMode(conversation);
+        reply(event, "本会话的图片发送形式：" + mode.label() + "（" + mode.key() + "）\n" + describeImageMode(mode)
+                + "\n改法：/imgmode record（聊天记录/合并转发/转发）、/imgmode single（普通/单张/逐张）、/imgmode auto（自动）");
+    }
+    /** 一种发送形式给用户看的一句话说明；传输层做不到合并转发时补一句实情，别让人以为设置生效了。 */
+    private String describeImageMode(Settings.ImageSendMode mode) {
+        String detail = switch (mode) {
+            case AUTO -> "自动规则（默认）：一批多于一张时合成一条聊天记录（合并转发），单张保持普通发送。";
+            case RECORD -> "一律合并转发：只有一张也合成一条聊天记录。";
+            case SINGLE -> "一律普通发送：多张也逐张发出去，不合成聊天记录。";
+        };
+        if (mode == Settings.ImageSendMode.RECORD && !forwardRecords)
+            detail += "\n注意：当前传输层不支持合并转发（没实现 sendRecord），record 实际会回退成普通发送。";
+        return detail;
     }
     static List<List<Path>> imageBatches(List<Path> paths, int limit) {
         if (limit < 1) throw new IllegalArgumentException("图片上限须为正整数。");
@@ -6366,8 +7461,10 @@ public final class Bot implements AutoCloseable {
                 SdClient.Prompts updated = userPrompts.replace(scope,
                         new SdClient.Prompts(positive, negative, UserPromptStore.PERSONAL_SOURCE));
                 new PromptFunctions(settings.root).reset(scope);
-                // 网页载入同样把样式记着的模型参数套回来（WebUI 之前只换提示词，模型还得手点）。
-                List<String> params = local.hasModel() && !noParams ? sd.applyModelParams(local.model()) : List.of();
+                // 网页载入同样把样式记着的模型参数套回来（WebUI 之前只换提示词，模型还得手点）；
+                // 与 QQ 侧同一条路：先切样式记着的 Forge 预设，再逐项套参数。
+                List<String> params = local.hasModel() && !noParams
+                        ? sd.applyModelParams(local.model(), this::switchPresetForStyle) : List.of();
                 message = "已用样式「" + local.name() + "」替换你个人的正向、反向 prompt（正向 "
                         + diffCount(previous.positive(), updated.positive()) + " 处、反向 "
                         + diffCount(previous.negative(), updated.negative()) + " 处变化）"
@@ -6655,6 +7752,19 @@ public final class Bot implements AutoCloseable {
         }
         return result;
     }
+    /**
+     * 「查看原文」里的步数要显示成整数：Forge 的配置里它是 {@code 32.0}（double），样式文件里也就存成了
+     * {@code 32.0}，网页上看着像小数。数值语义不变（{@code Json.num} 照旧读得出来），只是 JSON 里没有零头。
+     * 非整数（例如谁手工写了 32.5）原样留着，不假装是整数。
+     */
+    private static JsonObject integerSteps(JsonObject model) {
+        if (model == null || !model.has("steps")) return model;
+        JsonElement value = model.get("steps");
+        if (value == null || !value.isJsonPrimitive() || !value.getAsJsonPrimitive().isNumber()) return model;
+        double steps = value.getAsDouble();
+        if (steps == Math.rint(steps)) model.addProperty("steps", (long) steps);
+        return model;
+    }
     /** 一行样式：带原文（网页「查看原文」直接弹信息框，不用再走指令通道）。 */
     private JsonObject styleItem(int number, String name, String source, LocalStyles.LoraIndex index) {
         JsonObject item = new JsonObject();
@@ -6680,7 +7790,9 @@ public final class Bot implements AutoCloseable {
                 // 样式记着的模型参数（底模 + 采样方法/调度器/步数/CFG/Shift/尺寸）：面板直接显示摘要，
                 // 底模还给一份单独的字段，方便按底模标注。
                 if (style.hasModel()) {
-                    item.add("model", style.model().deepCopy());
+                    // 面板直接显示 model 的原始 JSON：步数在 Forge 的配置里是 32.0（double），
+                    // 显示成 32 才正常（数值语义不变，Json.num 照旧读得出来）。
+                    item.add("model", integerSteps(style.model().deepCopy()));
                     item.addProperty("modelSummary", style.modelSummary());
                     // 样式属于哪一栈（样式里的 stack 字段；老样式没有就用底模名判一次）。
                     String stack = Json.str(style.model(), "stack", "");
@@ -6703,9 +7815,13 @@ public final class Bot implements AutoCloseable {
                     if (stackSource.isBlank() && !stack.isBlank()) stackSource = cn.szu.bot.sd.StackClassifier.INFERRED_SOURCE;
                     item.addProperty("stackSource", stackSource);
                     item.addProperty("forgePreset", Json.str(style.model(), "forge_preset", ""));
-                    // 尺寸单独给一份（展示图样式记的就是这张展示图自己的像素）：面板单独标一个尺寸标签。
+                    // 尺寸单独给一份：width/height 是**载入时会用的生成尺寸**（展示图样式记的是按展示图
+                    // 同比例换算出来的那个值），展示图自己的真实像素另给 previewWidth/previewHeight；
+                    // sizeSource 保留，面板照旧按它标注来源。
                     item.addProperty("width", Json.num(style.model(), "width", 0));
                     item.addProperty("height", Json.num(style.model(), "height", 0));
+                    item.addProperty("previewWidth", Json.num(style.model(), "previewWidth", 0));
+                    item.addProperty("previewHeight", Json.num(style.model(), "previewHeight", 0));
                     item.addProperty("sizeSource", Json.str(style.model(), "sizeSource", ""));
                     item.addProperty("previewImage", Json.str(style.model(), "previewImage", ""));
                     item.addProperty("loraName", Json.str(style.model(), "lora", ""));
@@ -7255,7 +8371,7 @@ public final class Bot implements AutoCloseable {
     private static final Set<String> CONSOLE_COMMANDS = Set.of(
             "help", "yh", "liv", "get", "settings", "chat", "admin", "char", "batch",
             "sampler", "style", "size", "steps", "cfg", "seed", "model", "prompt", "promptr",
-            "preset", "function", "lora", "gen", "rg", "imgcnt", "usage", "map", "progen", "infix", "progress", "sd",
+            "preset", "function", "lora", "gen", "rg", "imgcnt", "imgmode", "usage", "map", "progen", "infix", "progress", "vae", "sd",
             "affinity",
             "jrlp", "wife", "marry", "propose", "divorce", "accept", "reject",
             "帮助", "进度", "老婆", "今日老婆", "强娶", "离婚", "同意", "拒绝");

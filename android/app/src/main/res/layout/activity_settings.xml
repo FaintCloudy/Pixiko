@@ -70,6 +70,18 @@
             android:textColor="@color/pixiko_text"
             android:textColorHint="@color/pixiko_muted" />
 
+        <!-- 构建时烧进去的测试地址提示：只有「包里真的带了 BuildConfig.PIXIKO_DEFAULT_HOST」
+             且是首次运行（还没保存过服务器）时才由 SettingsActivity 显示出来；
+             -NoDefaultHost 构建出来的包里它永远是 gone（=旧行为）。 -->
+        <TextView
+            android:id="@+id/build_host_hint"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="2dp"
+            android:textColor="@color/pixiko_accent"
+            android:textSize="12sp"
+            android:visibility="gone" />
+
         <EditText
             android:id="@+id/field_token"
             android:layout_width="match_parent"

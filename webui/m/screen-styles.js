@@ -216,45 +216,21 @@
     return 'hsl(' + sum + ',52%,42%)';
   }
   /**
-   * 下拉刷新：**这一屏自己接管手势**（外壳那份是给没实现 refresh 的屏兜底的）。
-   * 滚动交给外壳的 #m-main，只看它的 scrollTop；从顶部再下拖超过 56px 松手就刷这一屏。
+   * 下拉刷新：这一屏自己接管手势。判据用外壳那份共用实现 `P.ptrInstall()`（认"手指起点所属的可滚动
+   * 容器"是否真的在顶部、过程中滚过一次就作废、只认下拖），这里只负责提示条的文案与 class。
    */
   function installPullToRefresh(tip, onFire) {
     var host = document.getElementById('m-main') || document.getElementById('m-app') || document;
-    var startY = 0;
-    var tracking = false;
-    var armed = false;
-    var busy = false;
-    host.addEventListener('touchstart', function (event) {
-      if (busy || event.touches.length !== 1 || (host.scrollTop || 0) > 2) { tracking = false; return; }
-      startY = event.touches[0].clientY;
-      tracking = true;
-      armed = false;
-    }, { passive: true });
-    host.addEventListener('touchmove', function (event) {
-      if (!tracking) return;
-      if ((host.scrollTop || 0) > 2) { tracking = false; tip.classList.remove('st-on'); return; }
-      var delta = event.touches[0].clientY - startY;
-      if (delta > 12) {
-        tip.classList.add('st-on');
-        armed = delta > 56;
-        tip.textContent = armed ? '松手刷新' : '下拉刷新';
-      } else {
-        tip.classList.remove('st-on');
-        armed = false;
+    P.ptrInstall(host, {
+      screen: 'styles',
+      progress: function (armed) { tip.classList.add('st-on'); tip.textContent = armed ? '松手刷新' : '下拉刷新'; },
+      disarm: function () { tip.classList.remove('st-on'); tip.textContent = '下拉刷新'; },
+      fire: function () {
+        tip.textContent = '正在刷新…';
+        return Promise.resolve().then(onFire).catch(function () { /* 错误已经由屏内三态显示 */ })
+          .then(function () { tip.textContent = '下拉刷新'; });
       }
-    }, { passive: true });
-    host.addEventListener('touchend', function () {
-      tracking = false;
-      tip.classList.remove('st-on');
-      if (!armed || busy) return;
-      busy = true;
-      tip.textContent = '正在刷新…';
-      Promise.resolve().then(onFire).catch(function () { /* 错误已经由屏内三态显示 */ }).then(function () {
-        busy = false;
-        tip.textContent = '下拉刷新';
-      });
-    }, { passive: true });
+    });
   }
   var ICONS = {
     refresh: 'M12 5V1L7 6l5 5V7a5 5 0 1 1-5 5H5a7 7 0 1 0 7-7z',

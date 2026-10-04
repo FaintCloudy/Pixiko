@@ -97,23 +97,37 @@ public final class SdClient {
      * @param distilledCfg 蒸馏 CFG（Forge 的 "Distilled CFG"／Shift，Anima 推荐 3）；0＝不发送
      */
     public record GenerationSettings(String samplerName, String scheduler, List<String> styles, int width, int height,
-                                     double distilledCfg, String source) {
+                                     double distilledCfg, String source, String vae) {
         public GenerationSettings {
             Objects.requireNonNull(samplerName);
             scheduler = scheduler == null ? "" : scheduler.strip();
             styles = List.copyOf(styles);
             if (!Double.isFinite(distilledCfg) || distilledCfg < 0) distilledCfg = 0;
             Objects.requireNonNull(source);
+            // VAE 是这一份设置里唯一"存在 WebUI 侧"的项（sd_vae 是全局选项，不随请求发），
+            // 空串＝没设过（老 sd-settings.json 没有这个字段时就是这样）。
+            vae = vae == null ? "" : vae.strip();
         }
         /** 老写法：不带调度器与蒸馏 CFG。 */
         public GenerationSettings(String samplerName, List<String> styles, int width, int height, String source) {
-            this(samplerName, "", styles, width, height, 0, source);
+            this(samplerName, "", styles, width, height, 0, source, "");
         }
-        public GenerationSettings withSampler(String value) { return new GenerationSettings(value, scheduler, styles, width, height, distilledCfg, source); }
-        public GenerationSettings withStyles(List<String> value) { return new GenerationSettings(samplerName, scheduler, value, width, height, distilledCfg, source); }
-        public GenerationSettings withSize(int w, int h) { return new GenerationSettings(samplerName, scheduler, styles, w, h, distilledCfg, source); }
-        public GenerationSettings withForge(String scheduler, double distilled) { return new GenerationSettings(samplerName, scheduler, styles, width, height, distilled, source); }
-        public GenerationSettings withSource(String value) { return new GenerationSettings(samplerName, scheduler, styles, width, height, distilledCfg, value); }
+        /** 不带 VAE 的七参写法（保留，内部调用与老测试都用它）。 */
+        public GenerationSettings(String samplerName, String scheduler, List<String> styles, int width, int height,
+                                  double distilledCfg, String source) {
+            this(samplerName, scheduler, styles, width, height, distilledCfg, source, "");
+        }
+        /** 带 VAE 的简易写法（web/指令侧要一起给出 VAE 时用）。 */
+        public GenerationSettings(String samplerName, List<String> styles, int width, int height, String source, String vae) {
+            this(samplerName, "", styles, width, height, 0, source, vae);
+        }
+        public GenerationSettings withSampler(String value) { return new GenerationSettings(value, scheduler, styles, width, height, distilledCfg, source, vae); }
+        public GenerationSettings withStyles(List<String> value) { return new GenerationSettings(samplerName, scheduler, value, width, height, distilledCfg, source, vae); }
+        public GenerationSettings withSize(int w, int h) { return new GenerationSettings(samplerName, scheduler, styles, w, h, distilledCfg, source, vae); }
+        public GenerationSettings withForge(String scheduler, double distilled) { return new GenerationSettings(samplerName, scheduler, styles, width, height, distilled, source, vae); }
+        public GenerationSettings withSource(String value) { return new GenerationSettings(samplerName, scheduler, styles, width, height, distilledCfg, value, vae); }
+        /** 换 VAE 记录（只改这一项；写 WebUI 由 {@link SdClient#setVae(String)} 负责）。 */
+        public GenerationSettings withVae(String value) { return new GenerationSettings(samplerName, scheduler, styles, width, height, distilledCfg, source, value); }
     }
     public record GenerationRequest(Prompts prompts, GenerationSettings settings, GenerationParameters parameters) {
         public GenerationRequest(Prompts prompts, GenerationSettings settings) { this(prompts, settings, null); }
@@ -166,6 +180,14 @@ public final class SdClient {
      */
     private volatile String activeScheduler = "";
     private volatile double activeDistilledCfg;
+    /**
+     * 机器人自己记着的 VAE（{@code sd_vae}）。
+     *
+     * <p>为什么单独存一份、不放进 {@code cachedSettings}：{@code sd_vae} 是**WebUI 的全局选项**，
+     * 桥接扩展不认这个字段，每次 {@code refresh()} 从桥接重建 {@code cachedSettings} 都会把它冲掉
+     * （与调度器/蒸馏 CFG 完全同一个理由）。所以以这里的值为准，落盘时再合并回去。
+     */
+    private volatile String activeVae = "";
     private JsonElement revision;
     private boolean bridgeAvailable;
     private boolean settingsBridgeAvailable, settingsInitialized;
@@ -216,6 +238,8 @@ public final class SdClient {
                 cachedSettings = readSettings(Json.parse(Files.readString(settingsFile, StandardCharsets.UTF_8)), LOCAL_SOURCE);
                 activeScheduler = cachedSettings.scheduler();
                 activeDistilledCfg = cachedSettings.distilledCfg();
+                // 老 sd-settings.json 没有 vae 字段：读回来是空串（＝没设过），完全照旧。
+                activeVae = cachedSettings.vae();
             } catch (Exception e) {
                 throw new IOException("无法读取 data/sd-settings.json；请检查或恢复此配置文件。", e);
             }
@@ -230,7 +254,7 @@ public final class SdClient {
 
     public synchronized GenerationSettings settings() throws Exception {
         refresh(true);
-        return cachedSettings.withForge(activeScheduler, activeDistilledCfg);
+        return cachedSettings.withForge(activeScheduler, activeDistilledCfg).withVae(activeVae);
     }
 
     /** Capture prompts and parameters from one bridge revision, before queuing a generation. */
@@ -534,12 +558,22 @@ public final class SdClient {
     /**
      * 切 Forge 预设。
      *
-     * <p>两条路：新构建支持 {@code POST /sdapi/v1/options {"forge_preset": …}}；这台 Forge Neo 不支持
-     * （500 KeyError），于是走它 UI 内部同一条路——把这一栈的**检查点与模块**直接换掉
-     * （{@code sd_model_checkpoint} 经实测可用；{@code forge_additional_modules} 视构建而定，失败就跳过），
+     * <p>两条路：新构建支持 {@code POST /sdapi/v1/options {"forge_preset": …}}；有的构建不支持
+     * （500 KeyError），于是走它 UI 内部同一条路——把这一栈的**检查点与额外模块**直接换掉
+     * （{@code sd_model_checkpoint} 与 {@code forge_additional_modules} 都经实测可用），
      * 再加上把该栈的推荐参数采纳成机器人设置。效果与点 UI 里的预设一致：栈换过去了、参数也跟着换。
      *
-     * @return 这一栈的推荐参数（含 {@code applied} 字段说明实际做了什么）
+     * <p><b>额外模块必须跟着预设走（2026-10 灰图事故的根因）</b>：原来只在预设自带**非空**模块时才写
+     * {@code forge_additional_modules}，于是 {@code xl → anima → xl} 这一来一回把 anima 的
+     * {@code qwen_image_vae} / {@code qwen_3_06b_base} 留在 SDXL 检查点上，出图全灰。现在：
+     * <ul>
+     *   <li>切预设时**一定**写一次 {@code forge_additional_modules}，空数组也写——那正是"清掉上一个栈的残留"；</li>
+     *   <li>写完回读校验（按文件名比对），没确认就在 {@code applied} 里如实写"未确认"；</li>
+     *   <li>返回值里带上 {@code modules}（这一栈应有的）与 {@code conflict}（{@link VaeGuard} 对切换结果的判定），
+     *       调用方据此提示用户"这个预设自己就配错了"。</li>
+     * </ul>
+     *
+     * @return 这一栈的推荐参数（含 {@code applied}／{@code modulesWritten}／{@code conflict} 字段说明实际做了什么）
      */
     public synchronized JsonObject setForgePreset(String requested) throws Exception {
         List<String> presets = forgePresets();
@@ -548,17 +582,39 @@ public final class SdClient {
         String preset = presets.stream().filter(name -> name.equalsIgnoreCase(wanted)).findFirst()
                 .orElseThrow(() -> new IOException("未知预设：" + wanted + "；可用：" + String.join("、", presets) + "。"));
         JsonObject defaults = forgePresetDefaults(preset);
+        List<String> modules = stringValues(defaults.get("modules"));
         List<String> applied = new ArrayList<>();
-        boolean switched = false;
+        boolean switched = false, presetAccepted = false, modulesWritten = false;
+        // ① 预设 + 该预设的额外模块**一起**写：一次请求就把"栈"换干净（也顺带清掉上一个栈的残留）。
         JsonObject direct = new JsonObject();
         direct.addProperty("forge_preset", preset);
+        direct.add("forge_additional_modules", modulesJson(modules));
         try {
             HttpResponse<String> response = request("/sdapi/v1/options", "POST", direct, false, false);
-            // 有的构建会**接受** forge_preset（HTTP 200）却要等下一次加载才真正换栈，
-            // 所以不能只看状态码：切完必须回读当前底模，确认这一栈真的上去了。
-            switched = response.statusCode() >= 200 && response.statusCode() < 300 && checkpointApplied(defaults);
-            if (switched) applied.add("forge_preset=" + preset);
-        } catch (Exception ignored) { /* 这一版不接受 forge_preset，走下面的检查点路线 */ }
+            if (ok(response.statusCode())) {
+                presetAccepted = true;
+                // 有的构建会**接受** forge_preset（HTTP 200）却要等下一次加载才真正换栈，
+                // 所以不能只看状态码：切完必须回读当前底模，确认这一栈真的上去了。
+                switched = checkpointApplied(defaults);
+                if (switched) applied.add("forge_preset=" + preset);
+                modulesWritten = modulesConfirmed(modules);
+                if (modulesWritten) applied.add(modulesAppliedText(modules));
+            }
+        } catch (Exception ignored) { /* 这一版不接受 forge_preset（或模块字段），走下一条路 */ }
+        // ② 只发 forge_preset 再试一次：有的构建认预设但不认 "模块" 这个字段，别让模块把预设一起带崩。
+        if (!switched) {
+            JsonObject solo = new JsonObject();
+            solo.addProperty("forge_preset", preset);
+            try {
+                HttpResponse<String> response = request("/sdapi/v1/options", "POST", solo, false, false);
+                if (ok(response.statusCode())) {
+                    presetAccepted = true;
+                    switched = checkpointApplied(defaults);
+                    if (switched) applied.add("forge_preset=" + preset);
+                }
+            } catch (Exception ignored) { /* 依然不接受：走检查点那条路 */ }
+        }
+        // ③ 检查点路线（这台 Forge Neo 上验证过可用）：显式写 sd_model_checkpoint。
         if (!switched) {
             String checkpoint = Json.str(defaults, "checkpoint", "");
             if (checkpoint.isBlank())
@@ -566,25 +622,83 @@ public final class SdClient {
             JsonObject payload = new JsonObject();
             payload.addProperty("sd_model_checkpoint", checkpoint);
             HttpResponse<String> response = request("/sdapi/v1/options", "POST", payload, false, false);
-            if (response.statusCode() < 200 || response.statusCode() >= 300)
+            if (!ok(response.statusCode()))
                 throw new IOException("切换底模失败：HTTP " + response.statusCode() + "。" + response.body());
             applied.add("底模=" + checkpoint);
-            if (defaults.has("modules") && defaults.getAsJsonArray("modules").size() > 0) {
-                JsonObject modules = new JsonObject();
-                modules.add("forge_additional_modules", defaults.getAsJsonArray("modules").deepCopy());
-                try {
-                    HttpResponse<String> moduleResponse = request("/sdapi/v1/options", "POST", modules, false, false);
-                    if (moduleResponse.statusCode() >= 200 && moduleResponse.statusCode() < 300)
-                        applied.add("模块 " + defaults.getAsJsonArray("modules").size() + " 个");
-                } catch (Exception ignored) { /* 有的构建不通过 API 收模块，忽略 */ }
+        }
+        // ④ 额外模块：无论走哪条路都要落到"这一栈自己的清单"，空清单也要写（清残留）。
+        if (!modulesWritten) {
+            JsonObject payload = new JsonObject();
+            payload.add("forge_additional_modules", modulesJson(modules));
+            // 这个构建认 forge_preset 才把它带上（有的构建对未知键 500，带上会把模块写入一起弄失败）。
+            if (presetAccepted) payload.addProperty("forge_preset", preset);
+            try {
+                HttpResponse<String> response = request("/sdapi/v1/options", "POST", payload, false, false);
+                modulesWritten = ok(response.statusCode()) && modulesConfirmed(modules);
+                applied.add(modulesAppliedText(modules) + (modulesWritten ? "" : "（WebUI 未确认）"));
+            } catch (Exception error) {
+                applied.add(modulesAppliedText(modules) + "写入失败：" + Bot.error(error));
             }
         }
         JsonObject result = forgePresetDefaults(preset);
+        // 切完立刻判一次：这个预设自带的东西和它自己的检查点是不是同一栈。**照配置如实写**（不偷偷过滤），
+        // 但必须把"这个预设自己就配错了"讲出来——例如这台机器的 forge_additional_modules_sd 里存着
+        // qwen_image_vae + qwen_3_06b_base，那切到 sd 预设照样会出灰图，得让调用方看得见。
+        // VAE 不受切预设影响，用机器人自己记的那一份。
+        VaeGuard.Conflict conflict = VaeGuard.check(new VaeGuard.Facts(
+                Json.str(result, "checkpoint", ""), activeVae, modules));
+        if (conflict.blocked())
+            applied.add("⚠ 预设「" + preset + "」自带的额外模块与它的检查点不是一族：" + conflict.reason()
+                    + "（切过去会出灰图，请用 .vae check／在 Forge 页面里改这一栈的 VAE 与文本编码器）");
         JsonArray done = new JsonArray();
         for (String item : applied) done.add(item);
         result.add("applied", done);
         result.addProperty("switched", true);
+        result.addProperty("modulesWritten", modulesWritten);
+        JsonObject conflictJson = new JsonObject();
+        conflictJson.addProperty("level", conflict.level());
+        conflictJson.addProperty("reason", conflict.reason());
+        conflictJson.addProperty("suggestion", conflict.suggestion());
+        JsonArray culprits = new JsonArray();
+        for (String culprit : conflict.culprits()) culprits.add(culprit);
+        conflictJson.add("culprits", culprits);
+        result.add("conflict", conflictJson);
         return result;
+    }
+
+    private static boolean ok(int status) { return status >= 200 && status < 300; }
+
+    /** 预设的模块清单 → JSON 数组（写 {@code forge_additional_modules} 用；空清单就是空数组）。 */
+    private static JsonArray modulesJson(List<String> modules) {
+        JsonArray array = new JsonArray();
+        for (String module : modules) if (module != null && !module.isBlank()) array.add(module.strip());
+        return array;
+    }
+
+    /**
+     * 回读校验：WebUI 现在的 {@code forge_additional_modules} 是不是就是这一份（按 basename 比对，
+     * 大小写不敏感、顺序不敏感——Forge 可能把路径写成相对/绝对两种形态）。
+     */
+    private boolean modulesConfirmed(List<String> wanted) {
+        try {
+            List<String> current = stringValues(options().get("forge_additional_modules"));
+            return sameModuleNames(current, wanted);
+        } catch (Exception error) { return false; }
+    }
+
+    private static boolean sameModuleNames(List<String> left, List<String> right) {
+        java.util.TreeSet<String> a = new java.util.TreeSet<>(), b = new java.util.TreeSet<>();
+        for (String item : left) if (item != null && !item.isBlank()) a.add(bareName(item).toLowerCase(java.util.Locale.ROOT));
+        for (String item : right) if (item != null && !item.isBlank()) b.add(bareName(item).toLowerCase(java.util.Locale.ROOT));
+        return a.equals(b);
+    }
+
+    /** {@code applied} 里那一行"额外模块变成了什么"（空清单要说清是"已清空"）。 */
+    private static String modulesAppliedText(List<String> modules) {
+        if (modules.isEmpty()) return "额外模块已清空（该预设不需要额外模块）";
+        List<String> names = new ArrayList<>();
+        for (String module : modules) names.add(bareName(module));
+        return "额外模块 " + modules.size() + " 个：" + String.join("、", names);
     }
 
     /**
@@ -622,6 +736,9 @@ public final class SdClient {
                 if (!checkpoint.isBlank()) result.addProperty("checkpoint", checkpoint);
             }
         }
+        // 这一栈的 VAE 记录（`.vae set` 存的那一份）：**只读本地、不发请求**——保存样式必须能在
+        // WebUI 离线时完成（与这个方法开头那句约定一致）。
+        if (activeVae != null && !activeVae.isBlank()) result.addProperty("vae", activeVae);
         // 这个快照里**只有检查点名、没有底模名**（`.style save` 存的就是它）：把归属栈和该栈的规范底模名
         // 一起记下（来源标成推断：栈是拿检查点名/预设名判的），网页「按底模分组」才不会漏掉这条样式。
         String checkpoint = Json.str(result, "checkpoint", "");
@@ -640,41 +757,102 @@ public final class SdClient {
     }
 
     /**
+     * 载入样式时切换 Forge 预设的注入点：由 Bot 侧复用 {@code .model preset} 那条路（切栈 + 采纳该预设的
+     * 推荐参数）。做成回调是为了让 {@link #applyModelParams} 不去反向调用 Bot 的命令层。
+     */
+    @FunctionalInterface
+    public interface PresetSwitcher {
+        /** 切到该预设并采纳它的推荐参数；返回「实际采纳了什么」（会写进回执）；切不动就抛异常。 */
+        List<String> switchTo(String preset) throws Exception;
+    }
+
+    public synchronized List<String> applyModelParams(JsonObject model) { return applyModelParams(model, null); }
+
+    /**
      * 把样式里记着的模型参数套回机器人设置（载入样式时用）。
      * 逐项容错：某一项现在不可用（例如那个底模被删了）就跳过并如实说，不影响提示词已经载入这件事。
      *
+     * <p><b>顺序是有讲究的</b>：Forge／Forge Neo 下**预设决定栈**，栈不对的时候写另一个栈的检查点会出全灰
+     * 废图，调度器与尺寸也都是这一栈的，所以先切预设（有切换器时），再写底模，然后才是采样方法 / 调度器 /
+     * 步数 / CFG / 尺寸。老样式没有 {@code forge_preset} 字段时行为与以前完全一样（不切预设、不报错）。
+     *
+     * <p><b>尺寸</b>：样式里的 {@code width/height} 可能来自展示图（Civitai 预览图动辄 2400×3744），
+     * 超出 64–2048 或不是 8 的倍数时按 {@link #fitGenerationSize} 同比例缩到合法值，并在回执里**如实写明**
+     * 这是缩放后的尺寸——静默"保留原值"正是"尺寸不跟着样式走"的老毛病。
+     *
+     * @param switcher 预设切换器；null 表示没有可用的切换入口（老调用方、单元测试）
      * @return 「实际套上了什么」的中文说明；空列表表示这份参数里没有任何可用项
      */
-    public synchronized List<String> applyModelParams(JsonObject model) {
+    public synchronized List<String> applyModelParams(JsonObject model, PresetSwitcher switcher) {
         List<String> applied = new ArrayList<>();
         if (model == null || model.size() == 0) return applied;
+        // ① 预设：Forge 下"预设"就是"栈"，先把它切对，后面的底模/调度器/尺寸才有意义。
+        String preset = Json.str(model, "forge_preset", "");
+        if (!preset.isBlank()) {
+            try {
+                if (!forge()) applied.add("预设 " + preset + " 未切换（当前 WebUI 不是 Forge／Forge Neo）");
+                else {
+                    String active = forgePreset();
+                    if (preset.equalsIgnoreCase(active)) applied.add("预设 " + preset + "（已是当前预设，未重复切换）");
+                    else if (switcher == null) applied.add("预设 " + preset + " 未切换（没有可用的切换入口）");
+                    else {
+                        List<String> adopted = switcher.switchTo(preset);
+                        applied.add("预设 " + (active.isBlank() ? "（未知）" : active) + " → " + preset
+                                + (adopted == null || adopted.isEmpty() ? "" : "（" + String.join("、", adopted) + "）"));
+                    }
+                }
+            } catch (Exception error) {
+                applied.add("预设 " + preset + " 未切换：" + Bot.error(error) + "（保留原值）");
+            }
+        }
+        // ② 底模（此时栈已经对了，写检查点不会再出全灰废图）。
         String checkpoint = Json.str(model, "checkpoint", "");
         if (!checkpoint.isBlank()) {
             try { setParameter("model", checkpoint); applied.add("底模 " + checkpoint); }
-            catch (Exception error) { applied.add("底模 " + checkpoint + " 不可用（保留原值）"); }
+            catch (Exception error) { applied.add("底模 " + checkpoint + " 不可用（保留原值）：" + Bot.error(error)); }
         }
         String sampler = Json.str(model, "sampler", "");
         if (!sampler.isBlank()) {
             try { setSampler(sampler); applied.add(sampler); }
-            catch (Exception error) { applied.add("采样方法 " + sampler + " 不可用（保留原值）"); }
+            catch (Exception error) { applied.add("采样方法 " + sampler + " 不可用（保留原值）：" + Bot.error(error)); }
+        }
+        // ②' VAE（样式里记着 sd_vae 时套回去）：它是 WebUI 的全局选项，写入即生效。
+        String vae = Json.str(model, "vae", "");
+        if (!vae.isBlank()) {
+            try { setVae(vae); applied.add("VAE " + vae); }
+            catch (Exception error) { applied.add("VAE " + vae + " 不可用（保留原值）：" + Bot.error(error)); }
         }
         String scheduler = Json.str(model, "scheduler", "");
         double distilled = Json.decimal(model, "distilledCfg", 0);
         if (!scheduler.isBlank() || distilled > 0) {
             try { setForgeExtras(scheduler, distilled); applied.add("调度器 " + (scheduler.isBlank() ? "（不变）" : scheduler)); }
-            catch (Exception error) { applied.add("调度器未能写入（保留原值）"); }
+            catch (Exception error) { applied.add("调度器未能写入（保留原值）：" + Bot.error(error)); }
         }
         int steps = Json.num(model, "steps", 0);
-        if (steps > 0) { try { setParameter("steps", String.valueOf(steps)); applied.add(steps + " 步"); } catch (Exception ignored) { /* 跳过 */ } }
+        if (steps > 0) {
+            try { setParameter("steps", String.valueOf(steps)); applied.add(steps + " 步"); }
+            catch (Exception error) { applied.add("步数 " + steps + " 未能写入（保留原值）：" + Bot.error(error)); }
+        }
         double cfg = Json.decimal(model, "cfg", 0);
         if (cfg > 0) {
-            try { setParameter("cfg", cfg == Math.rint(cfg) ? String.valueOf((long) cfg) : String.valueOf(cfg)); applied.add("CFG " + (cfg == Math.rint(cfg) ? String.valueOf((long) cfg) : cfg)); }
-            catch (Exception ignored) { /* 跳过 */ }
+            String cfgText = cfg == Math.rint(cfg) ? String.valueOf((long) cfg) : String.valueOf(cfg);
+            try { setParameter("cfg", cfgText); applied.add("CFG " + cfgText); }
+            catch (Exception error) { applied.add("CFG " + cfgText + " 未能写入（保留原值）：" + Bot.error(error)); }
         }
+        // ④ 尺寸：样式里的尺寸常常来自展示图（2400×3744 这种），超限就同比例缩到合法值再套，
+        //    并如实说明；合法值原样套用（用户特意设的 768×512 不会被顺手改掉）。
         int width = Json.num(model, "width", 0), height = Json.num(model, "height", 0);
         if (width > 0 && height > 0) {
-            try { setSize(width, height); applied.add(width + "×" + height); }
-            catch (Exception error) { applied.add("尺寸 " + width + "×" + height + " 未被接受（保留原值）"); }
+            int[] fitted = fitGenerationSize(width, height);
+            try {
+                setSize(fitted[0], fitted[1]);
+                applied.add(sizeAppliedText(width, height, fitted));
+            } catch (Exception error) {
+                // 套不上也要说清为什么：以前只写"未被接受（保留原值）"，用户没法判断该怎么办。
+                applied.add("尺寸 " + width + "×" + height + " 未套用"
+                        + (fitted[0] == width && fitted[1] == height ? "" : "（已同比例缩到 " + fitted[0] + "×" + fitted[1] + "，仍被拒绝）")
+                        + "：" + Bot.error(error) + "（保留原值）");
+            }
         }
         // 展示图样式可能只记下了底模：那个底模不在当前 Forge 预设栈里时就没有可加载的检查点
         // （写别的栈的检查点会出全灰废图），如实说一句，别让"样式带参数"看起来像没生效。
@@ -714,14 +892,361 @@ public final class SdClient {
 
     /** Forge 的额外模块（VAE / 文本编码器）：Anima 要 qwen_image_vae 与 qwen_3_06b_base。 */
     public List<String> modules() throws Exception {
-        JsonArray catalog = responseArray(request("/sdapi/v1/sd-modules", "GET", null, false, false), "读取额外模块列表");
         List<String> names = new ArrayList<>();
+        for (String[] entry : moduleEntries()) if (!entry[0].isBlank()) names.add(entry[0]);
+        return List.copyOf(names);
+    }
+
+    /**
+     * {@code /sdapi/v1/sd-modules} 的原始条目：{@code [model_name, filename]}。
+     * 这台 Forge Neo 实测返回的就是这两个字段（VAE 与文本编码器混在一张表里），
+     * 文件名用来判断这个模块到底是 VAE 还是文本编码器（见 {@link #vaeList()}）。
+     */
+    private List<String[]> moduleEntries() throws Exception {
+        JsonArray catalog = responseArray(request("/sdapi/v1/sd-modules", "GET", null, false, false), "读取额外模块列表");
+        List<String[]> entries = new ArrayList<>();
         for (JsonElement item : catalog) {
             if (!item.isJsonObject()) continue;
-            String name = Json.str(item.getAsJsonObject(), "model_name", "");
-            if (!name.isBlank()) names.add(name);
+            JsonObject module = item.getAsJsonObject();
+            entries.add(new String[] { Json.str(module, "model_name", ""), Json.str(module, "filename", "") });
         }
-        return List.copyOf(names);
+        return List.copyOf(entries);
+    }
+
+    // ---------------------------------------------------------------- VAE（sd_vae）与冲突防呆
+
+    /** VAE 的"交给 WebUI 自己挑"写法（写进 sd_vae 的值就是这两个之一）。 */
+    public static final String VAE_AUTOMATIC = "Automatic", VAE_NONE = "None";
+
+    /**
+     * 当前 {@code sd_vae}：**以 WebUI 的 options 为准**（那是真正生效的值）；读不到就返回机器人自己记着的值。
+     *
+     * <p>注意这里是"读"，不会去改机器人记的那一份：WebUI 里手工改成 Automatic 之后，
+     * 这里要如实报 Automatic（权威在 WebUI），而机器人记的值只作为离线时的兜底。
+     */
+    public synchronized String vae() throws Exception {
+        try {
+            String current = Json.str(options(), "sd_vae", "").strip();
+            if (!current.isBlank()) return current;
+        } catch (Exception ignored) { /* 读不到就看机器人自己记的 */ }
+        return activeVae;
+    }
+
+    /**
+     * 写 VAE（{@code Automatic} / {@code None} / 具体文件名都支持），并落进机器人自己的设置。
+     *
+     * <p><b>非法名字一定先抛、绝不写入</b>：校验在发请求之前完成，报错里带上可用列表。
+     * 名字的来源是 {@link #vaeList()}——Forge 的 VAE 下拉框用的就是**文件 basename**（见 Forge 的
+     * {@code modules/sd_vae.py}：{@code vae_dict[os.path.basename(filepath)] = filepath}），
+     * 所以 basename 与 {@code Automatic}／{@code None} 都收，路径形态也一并容忍（归一成 basename）。
+     *
+     * <p>写完能读到就回读一次，落盘的是**回读到的值**（WebUI 才是权威）；读不到就落盘请求值，
+     * 并在 {@link #vaeSnapshot()} 里如实标出读不到状态。
+     */
+    public synchronized GenerationSettings setVae(String name) throws Exception {
+        String requested = name == null ? "" : name.strip();
+        if (requested.isEmpty())
+            throw new IOException("请提供 VAE 名称（Automatic／None／具体文件名）；使用 .vae list 查看可用名称。");
+        String canonical = canonicalVae(requested);
+        JsonObject payload = new JsonObject();
+        payload.addProperty("sd_vae", canonical);
+        HttpResponse<String> response = request("/sdapi/v1/options", "POST", payload, false, false);
+        if (response.statusCode() < 200 || response.statusCode() >= 300)
+            throw new IOException("设置 VAE 失败：HTTP " + response.statusCode() + "。" + response.body());
+        // 回读校验：有的构建会收下请求却不当真，回读到的值才是"实际生效"的那一个。
+        String applied = canonical;
+        try {
+            String readback = Json.str(options(), "sd_vae", "").strip();
+            if (!readback.isBlank()) applied = readback;
+        } catch (Exception ignored) { /* 回读不到就按请求值落盘，快照里会如实说读不到 */ }
+        GenerationSettings before = cachedSettings == null ? null : cachedSettings.withVae(activeVae);
+        activeVae = applied;
+        GenerationSettings updated = (cachedSettings == null ? fallbackSettings() : cachedSettings)
+                .withVae(applied).withSource(LOCAL_SOURCE);
+        persist(updated);
+        cachedSettings = updated;
+        logSettingsChange("VAE", before, updated);
+        return updated;
+    }
+
+    /**
+     * 可用 VAE 列表：**第一个一定是 {@code Automatic}**（第二个是 {@code None}）。
+     *
+     * <p>来源按可靠性排：
+     * <ol>
+     *   <li>{@code GET /sdapi/v1/sd-modules}——本机 Forge Neo 实测 200，条目形如
+     *       {@code {"model_name":"animevae.pt","filename":"…\\models\\VAE\\sd1.5\\animevae.pt"}}；
+     *       里面 VAE 与文本编码器是混着的，所以按文件名筛（名字含 vae／在 models/VAE 下才收）；</li>
+     *   <li>options 里现成的线索：当前 {@code sd_vae} 自己，以及各预设 {@code forge_additional_modules_*} 里的 VAE；</li>
+     *   <li>兜底：扫 {@code <sd.root>/models/VAE} 下的 VAE 文件（{@code .safetensors/.pt/.pth/.ckpt/.bin}），
+     *       外加 {@code models/} 下 {@code *.vae.*} 这种命名（Forge 自己也认这种）。</li>
+     * </ol>
+     * 读不到任何来源时至少返回 {@code [Automatic, None]}——这样下拉框与 {@code .vae set} 仍然可用。
+     */
+    public synchronized List<String> vaeList() {
+        LinkedHashSet<String> names = new LinkedHashSet<>();
+        try {
+            for (String[] entry : moduleEntries()) if (looksLikeVae(entry[0], entry[1])) names.add(bareName(entry[0]));
+        } catch (Exception ignored) { /* 这个构建没有 sd-modules：走下面的来源 */ }
+        try {
+            JsonObject options = options();
+            String current = Json.str(options, "sd_vae", "").strip();
+            if (!current.isBlank() && !VaeGuard.automaticVae(current)) names.add(bareName(current));
+            for (String key : options.keySet()) {
+                if (!key.startsWith("forge_additional_modules")) continue;
+                for (String module : stringValues(options.get(key))) if (looksLikeVae(module, module)) names.add(bareName(module));
+            }
+        } catch (Exception ignored) { /* 读不到 options 就只剩目录扫描 */ }
+        for (String file : vaeFilesOnDisk()) names.add(bareName(file));
+        if (!activeVae.isBlank() && !VaeGuard.automaticVae(activeVae)) names.add(bareName(activeVae));
+        LinkedHashSet<String> result = new LinkedHashSet<>();
+        result.add(VAE_AUTOMATIC);
+        result.add(VAE_NONE);
+        for (String name : names) if (!name.isBlank()) result.add(name);
+        return List.copyOf(result);
+    }
+
+    /**
+     * 某个 Forge 预设立场上的额外模块清单（**去目录的文件名**，与 {@link #vaeSnapshot()} 的
+     * {@code modules} 同一形态，调用方可以直接比对"回读到的模块"与"该预设应有的模块"）。
+     * 读不到（不是 Forge／SD 没在跑）返回空列表。
+     */
+    public synchronized List<String> presetModules(String preset) {
+        String name = preset == null ? "" : preset.strip();
+        if (name.isEmpty()) return List.of();
+        try {
+            JsonObject defaults = forgePresetDefaults(name);
+            List<String> result = new ArrayList<>();
+            for (String module : stringValues(defaults.get("modules"))) {
+                String bare = bareName(module);
+                result.add(bare.isEmpty() ? module.strip() : bare);
+            }
+            return List.copyOf(result);
+        } catch (Exception ignored) { return List.of(); }
+    }
+
+    /**
+     * 给网页／指令用的一次性"当前状态快照"：
+     * {@code {vae, vaeAuto, modules, modulesRaw, checkpoint, preset, conflict{level,reason,suggestion,culprits}, choices}}。
+     *
+     * <p>读不到 SD 时不抛异常（页面要能照常渲染）：{@code reachable=false}、{@code errors} 里带上原因，
+     * {@code vae} 退回机器人自己记的值，冲突判定按"能拿到的字段"照常给（多半是 WARN）。
+     */
+    public synchronized JsonObject vaeSnapshot() {
+        JsonObject result = new JsonObject();
+        List<String> errors = new ArrayList<>();
+        String checkpoint = "";
+        String vae = activeVae;
+        List<String> modules = new ArrayList<>();
+        boolean reachable = false;
+        JsonObject options = null;
+        try {
+            options = options();
+            reachable = true;
+        } catch (Exception error) { errors.add("读取 WebUI 选项失败：" + Bot.error(error)); }
+        if (options != null) {
+            String live = Json.str(options, "sd_vae", "").strip();
+            if (!live.isBlank()) vae = live;
+            checkpoint = Json.str(options, "sd_model_checkpoint", "").strip();
+            modules.addAll(stringValues(options.get("forge_additional_modules")));
+        }
+        List<VaeGuard.Reading> readings = checkpointReadings(options);
+        if (checkpoint.isBlank() && !readings.isEmpty()) checkpoint = readings.get(0).checkpoint();
+        result.addProperty("vae", vae);
+        result.addProperty("vaeAuto", VaeGuard.automaticVae(vae));
+        JsonArray raw = new JsonArray();
+        JsonArray shown = new JsonArray();
+        for (String module : modules) {
+            if (module == null || module.isBlank()) continue;
+            raw.add(module);
+            String bare = bareName(module);
+            shown.add(bare.isEmpty() ? module.strip() : bare);
+        }
+        result.add("modules", shown);
+        result.add("modulesRaw", raw);
+        result.addProperty("checkpoint", checkpoint);
+        // 多源读数如实交回：网页／指令据此显示"options 读到什么、当前预设声明什么、机器人记着什么"，
+        // 也解释了为什么有时只给 WARN（读数互相矛盾时不下结论）。
+        JsonArray readingList = new JsonArray();
+        for (VaeGuard.Reading reading : readings) {
+            JsonObject item = new JsonObject();
+            item.addProperty("source", reading.source());
+            item.addProperty("checkpoint", bareName(reading.checkpoint()));
+            readingList.add(item);
+        }
+        result.add("readings", readingList);
+        try { result.addProperty("preset", forgePreset()); } catch (Exception ignored) { /* 不是 Forge 就没有预设名 */ }
+        VaeGuard.Facts facts = new VaeGuard.Facts(checkpoint, vae, stringValues(result.get("modules")), readings);
+        result.addProperty("readingsConsistent", !VaeGuard.inconsistent(facts));
+        VaeGuard.Conflict conflict = VaeGuard.check(facts);
+        JsonObject conflictJson = new JsonObject();
+        conflictJson.addProperty("level", conflict.level());
+        conflictJson.addProperty("reason", conflict.reason());
+        conflictJson.addProperty("suggestion", conflict.suggestion());
+        JsonArray culprits = new JsonArray();
+        for (String culprit : conflict.culprits()) culprits.add(culprit);
+        conflictJson.add("culprits", culprits);
+        result.add("conflict", conflictJson);
+        JsonArray choices = new JsonArray();
+        for (String choice : vaeList()) choices.add(choice);
+        result.add("choices", choices);
+        result.addProperty("reachable", reachable);
+        JsonArray errorList = new JsonArray();
+        for (String error : errors) errorList.add(error);
+        result.add("errors", errorList);
+        return result;
+    }
+
+    /** 检查点 + 当前 sd_vae + 当前额外模块 + **多源读数** → {@link VaeGuard} 的输入（判定全在那边，纯函数）。 */
+    public synchronized VaeGuard.Facts vaeFacts() {
+        String checkpoint = "";
+        String vae = activeVae;
+        List<String> modules = List.of();
+        JsonObject options = null;
+        try {
+            options = options();
+            checkpoint = Json.str(options, "sd_model_checkpoint", "").strip();
+            String live = Json.str(options, "sd_vae", "").strip();
+            if (!live.isBlank()) vae = live;
+            modules = stringValues(options.get("forge_additional_modules"));
+        } catch (Exception ignored) { /* 离线：用机器人自己记的 VAE，检查点退回持久化参数 */ }
+        List<VaeGuard.Reading> readings = checkpointReadings(options);
+        if (checkpoint.isBlank() && !readings.isEmpty()) checkpoint = readings.get(0).checkpoint();
+        return new VaeGuard.Facts(checkpoint, vae, modules, readings);
+    }
+
+    /**
+     * **多源取检查点**（全部只读，绝不写）：这些来源互相矛盾时判定只到 WARN。
+     *
+     * <ol>
+     *   <li>{@code options.sd_model_checkpoint}——"设置里的值"。**它可能还是上一次的**：Forge 切换模型
+     *       期间/经 UI 切换后有一段时间读到的仍是旧值（2026-10 的误报就是这么来的：用户 UI 上是 anima，
+     *       options 还写着 SDXL，于是"SDXL + qwen 的 VAE"被判成 BLOCK）；</li>
+     *   <li>当前 {@code forge_preset} 声明的那一个（{@code forge_checkpoint_<preset>}，options 与
+     *       Forge 自己的 config.json 两处合起来看）——预设是"用户选定的栈"，切预设时由 Forge 写入；</li>
+     *   <li>机器人自己记着的底模（{@code data/sd-parameters.json}；空＝"跟随 WebUI 当前模型"，不算读数）；</li>
+     *   <li>按 {@code options.sd_checkpoint_hash} 反查到的"**已加载**"检查点（{@code /sdapi/v1/sd-models}
+     *       的标题带 {@code [哈希]}）——这一条最接近"真正在跑的模型"。</li>
+     * </ol>
+     * 读不到的来源直接不放进来（不编造）；全都读不到就是空列表，判定退回"单源"行为。
+     */
+    private List<VaeGuard.Reading> checkpointReadings(JsonObject options) {
+        List<VaeGuard.Reading> readings = new ArrayList<>();
+        if (options != null) {
+            String live = Json.str(options, "sd_model_checkpoint", "").strip();
+            if (!live.isBlank()) readings.add(new VaeGuard.Reading("options", live));
+            String preset = firstNonBlank(Json.str(options, "forge_preset", "").strip(),
+                    Json.str(forgeConfig(), "forge_preset", "").strip());
+            if (!preset.isBlank()) {
+                String expected = firstNonBlank(Json.str(options, "forge_checkpoint_" + preset, "").strip(),
+                        Json.str(forgeConfig(), "forge_checkpoint_" + preset, "").strip());
+                if (!expected.isBlank()) readings.add(new VaeGuard.Reading("Forge 预设 " + preset, expected));
+            }
+            String hash = Json.str(options, "sd_checkpoint_hash", "").strip();
+            if (!hash.isBlank()) {
+                String loaded = loadedCheckpoint(hash);
+                if (!loaded.isBlank()) readings.add(new VaeGuard.Reading("已加载哈希", loaded));
+            }
+        }
+        String remembered = generationParameters == null ? "" : generationParameters.checkpoint();
+        if (remembered != null && !remembered.isBlank()) readings.add(new VaeGuard.Reading("机器人记录", remembered));
+        return List.copyOf(readings);
+    }
+
+    /**
+     * 用 {@code sd_checkpoint_hash} 反查"真正加载中的"检查点：{@code /sdapi/v1/sd-models} 的标题形如
+     * {@code waiIllustriousSDXL_v170.safetensors [f116b0c78f]}，哈希前缀对得上就是它。
+     * 只 GET 列表（不读模型文件头部），读不到就返回空串——少一条读数不影响判定。
+     */
+    private String loadedCheckpoint(String hash) {
+        String wanted = hash.toLowerCase(java.util.Locale.ROOT).strip();
+        if (wanted.length() < 8) return "";
+        String prefix = "[" + wanted.substring(0, Math.min(10, wanted.length())) + "]";
+        try {
+            for (String title : models()) if (title.toLowerCase(java.util.Locale.ROOT).contains(prefix))
+                return StackClassifier.bareName(title);
+        } catch (Exception ignored) { /* 读不到模型列表就当没有这条读数 */ }
+        return "";
+    }
+
+    /** 网页 JSON 里的字符串数组 → List（缺字段／非数组时为空）。 */
+    private static List<String> stringValues(JsonElement element) {
+        if (element == null || element.isJsonNull() || !element.isJsonArray()) return List.of();
+        List<String> values = new ArrayList<>();
+        for (JsonElement item : element.getAsJsonArray())
+            if (item != null && item.isJsonPrimitive()) values.add(item.getAsString());
+        return List.copyOf(values);
+    }
+
+    /**
+     * 校验并归一 VAE 名字：{@code Automatic}／{@code None} 直接过；其余必须能在 {@link #vaeList()} 里对上
+     * （大小写不敏感、路径形态归一成 basename）。对不上就抛异常并**把可用列表写进错误信息**。
+     */
+    private String canonicalVae(String requested) throws Exception {
+        if (requested.equalsIgnoreCase(VAE_AUTOMATIC) || requested.equalsIgnoreCase("auto") || requested.equals("自动")
+                || requested.equals("跟随"))
+            return VAE_AUTOMATIC;
+        if (requested.equalsIgnoreCase(VAE_NONE) || requested.equals("无") || requested.equals("不用")) return VAE_NONE;
+        List<String> available = vaeList();
+        String wanted = bareName(requested);
+        for (String name : available)
+            if (name.equalsIgnoreCase(requested) || name.equalsIgnoreCase(wanted)) return name;
+        throw new IOException("未知 VAE：" + requested + "；可用：" + String.join("、", available)
+                + "（用 .vae list 查看全部；Forge 的 VAE 下拉框用的是文件名本身）。");
+    }
+
+    /** 去目录、去 {@code [哈希]} 后缀（VAE 列表与比对都用 basename，Forge 的 sd_vae 也是 basename）。 */
+    private static String bareName(String value) { return StackClassifier.bareName(value).strip(); }
+
+    /**
+     * 这一条额外模块是不是 VAE（{@code /sdapi/v1/sd-modules} 里 VAE 与文本编码器混在一张表里）。
+     * 判据：名字里带 {@code vae}，或文件在 {@code models/VAE} 下（Flux 的 VAE 就叫 {@code ae.safetensors}，
+     * 名字里没有 vae），或名字本身就是 {@code ae}。
+     */
+    private static boolean looksLikeVae(String name, String filename) {
+        String lower = (name == null ? "" : name).toLowerCase(java.util.Locale.ROOT);
+        String path = (filename == null ? "" : filename).toLowerCase(java.util.Locale.ROOT).replace('\\', '/');
+        if (lower.contains("vae") || path.contains("/vae/") || path.endsWith("/vae")) return true;
+        String stem = lower.replaceAll("(?i)\\.(safetensors|pt|pth|ckpt|bin|sft|gguf)$", "");
+        return stem.equals("ae") || stem.endsWith("/ae");
+    }
+
+    /**
+     * 扫 {@code <sd.root>/models/VAE} 下的 VAE 文件（Forge 自己的 {@code refresh_vae_list()} 就是扫这里，
+     * 文件名取 basename）；另外补上 {@code models/} 下 {@code *.vae.*} 这种命名。
+     * 只读目录、不发请求；读不到返回空列表。
+     */
+    private List<String> vaeFilesOnDisk() {
+        String directory = sdRoot();
+        if (directory.isBlank()) return List.of();
+        Path models;
+        try { models = Path.of(directory).resolve("models"); }
+        catch (Exception error) { return List.of(); }
+        List<String> files = new ArrayList<>();
+        try {
+            Path vaeDir = models.resolve("VAE");
+            if (Files.isDirectory(vaeDir)) {
+                try (var paths = Files.walk(vaeDir, 4)) {
+                    paths.filter(Files::isRegularFile).filter(SdClient::isVaeFile).limit(500)
+                            .forEach(path -> files.add(path.getFileName().toString()));
+                }
+            }
+            if (Files.isDirectory(models)) {
+                try (var paths = Files.list(models)) {
+                    paths.filter(Files::isRegularFile).limit(500)
+                            .filter(path -> path.getFileName().toString().toLowerCase(java.util.Locale.ROOT).contains(".vae."))
+                            .forEach(path -> files.add(path.getFileName().toString()));
+                }
+            }
+        } catch (Exception ignored) { /* 目录不可读就当没有：列表至少有 Automatic/None */ }
+        return List.copyOf(files);
+    }
+
+    private static boolean isVaeFile(Path path) {
+        String name = path.getFileName().toString().toLowerCase(java.util.Locale.ROOT);
+        for (String extension : List.of(".safetensors", ".pt", ".pth", ".ckpt", ".bin", ".sft", ".gguf"))
+            if (name.endsWith(extension)) return true;
+        return false;
     }
 
     private String canonicalModel(String requested) throws Exception {
@@ -799,6 +1324,8 @@ public final class SdClient {
             parts.add("预设样式 " + orNone(before.styles()) + " → " + orNone(after.styles()));
         if (!Objects.equals(before.scheduler(), after.scheduler()) || Double.compare(before.distilledCfg(), after.distilledCfg()) != 0)
             parts.add("调度器/Shift " + forgeSummary(before) + " → " + forgeSummary(after));
+        if (!Objects.equals(before.vae(), after.vae()))
+            parts.add("VAE " + orBlank(before.vae()) + " → " + orBlank(after.vae()));
         return String.join("；", parts);
     }
 
@@ -1268,9 +1795,22 @@ public final class SdClient {
         for (String key : List.of("sampler", "scheduler", "steps", "cfg", "distilledCfg", "width", "height")) {
             JsonElement value = preset.has(key) ? preset.get(key) : current.get(key);
             if (value == null || value.isJsonNull()) continue;
-            result.add(key, value.deepCopy());
+            result.add(key, integralValue(key, value));
         }
         return result;
+    }
+
+    /**
+     * 整数语义的数值字段（步数/宽/高）落成整数：Forge 的配置里它们可能是 {@code 32.0}（double），
+     * 原样写进样式就变成 {@code "steps": 32.0}，网页「查看原文」与列表里全是没意义的 {@code .0}。
+     * 数值不变（{@code Json.num} 照旧读得出来），只是 JSON 里不再有零头；别的键原样返回。
+     */
+    private static JsonElement integralValue(String key, JsonElement value) {
+        JsonElement copy = value.deepCopy();
+        if (!Set.of("steps", "width", "height").contains(key)) return copy;
+        if (!copy.isJsonPrimitive() || !copy.getAsJsonPrimitive().isNumber()) return copy;
+        double number = copy.getAsDouble();
+        return number == Math.rint(number) ? new JsonPrimitive((long) number) : copy;
     }
 
     /**
@@ -1624,6 +2164,9 @@ public final class SdClient {
             GenerationSettings updated = change.apply(cachedSettings);
             if (bridgeAvailable && settingsBridgeAvailable) {
                 JsonObject payload = settingsJson(updated);
+                // VAE 只写机器人自己的记录：桥接扩展不认 sd_vae，把 vae 混进 PUT 会污染
+                // "只发改动字段"的语义（SdSettingsTest 就在盯 keySet），所以这里一定摘掉。
+                payload.remove("vae");
                 if (settingsInitialized) {
                     for (String key : List.of("sampler_name", "styles", "width", "height"))
                         if (!fields.contains(key)) payload.remove(key);
@@ -1640,8 +2183,13 @@ public final class SdClient {
                 revision = state.get("revision").deepCopy();
             }
             persist(updated);
-            cachedSettings = updated;
+            // 日志与"变更了什么"都用桥接那一份比较（before 也是桥接来的，两边都没有 vae 字段，
+            // 不会因为合并 VAE 而每次改动都多报一行"VAE 变了"）。
             logSettingsChange(where, before, updated);
+            // 桥接回读里没有 vae（它不在桥接的字段表里）：合并回机器人自己记的那一份，
+            // 否则 setSampler/setSize 的返回值会把 VAE 显示成"没设过"。
+            updated = updated.withVae(activeVae);
+            cachedSettings = updated;
             return updated;
         }
         throw new IOException("WebUI 生成参数正在被其他窗口修改，请稍后重试。");
@@ -2048,7 +2596,14 @@ public final class SdClient {
         int width = requireInteger(state.get("width"), "width");
         int height = requireInteger(state.get("height"), "height");
         validateSize(width, height);
-        return new GenerationSettings(sampler, forgeScheduler(state), selected, width, height, forgeDistilledCfg(state), source);
+        return new GenerationSettings(sampler, forgeScheduler(state), selected, width, height, forgeDistilledCfg(state), source,
+                forgeVae(state));
+    }
+
+    /** VAE：没存过就是空串（＝没设过，老 sd-settings.json 读回来仍然兼容）。 */
+    private static String forgeVae(JsonObject state) {
+        JsonElement value = state.get("vae");
+        return value != null && value.isJsonPrimitive() && value.getAsJsonPrimitive().isString() ? value.getAsString() : "";
     }
 
     /** 调度器：没存过就是"不发送"（旧文件读回来仍然兼容）。 */
@@ -2085,6 +2640,68 @@ public final class SdClient {
             throw new IOException("图片宽高必须为 64–2048 之间的 8 的倍数；例如 .size set 768 512。");
     }
 
+    /** 生成尺寸的下限（与 {@link #validateSize} 同一套规则）。 */
+    public static final int MIN_GENERATION_SIZE = 64;
+    /** 生成尺寸的上限（与 {@link #validateSize} 同一套规则）。 */
+    public static final int MAX_GENERATION_SIZE = 2048;
+    /** 生成尺寸必须是它的倍数（与 {@link #validateSize} 同一套规则）。 */
+    public static final int GENERATION_SIZE_STEP = 8;
+    /**
+     * 样式里的尺寸要缩放时压到的**长边上限**：2048 是硬上限，但样式里的尺寸多半来自展示图
+     * （Civitai 预览图动辄 2400×3744），贴着 2048 换算出来的尺寸既慢又紧贴校验边界；
+     * 1536 是 SDXL 一类模型常用的工作尺寸，且长边落在 8 的倍数上，缩放后不会因为四舍五入再顶回上限。
+     */
+    public static final int STYLE_SIZE_LONG_SIDE = 1536;
+
+    /** 尺寸在合法范围内吗（64–2048 且是 8 的倍数）。 */
+    public static boolean validGenerationSize(int width, int height) {
+        return width >= MIN_GENERATION_SIZE && width <= MAX_GENERATION_SIZE && width % GENERATION_SIZE_STEP == 0
+                && height >= MIN_GENERATION_SIZE && height <= MAX_GENERATION_SIZE && height % GENERATION_SIZE_STEP == 0;
+    }
+
+    /**
+     * 把样式里记着的宽高换算成**能真正用于生成的**宽高。规则（可解释、可测试）：
+     * <ol>
+     *   <li>两边都合法（64–2048 且 8 的倍数）：**原样返回**——用户特意设的 768×512 / 1024×1024 不许被动；</li>
+     *   <li>两边都在 64–2048 之间、只是不是 8 的倍数：各自四舍五入到 8 的倍数（比例偏差 ≤0.6%）；</li>
+     *   <li>有一边超出 2048（展示图尺寸就是这种）：整体等比缩放，长边压到 ≤{@value #STYLE_SIZE_LONG_SIDE}，
+     *       再各自四舍五入到 8 的倍数；</li>
+     *   <li>缩完有边小于 64：把比例整体放大到短边＝64（极小尺寸抬到能生成的下限）；</li>
+     *   <li>放大后长边又超过 2048（极端比例，例如 100000×100）：以 2048 封顶，此时宽高比**保不住**，
+     *       只能保证两边都在 64–2048 且是 8 的倍数——普通图片比例走不到这一步。</li>
+     * </ol>
+     * 除第 5 条的极端比例外，结果与输入同比例（偏差 ≤1%）。
+     *
+     * @return {@code {width, height}}；宽或高 ≤0（没有可用尺寸）时返回 null
+     */
+    public static int[] fitGenerationSize(int width, int height) {
+        if (width <= 0 || height <= 0) return null;
+        if (validGenerationSize(width, height)) return new int[]{width, height};
+        if (width >= MIN_GENERATION_SIZE && width <= MAX_GENERATION_SIZE
+                && height >= MIN_GENERATION_SIZE && height <= MAX_GENERATION_SIZE)
+            return new int[]{snapGenerationSize(width), snapGenerationSize(height)};
+        int longest = Math.max(width, height), shortest = Math.min(width, height);
+        double scale = longest > STYLE_SIZE_LONG_SIDE ? (double) STYLE_SIZE_LONG_SIDE / longest : 1;
+        if (shortest * scale < MIN_GENERATION_SIZE) scale = (double) MIN_GENERATION_SIZE / shortest;
+        if (longest * scale > MAX_GENERATION_SIZE) scale = (double) MAX_GENERATION_SIZE / longest;
+        return new int[]{snapGenerationSize((int) Math.round(width * scale)), snapGenerationSize((int) Math.round(height * scale))};
+    }
+
+    /** 四舍五入到 {@value #GENERATION_SIZE_STEP} 的倍数，再夹进 64–2048。 */
+    private static int snapGenerationSize(int value) {
+        int snapped = (int) Math.round(value / (double) GENERATION_SIZE_STEP) * GENERATION_SIZE_STEP;
+        return Math.max(MIN_GENERATION_SIZE, Math.min(MAX_GENERATION_SIZE, snapped));
+    }
+
+    /**
+     * 载入样式时那一条尺寸说明：原样套用就是「尺寸 1024×1024」，缩放过就写明原值与新值
+     * （「尺寸 2400×3744 → 同比例缩到 984×1536」）——回执里必须看得出来这是换算过的。
+     */
+    public static String sizeAppliedText(int width, int height, int[] fitted) {
+        if (fitted == null || (fitted[0] == width && fitted[1] == height)) return "尺寸 " + width + "×" + height;
+        return "尺寸 " + width + "×" + height + " → 同比例缩到 " + fitted[0] + "×" + fitted[1];
+    }
+
     private static JsonObject settingsJson(GenerationSettings settings) {
         JsonObject state = new JsonObject();
         state.addProperty("sampler_name", settings.samplerName());
@@ -2094,11 +2711,13 @@ public final class SdClient {
         // 调度器与蒸馏 CFG 只在真的设了的时候落盘：老的 sd-settings.json 读回来仍是"不发送"。
         if (!settings.scheduler().isBlank()) state.addProperty("scheduler", settings.scheduler());
         if (settings.distilledCfg() > 0) state.addProperty("distilled_cfg", settings.distilledCfg());
+        // VAE 同理：没设过就不写字段，老的 settings 文件读回来仍然是空串（老文件没有该字段也要能容忍）。
+        if (!settings.vae().isBlank()) state.addProperty("vae", settings.vae());
         return state;
     }
 
     private void persist(GenerationSettings settings) throws IOException {
-        JsonObject state = settingsJson(settings.withForge(activeScheduler, activeDistilledCfg));
+        JsonObject state = settingsJson(settings.withForge(activeScheduler, activeDistilledCfg).withVae(activeVae));
         state.addProperty("source", settings.source());
         state.addProperty("updated_at", Instant.now().toString());
         Json.atomicWrite(settingsFile, state);

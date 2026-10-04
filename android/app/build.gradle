@@ -17,10 +17,23 @@ android {
         applicationId "cn.szu.bot.app"
         minSdk 26
         targetSdk 34
-        versionCode 150
-        versionName "1.5.0"
+        versionCode 160
+        versionName "1.6.0"
         // 没有自定义 vector drawable / 多密度拆分，保持单一 APK。
         resourceConfigurations += ['zh', 'en']
+
+        // 「构建时烧进去的测试默认服务器地址」：构建脚本 android/build-apk.ps1 每次编包前
+        // 探测本机局域网 IP，用 -PpixikoDefaultHost=192.168.x.y:8787 传进来（-NoDefaultHost 则不传）。
+        // 这里只把它变成 BuildConfig.PIXIKO_DEFAULT_HOST 字符串常量，**不写死任何 IP 到源码里**：
+        // 属性缺失时就是空串，App 行为与没有这个机制时完全一致。
+        // 用途只有一个：首次运行时预填到「服务器设置」的地址框（见 SettingsActivity#applyBuildDefaultHost），
+        // 不自动连接、不覆盖用户已保存的服务器、更不碰令牌。
+        def pixikoDefaultHost = project.hasProperty('pixikoDefaultHost')
+                ? project.property('pixikoDefaultHost').toString().trim()
+                : ''
+        // 只放行地址里合法出现的字符，避免引号 / 反斜杠破坏生成的 BuildConfig.java。
+        pixikoDefaultHost = pixikoDefaultHost.replaceAll(/[^0-9A-Za-z._:\-\[\]]/, '')
+        buildConfigField "String", "PIXIKO_DEFAULT_HOST", "\"${pixikoDefaultHost}\""
     }
 
     buildTypes {

@@ -2,7 +2,7 @@
 
 **v1.4.0 起新增**（**v1.5.0 起默认打开新的手机端界面 `/m`**）。作者：loriko（deloriko@outlook.com）。
 
-把网页控制台**搬到手机上**的一个 Android app：包名 `cn.szu.bot.app`，版本 **1.5.0**（`versionCode 150`）。
+把网页控制台**搬到手机上**的一个 Android app：包名 `cn.szu.bot.app`，版本 **1.6.0**（`versionCode 160`）。
 
 ---
 
@@ -33,6 +33,10 @@ app 里显示的就是**你机器人发出来的那套网页**：**v1.5.0 起默
 回执详情改增量渲染、取不到的图显示「图取不到」占位。
 **v1.5.3 起对话里「执行指令：…」这类系统行也从居中改成靠左**（与机器人回复同侧，
 样式像一行日志：无气泡底、左侧一条细线、灰字小一号）；**桌面控制台的 `.msg.sys` 仍是居中**。
+**v1.6.0 起 `/m` 又多了这些**：**出图屏与系统 / 更多屏里的 VAE 冲突横幅**（WARN 黄条 /
+**BLOCK 红条 + 一键修复**，与桌面控制台同一套判定）；**图片按真实比例显示**（图集与出图屏不再把非方图
+压成方块），"新出的图"不再闪空占位（改增量同步、不整块重建）；**LoRA 屏能直接搜 Civitai**
+（本地 / Civitai 分段、滚到底翻页、下载可暂停 / 取消）。
 在**电脑浏览器**里直接开 `/m` 时，满足「顶层文档 + 视口宽 `> 560px` + 主指针不是触摸
 （`pointer: coarse` 为假）」才会套一个 **390×844** 的机身框（缩放按视口高度自动算；**v1.5.1 起
 下限 70%**，且**可用高不足约 591px / `innerHeight` 不足约 687px 时干脆不套框、直接铺满**，
@@ -184,7 +188,7 @@ adb reverse tcp:8787 tcp:8787
 | **Gradle** | **8.9 – 8.14**（与 AGP 8.x / `compileSdk 34` 匹配） |
 
 工程本身的参数：Java、Android Gradle Plugin **8.x**（根 `build.gradle` 里是 **8.6.1**）、
-`compileSdk 34`、`minSdk 26`、`applicationId` **`cn.szu.bot.app`**、版本 **1.5.0**（`versionCode 150`）。
+`compileSdk 34`、`minSdk 26`、`applicationId` **`cn.szu.bot.app`**、版本 **1.6.0**（`versionCode 160`）。
 
 ### 一键构建
 
@@ -200,6 +204,52 @@ powershell -File android\build-apk.ps1 -SdkRoot <Android SDK 路径> -JdkHome <J
 - `-JdkHome`：**JDK 21** 的根目录；
 - 在**仓库根目录**执行（或者把 `android\build-apk.ps1` 换成实际路径）。
 
+### 构建时自动烧进「本机局域网地址」当测试默认值
+
+每次跑 `build-apk.ps1`，它都会**先探测本机局域网 IP**，把 **`<IP>:<端口>`** 通过 Gradle 属性
+`-PpixikoDefaultHost=…` 交给 `app/build.gradle`，后者把它变成 **`BuildConfig.PIXIKO_DEFAULT_HOST`**
+（**源码里没有任何写死的 IP**，只有这一条路）。App **首次运行**（一台服务器都还没保存过）打开
+「服务器设置」时，会把这个地址**预填**到地址框里，下面还有一行小字
+「↑ 这是构建时烧进去的测试地址（…），可直接改成别的；令牌仍要自己填」——
+装上就能直接点「测试连接 / 保存」，不用手输 IP。
+
+| 参数 | 作用 |
+|---|---|
+| **（都不给）** | 自动探测：读 `config.json` 的 `webui.port`（读不到用 **8787**）＋ 自己挑一张网卡的 IPv4 |
+| **`-DefaultHost 192.168.1.5:8787`** | 显式指定，跳过探测（只写 `192.168.1.5` 也行，缺端口按 `webui.port` 补） |
+| **`-NoDefaultHost`** | 完全不注入：`BuildConfig.PIXIKO_DEFAULT_HOST` 是**空串**，行为与没有这个机制时一致 |
+| **`-ConfigPath D:\x\config.json`** | 换个 `config.json` 读端口（**只读，绝不写**） |
+
+探测规则（这台机器有 VPN / 虚拟网卡，所以必须排除干净）：
+
+- **排除网段**：`127.*`、`169.254.*`（APIPA）、`0.*`、`224.*`、`240.*`、`198.18.*`
+  （代理软件的 fake-IP 段）、`100.64.*`（CGNAT）、`192.0.2.*` / `198.51.100.*` / `203.0.113.*`（保留段）；
+- **排除虚拟网卡**（对「网卡名 + 网卡描述」做关键字匹配）：VirtualBox / VMware / Hyper-V / WSL /
+  Docker / TAP / TUN / Wintun / WireGuard / OpenVPN / Tailscale / ZeroTier / 蓝牙 等；
+- **排序取第一名**：能 HTTP 应答机器人（`<IP>:<端口>` 的 `/healthz`）＞ 有 IPv4 默认路由 ＞ RFC1918 私网 ＞
+  接口度量（`InterfaceMetric + RouteMetric`）更小；最后对第一名**真发一次 `GET /healthz`**
+  （即「机器人真的在这张网卡上可达」，和 app 里「测试连接」的第一步是同一个判据）。
+  刻意**不用**「TCP 能连上」当验证：这台机器的 TUN 代理会对任意远端 IP 假握手
+  （实测连 `10.1.2.3:9999`、`8.8.8.8:9999` 都报「连上了」），那种验证等于没验证；
+- **探测失败不会让构建失败**：要么**不注入** + 打印一句人话警告，要么照常注入但明确警告
+  「`/healthz` 连不上这个地址，可能是机器人没在跑 / 防火墙挡着，可用 `-DefaultHost` 指定别的」。
+
+构建结束时脚本会把**本次烧进去的地址**清楚地打出来（还有生成的那一行 `BuildConfig.java`）：
+
+```
+  默认地址 : 172.30.204.50:8787
+             ↑ 本次烧进 APK 的测试默认服务器地址（BuildConfig.PIXIKO_DEFAULT_HOST）
+  BuildConfig: public static final String PIXIKO_DEFAULT_HOST = "172.30.204.50:8787";
+```
+
+几条边界，别误会：
+
+- **只是预填**：不自动连接、不写 SharedPreferences、不设为当前服务器，要用户自己点「保存」；
+- **不碰令牌**：`config.json → webui.access_token` 仍然要自己抄进 app（预填的**只有地址**）；
+- **不覆盖用户数据**：只要**已经保存过服务器**（或地址框里已经有内容），这个默认值就完全不出现；
+- **`-NoDefaultHost` 构建出来的包**：常量是空串、那行小字也不出现，与加这个机制之前**行为一致**
+  （APK 字节数当然还是会随其它源码/文档改动变化）。
+
 ### 产物在哪
 
 Gradle 的原始产物：
@@ -209,14 +259,14 @@ android\app\build\outputs\apk\debug\app-debug.apk
 ```
 
 脚本会把它复制到输出目录 **`F:\Bot\android\dist\`**，复制后的产物名是
-**`pixiko-<版本>-<构建类型>.apk`**，也就是本版的 **`pixiko-1.5.0-debug.apk`**
-（版本号取自 `app/build.gradle` 的 `versionName`）。
-本版 `android/dist/` 里另有一份**同内容、只是换了文件名**的 **`pixiko-android-1.5.0-debug.apk`**
-（发布用的就是它；两份的 sha256 完全一致）。两份都是 **6,221,489 B**，sha256 前 16 位
-**`048779403d511a51`**（那份 APK 是 **v1.5.0** 构建的）。
-**网页（含 `/m`）不在 APK 里**，所以网页更新**不需要重新出包**——**v1.5.1 / v1.5.2 都没有重新出包**
-（客户端自身版本仍是 **1.5.0**：那两版改的是网页侧的 `/m` 排版与图集缩略图）。
-> 上面那个 sha256 只对应**本版已经构建好的这一份**；APK 里**打进了** `app/src/main/assets/DESIGN.md`
+**`pixiko-<版本>-<构建类型>.apk`**，也就是本版的 **`pixiko-1.6.0-debug.apk`**
+（版本号取自 `app/build.gradle` 的 `versionName`；本版客户端 **1.6.0 / versionCode 160**）。
+**本版重新出包了**（外壳与构建脚本都有改动）；`android/dist/` 里那份 `pixiko-1.6.0-debug.apk`
+是**本机测试用**的（带了构建时烧入的局域网地址），**发布附件要用 `-NoDefaultHost` 构建的那一份**
+（不含任何本机私网地址，见上一节「构建时烧入局域网地址」）。
+**网页（含 `/m`）不在 APK 里**，所以**只改网页时不需要重新出包**——v1.5.1 / v1.5.2 / v1.5.3
+就都没有重新出包。
+> 上面提到的字节数与哈希只对应**当时构建的那一份**；APK 里**打进了** `app/src/main/assets/DESIGN.md`
 > （外壳设计说明，随包分发），所以**改了这份文档再重新构建，字节与哈希都会变**——这是预期的，
 > 不是构建不可复现。
 

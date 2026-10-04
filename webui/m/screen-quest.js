@@ -116,12 +116,19 @@
       '.q-text{white-space:pre-wrap;overflow-wrap:anywhere;word-break:break-word;font-size:var(--m-fs-body,15px);',
       '  line-height:1.5;color:#dde7fb}',
       '.q-step.q-err .q-text{color:#ffc9c9}',
-      /* 图集网格：一条回执里的图片合成一个网格 */
-      '.q-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(96px,1fr));gap:8px;margin-top:4px}',
-      '.q-tile{position:relative;display:block;width:100%;aspect-ratio:1/1;padding:0;margin:0;border:1px solid #24314e;',
+      /* 图集网格：一条回执里的图片合成一个网格。
+         修「图片在预览界面被异常压缩」：旧写法是 `.q-tile{aspect-ratio:1/1}` +
+         `img{width:100%;height:100%;object-fit:cover}` —— 1:1 方块里塞非方形图，横图两头被裁，
+         换成 contain 之后又变成四周一大片空白。现在**格子跟着图片自身的宽高比走**：
+         .q-tile 先给中性 `aspect-ratio:4/3` 占位（图没到也不塌成 0 高），图片 load 之后由
+         app.js 的 `P.applyNaturalRatio()` 把 aspect-ratio 换成 naturalWidth/naturalHeight；
+         `<img>` 只写 width:100% + height:auto。行高由图片自己撑开（grid-auto-rows:auto）。 */
+      '.q-grid{display:grid;grid-template-columns:repeat(2,1fr);grid-auto-rows:auto;gap:8px;margin-top:4px;align-items:start}',
+      '.q-grid:has(.q-tile:only-child){grid-template-columns:1fr}',   /* 只有一张图 → 占满整行，不留半边空列 */
+      '.q-tile{position:relative;display:block;width:100%;aspect-ratio:4/3;padding:0;margin:0;border:1px solid #24314e;',
       '  border-radius:12px;overflow:hidden;background:#0f1728;cursor:pointer;touch-action:manipulation}',
       '.q-tile:active{transform:scale(.97)}',
-      '.q-tile img{width:100%;height:100%;object-fit:cover;display:block}',
+      '.q-tile img{width:100%;height:auto;object-fit:fill;display:block}',
       '.q-tile.q-fail{display:flex;align-items:center;justify-content:center;color:#93a4c4;font-size:11px;text-align:center}'
     ].join('');
     document.head.appendChild(style);
@@ -217,46 +224,24 @@
   function shortName(file) { return text(file).replace(/^.*[\\/]/, '').split('?')[0]; }
 
   /**
-   * 下拉刷新：**这一屏自己接管手势**（外壳那份是给没实现 refresh 的屏兜底的，只在 #m-main 上做过一次，
-   * 我们不依赖它）。滚动交给外壳的 #m-main，所以只看它的 scrollTop；从顶部再往下拖超过 56px 就刷这一屏。
-   * 提示条放在屏内最上面，展开时把正文推下去（不做回弹动画）。
+   * 下拉刷新：这一屏自己接管手势（提示条放在屏内最上面，展开时把正文推下去，不做回弹动画）。
+   *
+   * <p>判据**不在这里**：用外壳那份共用实现 `P.ptrInstall()`（认"手指起点所属的可滚动容器"是否真的
+   * 在顶部、过程中滚过一次就作废、只认下拖），原因见 app.js 里 `PixikoM.ptrInstall` 的长注释。
+   * 这里只负责提示条的文案与 class。
    */
   function installPullToRefresh(tip, onFire) {
     var host = document.getElementById('m-main') || document.getElementById('m-app') || document;
-    var startY = 0;
-    var tracking = false;
-    var armed = false;
-    var busy = false;
-    host.addEventListener('touchstart', function (event) {
-      if (busy || event.touches.length !== 1 || (host.scrollTop || 0) > 2) { tracking = false; return; }
-      startY = event.touches[0].clientY;
-      tracking = true;
-      armed = false;
-    }, { passive: true });
-    host.addEventListener('touchmove', function (event) {
-      if (!tracking) return;
-      if ((host.scrollTop || 0) > 2) { tracking = false; tip.classList.remove('q-on'); return; }
-      var delta = event.touches[0].clientY - startY;
-      if (delta > 12) {
-        tip.classList.add('q-on');
-        armed = delta > 56;
-        tip.textContent = armed ? '松手刷新' : '下拉刷新';
-      } else {
-        tip.classList.remove('q-on');
-        armed = false;
+    P.ptrInstall(host, {
+      screen: 'quest',
+      progress: function (armed) { tip.classList.add('q-on'); tip.textContent = armed ? '松手刷新' : '下拉刷新'; },
+      disarm: function () { tip.classList.remove('q-on'); tip.textContent = '下拉刷新'; },
+      fire: function () {
+        tip.textContent = '正在刷新…';
+        return Promise.resolve().then(onFire).catch(function () { /* 错误已经由屏内三态显示 */ })
+          .then(function () { tip.textContent = '下拉刷新'; });
       }
-    }, { passive: true });
-    host.addEventListener('touchend', function () {
-      tracking = false;
-      tip.classList.remove('q-on');
-      if (!armed || busy) return;
-      busy = true;
-      tip.textContent = '正在刷新…';
-      Promise.resolve().then(onFire).catch(function () { /* 错误已经由屏内三态显示 */ }).then(function () {
-        busy = false;
-        tip.textContent = '下拉刷新';
-      });
-    }, { passive: true });
+    });
   }
 
   /** 同步契约里的未读总数 / 列表：写进 state.quests.unread 后，也让屏内的未读摘要条跟着变。 */
@@ -323,53 +308,133 @@
 
   /* ───────────────────────── 3. 列表屏 id = 'quest' ───────────────────────── */
   var LIMIT = 60;
+  var LIST_POLL_MS = 3000;          // 列表实时刷新：与出图屏同频（可见时每 3 秒一次）
   var list = { root: null, body: null, refresh: null, sumBadge: null, sumText: null, quests: null,
-    unread: 0, latest: 0, error: '', loading: false, timer: null, lastAt: 0 };
+    unread: 0, latest: 0, error: '', loading: false, timer: null, lastAt: 0,
+    rowNodes: Object.create(null), percent: 0 };
 
+  /** 建一行（只建骨架 + 绑一次点击；内容统统由 {@link fillRow} 改）。 */
   function rowFor(quest) {
-    var number = num(quest.number, 0);
-    var unread = !!quest.unread;
-    var row = el('button', 'q-row' + (unread ? ' q-unread' : ''));
+    var row = el('button', 'q-row');
     row.type = 'button';
-    row.setAttribute('data-number', String(number));
+    row.setAttribute('data-number', String(num(quest.number, 0)));
     var main = el('div', 'q-row-main');
     var top = el('div', 'q-row-top');
-    top.appendChild(el('span', 'q-no', '#' + number));
-    top.appendChild(el('span', 'q-cmd', text(quest.command) || '（没有指令文本）'));
-    top.appendChild(el('span', 'q-when', when(quest.startedAt, quest.ageMillis)));
+    top.appendChild(el('span', 'q-no', ''));
+    top.appendChild(el('span', 'q-cmd', ''));
+    top.appendChild(el('span', 'q-when', ''));
     main.appendChild(top);
-    main.appendChild(el('div', 'q-sum', text(quest.summary) || '（这条回执还没有输出）'));
-    var tags = el('div', 'q-tags');
-    if (unread) tags.appendChild(el('span', 'q-tag q-live', '未读'));
+    main.appendChild(el('div', 'q-sum', ''));
+    main.appendChild(el('div', 'q-tags'));
+    row.appendChild(main);
+    row.appendChild(el('span', 'q-dot', '1'));
+    row.appendChild(el('span', 'q-chev', '›'));
+    row.addEventListener('click', function () { openDetail(num(row.getAttribute('data-number'), 0)); });
+    return row;
+  }
+
+  /**
+   * 把一条回执的内容写进**已有的行**（未读、摘要、标签、生成中进度都只改这一行）。
+   *
+   * <p>为什么必须原地改：列表每 3 秒轮询一次，`clear(rows)` 整块重画会把所有行节点换掉 ——
+   * 滚动位置会跳、点击目标会失效、整屏闪一下（用户要的是"实时刷新"，不是"每 3 秒重画一次"）。
+   */
+  function fillRow(row, quest) {
+    var unread = !!quest.unread;
+    if (row.classList.contains('q-unread') !== unread) row.classList.toggle('q-unread', unread);
+    var main = row.firstChild;
+    var top = main && main.firstChild;
+    var no = top && top.children[0], cmd = top && top.children[1], whenNode = top && top.children[2];
+    var sum = main && main.children[1];
+    var tags = main && main.children[2];
+    if (no) no.textContent = '#' + num(quest.number, 0);
+    if (cmd) {
+      var wantCmd = text(quest.command) || '（没有指令文本）';
+      if (cmd.textContent !== wantCmd) cmd.textContent = wantCmd;
+    }
+    if (whenNode) {
+      var wantWhen = when(quest.startedAt, quest.ageMillis);
+      if (whenNode.textContent !== wantWhen) whenNode.textContent = wantWhen;
+    }
+    if (sum) {
+      var wantSum = text(quest.summary) || '（这条回执还没有输出）';
+      if (sum.textContent !== wantSum) sum.textContent = wantSum;
+    }
+    if (tags) fillTags(tags, quest);
+    var dot = row.lastChild && row.lastChild.previousSibling;
+    if (dot && dot.classList && dot.classList.contains('q-dot')) dot.style.display = unread ? '' : 'none';
+  }
+
+  /** 标签行：未读 / 段数 / 张数 / 进行中（带实时百分比）/ 失败 / 已完成 / 正文不在了。 */
+  function fillTags(tags, quest) {
+    var unread = !!quest.unread;
     var texts = num(quest.texts, 0);
     var images = num(quest.images, 0);
-    if (texts) tags.appendChild(el('span', 'q-tag', texts + ' 段文字'));
-    if (images) tags.appendChild(el('span', 'q-tag', images + ' 张图'));
-    if (quest.busy || (quest.done === false && !quest.expired)) {
-      tags.appendChild(el('span', 'q-tag q-live', '进行中…'));
-    } else if (quest.error) {
-      tags.appendChild(el('span', 'q-tag q-warn', '失败'));
-    } else {
-      tags.appendChild(el('span', 'q-tag', '已完成'));
+    var busy = !!(quest.busy || (quest.done === false && !quest.expired));
+    var percent = busy && list.percent > 0 ? '生成中 ' + Math.round(list.percent) + '%' : '进行中…';
+    var wanted = [];
+    if (unread) wanted.push(['未读', 'q-tag q-live']);
+    if (texts) wanted.push([texts + ' 段文字', 'q-tag']);
+    if (images) wanted.push([images + ' 张图', 'q-tag']);
+    if (busy) wanted.push([percent, 'q-tag q-live']);
+    else if (quest.error) wanted.push(['失败', 'q-tag q-warn']);
+    else wanted.push(['已完成', 'q-tag']);
+    if (quest.expired) wanted.push(['正文不在了', 'q-tag q-warn']);
+    var same = tags.children.length === wanted.length;
+    for (var i = 0; same && i < wanted.length; i++) {
+      var node = tags.children[i];
+      if (node.textContent !== wanted[i][0] || node.className !== wanted[i][1]) same = false;
     }
-    if (quest.expired) tags.appendChild(el('span', 'q-tag q-warn', '正文不在了'));
-    main.appendChild(tags);
-    row.appendChild(main);
-    if (unread) row.appendChild(el('span', 'q-dot', '1'));
-    row.appendChild(el('span', 'q-chev', '›'));
-    row.addEventListener('click', function () { openDetail(number); });
-    return row;
+    if (same) return;
+    clear(tags);
+    wanted.forEach(function (pair) { tags.appendChild(el('span', pair[1], pair[0])); });
+  }
+
+  /**
+   * 列表增量同步：按 `data-number` 复用行节点 —— 新回执只 append 一行、消失的才摘掉、
+   * 其余的行原地更新（未读数、摘要、进度）。顺序按新数据排（`insertBefore` 只移动节点）。
+   */
+  function syncRows(quests) {
+    var rows = list.rows;
+    if (!rows) return;
+    var store = list.rowNodes;
+    var keep = Object.create(null);
+    quests.forEach(function (quest) {
+      var key = String(num(quest.number, 0));
+      keep[key] = true;
+      var row = store[key];
+      if (!row) { row = rowFor(quest); store[key] = row; }
+      fillRow(row, quest);
+    });
+    Object.keys(store).forEach(function (key) {
+      if (keep[key]) return;
+      var dead = store[key];
+      if (dead.parentNode === rows) rows.removeChild(dead);
+      delete store[key];
+    });
+    var previous = null;
+    quests.forEach(function (quest) {
+      var row = store[String(num(quest.number, 0))];
+      if (!row) return;
+      if (previous ? previous.nextSibling !== row : rows.firstChild !== row) {
+        rows.insertBefore(row, previous ? previous.nextSibling : rows.firstChild);
+      }
+      previous = row;
+    });
   }
 
   function renderList() {
     if (!list.rows) return;
     var rows = list.rows;
-    clear(rows);
     if (list.loading && !list.quests) {
+      clear(rows);
+      list.rowNodes = Object.create(null);
       rows.appendChild(skeleton(5));
       return;
     }
     if (list.error) {
+      clear(rows);
+      list.rowNodes = Object.create(null);
       rows.appendChild(stateBox('q-err', '回执列表读取失败：' + list.error, function () { loadList(true); }));
       if (list.quests && list.quests.length) {
         rows.appendChild(el('div', 'q-step-head', '下面是上一次读到的内容'));
@@ -379,10 +444,12 @@
     }
     var quests = list.quests || [];
     if (!quests.length) {
+      clear(rows);
+      list.rowNodes = Object.create(null);
       rows.appendChild(emptyBox());
       return;
     }
-    quests.forEach(function (quest) { rows.appendChild(rowFor(quest)); });
+    syncRows(quests);              // ← 增量：只动变化的那几行
   }
 
   function loadList(showSpinner) {
@@ -499,6 +566,9 @@
     detail.error = '';
     detail.files = [];
     detail.extras = [];
+    detail.owned = [];                          // 换条目：这条回执自己的图与"本次开始时刻"全部作废
+    detail.ownedDirs = Object.create(null);
+    detail.pullSince = 0;
     detail.stepNodes = [];      // 新条目：DOM 会被整屏重挂，增量记账跟着清
     detail.stepCount = 0;
     if (typeof P.go === 'function') P.go('quest-detail');
@@ -533,14 +603,21 @@
 
     renderList();
     installPullToRefresh(ptr, function () { return loadList(true); });
-    /* 列表轻轮询：有新回执 / 有「进行中」的条目就刷一次，页面隐藏时自动停表。 */
+    /* 列表**实时**刷新：可见时每 3 秒拉一次（与出图屏同频），只增量改行（见 syncRows）。
+       三层让路：不在这一屏 / 有浮层开着（查看器、sheet、对话框）/ 上一轮还没回来 —— 都直接跳过，
+       绝不打扰用户看图或选东西。 */
     list.timer = P.pollWhileVisible(function () {
       if (list.loading) return;
       if (typeof P.current === 'function' && P.current() !== 'quest') return;
-      var stale = Date.now() - list.lastAt > 15000;
+      if (typeof P.overlayBusy === 'function' && P.overlayBusy()) return;
       var running = (list.quests || []).some(function (item) { return item && (item.busy || (item.done === false && !item.expired)); });
-      if (stale || running) loadList(false);
-    }, 5000);
+      if (!running) { list.percent = 0; return loadList(false); }
+      /* 有正在生成的：顺手把实时百分比拿回来（/api/progress 是只读，一次请求），只影响那一行的标签。 */
+      return Promise.resolve(P.api('/api/progress', { body: {} })).then(function (live) {
+        list.percent = num(live && live.percent, 0);
+        return loadList(false);
+      }).catch(function () { list.percent = 0; return loadList(false); });
+    }, LIST_POLL_MS);
   }
 
   function refreshList() {
@@ -566,7 +643,79 @@
   /* `stepNodes` / `stepCount` 是增量渲染的记账：已画好的步骤行节点与它们的数量。
      换条目（openDetail）或整屏重挂（mountDetail）时必须清掉 —— 那时 DOM 已经不在，留着会串页。 */
   var detail = { root: null, body: null, head: null, headNodes: null, number: 0, payload: null, error: '',
-    loading: false, files: [], extras: [], timer: null, progress: null, stepNodes: [], stepCount: 0 };
+    loading: false, files: [], extras: [], timer: null, progress: null, stepNodes: [], stepCount: 0,
+    owned: [], ownedDirs: Object.create(null), pullSince: 0 };
+
+  /**
+   * 这条回执**自己**的图片（只认 `/api/quest` 的 `messages`/`images` —— 服务端权威，不含"提前拉进来的" extras）。
+   * 用来得出"这条回执的生成目录"，见 {@link belongsToRun}。
+   */
+  function ownedFiles(payload) {
+    var files = [];
+    function push(value) {
+      var path = normalizePath(value);
+      if (path && files.indexOf(path) < 0) files.push(path);
+    }
+    var groups = payload && Array.isArray(payload.messages) && payload.messages.length ? payload.messages : null;
+    if (groups) {
+      groups.forEach(function (pieces) {
+        (pieces || []).forEach(function (piece) { if (piece && piece.type === 'image' && piece.file) push(piece.file); });
+      });
+    } else if (payload && Array.isArray(payload.images)) {
+      payload.images.forEach(function (image) { push(image); });
+    }
+    return files;
+  }
+
+  /** `data/generated/task-…/<20261005-034042>-…/image-01.png` → 它所在的那一轮生成目录（到最后一个 `/` 为止）。 */
+  function imageDirOf(path) {
+    var value = String(path || '');
+    var at = value.lastIndexOf('/');
+    return at > 0 ? value.slice(0, at + 1) : '';
+  }
+
+  /** 一张图的时间：优先用服务端给的 `modified`（ISO），缺失/非法才回退路径里的 `20261005-034042`（本地时间）。 */
+  function imageTime(item) {
+    if (item && typeof item === 'object' && item.modified) {
+      var parsed = Date.parse(item.modified);
+      if (isFinite(parsed)) return parsed;
+    }
+    var path = typeof item === 'string' ? item : (item && item.path) || '';
+    var match = /(\d{8})-(\d{6})/.exec(String(path));
+    if (!match) return 0;
+    return new Date(+match[1].slice(0, 4), +match[1].slice(4, 6) - 1, +match[1].slice(6, 8),
+      +match[2].slice(0, 2), +match[2].slice(2, 4), +match[2].slice(4, 6)).getTime();
+  }
+
+  /**
+   * 「本次生成开始时刻」。优先用服务端给的 `ageMillis` 反推 —— 同一条回执每轮算出来**都是同一个值**，
+   * 不会跟着轮询往后跑；拿不到才退回"第一次看到它 running 的那一刻"（只记一次）。
+   */
+  function runStartMillis(payload) {
+    var now = Date.now();
+    var age = num(payload && payload.ageMillis, 0);
+    if (age > 0 && age < 86400000) return Math.min(detail.pullSince || now, now - age);
+    return detail.pullSince || now;
+  }
+
+  /**
+   * 这张图**是不是这条回执"这一次生成"的产物**（用户报的「回执界面生成图片时会加入不属于该任务的先前图片」）。
+   *
+   * <p>判据只有两条，都不成立就**不并进来**（宁可少并：下一轮 `renderDetail()` 会从回执正文里把它补回来）：
+   *   ① 它所在的生成目录 == 这条回执**自己**已经有的图片的目录（同一轮 task 目录，最硬）；
+   *   ② 它的时间（`modified`，缺失才回退路径时间戳）≥ {@link runStartMillis}（本次生成开始时刻）。
+   * ② 覆盖"换一次生成会开一个新的 task 目录"这种情况 —— 新目录里的图只要晚于本次开始就照样进得来。
+   */
+  function belongsToRun(item) {
+    var path = typeof item === 'string' ? item : (item && item.path);
+    path = normalizePath(path);
+    if (!path) return false;
+    var dir = imageDirOf(path);
+    if (dir && detail.ownedDirs[dir]) return true;
+    var when = imageTime(item);
+    if (!when) return false;
+    return when >= detail.pullSince;
+  }
 
   function piecesOf(payload) {
     var groups = payload && Array.isArray(payload.messages) && payload.messages.length ? payload.messages : null;
@@ -688,7 +837,14 @@
     detail.progress.label = parts.join(' · ');
     tickProgress();
   }
-  /** 生成期间提前到达的新图（把这条回执对应的最新生成图并进图集，按路径去重）。 */
+  /**
+   * 生成期间提前到达的新图（把这条回执对应的最新生成图并进图集，按路径去重）。
+   *
+   * <p><b>只并"确实属于这一次生成"的图</b>：`/api/images` 给的是**全站**最近几张，老写法只按"这条回执里
+   * 还没有它"去重，于是别的任务/别的回执的图会被并进来（用户报的"回执界面生成图片时会加入不属于该任务的
+   * 先前图片"）。现在每张都过一遍 {@link belongsToRun}：同一轮生成目录、或时间晚于本次开始 —— 两者都不
+   * 满足就丢掉，等下一轮 `renderDetail()` 从回执正文（服务端权威）里补。
+   */
   function pullLiveImages() {
     return Promise.resolve(P.api('/api/images', { body: { limit: 6 } })).then(function (data) {
       var images = (data && Array.isArray(data.images)) ? data.images : [];
@@ -696,7 +852,9 @@
       images.forEach(function (image) {
         var path = normalizePath(image);            // {path:"data/generated/…"} 或裸字符串都收
         if (!path || path.indexOf('data/generated/webui/') === 0) return;
-        if (detail.files.indexOf(path) < 0 && detail.extras.indexOf(path) < 0) detail.extras.push(path);
+        if (detail.files.indexOf(path) >= 0 || detail.extras.indexOf(path) >= 0) return;
+        if (!belongsToRun(image)) return;           // 不是这一次生成的 → 一张都不并
+        detail.extras.push(path);
       });
       if (detail.extras.length !== before) renderDetail();
       return images.length;
@@ -742,24 +900,49 @@
     return grid;
   }
 
-  /** 一个图集格子：1:1 盒子 + 缩略图 + 失败占位（失败只换这一格，别的图不受影响）。 */
+  /**
+   * 一个图集格子：按图片自身宽高比撑开 + 缩略图 + 失败占位（失败只换这一格）。
+   *
+   * <p>**会话级缓存**（见 app.js 的 `P.imageCache`）：同一路径在本会话里只请求一次。
+   * 已经加载过的图，重画/换屏时连节点都还是同一个（搬过去不请求、不重新解码），
+   * 比例直接取缓存里的真实值 —— 所以**永不回到"加载中"**；失败过的不再重试。
+   */
   function tileFor(file, index) {
     var tile = el('div', 'q-tile');
     tile.setAttribute('data-path', file);
-    var img = document.createElement('img');
-    img.alt = '任务 #' + (detail.number || 0) + ' ' + shortName(file);
-    img.loading = index < 4 ? 'eager' : 'lazy';       // 首屏可见的前几张先加载，别让用户看到空白格
-    img.decoding = 'async';
-    img.addEventListener('error', function () { markTileFail(tile, file); }, { once: true });
-    function judge() {
-      // 非 1:1 的图在 1:1 的格子里会被 `.q-tile img{object-fit:cover}` 裁掉两头 → 换 contain
-      var w = img.naturalWidth, h = img.naturalHeight;
-      if (w > 0 && h > 0 && Math.abs(w / h - 1) > 0.06) img.classList.add('mx-contain');
+    var cache = P.imageCache;
+    var src = imageSrc(file, true);
+    var cachedRatio = cache && typeof cache.ratio === 'function' ? cache.ratio(file) : '';
+    if (cachedRatio) tile.style.aspectRatio = cachedRatio;     // 已知真实比例：连占位都不用
+    if (cache && typeof cache.failed === 'function' && cache.failed(file)) {
+      markTileFail(tile, file, true);                          // 失败终态：不再造 <img>、不再重试
+      return tile;
     }
-    img.addEventListener('load', judge, { once: true });
-    img.src = imageSrc(file, true);      // 格子只是小尺寸展示 → 缩略图
-    if (img.complete && img.naturalWidth > 0) judge();
-    tile.appendChild(img);
+    var img = cache && typeof cache.node === 'function' ? cache.node(file, src) : document.createElement('img');
+    img.alt = '任务 #' + (detail.number || 0) + ' ' + shortName(file);
+    var reuse = !!(cachedRatio && img.getAttribute('src') === src);
+    if (reuse) {
+      tile.appendChild(img);                                   // 同一个节点搬过来：0 请求、0 解码、不闪
+    } else {
+      img.loading = index < 4 ? 'eager' : 'lazy';              // 首屏可见的前几张先加载，别让用户看到空白格
+      img.decoding = 'async';
+      img.addEventListener('error', function () {
+        if (cache && typeof cache.mark === 'function') cache.mark(file, false, img);
+        markTileFail(tile, file);
+      }, { once: true });
+      function judge() {
+        // 图片按自身宽高比显示：把格子的 aspect-ratio 换成真实比例（格子默认先按 4:3 占位）。
+        var w = img.naturalWidth, h = img.naturalHeight;
+        if (!(w > 0 && h > 0)) return;
+        if (cache && typeof cache.mark === 'function') cache.mark(file, true, img);
+        if (typeof P.applyNaturalRatio === 'function') { P.applyNaturalRatio(img); return; }
+        if (tile.style.aspectRatio !== w + ' / ' + h) tile.style.aspectRatio = w + ' / ' + h;   // 兜底（app.js 没这套 API 时）
+      }
+      img.addEventListener('load', judge, { once: true });
+      img.src = src;      // 格子只是小尺寸展示 → 缩略图
+      if (img.complete && img.naturalWidth > 0) judge();
+      tile.appendChild(img);
+    }
     tile.addEventListener('click', function () {
       if (tile.classList.contains('q-fail')) return;   // 失败态点击 = 复制路径（见 markTileFail）
       if (typeof P.openViewer !== 'function') return;
@@ -803,10 +986,11 @@
   }
 
   /** 图取不到：把这一格换成「图取不到」占位（带上文件名，点一下复制完整路径）。 */
-  function markTileFail(tile, file) {
+  function markTileFail(tile, file, noRetry) {
     if (!tile || tile.getAttribute('data-img-failed') === '1') return;
     tile.setAttribute('data-img-failed', '1');
     tile.classList.add('q-fail');
+    if (noRetry) tile.setAttribute('data-img-noretry', '1');
     clear(tile);
     var box = el('div', '', '图取不到');
     box.title = file;
@@ -1048,7 +1232,11 @@
     var target = num(number, 0);
     if (!target) { detail.number = 0; }
     detail.loading = true;
-    if (!quiet) { detail.payload = null; detail.error = ''; renderDetail(); }
+    /* 同一条回执的"再看一次"（刷新/下拉/进入已看过的详情）**不清空、不出骨架**：
+       已经画好的图集与步骤行留在屏幕上原地更新 —— 否则用户看到的就是"图明明已经加载好了，
+       一刷新又回到加载中/骨架"（这正是本轮要修的那条）。只有换到另一条回执才整屏重来。 */
+    var sameEntry = !!detail.payload && num(detail.quest, 0) === target;
+    if (!quiet && !sameEntry) { detail.payload = null; detail.error = ''; renderDetail(); }
     else if (detail.body && !detail.body.childNodes.length) renderDetail();
     var pending = P.api('/api/quest', { body: { id: target } });
     return Promise.resolve(pending).then(function (data) {
@@ -1063,13 +1251,28 @@
         || (Array.isArray(detail.payload.texts) && detail.payload.texts.length > 0)
         || (Array.isArray(detail.payload.images) && detail.payload.images.length > 0);
       if (detail.payload.error && !hasBody) detail.error = text(detail.payload.error);
-      detail.extras = [];
+      if (got > 0 && num(detail.quest, 0) !== got) {   // 换到另一条回执了：这一次的记账全部作废
+        detail.extras = [];
+        detail.owned = [];
+        detail.ownedDirs = Object.create(null);
+        detail.pullSince = 0;
+      }
+      detail.quest = got;
+      detail.owned = ownedFiles(detail.payload);
+      detail.ownedDirs = Object.create(null);
+      detail.owned.forEach(function (file) {
+        var dir = imageDirOf(file);
+        if (dir) detail.ownedDirs[dir] = true;
+      });
       renderDetail();
       var running = !detail.payload.error && !(detail.payload.done && !detail.payload.busy);
       return Promise.resolve(P.api('/api/progress', { body: {} })).then(function (live) {
         setProgress(live);
         renderProgress();
-        if (running && live && (live.running || num(live.queue, 0) > 0)) pullLiveImages();
+        if (running && live && (live.running || num(live.queue, 0) > 0)) {
+          detail.pullSince = runStartMillis(detail.payload);     // 本次生成开始时刻（服务端 ageMillis 反推）
+          pullLiveImages();
+        }
         return detail.payload;
       }).catch(function () { setProgress(null); renderProgress(); return detail.payload; });
     }).catch(function (error) {

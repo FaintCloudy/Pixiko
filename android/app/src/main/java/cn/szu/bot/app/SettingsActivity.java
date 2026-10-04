@@ -40,6 +40,8 @@ public class SettingsActivity extends AppCompatActivity {
     private EditText tokenField;
     private CheckBox activeField;
     private TextView statusText;
+    /** 「这是构建时烧进去的测试地址」那行小字（没有烧地址的包里永远 GONE）。 */
+    private TextView buildHostHint;
     private ProgressBar scanProgress;
     private LinearLayout serverList;
     private TextView serverEmpty;
@@ -71,6 +73,7 @@ public class SettingsActivity extends AppCompatActivity {
         tokenField = findViewById(R.id.field_token);
         activeField = findViewById(R.id.field_active);
         statusText = findViewById(R.id.status_text);
+        buildHostHint = findViewById(R.id.build_host_hint);
         scanProgress = findViewById(R.id.scan_progress);
         serverList = findViewById(R.id.server_list);
         serverEmpty = findViewById(R.id.server_empty);
@@ -89,7 +92,45 @@ public class SettingsActivity extends AppCompatActivity {
         actionSave.setOnClickListener(view -> saveCurrentInput());
         if (actionCancelEdit != null) actionCancelEdit.setOnClickListener(view -> resetInput(true));
 
+        applyBuildDefaultHost();
         renderList();
+    }
+
+    /**
+     * 首次运行时把「构建时烧进去的测试默认地址」预填到地址输入框里。
+     *
+     * <p>地址来源：构建脚本 <code>android/build-apk.ps1</code> 每次编包前探测本机局域网 IP，
+     * 用 <code>-PpixikoDefaultHost=192.168.x.y:8787</code> 交给 Gradle，
+     * <code>app/build.gradle</code> 再把它变成 {@link BuildConfig#PIXIKO_DEFAULT_HOST}
+     * （源码里<b>没有</b>任何写死的 IP，只有构建属性这一条路）。
+     *
+     * <p><b>只是预填</b>，所以这里刻意什么都不做别的：
+     * <ul>
+     *   <li><b>不</b>写 SharedPreferences、<b>不</b>设为当前服务器、<b>不</b>自动发起连接——用户仍要自己点「保存」；</li>
+     *   <li><b>不</b>填令牌：令牌仍然必须由用户从 <code>config.json → webui.access_token</code>
+     *       抄过来手填，这里一个字都不写（不绕过令牌，也不降低令牌的必要性）；</li>
+     *   <li>只在「一台服务器都没保存过」<b>且</b>地址框本来就是空的时候才填，
+     *       所以<b>永远不会覆盖用户已保存或已经敲进去的内容</b>；</li>
+     *   <li>用 <code>-NoDefaultHost</code> 构建的包里这个常量是空串 → 本方法第一步就返回，
+     *       「服务器设置」的行为与加这个功能之前<b>完全一致</b>。</li>
+     * </ul>
+     */
+    private void applyBuildDefaultHost() {
+        // 这是构建时烧进去的测试默认值，可直接改成别的；没有烧地址的包里它是空串。
+        final String preset = BuildConfig.PIXIKO_DEFAULT_HOST == null ? "" : BuildConfig.PIXIKO_DEFAULT_HOST.trim();
+        if (preset.isEmpty()) return;
+        // 存过服务器就绝不插手（用户的数据永远优先于构建默认值）。
+        if (!repository.list().isEmpty()) return;
+        // 输入框里已经有东西（用户自己敲的、或旋转重建恢复回来的）也不覆盖。
+        if (!addressField.getText().toString().trim().isEmpty()) return;
+
+        String normalized = UrlHelper.normalizeBase(preset);
+        addressField.setText(normalized == null ? preset : normalized);
+        if (buildHostHint != null) {
+            buildHostHint.setText(getString(R.string.settings_build_default_hint, preset));
+            buildHostHint.setVisibility(View.VISIBLE);
+        }
+        Log.d("已预填构建时烧进去的测试默认地址：" + preset + "（仅预填：未保存、未连接、未填令牌）");
     }
 
     @Override
@@ -134,6 +175,8 @@ public class SettingsActivity extends AppCompatActivity {
         Log.i("已保存服务器配置：" + UrlHelper.hostOf(normalized) + "，令牌=" + Log.mask(token));
         setStatus("已保存：" + UrlHelper.hostOf(normalized) + (makeCurrent ? "（设为当前服务器）" : ""), false);
         editedId = config.id;
+        // 地址已经落库了，「构建时带的测试地址」这行提示就没意义了，收起来。
+        if (buildHostHint != null) buildHostHint.setVisibility(View.GONE);
         renderList();
     }
 
@@ -216,6 +259,8 @@ public class SettingsActivity extends AppCompatActivity {
         addressField.setText(config.base);
         tokenField.setText(config.token);
         if (actionSave != null) actionSave.setText("保存修改");
+        // 编辑的是已保存的服务器，构建时的测试地址提示不再适用。
+        if (buildHostHint != null) buildHostHint.setVisibility(View.GONE);
         Log.d("载入到编辑框：" + UrlHelper.hostOf(config.base) + "，令牌=" + Log.mask(config.token));
     }
 

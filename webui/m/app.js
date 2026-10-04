@@ -341,6 +341,13 @@
     }
   }
 
+  /** 有没有浮层开着（查看器 / 对话框 / sheet）。列表轮询据此停下来，别在用户看图/选东西时打扰。 */
+  PixikoM.overlayBusy = function () {
+    if (liveOverlays.length) return true;
+    var root = $('m-overlay');
+    return !!(root && root.querySelector('.scrim, .sheet, .dialog, .viewer'));
+  };
+
   /**
    * 浮层公共件：遮罩 + 关闭。返回 {scrim, close, panel}。
    * @param {boolean} [immediate] close(true)：同步摘节点（drainOverlays 用），不走 240ms 过渡。
@@ -570,9 +577,11 @@
     return 'lazy';
   }
 
-  /* 失败态 + 比例：`<img>` 加载不出来时，用 `!important` 的样式表压掉 app.css 里"强制定高"的规则，
-     让占位块在气泡/图集/进度格子里都真的占得住位置、看得见字；`.mx-contain` 则给**非 1:1** 的图
-     换掉 `object-fit:cover`（app.css 不归本文件改，只能这样覆盖）。 */
+  /* 失败态：`<img>` 加载不出来时，用 `!important` 的样式表压掉 app.css 里"强制定高"的规则，
+     让占位块在气泡/图集/进度格子里都真的占得住位置、看得见字。
+     （2026-10-05：原来这里还有一条 `.mx-contain{object-fit:contain!important}`，用来给"非 1:1 的图
+     在 1:1 方块里"换成 contain 避免裁掉两头 —— 那只是把"裁切"换成"四周一大片空白"。
+     现在格子按图片自身宽高比显示（见 applyNaturalRatio），这条 hack 已删除。） */
   (function installImageFailStyle() {
     var id = 'pixiko-m-imgfail-style';
     if (document.getElementById(id)) return;
@@ -582,8 +591,7 @@
       + 'width:100%!important;height:100%!important;min-height:64px;padding:6px;box-sizing:border-box;'
       + 'background:#1b1119!important;border:1px dashed #5a2b33!important;border-radius:10px!important;'
       + 'color:#ff9b9b!important;font-size:11.5px;line-height:1.35;text-align:center;'
-      + 'overflow-wrap:anywhere;word-break:break-word;cursor:pointer;user-select:none;}'
-      + '.grid-imgs .cell .thumb img.mx-contain,.q-tile img.mx-contain{object-fit:contain!important}';
+      + 'overflow-wrap:anywhere;word-break:break-word;cursor:pointer;user-select:none;}';
     document.head.appendChild(style);
   })();
 
@@ -622,10 +630,129 @@
   }
 
   /**
+   * 把图片的**真实宽高比**写到它的格子盒子上（`.thumb` / `.bubble-img` / `.q-tile` 都是"图片的 parentNode"）。
+   *
+   * <p>为什么写在**盒子**而不是图片自己身上：CSS 给盒子一个中性初始比例（`aspect-ratio: 4 / 3`），
+   * 图片还没解码时格子就已经占住位置，不会"塌成 0 高、图一到又跳一下"；图片 load 之后再按
+   * `naturalWidth / naturalHeight` 把盒子换成真实比例，而 `<img>` 只写 `width:100%;height:auto`
+   * （`object-fit: fill`，不裁不缩）。于是渲染宽高比 == 原图宽高比：**不变形、不裁切、不留大片空白**。
+   *
+   * <p>图已缓存（`complete && naturalWidth > 0`）时调用点会立刻进来；此刻若 img 还没被
+   * `appendChild` 进盒子（调用点普遍是"先 mountImage 再 appendChild"），就等一拍补写一次，
+   * 免得盒子永远停在 4:3。
+   *
+   * @param {HTMLImageElement} img
+   * @param {boolean} [retry] 内部用：这是补写那次，别再往下排
+   * @returns {boolean} 写成功没有
+   */
+  function applyNaturalRatio(img, retry) {
+    var nw = img.naturalWidth, nh = img.naturalHeight;
+    if (!(nw > 0 && nh > 0)) return false;
+    var host = img.parentNode;
+    if (!host || host.nodeType !== 1) {
+      if (!retry) window.setTimeout(function () { applyNaturalRatio(img, true); }, 0);
+      return false;
+    }
+    var ratio = nw + ' / ' + nh;
+    if (host.style.aspectRatio !== ratio) host.style.aspectRatio = ratio;
+    host.setAttribute('data-ratio', nw + 'x' + nh);
+    return true;
+  }
+  /** 回执详情的图集格子（screen-quest.js）用同一份实现，别在两处写两套比例逻辑。 */
+  PixikoM.applyNaturalRatio = applyNaturalRatio;
+
+  var imageCache = (function () {
+    var store = Object.create(null);
+    function entry(path) { return store[path] || null; }
+    function ensure(path) {
+      var found = store[path];
+      if (!found) found = store[path] = { url: '', nodes: [], loaded: false, failed: false, width: 0, height: 0 };
+      return found;
+    }
+    return {
+      /**
+       * 取一个可以马上挂上去的 `<img>`：**优先还一个当前没挂在文档里的旧节点** —— 搬节点既不重新
+       * 请求也不重新解码（`/api/image` 虽然带 `max-age=86400`，但新节点仍要解码一次，安卓上就是
+       * 肉眼可见的"又是加载中"）。没有空闲节点才新建。
+       */
+      node: function (path, url) {
+        var found = ensure(path);
+        if (found.url && url && found.url !== url) { found.nodes.length = 0; found.loaded = false; found.failed = false; found.width = found.height = 0; }
+        if (url) found.url = url;
+        for (var i = 0; i < found.nodes.length; i++) if (!found.nodes[i].isConnected) return found.nodes[i];
+        var fresh = document.createElement('img');
+        found.nodes.push(fresh);
+        return fresh;
+      },
+      /** 这个路径在本会话里**已经装好图了**（调用点据此跳过加载态、直接按真实比例摆好）。 */
+      ready: function (path) { var found = entry(path); return !!(found && found.loaded && found.width > 0 && found.height > 0); },
+      /** 已加载图的真实比例 `'234 / 320'`；没加载过给空串。 */
+      ratio: function (path) {
+        var found = entry(path);
+        return found && found.loaded && found.width > 0 && found.height > 0 ? found.width + ' / ' + found.height : '';
+      },
+      /** 失败过（终态：不再重试、不再刷请求）。 */
+      failed: function (path) { var found = entry(path); return !!(found && found.failed); },
+      /** 记一次结果：成功连 naturalWidth/Height 一起记，失败记终态。 */
+      mark: function (path, ok, img) {
+        var found = ensure(path);
+        if (ok && img && img.naturalWidth > 0 && img.naturalHeight > 0) {
+          found.loaded = true; found.failed = false; found.width = img.naturalWidth; found.height = img.naturalHeight;
+        } else if (!ok) { found.failed = true; }
+        return found;
+      },
+      /** 小账本（探针/报告用）。 */
+      stats: function () {
+        var paths = 0, loaded = 0, failed = 0, nodes = 0;
+        Object.keys(store).forEach(function (key) {
+          paths++;
+          if (store[key].loaded) loaded++;
+          if (store[key].failed) failed++;
+          nodes += store[key].nodes.length;
+        });
+        return { paths: paths, loaded: loaded, failed: failed, nodes: nodes };
+      },
+      /** 清空（换 scope / 重新登录时用；正常流程不需要）。 */
+      clear: function () { store = Object.create(null); }
+    };
+  })();
+  /**
+   * 会话级图片缓存（出图屏与回执图集共用；见 {@link imageCache}）。
+   *
+   * <p>为什么必须有：轮询（1.5s / 3s 一次）与换屏重挂都会重新造 `<img>`。即便 URL 命中 HTTP 缓存，
+   * **新节点仍要重新解码一次**，于是"已经加载好的图又回到加载中/骨架"（用户报的"错误载入加载中的
+   * 图集行为"）；失败路径更糟：每重造一次就重试一次请求。缓存了**节点**与**状态**之后：
+   *   · 已加载过的路径 → 复用同一个节点（0 请求、0 解码、永不回到加载态）；
+   *   · 失败过的路径 → 直接出「图取不到」终态，不再请求。
+   */
+  PixikoM.imageCache = imageCache;
+
+  /**
+   * 给一个路径拿"装好的 `<img>`"：命中会话缓存就**连解码都不做**（同一个节点搬过来），
+   * 否则新建并走 {@link mountImage} 正常装载（设 src、挂 load/error、按真实比例撑格子）。
+   * @param {string} [alt] 先设好 alt 再装载（装载失败时占位块要拿它当说明/复制的路径）
+   * @returns {{img:HTMLImageElement, cached:boolean, failed:boolean}}
+   */
+  function imageNodeFor(rawPath, index, onReady, alt) {
+    var path = normalizeImagePath(rawPath);
+    var src = thumbUrl(path);
+    var img = imageCache.node(path, src);
+    if (alt !== undefined) img.alt = alt;
+    if (path && imageCache.failed(path)) return { img: img, cached: false, failed: true };
+    if (path && imageCache.ready(path) && img.getAttribute('src') === src) {
+      if (typeof onReady === 'function') onReady(img);      // 已经装好：不设 src、不挂监听、不请求
+      return { img: img, cached: true, failed: false };
+    }
+    mountImage(img, rawPath, index, onReady);
+    return { img: img, cached: false, failed: false };
+  }
+
+  /**
    * 统一的图片装载（对话气泡 / 出图图集 / 进度格子都走它）：
    *   · 归一后的缩略图地址；`decoding=async`；
    *   · 失败 → 换成「图取不到」占位块（**只换这一张**，不清空整个图集/气泡），长按/点击复制路径；
-   *   · 成功 → `onReady`（调用点用它按原图长宽补齐 aspect-ratio，避免布局跳）。
+   *   · 成功 → 把**格子的宽高比**换成原图宽高比（`applyNaturalRatio`），并记进会话缓存；
+   *     调用点自己的 `onReady` 照旧回调。
    */
   function mountImage(img, rawPath, index, onReady) {
     var path = normalizeImagePath(rawPath);
@@ -634,11 +761,11 @@
     img.loading = loadingFor(img, index);
     img.src = src;
     if (!path) { markImageFail(img, img.alt || rawPath); return img; }
-    img.addEventListener('error', function () { markImageFail(img, path); }, { once: true });
+    img.addEventListener('error', function () { imageCache.mark(path, false, img); markImageFail(img, path); }, { once: true });
     function ready() {
-      // 非 1:1 的图在"强制定高 + cover"的盒子里会被裁掉两头 —— 换成 contain，完整看得见
-      var w = img.naturalWidth, h = img.naturalHeight;
-      if (w > 0 && h > 0 && Math.abs(w / h - 1) > 0.06) img.classList.add('mx-contain');
+      // 按图片自身的宽高比撑格子（旧写法是给非 1:1 的图加 .mx-contain → contain 四周一片空白，已删）
+      applyNaturalRatio(img);
+      imageCache.mark(path, true, img);
       if (typeof onReady === 'function') onReady(img);
     }
     if (img.complete) { if (img.naturalWidth > 0) ready(); }
@@ -651,6 +778,7 @@
     var host = img.parentNode;
     if (!host || host.getAttribute('data-img-failed') === '1') return;
     host.setAttribute('data-img-failed', '1');
+    if (host.classList) host.classList.remove('loading');       // 失败态不是"还在加载"，别留骨架灰条
     var path = String(label || img.alt || '');
     if (path && !imageFailures[path]) imageFailures[path] = true;
     try { host.removeChild(img); } catch (error) { /* 已经被换掉了 */ }
@@ -676,15 +804,19 @@
 
     var panel = el('div', 'viewer');
     panel.setAttribute('data-viewer', '1');
+    /* 两个翻页按钮**必须排在 `<img>` 后面**：`img` 上有 `will-change: transform`（app.css），
+       它自成一个层叠上下文，而绝对定位的按钮是 z-index:auto —— 同一层里按 DOM 顺序画，
+       排在 img 前面的那个（原来的「上一张」）会被图片整个盖住：看不见、也点不到
+       （用户报的「向左浏览的按钮缺失」就是这么来的）。再给它们显式 z-index 兜一层。 */
     panel.innerHTML =
       '<div class="viewer-top"><span class="viewer-count"></span>' +
         '<button class="bar-btn" data-viewer-close="1" type="button" aria-label="关闭">' +
           '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18"/></svg>' +
         '</button></div>' +
       '<div class="viewer-stage">' +
+        '<img alt="" draggable="false">' +
         '<button class="viewer-nav prev" data-viewer-prev="1" type="button" aria-label="上一张">' +
           '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M15 5l-7 7 7 7"/></svg></button>' +
-        '<img alt="" draggable="false">' +
         '<button class="viewer-nav next" data-viewer-next="1" type="button" aria-label="下一张">' +
           '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 5l7 7-7 7"/></svg></button>' +
       '</div>' +
@@ -699,6 +831,8 @@
     var capNode = panel.querySelector('.viewer-bottom');
     var prevBtn = panel.querySelector('[data-viewer-prev]');
     var nextBtn = panel.querySelector('[data-viewer-next]');
+    prevBtn.style.zIndex = '2';
+    nextBtn.style.zIndex = '2';
     var scale = 1, tx = 0, ty = 0;
 
     function apply() {
@@ -784,10 +918,12 @@
     // 手势：单指左右翻页；双指捏合缩放；放大后单指拖动平移。
     var pointers = Object.create(null);
     var startX = 0, startY = 0, startDist = 0, startScale = 1, startTx = 0, startTy = 0, moved = false;
+    var startTarget = null;      // 本次手势的落点：落在翻页按钮上时，单击翻页交给按钮自己（否则会**翻两张**）
     function pointList() { return Object.keys(pointers).map(function (k) { return pointers[k]; }); }
     function dist(a, b) { return Math.hypot(a.x - b.x, a.y - b.y); }
     var stage = panel.querySelector('.viewer-stage');
     stage.addEventListener('pointerdown', function (event) {
+      if (pointList().length === 0) startTarget = event.target;
       pointers[event.pointerId] = { x: event.clientX, y: event.clientY };
       var all = pointList();
       moved = false;
@@ -811,17 +947,24 @@
       }
     });
     function pointerUp(event) {
+      // 只认"我们记过的指针"：兼容鼠标/多余 pointerup 也会落到这里，不挡的话一次点击能翻两张
+      if (!pointers[event.pointerId]) return;
       var wasSingle = pointList().length === 1;
       delete pointers[event.pointerId];
       img.classList.remove('snap');
       if (wasSingle && !moved) {
-        // 单击：左右半屏翻页（和大多数看图 app 一致）
-        var rect = stage.getBoundingClientRect();
-        if (event.clientX < rect.left + rect.width * 0.3) step(-1);
-        else if (event.clientX > rect.left + rect.width * 0.7) step(1);
-        else if (scale > 1.02) reset();
+        // 单击：左右半屏翻页（和大多数看图 app 一致）。
+        // **落在翻页按钮上的那次不算** —— 按钮自己的 click 会翻一张，这里再翻就跳张了。
+        var onNav = !!(startTarget && startTarget.closest && startTarget.closest('.viewer-nav'));
+        if (!onNav) {
+          var rect = stage.getBoundingClientRect();
+          if (event.clientX < rect.left + rect.width * 0.3) step(-1);
+          else if (event.clientX > rect.left + rect.width * 0.7) step(1);
+          else if (scale > 1.02) reset();
+        }
       }
       if (!moved && pointList().length === 0 && scale <= 1.02) { tx = 0; ty = 0; apply(); }
+      if (pointList().length === 0) startTarget = null;
     }
     stage.addEventListener('pointerup', pointerUp);
     stage.addEventListener('pointercancel', function (event) { delete pointers[event.pointerId]; img.classList.remove('snap'); });
@@ -1133,8 +1276,119 @@
     PixikoM.toast('服务器设置在 Android app 里配置；浏览器里直接用当前地址即可');
   }
 
+  /* ── 下拉刷新：外壳与各屏**共用同一份判据**（用户报的「上滑很容易触发刷新」）──────────────
+   *
+   * 老代码有三个坑，全在判据里：
+   *   1) 只看 `#m-main.scrollTop`。可对话屏真正滚的是内层 `.chat-log`（帮助屏的日志框是
+   *      `.hp-logscroll`、sheet 里是 `.st-panel-body`），`#m-main` 的 scrollTop 恒为 0 ——
+   *      于是**列表滚在中间照样武装**，一松手就刷；
+   *   2) `touchend` 只看 `armed`、不看 `tracking`，而 `touchstart` 被拒时又**不重置** `armed`：
+   *      一次成功下拉之后，在列表中部**碰一下再抬手**（零位移）也会再刷一次；
+   *   3) 外壳与屏各自装了一份（都挂 `#m-main`）：一次下拉触发**两次**刷新。
+   * 现在三处（app.js 外壳 / screen-quest.js / screen-styles.js）都走 {@link PixikoM.ptrInstall}：
+   *   · 认**手指起点所属的最近可滚动祖先**（`overflow-y: auto|scroll` 且真的 overflow），找不到才退回 `#m-main`；
+   *   · 起手那一刻容器 `scrollTop !== 0` → 根本不武装；手势过程中那个容器**只要滚过一次**（含惯性、
+   *     回弹到顶）→ 立刻作废且不恢复；
+   *   · 位移取**手指竖直位移**（下拖为正）：> {@link PTR_SLOP} 显示提示，> {@link PTR_ARM} 松手才刷；
+   *     向上位移超过 SLOP（明确上滑）同样作废 —— "上滑到顶再下拖"不会刷；
+   *   · 一次触摸只有一个赢家：屏自己那份先认领，外壳那份闭嘴（不再刷两次）。
+   */
+  var PTR_SLOP = 12;      // 下拖超过它才显示提示
+  var PTR_ARM = 56;       // 下拖超过它、松手才刷新（外壳原来是 66、两个屏是 56，现统一 56）
+  var ptrGesture = { event: null, owner: null };
+
+  /** 手指起点所属的、**真的在滚**的那个容器（最近的可滚动祖先）；找不到退回 `#m-main`。 */
+  function ptrScrollHost(target) {
+    var node = target && target.nodeType === 1 ? target : (target && target.parentElement);
+    while (node && node !== document.body && node !== document.documentElement) {
+      var style = null;
+      try { style = window.getComputedStyle(node); } catch (error) { style = null; }
+      if (style && /(auto|scroll|overlay)/.test(String(style.overflowY || '')) && node.scrollHeight > node.clientHeight + 1) return node;
+      node = node.parentElement;
+    }
+    return $('m-main');
+  }
+
   /**
-   * 下拉刷新：**选了「刷新按钮 + 顶部下拉手势」两者都做**（报告里写明）。
+   * 装一个下拉刷新手势（三处用同一份判据）。
+   *
+   * @param {Element} host 事件宿主（三处都是 `#m-main`；touch 事件从手指下的元素冒泡上来）
+   * @param {{screen?:string,isFallback?:boolean,progress:function(boolean),disarm:function(),fire:function()}} hooks
+   *   · `screen` 给了就只在 `PixikoM.current() === screen` 时参与（屏自己那份）；
+   *   · `isFallback` 是外壳那份：只有这次手势**没有任何屏认领**时才刷；
+   *   · `progress(armed)` 显示 / 更新提示（`armed` = 松手就刷），`disarm()` 收起提示，
+   *     `fire()` 真刷新（返回 Promise 会等它结束，期间不再响应新手势）。
+   * @returns {boolean} 装上没有（同一个 host + 同一份 hooks 只装一次）
+   */
+  PixikoM.ptrInstall = function (host, hooks) {
+    if (!host || !hooks) return false;
+    var bound = host.__ptrHooks || (host.__ptrHooks = []);
+    if (bound.indexOf(hooks) >= 0) return false;
+    bound.push(hooks);
+
+    var startY = 0, tracking = false, armed = false, busy = false, moved = 0;
+    var scrollHost = null, scrolled = false, watch = null;
+
+    function stopWatch() { if (watch && scrollHost) { scrollHost.removeEventListener('scroll', watch); watch = null; } }
+    function disarm() { armed = false; hooks.disarm(); }
+    function active() { return !hooks.screen || (typeof PixikoM.current === 'function' && PixikoM.current() === hooks.screen); }
+    function finish(fire) {
+      tracking = false; armed = false; stopWatch();
+      hooks.disarm();
+      if (!fire || busy) return;
+      busy = true;
+      Promise.resolve(hooks.fire()).catch(function () { /* 错误已经由各屏自己显示 */ }).then(function () { busy = false; });
+    }
+
+    host.addEventListener('touchstart', function (event) {
+      // 一次触摸一个令牌（同一事件对象只建一次）：认领关系不跨手势
+      if (ptrGesture.event !== event) ptrGesture = { event: event, owner: null };
+      // **无条件**重置：绝不能把上一次手势的 armed 带到这一次（老代码就是这么误刷的）
+      tracking = false; armed = false; moved = 0; scrolled = false;
+      stopWatch();
+      if (busy || !active() || !event.touches || event.touches.length !== 1) return;
+      var touch = event.touches[0];
+      scrollHost = ptrScrollHost(touch.target || event.target);
+      if (!scrollHost) return;
+      if (scrollHost.scrollTop > 0) { scrolled = true; return; }      // 起手就不在顶部 → 这次不作数
+      startY = touch.clientY;
+      tracking = true;
+      // 手势期间容器滚动过（含惯性/回弹到顶）→ 立刻作废（scroll 事件比 touchmove 采样更及时）
+      watch = function () { scrolled = true; if (tracking) disarm(); };
+      scrollHost.addEventListener('scroll', watch, { passive: true });
+    }, { passive: true });
+
+    host.addEventListener('touchmove', function (event) {
+      if (!tracking) return;
+      if (event.touches.length !== 1 || scrolled || !scrollHost || scrollHost.scrollTop > 0) {
+        if (scrollHost && scrollHost.scrollTop > 0) scrolled = true;
+        disarm();
+        return;
+      }
+      var touch = event.touches[0];
+      var delta = touch.clientY - startY;                             // 手指下拖为正
+      if (delta < moved) moved = delta;                               // 记下本次手势最靠上的位置
+      if (delta <= PTR_SLOP || moved < -PTR_SLOP) { disarm(); return; }   // 没下拖 / 先明显上滑 → 不武装
+      armed = delta > PTR_ARM;
+      if (armed) {
+        if (!ptrGesture.owner) ptrGesture.owner = hooks;              // 谁先武装谁认领
+        if (ptrGesture.owner !== hooks) { disarm(); return; }         // 已经被别的（屏自己的）认领 → 让位
+      }
+      hooks.progress(armed);
+    }, { passive: true });
+
+    host.addEventListener('touchend', function () {
+      // 必须"这次手势真的武装过"才算（老代码漏了 tracking，才会被上一次的 armed 带着误刷）
+      var fire = tracking && armed;
+      if (fire && ptrGesture.owner && ptrGesture.owner !== hooks) fire = false;
+      finish(fire);
+    }, { passive: true });
+    host.addEventListener('touchcancel', function () { finish(false); }, { passive: true });
+    return true;
+  };
+
+  /**
+   * 下拉刷新（外壳这份是**兜底**：给没有自己实现 refresh 的屏用；有自己那份的屏会先认领，它就让位）。
    * 手势只在主区滚到顶且单指下拖时生效，位移超过阈值松手才刷；不做原生那种回弹动画。
    */
   function installPullToRefresh() {
@@ -1142,34 +1396,17 @@
     var tip = el('div', 'ptr');
     tip.innerHTML = '<div class="ptr-track"><span class="spinner"></span><span class="ptr-text">下拉刷新</span></div>';
     main.insertBefore(tip, main.firstChild);
-    var startY = 0, tracking = false, armed = false, busy = false;
     var textNode = tip.querySelector('.ptr-text');
-    main.addEventListener('touchstart', function (event) {
-      if (busy || event.touches.length !== 1 || main.scrollTop > 0) { tracking = false; return; }
-      startY = event.touches[0].clientY; tracking = true; armed = false;
-    }, { passive: true });
-    main.addEventListener('touchmove', function (event) {
-      if (!tracking) return;
-      if (main.scrollTop > 0) { tracking = false; tip.classList.remove('on'); return; }
-      var delta = event.touches[0].clientY - startY;
-      if (delta > 12 && main.scrollTop <= 0) {
-        tip.classList.add('on');
-        armed = delta > 66;
-        if (textNode) textNode.textContent = armed ? '松手刷新' : '下拉刷新';
-      } else {
-        tip.classList.remove('on'); armed = false;
+    var setText = function (value) { if (textNode) textNode.textContent = value; };
+    PixikoM.ptrInstall(main, {
+      isFallback: true,
+      progress: function (armed) { tip.classList.add('on'); setText(armed ? '松手刷新' : '下拉刷新'); },
+      disarm: function () { tip.classList.remove('on'); setText('下拉刷新'); },
+      fire: function () {
+        setText('正在刷新…');
+        return Promise.resolve().then(refreshCurrent).then(function () { setText('下拉刷新'); });
       }
-    }, { passive: true });
-    main.addEventListener('touchend', async function () {
-      tracking = false;
-      tip.classList.remove('on');
-      if (!armed || busy) return;
-      busy = true;
-      if (textNode) textNode.textContent = '正在刷新…';
-      try { await refreshCurrent(); } catch (error) { /* 错误已经由各屏显示 */ }
-      busy = false;
-      if (textNode) textNode.textContent = '下拉刷新';
-    }, { passive: true });
+    });
   }
 
   /**
@@ -1361,16 +1598,26 @@
       var list = entry.images.map(function (src, index) { return { src: src, caption: '第 ' + (index + 1) + ' 张' }; });
       entry.images.forEach(function (raw, index) {
         var src = normalizeImagePath(raw);
-        var img = el('img');
-        img.alt = '图片 ' + (index + 1) + '：' + String(src).replace(/^.*[\\/]/, '');
+        // 每张图外面套一层宽高比宿主：CSS 先给中性 4:3 占位，图 load 后由 applyNaturalRatio
+        // 换成原图真实比例（不用固定 height + object-fit，免得横图被裁、竖图被挤成小方块）。
+        // 命中会话缓存时连占位都不用：直接按已知的真实比例摆好（见 imageCache）。
+        var cell = el('div', 'bubble-img');
+        var cached = imageCache.ratio(src);
+        if (cached) cell.style.aspectRatio = cached;
+        if (imageCache.failed(src)) { cell.appendChild(imageFailBox(src)); box.appendChild(cell); return; }
         // 气泡是首屏内容：前几张 eager，其余 lazy（mountImage 里按可见性判断）
-        mountImage(img, raw, index);
+        var made = imageNodeFor(raw, index, function (loaded) {
+          var w = loaded.naturalWidth, h = loaded.naturalHeight;
+          if (w > 0 && h > 0) cell.style.aspectRatio = w + ' / ' + h;
+        }, '图片 ' + (index + 1) + '：' + String(src).replace(/^.*[\\/]/, ''));
+        var img = made.img;
         img.setAttribute('data-img-index', String(index));
         img.addEventListener('click', function () {
           if (img.parentNode && img.parentNode.getAttribute('data-img-failed') === '1') return;   // 失败态点击 = 复制路径
           PixikoM.openViewer(list, index);
         });
-        box.appendChild(img);
+        cell.appendChild(img);
+        box.appendChild(cell);
       });
       node.appendChild(box);
     }
@@ -1831,6 +2078,7 @@
     params: null,           // {sampler,width,height,steps,cfg,seed,model,imageCount}
     count: 1,
     images: [],             // /api/images → [{path,name,size,modified,pending}]
+    ratios: Object.create(null),   // 路径 → 已知的真实比例 '234 / 320'（新格子先用它/生成参数垫盒子）
     busyRendering: false,
     stops: [],
     lastGridKey: ''
@@ -2109,6 +2357,233 @@
     };
   }
 
+  /* ── 出图屏：跨轮询复用的 DOM（进度卡每拍重建，网格里的 <img> 绝不重建）───────────────
+   *
+   * 为什么必须这样：这个屏每 1.5 秒轮询一次 /api/progress + /api/tasks + /api/images，
+   * 老写法每拍把整块宿主 `clear()` 掉重建 —— 刚生成的那张图**缩略图还没缓存**（服务端要现解码
+   * 一张 1216×1664 再缩到 320px，往往超过一个轮询周期），于是每一拍都把它正在加载的 <img> 丢掉、
+   * 下一个 <img> 从头再来。用户看到的就是"出图完成后冒出一个空占位、过一会儿才消失"。
+   * 现在只有进度卡（纯文字）每拍重建；两个网格连同它们里面的 <img> 一直在，按**图片路径**增量增删。
+   */
+  function genProgressDom(host) {
+    var dom = host.__genDom;
+    if (dom && host.contains(dom.grid)) return dom;              // 建好过、还在宿主里 → 直接复用
+    clear(host);
+    var cardHost = el('div');
+    cardHost.setAttribute('data-gen-card-host', '1');
+    host.appendChild(cardHost);
+    var gridCard = el('div', 'card');
+    var head = el('div', 'card-head');
+    head.appendChild(el('div', 'card-title', '这一轮的图'));
+    var count = el('div', 'row-tail', '0 / 0');
+    count.setAttribute('data-gen-grid-count', '0');
+    head.appendChild(count);
+    gridCard.appendChild(head);
+    var grid = el('div', 'grid-imgs');
+    grid.setAttribute('data-gen-grid', '1');
+    gridCard.appendChild(grid);
+    var empty = el('div', 'hint', '还没有图。点下面的「开始生成」。');
+    empty.style.display = 'none';
+    gridCard.appendChild(empty);
+    host.appendChild(gridCard);
+    dom = { cardHost: cardHost, grid: grid, count: count, empty: empty };
+    host.__genDom = dom;
+    return dom;
+  }
+
+  /** 「最近的作品」那块的持久 DOM（网格 + 空态提示；网格跨轮询保留）。 */
+  function genGalleryDom(host) {
+    var dom = host.__genDom;
+    if (dom && host.contains(dom.grid)) return dom;
+    clear(host);
+    var grid = el('div', 'grid-imgs');
+    grid.setAttribute('data-gen-gallery-grid', '1');
+    host.appendChild(grid);
+    var empty = el('div', 'hint', '读取中…');
+    host.appendChild(empty);
+    dom = { grid: grid, empty: empty };
+    host.__genDom = dom;
+    return dom;
+  }
+
+  /** 一个网格的"键 → 格子"表（挂在网格元素上，跨轮询复用同一批节点）。 */
+  function gridCells(grid) {
+    if (!grid.__cells) grid.__cells = Object.create(null);
+    return grid.__cells;
+  }
+
+  /**
+   * 把 `entries` 增量同步进网格：`entry.key` 认格子。
+   *   · 已有键 → **原样复用**（只调 `update` 改文字/属性，绝不碰 <img> 的 src，更不重建节点）；
+   *   · 新键 → `make` 造一个；本轮不该有的键 → 摘掉。
+   * 顺序按 `entries` 排（`insertBefore` 只移动节点，不会让图片重新解码、不会重发请求）。
+   */
+  function syncCells(grid, entries, make, update) {
+    var store = gridCells(grid);
+    var keep = Object.create(null);
+    entries.forEach(function (entry) { keep[entry.key] = true; });
+    Object.keys(store).forEach(function (key) {
+      if (keep[key]) return;
+      var dead = store[key];
+      if (dead.parentNode === grid) grid.removeChild(dead);
+      delete store[key];
+    });
+    var previous = null;
+    entries.forEach(function (entry) {
+      var node = store[entry.key];
+      if (!node) { node = make(entry); store[entry.key] = node; }
+      else if (typeof update === 'function') update(node, entry);
+      if (previous ? previous.nextSibling !== node : grid.firstChild !== node) {
+        grid.insertBefore(node, previous ? previous.nextSibling : grid.firstChild);
+      }
+      previous = node;
+    });
+  }
+
+  /**
+   * 新格子该预设什么比例：
+   *   0) **本会话已经量过**这张图 → 直接用缓存里的真实比例（连加载态都不用出现）；
+   *   1) 这张图以前画过 → 用记下来的**真实比例**（`gen.ratios`，最准）；
+   *   2) 否则用**生成参数**（`/api/status` 的 `generation.width/height`）—— 图就是按这个尺寸出的，
+   *      缩略图没到之前盒子已经是正确形状，不会"先空盒子、图到了再变一下"；
+   *   3) 都拿不到 → 空串，CSS 的 `.thumb.ratio-unknown` 给中性 4:3 **加明确的「加载中…」**。
+   */
+  function genPresetRatio(path) {
+    var cached = path ? imageCache.ratio(path) : '';
+    if (cached) return cached;
+    var known = path ? gen.ratios[path] : '';
+    if (known) return known;
+    var p = gen.params || {};
+    var w = fmtNum(p.width, 0), h = fmtNum(p.height, 0);
+    return w > 0 && h > 0 ? w + ' / ' + h : '';
+  }
+
+  /** 图片在 `gen.images` 里的下标。**点击这一刻现算**：列表会增长，建格子时记下的下标会过期。 */
+  function genIndexOf(path) {
+    for (var i = 0; i < gen.images.length; i++) if (gen.images[i] && gen.images[i].path === path) return i;
+    return -1;
+  }
+  /** 查看器条目：与 `gen.images` 一一对应（原图地址，不带 w）。 */
+  function genViewerList() {
+    return gen.images.map(function (it) { return { src: it.path, caption: (it.name || '') + '（' + fmtBytes(it.size) + '）' }; });
+  }
+  function genOpenImage(path) {
+    var at = genIndexOf(path);
+    PixikoM.openViewer(genViewerList(), at < 0 ? 0 : at);
+  }
+  function genMenuAt(path) {
+    var at = genIndexOf(path);
+    if (at >= 0) genImageMenu(gen.images[at], at);
+  }
+
+  /**
+   * 一个图片格子：`.cell.done[data-path] > .thumb(.loading) > img`，文件名/「待领取」放在 `.cap`。
+   * `.thumb` **先用已知比例把形状定下来**并带 `loading`（骨架灰条 + 一行「加载中…」）；图片 load 后
+   * 由 `applyNaturalRatio` 换成真实比例、这里摘掉 `loading`。所以从第一帧起就不是"空盒子"。
+   */
+  function genImageCell(entry) {
+    var item = entry.item;
+    var cell = el('div', 'cell done tap');
+    cell.setAttribute('data-cell', 'done');
+    cell.setAttribute('data-path', item.path);
+    var cached = imageCache.ratio(item.path);              // 本会话已经量过 → 连加载态都不用出现
+    /* 只有"现在真的会去取"的格子才显示加载态（骨架 + 「加载中…」）：新格子是游离节点，`loadingFor`
+       只会对前 4 个给 eager，其余是 `loading=lazy`（浏览器要等它滚进视口才发请求）—— 那些格子如果也挂
+       `loading`，屏幕上就永远挂着一排"加载中…"（实测真机观察里 100 秒内有 58 帧是这种假加载态）。 */
+    var willFetch = cached ? false : (entry.index < 4);
+    var thumb = el('div', 'thumb' + (willFetch ? ' loading' : ''));
+    var ratio = genPresetRatio(item.path);
+    if (ratio) thumb.style.aspectRatio = ratio;
+    else if (!cached) thumb.classList.add('ratio-unknown');
+    if (imageCache.failed(item.path)) {
+      // 失败终态：直接出「图取不到」，不再造 <img>、不再重试刷请求
+      thumb.appendChild(imageFailBox(item.path));
+      cell.appendChild(thumb);
+      genImageCellUpdate(cell, entry);
+      return cell;
+    }
+    var img = imageCache.node(item.path, thumbUrl(item.path));
+    var reuse = !!(cached && img.getAttribute('src') === thumbUrl(item.path));
+    if (reuse) {
+      img.alt = item.name || '';
+      thumb.appendChild(img);                              // 同一个节点搬过来：0 请求、0 解码、不闪
+    } else {
+      img.alt = item.name || '';
+      mountImage(img, item.path, entry.index, function () {
+        thumb.classList.remove('loading');
+        var w = img.naturalWidth, h = img.naturalHeight;
+        if (w > 0 && h > 0) gen.ratios[item.path] = w + ' / ' + h;   // 记下来给以后复用的格子用
+      });
+      thumb.appendChild(img);
+    }
+    cell.appendChild(thumb);
+    genImageCellUpdate(cell, entry);
+    cell.addEventListener('click', function () { genOpenImage(item.path); });
+    var timer = null;
+    cell.addEventListener('touchstart', function () {
+      clearTimeout(timer);
+      timer = setTimeout(function () { genMenuAt(item.path); }, 520);
+    }, { passive: true });
+    cell.addEventListener('touchend', function () { clearTimeout(timer); }, { passive: true });
+    cell.addEventListener('touchmove', function () { clearTimeout(timer); }, { passive: true });
+    cell.addEventListener('contextmenu', function (event) { event.preventDefault(); genMenuAt(item.path); });
+    return cell;
+  }
+
+  /** 复用格子时只更新"会变的那点东西"：文件名/「待领取」这一行、画廊下标属性。图片本身不动。 */
+  function genImageCellUpdate(cell, entry) {
+    var want = entry.cap === 'name' ? (entry.item.name || '') : entry.cap === 'pending' ? '待领取' : '';
+    var cap = null;
+    for (var i = 0; i < cell.children.length; i++) {
+      if (cell.children[i].classList && cell.children[i].classList.contains('cap')) cap = cell.children[i];
+    }
+    if (want) {
+      if (!cap) cell.appendChild(el('div', 'cap', want));
+      else if (cap.textContent !== want) cap.textContent = want;
+    } else if (cap) cell.removeChild(cap);
+    if (entry.galleryIndex !== undefined && cell.getAttribute('data-gallery-cell') !== String(entry.galleryIndex)) {
+      cell.setAttribute('data-gallery-cell', String(entry.galleryIndex));
+    }
+  }
+
+  /** 生成中的环形进度格子（节点复用，只改 stroke-dashoffset 与百分比文字）。 */
+  function genRingCell(entry) {
+    var cell = el('div', 'cell');
+    cell.setAttribute('data-cell', 'running');
+    var thumb = el('div', 'thumb');
+    var ratio = genPresetRatio('');
+    if (ratio) thumb.style.aspectRatio = ratio;
+    var radius = 15, circumference = 2 * Math.PI * radius;
+    thumb.innerHTML = '<svg class="ring" viewBox="0 0 34 34"><circle class="bg" cx="17" cy="17" r="' + radius + '"></circle>' +
+      '<circle class="fg" cx="17" cy="17" r="' + radius + '" stroke-dasharray="' + circumference.toFixed(1) + '" stroke-dashoffset="' + circumference.toFixed(1) + '" transform="rotate(-90 17 17)"></circle></svg>' +
+      '<div class="pct">0%</div>';
+    cell.appendChild(thumb);
+    cell.__ring = { thumb: thumb, fg: thumb.querySelector('.fg'), pct: thumb.querySelector('.pct'), circumference: circumference, held: null };
+    genRingUpdate(cell, entry);
+    return cell;
+  }
+  function genRingUpdate(cell, entry) {
+    var ring = cell.__ring;
+    if (!ring) return;
+    var percent = Math.max(0, Math.min(100, fmtNum(entry.percent, 0)));
+    ring.fg.setAttribute('stroke-dashoffset', (ring.circumference * (1 - percent / 100)).toFixed(1));
+    ring.pct.textContent = Math.round(percent) + '%';
+    if (entry.suspended && !ring.held) { ring.held = el('div', 'held-tag', '挂起'); ring.thumb.appendChild(ring.held); }
+    else if (!entry.suspended && ring.held) { ring.thumb.removeChild(ring.held); ring.held = null; }
+  }
+
+  /** 还在排队、这一轮还没轮到的格子：明确的「等待」占位（不是空的 `—`）。 */
+  function genPendingCell() {
+    var cell = el('div', 'cell pending');
+    cell.setAttribute('data-cell', 'pending');
+    var thumb = el('div', 'thumb');
+    var ratio = genPresetRatio('');
+    if (ratio) thumb.style.aspectRatio = ratio;
+    thumb.appendChild(el('div', 'muted', '等待'));
+    cell.appendChild(thumb);
+    return cell;
+  }
+
   /** 进度卡 + 图集网格。 */
   function genRenderProgress() {
     var host = gen.root && gen.root.querySelector('[data-gen-progress]');
@@ -2117,7 +2592,8 @@
     var progress = PixikoM.state.progress || {};
     var imagePercent = fmtNum(progress.percent, 0);
     var overall = genOverall(tasks, imagePercent);
-    clear(host);
+    var dom = genProgressDom(host);
+    clear(dom.cardHost);                     // 只有进度卡（纯文字，没有图片）每拍重建
 
     // ── 进度卡
     var card = el('div', 'card progress-card');
@@ -2172,121 +2648,50 @@
       queueNote.textContent = progress.text ? String(progress.text) : '';
     }
     card.appendChild(queueNote);
-    host.appendChild(card);
+    dom.cardHost.appendChild(card);
 
-    // ── 图集网格：1 张缩略图 + 1 个生成中占位 + 1 个等待中占位（数量关系由任务字段推出来）
-    var grid = el('div', 'grid-imgs');
-    grid.setAttribute('data-gen-grid', '1');
+    // ── 「这一轮的图」：按**图片路径**增量同步（老格子连同它的 <img> 原样复用，跨轮询不重建）
+    //    数量关系：done = 真的在 /api/images 里存在的那些；任务计数（task.images）比列表快一拍时
+    //    （图还没进列表）**只画已存在的、剩下的等下一拍**，绝不画 `—` 空占位 —— 那正是 ghost placeholder。
     var images = fmtNum(task && task.images, 0);
     var failed = fmtNum(task && task.failed, 0);
     var total = fmtNum(task && task.total, 0);
     var runningSlots = task && task.running ? 1 : 0;
     var pending = Math.max(0, total - images - failed - runningSlots);
-    var shown = 0;
+    var done = Math.min(images, gen.images.length);
+    var entries = [];
+    for (var i = 0; i < done; i++) {
+      entries.push({ key: 'img:' + gen.images[i].path, kind: 'img', item: gen.images[i], index: i, cap: 'name' });
+    }
+    if (runningSlots) entries.push({ key: 'ring', kind: 'ring', percent: imagePercent, suspended: !!(task && task.suspended) });
+    for (var k = 0; k < pending; k++) entries.push({ key: 'pending:' + k, kind: 'pending' });
+    syncCells(dom.grid, entries, function (entry) {
+      if (entry.kind === 'ring') return genRingCell(entry);
+      if (entry.kind === 'pending') return genPendingCell(entry);
+      return genImageCell(entry);
+    }, function (node, entry) {
+      if (entry.kind === 'ring') genRingUpdate(node, entry);
+      else if (entry.kind === 'img') genImageCellUpdate(node, entry);
+    });
+    var shown = entries.length;
+    dom.count.textContent = shown + ' / ' + (total || shown);
+    dom.count.setAttribute('data-gen-grid-count', String(shown));
+    dom.grid.style.display = shown ? '' : 'none';
+    dom.empty.style.display = shown ? 'none' : '';
+    // 任务说"出过图"但列表里还没有 → 给一句明确的说明（不是画一个空盒子）
+    var emptyText = task && images > 0 && !done ? '图还在路上，稍等一下…' : '还没有图。点下面的「开始生成」。';
+    if (dom.empty.textContent !== emptyText) dom.empty.textContent = emptyText;
 
-    for (var i = 0; i < images; i++) {
-      var item = gen.images[i];
-      var cell = el('div', 'cell done tap');
-      cell.setAttribute('data-cell', 'done');
-      if (item) {
-        var thumb = el('div', 'thumb');       // 缩略图盒（1:1、圆角、裁切）；文件名在它下面完整换行
-        var img = el('img');
-        img.alt = item.name || ('生成图 ' + (i + 1));
-        mountImage(img, item.path, i);
-        thumb.appendChild(img);
-        cell.appendChild(thumb);
-        var cap = el('div', 'cap', item.name || '');
-        cell.appendChild(cap);
-        (function (entry, index, node, source) {
-          node.addEventListener('click', function () {
-            var list = gen.images.map(function (it) { return { src: it.path, caption: it.name + '（' + fmtBytes(it.size) + '）' }; });
-            PixikoM.openViewer(list, index);
-          });
-          // 长按 → 原生桥（桌面上没桥时用 sheet 兜底），与 index.html 的注入脚本互不冲突
-          var timer = null;
-          node.addEventListener('touchstart', function () {
-            clearTimeout(timer);
-            timer = setTimeout(function () { genImageMenu(entry, index); }, 520);
-          }, { passive: true });
-          node.addEventListener('touchend', function () { clearTimeout(timer); }, { passive: true });
-          node.addEventListener('touchmove', function () { clearTimeout(timer); }, { passive: true });
-          node.addEventListener('contextmenu', function (event) { event.preventDefault(); genImageMenu(entry, index); });
-        })(item, i, cell, item.path);
-      } else {
-        var emptyThumb = el('div', 'thumb');
-        emptyThumb.appendChild(el('div', 'muted', '—'));
-        cell.appendChild(emptyThumb);
-      }
-      grid.appendChild(cell);
-      shown++;
-    }
-    if (runningSlots) {
-      var ringCell = el('div', 'cell');
-      ringCell.setAttribute('data-cell', 'running');
-      var percent = Math.max(0, Math.min(100, imagePercent));
-      var radius = 15, circumference = 2 * Math.PI * radius;
-      var offset = circumference * (1 - percent / 100);
-      var ringThumb = el('div', 'thumb');
-      ringThumb.innerHTML = '<svg class="ring" viewBox="0 0 34 34"><circle class="bg" cx="17" cy="17" r="' + radius + '"></circle>' +
-        '<circle class="fg" cx="17" cy="17" r="' + radius + '" stroke-dasharray="' + circumference.toFixed(1) + '" stroke-dashoffset="' + offset.toFixed(1) + '" transform="rotate(-90 17 17)"></circle></svg>' +
-        '<div class="pct">' + Math.round(percent) + '%</div>';
-      if (task && task.suspended) ringThumb.appendChild(el('div', 'held-tag', '挂起'));
-      ringCell.appendChild(ringThumb);
-      grid.appendChild(ringCell);
-      shown++;
-    }
-    for (var k = 0; k < pending; k++) {
-      var wait = el('div', 'cell pending');
-      wait.setAttribute('data-cell', 'pending');
-      var waitThumb = el('div', 'thumb');
-      waitThumb.appendChild(el('div', 'muted', '等待'));
-      wait.appendChild(waitThumb);
-      grid.appendChild(wait);
-      shown++;
-    }
-    var gridCard = el('div', 'card');
-    var head2 = el('div', 'card-head');
-    var title2 = el('div', 'card-title', '这一轮的图');
-    head2.appendChild(title2);
-    var count2 = el('div', 'row-tail', shown + ' / ' + (total || shown));
-    count2.setAttribute('data-gen-grid-count', String(shown));
-    head2.appendChild(count2);
-    gridCard.appendChild(head2);
-    if (shown) gridCard.appendChild(grid);
-    else gridCard.appendChild(el('div', 'hint', '还没有图。点下面的「开始生成」。'));
-    host.appendChild(gridCard);
-
-    // ── 新出的图（/api/images，最近的作品，点开进查看器）
-    var gallery = gen.root.querySelector('[data-gen-gallery]');
-    if (gallery) {
-      clear(gallery);
-      if (!gen.images.length) {
-        gallery.appendChild(el('div', 'hint', '还没有历史作品。'));
-      } else {
-        var list = gen.images.map(function (it) { return { src: it.path, caption: it.name + '（' + fmtBytes(it.size) + '）' }; });
-        var g = el('div', 'grid-imgs');
-        gen.images.forEach(function (item, index) {
-          var cell = el('div', 'cell done tap');
-          cell.setAttribute('data-gallery-cell', String(index));
-          var thumb = el('div', 'thumb');     // 与上面同一套：缩略图 + 完整文件名在下面换行
-          var img = el('img');
-          img.alt = item.name || '';
-          mountImage(img, item.path, index);
-          thumb.appendChild(img);
-          cell.appendChild(thumb);
-          if (item.pending) cell.appendChild(el('div', 'cap', '待领取'));
-          cell.addEventListener('click', function () { PixikoM.openViewer(list, index); });
-          var timer = null;
-          cell.addEventListener('touchstart', function () {
-            clearTimeout(timer);
-            timer = setTimeout(function () { genImageMenu(item, index); }, 520);
-          }, { passive: true });
-          cell.addEventListener('touchend', function () { clearTimeout(timer); }, { passive: true });
-          cell.addEventListener('contextmenu', function (event) { event.preventDefault(); genImageMenu(item, index); });
-          g.appendChild(cell);
-        });
-        gallery.appendChild(g);
-      }
+    // ── 最近的作品（/api/images）：同一个增量同步，同一个 <img> 跨轮询一直活着
+    var galleryHost = gen.root.querySelector('[data-gen-gallery]');
+    if (galleryHost) {
+      var gdom = genGalleryDom(galleryHost);
+      var gentries = gen.images.map(function (item, index) {
+        return { key: 'img:' + item.path, kind: 'img', item: item, index: index, cap: item.pending ? 'pending' : 'none', galleryIndex: index };
+      });
+      syncCells(gdom.grid, gentries, genImageCell, genImageCellUpdate);
+      gdom.empty.style.display = gentries.length ? 'none' : '';
+      if (!gentries.length && gdom.empty.textContent !== '还没有历史作品。') gdom.empty.textContent = '还没有历史作品。';
     }
   }
 

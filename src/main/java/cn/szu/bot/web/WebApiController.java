@@ -137,6 +137,20 @@ public class WebApiController {
             }
             // 下载进度单独一条轻接口：面板每秒轮询，不能顺带把 SD 的 LoRA 列表也拉一遍。
             case "/api/lora/progress": return WebJson.ok(bot.loraProgress());
+            // 取消/暂停/继续当前下载：权限与 /api/lora/download 完全相同（同一个 scope 与 admin 规则）。
+            // 三条都是幂等的：没有任务在跑也回 200 + 一句 message，不报错。
+            case "/api/lora/cancel": {
+                requirePost(method);
+                return WebJson.ok(bot.webLoraCancel(scope));
+            }
+            case "/api/lora/pause": {
+                requirePost(method);
+                return WebJson.ok(bot.webLoraPause(scope));
+            }
+            case "/api/lora/resume": {
+                requirePost(method);
+                return WebJson.ok(bot.webLoraResume(scope));
+            }
             case "/api/lora/preview": return serveLoraPreview(loraNameQuery(request, body));
             // 样式的预览图（只给网页看）：和 LoRA 展示图一样，<img> 只能把令牌挂查询串上。
             case "/api/style/preview": return serveStylePreview(loraNameQuery(request, body));
@@ -275,6 +289,18 @@ public class WebApiController {
             case "/api/sd/preset": {
                 requirePost(method);
                 return WebJson.ok(bot.webSetForgePreset(Json.str(body, "name", "")));
+            }
+            // VAE：查看当前值 + 冲突判定（与其它 SD 接口同一权限）。
+            case "/api/sd/vae": return WebJson.ok(bot.webVae());
+            case "/api/sd/vae/list": return WebJson.ok(bot.webVaeList());
+            case "/api/sd/vae/set": {
+                requirePost(method);
+                return WebJson.ok(bot.webVaeSet(Json.str(body, "name", "")));
+            }
+            // 一键修复：清掉冲突的额外模块 + 把 VAE 设回 Automatic，回同一份快照 + actions。
+            case "/api/sd/vae/fix": {
+                requirePost(method);
+                return WebJson.ok(bot.webVaeFix());
             }
             case "/api/sd/start": {
                 // 「启动 SD」按钮：拉起 SD 要等模型加载（几十秒到几分钟），后台跑，网页轮询状态即可。

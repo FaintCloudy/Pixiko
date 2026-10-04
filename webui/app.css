@@ -217,14 +217,21 @@ code { background: rgba(120, 160, 220, .14); padding: 1px 5px; border-radius: 6p
    只有背景与间距，没有这些属性（自测里有断言盯着）。
    `main#app[hidden]` 的语义不受影响：display:none 的祖先会把整棵子树（含 fixed 的右栏）一起隐藏。
 
-   高度吃满可视区：100vh - 吸顶位置(62px) - 底部留白(14px)，再减 env(safe-area-inset-bottom)；
+   高度：**上边界与左侧导航栏 `<nav class="tabs">` 的上边界齐平**（用户要求的两栏对齐），
+   下边界到视口底留 `--rail-gutter`(24px) 的规范间距；
    内部**只有 #chat-log 滚动**（flex:1 + min-height:0 + overflow-y:auto），输入区常驻右栏底部。
+   （沿革：更早是 `top: 62px` = 页头下沿，右栏上边界比导航栏高 12px、下边只有 14px；
+   中间一版把右栏放到导航栏**下方** +24px，于是又比导航栏低了一整条（55px）—— 都对不齐。
+   现在按用户的话取"两条栏上边界同一条水平线"，下边保持同一套 24px 外留白。）
 
    自包含变量（唯一出处；@media 的条件里不能用 var()，所以窄屏断点写在下面的 @media 里，数值是 1000px）：
-     --rail-gap:       14px     两栏之间的间距（窄屏堆叠时也是上下间距）
-     --rail-stick-top: 62px     页头 .bar 的实测高度（右栏顶边贴页头下沿，与 .tabs 的 top:62px 同口径）
-     --rail-bottom:    14px     右栏底边与视口底边的留白
-     --rail-gutter:    24px     页面外留白：#app 的左右内边距 + 右栏的右边距（只压缩左栏，不影响右栏宽）
+     --rail-gap:       14px     两栏之间的水平间距（窄屏堆叠时是上下间距）
+     --rail-gutter:    24px     页面外留白：左右 + 右栏**下边**的间距（下边与左右同一个数）
+     --rail-top:       **首选**：右栏顶边，由 app.js 的 syncRailSpacing 量出「导航栏 .tabs 的上边界」
+                       （`.bar`/`.tabs` 的实际高度带亚像素，写死常数会差 0.25~0.5px、还会整条错位）
+     --rail-bottom:    右栏底边与视口底边的留白（= --rail-gutter，那个 24px）
+     --rail-bar/--rail-tabs  只是 --rail-top 量不到时的**兜底**量：页头 .bar / 导航栏 .tabs 的高度
+                       （62px / 55px），右栏顶边 = bar + tabs（略低于导航栏上边界，见 app.js）
      --rail-pad:       12px     右栏宽度的基准（已经不是页面内边距了：动它右栏才会变宽变窄）
      --rail-w-flow:    在流内的右栏宽（.workspace 的右留白基准）
      --rail-w-fixed:   固定右栏的宽
@@ -232,9 +239,12 @@ code { background: rgba(120, 160, 220, .14); padding: 1px 5px; border-radius: 6p
    窄屏断点：**1000px**（<=1000px 单列堆叠、static，见下面的 @media）。 */
 body {
   --rail-gap: 14px;
-  --rail-stick-top: 62px;
-  --rail-bottom: 14px;
+  --rail-bar: 62px;
+  --rail-tabs: 55px;
+  --rail-bottom: 24px;                                   /* = --rail-gutter：下边那个 24px */
   --rail-gutter: 24px;
+  /* 兜底：右栏顶边 ≈ 页头 + 导航栏（JS 量到 --rail-top 时以它为准，见 app.js 的 syncRailSpacing） */
+  --rail-stick-top: calc(var(--rail-bar) + var(--rail-tabs));
   --rail-pad: 12px;
   /* 在流内用：100% = .shell 内容框（= 视口宽 - 2×外留白），比「右栏宽」的基准多减了外留白，
      所以这里把 2 × (外留白 - 基准) 加回去 —— 算出来仍是同一个右栏宽 */
@@ -251,12 +261,17 @@ body {
 }
 .agent-rail {
   position: fixed;               /* 宽屏：真正固定（取舍见上面的注释） */
-  top: var(--rail-stick-top);
+  /* 顶边优先用 JS 量的 --rail-top（= 左侧导航栏 .tabs 的上边界，见 app.js 的 syncRailSpacing）——
+     两条栏的上边界要在同一条水平线上；JS 没跑（或元素不在这一页）时退回 CSS 那套兜底值。 */
+  top: var(--rail-top, var(--rail-stick-top));
   right: var(--rail-right);
+  bottom: calc(var(--rail-bottom) + env(safe-area-inset-bottom, 0px));
   width: var(--rail-w-fixed);
-  height: calc(100vh - var(--rail-stick-top) - var(--rail-bottom) - env(safe-area-inset-bottom, 0px));
-  /* 地址栏伸缩时跟着变；不认 dvh 的浏览器用上面那行 100vh */
-  height: calc(100dvh - var(--rail-stick-top) - var(--rail-bottom) - env(safe-area-inset-bottom, 0px));
+  /* 高度交给 top + bottom 撑开（**不要再写一条 `height: calc(100vh - top - bottom)`**：
+     那条算式与 `top` 是两份独立声明，改了 top 而高度算式没跟着重算时，右栏底边就会跑到
+     视口外/离底边只有一半 —— 实测出现过 top 153.5、底边 888（离底 12px 而不是 24px）。
+     top/bottom 一起约束 + 高度 auto 是同一个意图的唯一一处表达，不会再漂。 */
+  height: auto;
   min-width: 0;                  /* 窄屏/长内容不许把它顶宽 */
   min-height: 0;
   display: flex;                 /* 纵向：栏头 / #chat-log（唯一滚动容器）/ 输入框 / 底部那行 */
@@ -441,13 +456,22 @@ body {
 }
 @keyframes lora-slide { from { margin-left: -35%; } to { margin-left: 100%; } }
 
-.grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(136px, 1fr)); gap: 9px; }
+/* 照片格子：一格按图片自身的宽高比显示 —— 宽度铺满整格，高度按比例，图片把行撑开
+   （`grid-auto-rows: auto` 是规格默认值，这里显式写出来：行高由内容决定，图片再高也不会被裁）。
+   图片尺寸只归这一条管：`width: 100%` 铺满 + `height: auto` 按比例。
+   `aspect-ratio: 4 / 3` 是**图没到之前**的中性占位比例，app.js 的 imageHintSync 在图片加载完后
+   会把它换成 `naturalWidth / naturalHeight` 的真实比例（缓存命中时立即换）。
+   **不要再改回 `aspect-ratio: 1` + `object-fit: cover`**：那会把每一张都裁成正方形（用户报的「被异常压缩」）。
+   **也不要再加 `height: 100%`**：`.grid a` 的高度是不确定的（由这一格撑开），百分比高度会在
+   解析时退化成「图片自身的像素高」——上一轮 `<img width="1664" height="1216">` 属性把图撑成
+   141×1216 就是这个回路。 */
+.grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(136px, 1fr)); gap: 9px; grid-auto-rows: auto; }
 .grid a {
   display: block; border: 1px solid var(--line); border-radius: 12px; overflow: hidden;
   background: var(--panel); transition: transform .22s var(--ease), box-shadow .22s var(--ease);
 }
 .grid a:hover { transform: translateY(-2px); box-shadow: var(--shadow); }
-.grid img { width: 100%; display: block; aspect-ratio: 1; object-fit: cover; }
+.grid img { width: 100%; height: auto; aspect-ratio: 4 / 3; display: block; max-width: 100%; }
 .grid .meta { padding: 6px 8px; font-size: 11px; color: var(--muted); word-break: break-all; }
 
 /* Civitai 搜索结果：卡片里直接给封面图 + 信息（不再是一条消息回执） */
@@ -675,6 +699,38 @@ body.console-full .terminal {
 .editable:hover { color: var(--text); border-bottom-color: var(--accent); }
 .rename-input { min-height: 30px; padding: 2px 6px; font-size: 14px; }
 
+/* ------------------------------------------------------------------ VAE 一行 + 栈冲突提示
+   这一块是 app.js 的 ensureVaePanel() **动态建**在「生成参数」卡里的（index.html 不动），
+   所以样式全在这里；改完尺寸/步数/CFG 的同一格里就能看见 VAE 与冲突结论。
+   颜色只用主题里已有的令牌（--danger / --accent-2），警示色的黄给字面色值 + 回退变量，
+   免得别的代理改 :root 时这一块跟着坏掉。 */
+.vae-row {
+  display: grid; grid-template-columns: minmax(150px, 1fr) auto minmax(120px, 1fr); gap: 8px;
+  align-items: end; margin-top: 10px; padding-top: 10px;
+  border-top: 1px dashed rgba(120, 160, 220, .22);
+}
+.vae-row .vae-field { grid-column: 1; }
+.vae-row .vae-reload { grid-column: 2; min-height: 38px; }
+.vae-row .vae-modules { grid-column: 3; align-self: center; overflow-wrap: anywhere; }
+.vae-row .vae-hint { grid-column: 1 / -1; }
+.vae-row .vae-conflict { grid-column: 1 / -1; }
+.vae-modules:empty { display: none; }
+.vae-hint { font-size: 12.5px; color: var(--muted); line-height: 1.5; overflow-wrap: anywhere; }
+.vae-hint-off { color: #f2c14e; }
+
+/* 冲突横幅：WARN 黄、BLOCK 红（红的那档要"醒目"，所以给左边框 + 淡红底 + 抬一层）。 */
+.vae-conflict { border-radius: 12px; padding: 10px 12px; font-size: 14px; line-height: 1.55; }
+.vae-conflict .vae-line { overflow-wrap: anywhere; }
+.vae-conflict .vae-suggestion { margin-top: 4px; }
+.vae-conflict .vae-culprits { margin-top: 4px; opacity: .85; font-size: 13px; }
+.vae-warn { background: rgba(242, 193, 78, .1); border: 1px solid rgba(242, 193, 78, .42); color: #ffe6b0; }
+.vae-block {
+  background: rgba(255, 125, 138, .14); border: 1px solid rgba(255, 125, 138, .5);
+  border-left: 4px solid var(--danger); color: #ffd9dd; font-weight: 550;
+  box-shadow: 0 10px 26px rgba(120, 20, 40, .28); animation: drop-in .32s var(--ease) both;
+}
+.vae-block .vae-fix { margin-top: 8px; min-height: 40px; }
+
 /* ------------------------------------------------------------------ 下拉框（统一放最后，避免被后面的规则改坏）
    去掉系统自带的箭头，换成本主题的上下双向箭头；显式写 no-repeat，绝不会铺成一排箭头。 */
 select {
@@ -846,7 +902,9 @@ a.image-link img:hover { border-color: rgba(120, 160, 220, .55); }
 .quest-cloud-link:hover { text-decoration: underline; }
 
 /* ---------------------------------------------------------------- 任务回执页 */
-.quest-body { display: flex; flex-direction: column; gap: 10px; }
+/* 右卡「执行结果」的本体：吃满卡片剩余高度（`flex: 1`），内容多时**在自己栏内滚**，
+   不把卡片顶高 —— 卡片高度归 .quest-split 的同高规则管，两栏底边才对得齐。 */
+.quest-body { display: flex; flex-direction: column; gap: 10px; flex: 1 1 auto; min-height: 0; overflow-y: auto; }
 /* 右栏「执行结果」：状态与进度并排在卡片头部（.card-head 本来就是 flex + wrap），指令另起一行小字。
    两者都允许收缩与断行，窄屏下不会把卡片头部挤爆；没有指令时整行不占位。 */
 #quest-state, #quest-progress { min-width: 0; overflow-wrap: anywhere; }
@@ -865,14 +923,40 @@ a.image-link img:hover { border-color: rgba(120, 160, 220, .55); }
 .quest-empty { color: var(--muted); }
 
 /* ---------------------------------------------------------------- 回执列表（左列表 / 右详情）
-   未查看（unread）的行：左边一条色条 + 圆点 + 加粗 + 高亮底色 + 「未读」徽标，四种标记一起上。 */
-.quest-split { display: grid; grid-template-columns: minmax(250px, 340px) minmax(0, 1fr); gap: 12px; align-items: start; }
-/* 列表卡：竖直排列「卡片头 / 状态行 / 列表」，列表吃掉剩余高度并可内部滚动 */
-.quest-list-card { min-width: 0; display: flex; flex-direction: column; }
+   未查看（unread）的行：左边一条色条 + 圆点 + 加粗 + 高亮底色 + 「未读」徽标，四种标记一起上。
+
+   **两栏底边与右栏「对话」的底边齐平**（用户要求：把「回执」与「执行结果」两栏的底部延长至与「对话」底部平齐）：
+   两个 grid 项都 `stretch`、行夹成 `minmax(0, 1fr)`，高度取 `--quest-pane-h + 20px`
+   （20px = 上下各 10px 呼吸；卡片因此正好落在容器内容框里）。
+   `--quest-pane-h` 由 `app.js` 的 `syncRailSpacing()` 量出来写进 `body.style`：
+     `--quest-pane-h = #agent-rail 的 rect.bottom - .quest-split 的 rect.top - 20`
+   也就是**跟着右栏的真实底边**（= 视口底 − `--rail-bottom` 24px），不再另写一份「100vh − …」的算式 ——
+   上一轮 `top` + `calc(100dvh - top - bottom)` 两份独立声明漂移过（底边只剩 12px），这次只有一处来源。
+   量不到 / 窄屏单列时退回 CSS 里的兜底 `min(76vh, 760px)`（竖排时「底边齐平」本来就不适用）。
+   注意：这段注释里**不能出现半角双引号** —— 它会把 `/* … */` 提前结束，整条 `.quest-split` 规则被当成垃圾丢掉
+   （实测过：`.quest-split` 变成 `display: block`，两栏叠成竖排、各 4 千多像素高）。 */
+.quest-split {
+  display: grid; grid-template-columns: minmax(250px, 340px) minmax(0, 1fr);
+  /* 行也要一起夹住：只给容器 `height` 而让行是 `auto`，行会按内容的 min-content 撑出去
+     （实测 1280×800：容器 628 而行 759、两卡跟着 759），高上限等于没生效。
+     `minmax(0, 1fr)` 让行严格等于容器的可用高，两卡才真的落在同一个上限里。 */
+  grid-template-rows: minmax(0, 1fr);
+  gap: 12px;
+  align-items: stretch;
+  /* 内高（不含上下各 10px 的呼吸）；JS 量得到就覆盖成"延长到对话栏底边"的那个高度 */
+  --quest-pane-h: min(76vh, 760px);
+  height: calc(var(--quest-pane-h) + 20px);
+  min-height: 260px;
+}
+/* 列表卡：竖直排列「卡片头 / 状态行 / 列表」，列表吃掉剩余高度并可内部滚动。
+   `min-height: 0` 是必需的：grid 项默认 `min-height: auto`，不给 0 就会按内容撑破上面的行夹。 */
+.quest-list-card { min-width: 0; min-height: 0; display: flex; flex-direction: column; }
+.quest-split > .card { min-height: 0; }
 .quest-list {
   display: flex; flex-direction: column; gap: 8px;
-  /* 整体加高：可视高度明显提升，内部仍可滚动 */
-  max-height: min(76vh, 760px); overflow-y: auto; padding-right: 2px;
+  /* 高度交给卡片的 flex 链（`flex: 1 1 auto` 吃掉剩余高度）；卡片高度由 `.quest-split` 统一决定，
+     `max-height` 不再单独写一份 —— 两份独立来源就是漂移的来源。 */
+  overflow-y: auto; padding-right: 2px;
   border-radius: 10px;
   flex: 1 1 auto; min-height: 0;
 }
@@ -950,6 +1034,9 @@ a.image-link img:hover { border-color: rgba(120, 160, 220, .55); }
   /* 窄屏：列表与详情改成上下堆叠；列表同步加高，但仍留在视口内 */
   .quest-split { grid-template-columns: minmax(0, 1fr); }
   .quest-list { max-height: min(64vh, 620px); }
+  /* 竖排了，"底边与对话栏齐平"不适用：把 JS 量出来的"延长到对话栏底边"关掉，
+     退回上面那条 max-height 的窄屏规则 */
+  .quest-split { --quest-pane-h: 0px; height: auto; min-height: 0; }
   /* 窄屏：翻页按钮贴边收窄一点，别压住画面 */
   .viewer-nav { width: 38px; height: 62px; min-height: 62px; font-size: 22px; }
   #viewer-prev { left: 6px; }
@@ -957,11 +1044,13 @@ a.image-link img:hover { border-color: rgba(120, 160, 220, .55); }
 }
 
 /* ---------------------------------------------------------------- 图集（一条回执的多张图 = 一张卡）
-   缩略图网格：每格固定 140px 见方（object-fit: cover、圆角），点任意一张用查看器打开**整组**
-   （查看器里前后按钮 / ←→ 在组内翻页，计数显示 i / N）。只有一张图时不用图集，仍是单张图片卡。 */
+   缩略图网格：列宽固定 140px、圆角，点任意一张用查看器打开**整组**
+   （查看器里前后按钮 / ←→ 在组内翻页，计数显示 i / N）。只有一张图时不用图集，仍是单张图片卡。
+   每一格按**图片自身的宽高比**显示（宽铺满 140px、高按比例，行高由图片撑开），
+   **不 `object-fit: cover`**（不再裁成正方形）、**不钉 `aspect-ratio: 1`**（不再压成竖条）。 */
 .gallery-grid {
-  display: grid; grid-template-columns: repeat(auto-fill, 140px);
-  justify-content: start; gap: 8px;
+  display: grid; grid-template-columns: repeat(auto-fill, minmax(0, 140px));
+  justify-content: start; gap: 8px; grid-auto-rows: auto;
 }
 a.image-link.gallery-thumb {
   display: block; line-height: 0; overflow: hidden; border-radius: 10px;
@@ -969,9 +1058,11 @@ a.image-link.gallery-thumb {
   transition: transform .18s var(--ease), border-color .2s var(--ease);
 }
 a.image-link.gallery-thumb:hover { transform: translateY(-2px); border-color: rgba(120, 160, 220, .55); }
+/* 格子里的图：宽度铺满、高度按比例（`aspect-ratio` 由 app.js 在加载前给中性比例、加载后换成真实比例）。
+   `min-width: 0` 免得长边把格子撑宽；**`height` 一律 `auto`**，被定成具体高度就会拉伸或裁切。 */
 .gallery-grid img, .gallery-grid img.gallery-thumb-image {
-  display: block; width: 100%; height: auto; aspect-ratio: 1; object-fit: cover;
-  max-width: none; max-height: none; border: 0; border-radius: 0;
+  display: block; width: 100%; height: auto; aspect-ratio: 4 / 3;
+  min-width: 0; max-width: 100%; max-height: none; border: 0; border-radius: 0;
 }
 /* 对话页里的图集格：尺寸归 .gallery-grid 管（140px 方格），这里把上限显式钉死。
    `.msg img`（对话单张图，上限 260px）与本规则优先级相同（0,1,1），只靠「写在后面」太脆；
@@ -979,7 +1070,7 @@ a.image-link.gallery-thumb:hover { transform: translateY(-2px); border-color: rg
 .msg .gallery-grid img { max-width: none; max-height: none; }
 /* 带图集的气泡必须给一个**确定宽度**（这是「图集网格」能不能排成一行前提，不只是好不好看）：
    `#chat-log` 是 `.messages`（flex 纵向）、`.msg` 默认 shrink-to-fit，宽度由内容决定 →
-   `.gallery-grid` 的 `repeat(auto-fill, 140px)` 在该轴尺寸不确定时按规范只解析出 **1 条轨道**，
+   `.gallery-grid` 的 `repeat(auto-fill, minmax(0, 140px))` 在该轴尺寸不确定时按规范只解析出 **1 条轨道**，
    3 张缩略图于是竖着排成一列、气泡只有一格宽（同一个组件在整宽的回执卡里是正常的）。
    `align-self: stretch` 让这种气泡撑到容器宽的 88%（`.msg` 的 max-width），网格才排成一行；
    单图气泡**没有**这个类，仍是 260px 上限、仍按内容收窄。
@@ -987,18 +1078,37 @@ a.image-link.gallery-thumb:hover { transform: translateY(-2px); border-color: rg
 .messages .msg.chat-gallery-entry { align-self: stretch; }
 .gallery-receipt { padding: 8px; }
 
+/* 图没到时的**加载态**：中性比例盒子不许是"空盒子"——给底色 + 一道流光，明确表示"正在加载"。
+   app.js 的 imageHintSync 在不知道真实尺寸时贴 .is-loading，load/error 时摘掉；
+   知道真实生成尺寸的那几张（刚出图）从第一帧就是正确比例，根本不进这个态。 */
+.gallery-tile.is-photo img.is-loading, .grid img.is-loading, .receipt img.is-loading,
+img.gallery-thumb-image.is-loading, img.receipt-image.is-loading, img.quest-image.is-loading {
+  background: linear-gradient(100deg, rgba(120, 160, 220, .06) 30%, rgba(120, 160, 220, .17) 50%, rgba(120, 160, 220, .06) 70%);
+  background-size: 220% 100%;
+  animation: img-skeleton 1.25s ease-in-out infinite;
+}
+@keyframes img-skeleton { from { background-position: 130% 0; } to { background-position: -30% 0; } }
+/* 系统开了"减少动态效果"：留底色，不要流光 */
+@media (prefers-reduced-motion: reduce) { img.is-loading { animation: none; } }
+
 /* ---------------------------------------------------------------- 图集占位格（未生成 / 生成中 / 失败）
-   网格里的每一格都包一层 .gallery-tile（真实缩略图或占位都算一格），尺寸与 .gallery-grid 的
-   140px 方形保持一致：真实缩略图仍是 a.image-link.gallery-thumb 铺满整格，观感不变。
+   网格里的每一格都包一层 .gallery-tile（真实缩略图或占位都算一格）。
    占位格按「圆形进度环 + 状态文字」竖排，不参与文字撑高（min-width: 0 + overflow: hidden）。 */
 .gallery-tile {
   position: relative; display: flex; flex-direction: column;
   align-items: center; justify-content: center; gap: 6px;
-  width: 100%; min-width: 0; aspect-ratio: 1; overflow: hidden;
+  width: 100%; min-width: 0; overflow: hidden;
 }
-/* 真实缩略图那一格：让缩略图铺满整格，不被这一层引入额外内边距 */
-.gallery-tile > a.image-link.gallery-thumb { width: 100%; height: 100%; }
-.gallery-tile > a.image-link.gallery-thumb > img { width: 100%; height: 100%; }
+/* 占位格：状态文字那一格保持正方形（和以前一样）。**不要把 `aspect-ratio: 1` 提到 .gallery-tile 上**：
+   真图那一格（`.is-photo`）要按图片自身比例，钉成正方形就会把竖图压扁 / 裁掉一半。 */
+.gallery-tile:not(.is-photo) { aspect-ratio: 1; }
+/* 真图那一格：高度交给图片自己（`aspect-ratio: auto` 覆盖掉上面的正方形），
+   `overflow: visible` 让图片完整显示而不是被这一层裁掉。 */
+.gallery-tile.is-photo { aspect-ratio: auto; overflow: visible; }
+/* 真实缩略图那一格：缩略图铺满整格宽，高度由图片按比例撑开（`height: auto`，**不是 100%**：
+   百分比高度会退化回图片自身的像素高，实测会把图撑成 141×1216 的竖条）。 */
+.gallery-tile > a.image-link.gallery-thumb { width: 100%; height: auto; }
+.gallery-tile > a.image-link.gallery-thumb > img { width: 100%; height: auto; }
 
 /* 占位格本体：和缩略图同一套圆角 / 底色，比真实缩略图更低调 */
 .gallery-placeholder {

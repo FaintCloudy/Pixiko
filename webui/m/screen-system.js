@@ -98,7 +98,24 @@
       '.sy-mono{font-family:Consolas,Menlo,monospace;font-size:var(--m-fs-sm,13px);font-variant-numeric:tabular-nums}',
       '.sy-link{display:flex;align-items:center;min-height:48px;padding:0 2px;color:#5aa2ff;font-size:var(--m-fs-body,15px);',
       'text-decoration:none;white-space:normal;overflow-wrap:anywhere}',
-      '.sy-link:active{opacity:.7}'
+      '.sy-link:active{opacity:.7}',
+      /* 出图屏的 VAE 一行 + 栈冲突横幅（见文件末尾「出图屏：VAE 与栈冲突」那一节）。
+         颜色一律走 app.css 第 1 段的 --m-* / --danger / --warn 令牌，回退值写成同一批数字：
+         令牌没加载出来时也不会跟别的屏打架。触摸目标全部 ≥44px（--m-tap）。 */
+      '.vae-field{margin-top:4px}',
+      '.vae-alert{display:flex;flex-direction:column;gap:6px;margin-bottom:var(--m-gap,12px);',
+      'font-size:var(--m-fs-sm,13px);line-height:var(--m-lh-sm,1.45);overflow-wrap:anywhere}',
+      '.vae-alert-title{font-size:var(--m-fs-title,15px);font-weight:600;color:#e8eefc}',
+      '.vae-alert-line{color:#e8eefc}',
+      '.vae-alert-dim{color:#93a4c4;font-size:var(--m-fs-xs,12px)}',
+      /* WARN：黄条。BLOCK：红条（左边框加粗 + 红底 + 红标题），出图屏顶部一眼就能看见。 */
+      '.vae-alert-warn{border:1px solid rgba(255,194,102,.45);border-left:4px solid var(--warn,#ffc266);',
+      'background:rgba(255,194,102,.1)}',
+      '.vae-alert-warn .vae-alert-title{color:var(--warn,#ffc266)}',
+      '.vae-alert-block{border:1px solid rgba(255,107,107,.55);border-left:4px solid var(--danger,#ff6b6b);',
+      'background:rgba(255,107,107,.14)}',
+      '.vae-alert-block .vae-alert-title{color:var(--danger,#ff6b6b)}',
+      '.vae-alert .btn{align-self:stretch;margin-top:4px}'
     ].join('');
     document.head.appendChild(style);
   }
@@ -1347,6 +1364,366 @@
     if (main) main.scrollTop = 0;
   }
 
+  /* ================================================================ 出图屏：VAE 与栈冲突（防呆）
+
+     为什么写在这个文件里：手机端的「出图」屏（id `gen`）是在 `m/app.js` 里注册的，而
+     本轮任务**不许改 `m/app.js`**，也不存在 `screen-gen.js`。`screen-system.js` 是
+     `m/index.html` 已经加载、且已经拿 PixikoM 契约（el/clear/toast/confirm/api）的脚本，
+     所以 VAE 选择与冲突横幅在这里实现，再挂到 `gen` 屏的 DOM 上：
+
+       · VAE 一行：追加进出图的「生成参数」卡的 `[data-gen-params]`（与尺寸/步数/CFG 同一区）。
+         卡里的参数是**整块重画**的（genRenderParams 每轮 clear 一遍），所以用 MutationObserver
+         在每次重画之后把自己补回去，节点本身不重建（下拉焦点与选项不丢）。
+       · 冲突横幅：插在 `#screen-gen` 的**最上面**（红条/黄条 + 「一键修复」），
+         这条路径只在挂载时跑一次，不会被重画冲掉。
+
+     服务端契约（字段已冻结，别的代理实现）：
+       POST /api/sd/vae       → {vae, vaeAuto, modules[], checkpoint, choices[],
+                                 conflict:{level:'OK|WARN|BLOCK', reason, suggestion, culprits[]}}
+       POST /api/sd/vae/set   {name} → 同一份快照 + message
+       POST /api/sd/vae/fix   → 同一份快照 + message + actions[]
+
+     降级：接口 404 / 字段缺失 → 这一行置灰 + 一句人话，**不报错弹窗、不白屏**。
+     事故背景：切 Forge 预设后 anima 的额外模块（qwen_image_vae + qwen_3_06b_base）没清掉，
+     SDXL 底模配 Qwen 的 VAE → 出图纯灰。BLOCK 必须在出图屏顶部是一条醒目的红条。 */
+
+  var VAE_MODULE_SHORT = 30;
+  var vae = { ready: true, missing: false, last: null, error: '', busy: false, field: null, key: '',
+    select: null, modulesBox: null, hint: null, conflict: null, observer: null, attached: false, timer: null };
+
+  /** 服务端还没这个接口：`api()` 抛的是 404 +「未知接口：…」（WebApiController 的 default 分支）。 */
+  function vaeMissingEndpoint(error) {
+    var text = messageOf(error) + ' ' + String((error && error.status) || '');
+    return /未知接口|未知的接口|HTTP 404|not found|404/i.test(text);
+  }
+
+  function vaeNamesOf(payload) {
+    var list = (payload && payload.modules) || [];
+    if (!(list instanceof Array)) return [];
+    return list.map(function (item) { return String(item || ''); }).filter(Boolean);
+  }
+
+  /** 只认 WARN / BLOCK；OK 与字段缺失返回 null（界面上一点都不占位）。 */
+  function vaeConflictOf(payload) {
+    var raw = (payload && payload.conflict) || null;
+    if (!raw || typeof raw !== 'object') return null;
+    var level = String(raw.level || '').toUpperCase();
+    if (level !== 'WARN' && level !== 'BLOCK') return null;
+    var culprits = (raw.culprits instanceof Array ? raw.culprits : []).map(function (item) { return String(item || ''); }).filter(Boolean);
+    return { level: level, reason: String(raw.reason || ''), suggestion: String(raw.suggestion || ''), culprits: culprits };
+  }
+
+  /* ---------------------------------------------------------- VAE 一行（在「生成参数」卡里） */
+
+  function vaeFieldNode() {
+    var wrap = make('div', 'sy-field vae-field');
+    wrap.setAttribute('data-vae-field', '1');
+    wrap.appendChild(make('span', null, 'VAE（可选，留 Automatic 就跟随底模）'));
+    // 用出图屏既有的 `.input` 语言：44px 高、宽吃满卡片（触摸目标 ≥44px）
+    var select = make('select', 'input');
+    select.id = 'vae-select';
+    select.setAttribute('aria-label', 'VAE');
+    select.disabled = true;
+    select.addEventListener('change', function () { setVae(select.value); });
+    wrap.appendChild(select);
+    var value = attachValueLine(select, '（还没读到 VAE 列表）');
+    value.setAttribute('data-vae-value', '1');
+    value.id = 'vae-value';
+    var modulesBox = make('div', 'sy-note');
+    modulesBox.id = 'vae-modules';
+    modulesBox.hidden = true;
+    wrap.appendChild(modulesBox);
+    var hint = make('div', 'sy-note');
+    hint.id = 'vae-hint';
+    hint.hidden = true;
+    wrap.appendChild(hint);
+    vae.field = wrap; vae.select = select; vae.modulesBox = modulesBox; vae.hint = hint;
+    return wrap;
+  }
+
+  /** 出图屏的参数卡里那个「参数宿主」；屏还没挂载时返回 null。 */
+  function genParamsHost() {
+    var root = document.getElementById('screen-gen');
+    return root ? root.querySelector('[data-gen-params]') : null;
+  }
+
+  /** 把 VAE 那一行补进参数宿主（已经在里面就什么都不做）。 */
+  function ensureVaeField() {
+    var host = genParamsHost();
+    if (!host) return null;
+    if (!vae.field) vaeFieldNode();
+    if (vae.field.parentNode !== host) host.appendChild(vae.field);
+    return vae.field;
+  }
+
+  /**
+   * 参数宿主是整块重画的：每次重画之后把 VAE 那一行补回去。
+   *
+   * <p>**这条回调必须是"纯幂等"的**：它自己改 DOM 又会把观察者叫醒（观察的是整棵 #m-main 的
+   * childList + subtree），只要回调里有任何"每次都重建节点"的动作，就是死循环 —— 实测直接把
+   * 渲染进程冻死（CDP 的 Runtime.evaluate 全部超时，页面再也醒不过来）。
+   * 所以回调里只做两件幂等的事：① 行不在宿主里才 append；② 快照与画出来的一模一样就一个字都不改
+   * （见 renderVae 的 currentKey 早退）。改完之后再没有新的 DOM 变更，观察者自然静默。
+   */
+  function watchGenParams() {
+    if (vae.observer || typeof MutationObserver !== 'function') return;
+    vae.observer = new MutationObserver(function () {
+      ensureVaeField();
+      renderVae(vae.last, vae.error);
+    });
+    vae.observer.observe(document.getElementById('m-main') || document.body, { childList: true, subtree: true });
+  }
+
+  function refreshVaeValueLine() {
+    if (vae.select && typeof vae.select.__syncValueLine === 'function') {
+      try { vae.select.__syncValueLine(); } catch (error) { /* 值行只是锦上添花 */ }
+    }
+  }
+
+  /**
+   * 画 VAE 一行。`payload` 为 null = 没读到（降级态或读失败）。
+   *
+   * <p>幂等：把"要画成什么样"压成一个指纹（`vae.key`），一样就直接返回 —— 一行 DOM 都不碰。
+   * 这一条是**必需**的，不是优化：见 watchGenParams 的注释（不幂等 = 死循环）。
+   */
+  function renderVae(payload, errorText) {
+    vae.error = errorText || '';
+    if (!ensureVaeField()) return;
+    var choices = ((payload && payload.choices) || []).map(function (item) { return String(item || ''); }).filter(Boolean);
+    var current = payload ? String(payload.vae || '') : '';
+    // choices 里可能有值对象（别的接口给的是 {name} 形状），这里统一按字符串收，缺了当前值就补一个。
+    if (current && choices.indexOf(current) < 0) choices.push(current);
+    var usable = !!(payload && choices.length);
+    var modules = vaeNamesOf(payload);
+    var hint = errorText || '';
+    if (!vae.ready) hint = '这个机器人还没有 VAE 接口（服务端未就绪），这一行先不能用。';
+    else if (payload && payload.vaeAuto && /automatic/i.test(current)) hint = 'VAE 正在跟随当前基础模型自动选。';
+    var key = JSON.stringify([choices, current, usable, modules, hint]);
+    if (key === vae.key) return;
+    vae.key = key;
+
+    clear(vae.select);
+    choices.forEach(function (name) {
+      var option = document.createElement('option');
+      option.value = name;
+      option.textContent = name;
+      if (name === current) option.selected = true;
+      vae.select.appendChild(option);
+    });
+    if (current) vae.select.value = current;
+    vae.select.disabled = !usable;
+
+    // 额外模块：一个短名字直接列出来；多个或很长就折叠成「共 N 个」（全名放 title，别把信息吞掉）
+    var shortAll = modules.every(function (item) { return item.length <= VAE_MODULE_SHORT; });
+    if (!modules.length) {
+      vae.modulesBox.hidden = true;
+      vae.modulesBox.textContent = '';
+    } else {
+      vae.modulesBox.hidden = false;
+      vae.modulesBox.textContent = (modules.length === 1 && shortAll)
+        ? '额外模块：' + modules[0]
+        : '额外模块：共 ' + modules.length + ' 个' + (shortAll ? '（' + modules.join('、') + '）' : '');
+      vae.modulesBox.title = modules.join('、');
+    }
+
+    vae.hint.textContent = hint;
+    vae.hint.hidden = !hint;
+    refreshVaeValueLine();
+  }
+
+  /**
+   * 拉一次快照。缺 `choices` 时用 `/api/sd/vae/list` 补；接口不存在就整体降级。
+   * `silent` 给 30 秒的背景轮询用：不重复 toast。
+   */
+  function loadVae(silent) {
+    var M = api();
+    if (!M || typeof M.api !== 'function') return Promise.resolve(null);
+    return M.api('/api/sd/vae', { method: 'POST', body: { scope: scopeOf() } }).then(function (data) {
+      var payload = data || {};
+      vae.ready = true; vae.missing = false; vae.last = payload;
+      renderVae(payload);
+      if (payload.choices instanceof Array && payload.choices.length) return payload;
+      return M.api('/api/sd/vae/list', { method: 'POST', body: { scope: scopeOf() } }).then(function (extra) {
+        if (extra && extra.choices instanceof Array && extra.choices.length) {
+          payload.choices = extra.choices;
+          vae.last = payload;
+          renderVae(payload);
+        }
+        return payload;
+      }, function () { return payload; });        // 补不上就照旧：一个选项也能用
+    }, function (error) {
+      if (String((error && error.code) || '') === 'unauthorized') return null;
+      vae.ready = false; vae.last = null;
+      if (vaeMissingEndpoint(error)) {
+        vae.missing = true;
+        renderVae(null);
+        return null;
+      }
+      renderVae(null, '读取 VAE 失败：' + messageOf(error));
+      if (!silent) toast('读取 VAE 失败：' + messageOf(error));
+      return null;
+    });
+  }
+
+  /** 改选 VAE：POST /api/sd/vae/set {name}，成功后 toast 服务端的 message 并刷新快照。 */
+  function setVae(name) {
+    var wanted = String(name == null ? '' : name);
+    if (!wanted || vae.busy) return;
+    var M = api();
+    vae.busy = true;
+    vae.select.disabled = true;
+    M.api('/api/sd/vae/set', { method: 'POST', body: { name: wanted, scope: scopeOf() } }).then(function (data) {
+      vae.ready = true; vae.missing = false; vae.last = data || null;
+      if (data) renderVae(data);
+      toast((data && data.message) ? String(data.message) : ('VAE 已切到 ' + wanted));
+      vae.busy = false;
+      loadVae(true);
+    }, function (error) {
+      vae.busy = false;
+      vae.select.disabled = false;
+      if (String((error && error.code) || '') === 'unauthorized') return;
+      if (vaeMissingEndpoint(error)) {
+        vae.ready = false; vae.missing = true;
+        toast('这个机器人还没有 VAE 接口（服务端未就绪），改不了。');
+        renderVae(null);
+        return;
+      }
+      toast('切换 VAE 失败：' + messageOf(error));
+      loadVae(true);
+    });
+  }
+
+  /* ---------------------------------------------------------- 冲突横幅（出图屏最上面） */
+
+  /**
+   * 冲突横幅：WARN 黄条、BLOCK 红条 + 「一键修复」。
+   * 挂在 `#screen-gen` 的第一个子节点上（挂载时一次）；OK / 缺字段整块 hidden，不占位。
+   */
+  function ensureVaeConflict(root) {
+    if (!root) root = document.getElementById('screen-gen');
+    if (!root) return null;
+    if (vae.conflict && vae.conflict.parentNode === root) return vae.conflict;
+    var box = make('div', 'sy-card vae-alert');
+    box.id = 'vae-conflict';
+    box.setAttribute('data-vae-conflict', '1');
+    box.hidden = true;
+    root.insertBefore(box, root.firstChild || null);
+    vae.conflict = box;
+    return box;
+  }
+
+  /** 红条里的「一键修复」：**先 PixikoM.confirm 二次确认**，确认了才发 /api/sd/vae/fix。 */
+  function confirmVaeFix(reason) {
+    return confirmBox('一键修复栈冲突？',
+      '会清掉与当前底模不匹配的额外模块（VAE / 文本编码器），并把 VAE 设回 Automatic，修复完立刻生效。\n\n'
+      + (reason || '检测到栈冲突'),
+      '修复', true);
+  }
+
+  function vaeActionText(action) {
+    var text = String(action == null ? '' : action);
+    var MAP = {
+      clear_modules: '已清空额外模块', clear_extra_modules: '已清空额外模块',
+      set_vae_auto: 'VAE 已设为 Automatic', set_vae_automatic: 'VAE 已设为 Automatic',
+      reload_checkpoint: '已重载底模', reload_model: '已重载底模', reset_vae: 'VAE 已重置',
+      clear_vae: '已清空 VAE 选择', refresh: '已刷新', apply_preset: '已重新应用预设'
+    };
+    return MAP[text] || text;
+  }
+
+  function fixVae(button) {
+    var M = api();
+    var conflict = vaeConflictOf(vae.last);
+    confirmVaeFix(conflict && conflict.reason).then(function (yes) {
+      if (!yes) return null;
+      if (button) button.disabled = true;
+      return M.api('/api/sd/vae/fix', { method: 'POST', body: { scope: scopeOf() } }).then(function (data) {
+        vae.ready = true; vae.missing = false; vae.last = data || null;
+        renderVae(data || null);
+        renderVaeConflict(data || null);        // 红条必须跟着修复结果收掉（少了这句，修好了红条还挂在那儿）
+        var actions = (data && data.actions instanceof Array ? data.actions : []).map(vaeActionText).filter(Boolean);
+        toast((data && data.message) ? String(data.message) : '已修复栈冲突');
+        if (actions.length) toast('已执行：' + actions.slice(0, 2).join('；'));
+        return data;
+      }, function (error) {
+        if (button) button.disabled = false;
+        if (String((error && error.code) || '') === 'unauthorized') return null;
+        if (vaeMissingEndpoint(error)) {
+          vae.ready = false; vae.missing = true;
+          toast('这个机器人还没有一键修复接口（服务端未就绪）。');
+          renderVae(null);
+          renderVaeConflict(null);
+          return null;
+        }
+        toast('修复失败：' + messageOf(error));
+        return null;
+      });
+    });
+  }
+
+  /** 按一份快照画冲突横幅（WARN 黄 / BLOCK 红 + 修复键）。 */
+  function renderVaeConflict(payload, errorText) {
+    var box = ensureVaeConflict();
+    if (!box) return;
+    clear(box);
+    box.className = 'sy-card vae-alert';
+    box.removeAttribute('data-vae-level');
+    var conflict = vaeConflictOf(payload);
+    if (!conflict) {
+      box.hidden = true;
+      return;
+    }
+    box.hidden = false;
+    box.setAttribute('data-vae-level', conflict.level);
+    box.classList.add(conflict.level === 'BLOCK' ? 'vae-alert-block' : 'vae-alert-warn');
+    box.appendChild(make('b', 'vae-alert-title',
+      conflict.level === 'BLOCK' ? '⛔ 栈冲突，会出灰图' : '⚠ 可能有冲突'));
+    box.appendChild(make('div', 'vae-alert-line',
+      conflict.reason || '检测到额外模块与当前底模不匹配'));
+    if (conflict.suggestion) box.appendChild(make('div', 'vae-alert-line', '建议：' + conflict.suggestion));
+    if (conflict.culprits.length) box.appendChild(make('div', 'vae-alert-line vae-alert-dim', '可疑项：' + conflict.culprits.join('、')));
+    if (errorText) box.appendChild(make('div', 'vae-alert-line vae-alert-dim', errorText));
+    if (conflict.level === 'BLOCK') {
+      var fix = button('btn danger vae-fix', '一键修复');
+      fix.id = 'vae-fix';
+      fix.setAttribute('data-vae-fix', '1');
+      fix.addEventListener('click', function () { fixVae(fix); });
+      box.appendChild(fix);
+    }
+  }
+
+  /** 出图屏挂载后接手：先建冲突槽，再灌数据、装观察者、起 30 秒的背景轮询。 */
+  function attachGenVae() {
+    var root = document.getElementById('screen-gen');
+    if (!root || vae.attached) return !!vae.attached;
+    vae.attached = true;
+    ensureVaeConflict(root);
+    ensureVaeField();
+    watchGenParams();
+    loadVae(true).then(function (payload) {
+      renderVaeConflict(payload, vae.ready ? '' : undefined);
+    });
+    vae.timer = setInterval(function () {
+      if (document.hidden) return;
+      var main = document.getElementById('m-main');
+      if (!main || !root.classList.contains('active')) return;
+      loadVae(true).then(function (payload) { renderVaeConflict(payload); });
+    }, 30000);
+    return true;
+  }
+
+  /** 出图屏是别的文件注册的、root 要等用户第一次进那一屏才有：轮询等它出现（最多约 20 秒）。 */
+  function awaitGenScreen() {
+    var tries = 0;
+    function tick() {
+      if (attachGenVae()) return;
+      tries += 1;
+      if (tries > 100) return;                    // 一直没进过出图屏：什么都不做（下次进也不会漏，mount 会再触发）
+      setTimeout(tick, 200);
+    }
+    tick();
+  }
+
   /* ---------------------------------------------------------------- 注册 */
 
   injectStyle();
@@ -1375,5 +1752,7 @@
     claimRoute('chatcfg');
     claimRoute('setup');
     claimRoute('server');
+    // 出图屏的 VAE 与栈冲突（防呆）：屏本体由 m/app.js 注册（本文件不改它），这里等它挂载后接手。
+    awaitGenScreen();
   });
 })();

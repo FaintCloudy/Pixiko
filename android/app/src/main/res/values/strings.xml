@@ -34,6 +34,9 @@
     <string name="settings_reset">清空输入</string>
     <string name="settings_set_active">保存后设为当前服务器</string>
     <string name="settings_saved_title">已保存的服务器</string>
+    <!-- 构建时烧进去的测试默认地址（BuildConfig.PIXIKO_DEFAULT_HOST）预填后显示的小字提示。
+         %1$s 就是那个地址；没烧地址（-NoDefaultHost）的包里这个提示不会出现。 -->
+    <string name="settings_build_default_hint">↑ 这是构建时烧进去的测试地址（%1$s），可直接改成别的；令牌仍要自己填</string>
     <string name="settings_empty">还没有保存任何服务器。填好地址与令牌后点「保存」。</string>
     <string name="settings_security_note">说明：多台服务器的「名称 / 地址 / 令牌」存在应用私有的 SharedPreferences 里（卸载 app 即清除），令牌是明文存储，不要用外部存储保存或把该文件拷给别人。清理数据会一并清掉。</string>
 

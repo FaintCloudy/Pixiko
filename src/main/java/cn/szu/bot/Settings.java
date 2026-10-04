@@ -95,6 +95,71 @@ public final class Settings {
         return keys;
     }
     /**
+     * 出图的发送形式，按会话持久化（{@code image_send.modes.<会话键>}）。
+     *
+     * <p>{@link #AUTO} 是默认值，也是老配置（没有 {@code image_send} 段）读出来的样子：
+     * 一批多于一张时合成一条「合并转发」，单张保持普通发送。{@link #RECORD} 一律合并转发（一张也合并），
+     * {@link #SINGLE} 一律逐张普通发送（多张也逐张）。传输层不会发合并转发时，record 会如实回退普通发送。
+     */
+    public enum ImageSendMode {
+        AUTO("auto", "自动"), RECORD("record", "合并转发"), SINGLE("single", "普通发送");
+        private final String key, label;
+        ImageSendMode(String key, String label) { this.key = key; this.label = label; }
+        /** 存进 config.json 的取值。 */
+        public String key() { return key; }
+        /** 回执里给用户看的中文说法。 */
+        public String label() { return label; }
+        /**
+         * 从 config.json 里读到的值：大小写不敏感，缺失/未知/类型不对一律当 auto。
+         * 手写的、被改坏的或旧版本的配置都不该让机器人读配置失败。
+         */
+        public static ImageSendMode stored(String value) {
+            if (value == null) return AUTO;
+            return switch (value.strip().toLowerCase(java.util.Locale.ROOT)) {
+                case "record", "forward" -> RECORD;
+                case "single", "plain" -> SINGLE;
+                default -> AUTO;
+            };
+        }
+        /** 用户输入的参数（含中文别名）；认不出来返回 null，由调用方给出用法。 */
+        public static ImageSendMode parse(String value) {
+            if (value == null) return null;
+            return switch (value.strip().toLowerCase(java.util.Locale.ROOT)) {
+                case "record", "forward", "聊天记录", "合并转发", "转发" -> RECORD;
+                case "single", "plain", "普通", "普通发送", "单张", "逐张" -> SINGLE;
+                case "auto", "自动", "默认" -> AUTO;
+                default -> null;
+            };
+        }
+    }
+    /** 一个会话的出图发送形式；没有设置过（含老配置）就是 auto。 */
+    public synchronized ImageSendMode imageSendMode(String conversation) {
+        JsonElement modes = Json.obj(data, "image_send").get("modes");
+        if (modes == null || !modes.isJsonObject()) return ImageSendMode.AUTO;
+        JsonElement value = modes.getAsJsonObject().get(conversation);
+        if (value == null || !value.isJsonPrimitive() || !value.getAsJsonPrimitive().isString()) return ImageSendMode.AUTO;
+        return ImageSendMode.stored(value.getAsString());
+    }
+    /** 保存一个会话的出图发送形式；auto 就是删掉这条设置（回到默认）。返回保存后的值。 */
+    public synchronized ImageSendMode setImageSendMode(String conversation, ImageSendMode mode) throws IOException {
+        if (mode == null) throw new IllegalArgumentException("发送形式不能为空。");
+        JsonObject next = freshSnapshot(), section = Json.obj(next, "image_send"), modes = Json.obj(section, "modes");
+        // 逐键写回：别的会话（以及别的代理写进同一段的键）都不会被这次保存抹掉。
+        java.util.TreeMap<String, String> stored = new java.util.TreeMap<>();
+        for (String key : modes.keySet()) {
+            JsonElement value = modes.get(key);
+            if (value != null && value.isJsonPrimitive() && value.getAsJsonPrimitive().isString()
+                    && ImageSendMode.stored(value.getAsString()) != ImageSendMode.AUTO) stored.put(key, value.getAsString());
+        }
+        if (mode == ImageSendMode.AUTO) stored.remove(conversation);
+        else stored.put(conversation, mode.key());
+        JsonObject updated = new JsonObject();
+        for (java.util.Map.Entry<String, String> entry : stored.entrySet()) updated.addProperty(entry.getKey(), entry.getValue());
+        section.add("modes", updated); next.add("image_send", section);
+        Json.atomicWrite(root.resolve("config.json"), next); data = next;
+        return mode;
+    }
+    /**
      * How long a numbered list stays usable for "#编号". This is separate from the chat topic window on
      * purpose: planning a multi-step request takes seconds, and a list the user just asked for must not
      * expire while the plan is still being built.

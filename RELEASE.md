@@ -1,11 +1,278 @@
-# Pixiko v1.5.3 发行说明
+# Pixiko v1.6.0 发行说明
 
-- **版本**：v1.5.3
+- **版本**：v1.6.0
 - **日期**：2026-10-04
 - **作者**：loriko（deloriko@outlook.com）
 - **当前实现**：Java 版（`src/`）。另有一次**未完成的** Next.js 重构，见 `nextjs-wip/`，**不可运行**。
 
 ---
+
+## 〇、本版新增（v1.6.0）
+
+**三件新功能 + 两个修复 + 构建工具**（按项目规则走**中间位进位**）：**`.style load` 真的切 Forge 预设与
+尺寸**、**LoRA 下载可暂停 / 取消**、**手机端也能从 Civitai 搜 LoRA**；**`.infix` 的祈使句能稳定解析**、
+**图片不再被异常压缩**；**APK 每次构建自动烧入本机局域网地址**。Android 客户端随之**重出包**
+（**1.6.0 / versionCode 160**）；另外把 **v1.0.7–v1.5.3 一直缺的 GitHub Release 补齐**了。
+
+- **1）样式载入时 Forge 预设与尺寸终于真的同步**（用户原话「**解决加载 style 但是 preset（主要是尺寸）
+  不同步加载的问题**」）：
+  - **两个根因**：`SdClient.applyModelParams` **从来不读**样式里记着的 `forge_preset`
+    （样式 JSON 里明明有 `"forge_preset":"xl"` / `"anima"`）→ **预设不切、栈不对**
+    （写别的栈的检查点还会出全灰废图），尺寸自然也不对；样式记的尺寸来自**展示图**
+    （Civitai 预览图 2400×3744 / 3744×2400 / 1808×2336），而 `validateSize` 只收
+    **64–2048 且 8 的倍数** → `setSize` 抛异常被 `catch` 吞掉 → 尺寸**静默保留旧值**。
+  - **改法**：载入顺序固定为 **① 切 Forge 预设（复用 `.model preset` 那条路）→ ② 底模 →
+    ③ 采样方法 / 调度器 + 蒸馏 CFG / 步数 / CFG → ④ 尺寸**；尺寸超限或不是 8 的倍数时
+    **按同比例缩放**（长边压到 **≤1536**、两边取整到 8 的倍数，普通比例偏差 **≤1%**），
+    回执里**如实写**「尺寸 1808×2336 → 同比例缩到 1192×1536」；**合法值一律原样**。
+    保存侧改成 `width` / `height` 记**能直接用于生成的尺寸**，展示图真实像素挪到新字段
+    `previewWidth` / `previewHeight`（`sizeSource` 保留；**老样式不迁移**、载入时现算）。
+    `/api/styles` 的 `steps` 从 `32.0` 修成 `32`。
+  - **实测（线上）**：载入 #22 → 回执「尺寸 1808×2336 → 同比例缩到 1192×1536」，且 `/api/status`
+    立刻变 **1192×1536**；载入 #1 → 「预设 **xl → anima**（采样方法 ER SDE、调度器 Beta、
+    蒸馏 CFG 3、步数 32、CFG 4、底模 animaCatTower_v11.safetensors）」，线上真的切到 anima、
+    **1024×1024**、该检查点。缩放表：2400×3744 → **984×1536**、3744×2400 → **1536×984**、
+    1808×2336 → **1192×1536**、4096×2048 → **1536×768**、1000×700 → **1000×704**、
+    16×8 → **128×64**；1024×1024 / 768×512 / 1664×1216 **原样**；
+    **极端比例 100000×100 → 2048×64**（比例保不住，已在本文档与测试里写明）。
+  - **测试**：新增 **`StylePresetSyncTest`（124 条断言）**；`StyleCoverTest` 98、`StyleCategoryTest` 84、
+    `StyleSaveTest` 286、`WebUiTest` 446 **前后一致**。
+- **2）LoRA 下载可以暂停 / 取消**（用户原话「**加入 lora 下载可取消，暂停的功能**」）：
+  - 新类 **`cn.szu.bot.civitai.DownloadControl`**（`cancel` / `pause` / `resume` / `isPaused` /
+    `awaitResume` / `attach` / `checkCancelled`；用 `wait` / `notify` 阻塞**不忙等**；
+    `cancel()` 顺手关掉在跑的流，卡在 `read` 的线程立刻退出）。
+  - `CivitaiClient` 的流式复制循环**每 64 KB 查一次**；取消走专用 `CancelledException`
+    （**不会被包装成"下载失败"**）、**绝不续传**、**删掉半截 `.part` 文件**、
+    **暂停时长不计入下载总超时**（看门狗顺延）。
+  - 接口：`POST /api/lora/cancel` / `pause` / `resume`（**幂等**；200 + 同一份 progress JSON +
+    `message` + `cancelled`）；`POST /api/lora/progress` **追加** `active` / `cancellable` / `paused`，
+    老字段 `busy` / `downloading` / `stage` / `metered` / `done` / `total` / `percent` / `speed` /
+    `etaSeconds` **一个不动**；QQ 侧同款 **`.lora cancel` / `.lora pause` / `.lora resume`**。
+  - **实测**：`LoraDownloadControlTest` **142 条断言**（含「取消后目录里 0 个 `.part`」、
+    「暂停后 1 秒 `done` 不变」、「暂停中能取消」、「无任务幂等」、「并发仍被拒 + 老字段仍在」）；
+    线上三个接口都 **HTTP 200** 且给人话（「当前没有 LoRA 下载在跑，无需取消。」）；
+    **加载阶段**取消会如实回 `cancelled=false` + 「这个阶段无法取消（文件保留，不是半截）」。
+- **3）手机端 LoRA 也能从 Civitai 搜索**（用户原话「**手机端 lora 功能也要能够从 civitai 上搜索**」）
+  **+ 两端都能暂停 / 取消**：
+  - `webui/m/screen-loras.js`：顶部「**本地 / Civitai**」分段（默认本地；切换**只切显示、不重画不丢
+    状态、hash 不变**）；搜索 `{query,page,scope}`；封面走 `/api/civitai/thumb` 且图床 URL 带
+    `width=320`；**滚到底自动加载下一页** + 「加载更多」；结果卡 → **底部 sheet**（触发词可一键复制 /
+    底模·类型 / 大小·分级 / 下载 / 打开模型页）；下载后进度条 + **暂停·继续 / 取消**
+    （取消**先二次确认**，说明"已下载的部分会被删掉"）；没配 Cookie 会提示"成人内容与部分模型不可见"
+    并指路桌面控制台（**手机端不做 Cookie 输入**）；服务端新字段缺失或 404 → 按钮置灰 + 一句人话，
+    **不白屏**。
+  - 桌面控制台 `webui/app.js`：在已有下载进度卡上补「**暂停 / 继续**」「**取消**」（走 `askConfirm`，
+    不是浏览器原生 `confirm`），**老字段渲染一字未改**。
+  - **实测**：手机端探针 **50/50 契约、0 失败**（暂停后跨两次轮询 **70% → 70%** 不前进，
+    运行中 **2.4 秒前进 25 个百分点**；取消先弹确认且此刻 **0 请求** → 确认后**恰好 1 次**
+    `POST /api/lora/cancel`；无横向溢出；触摸目标全 **≥44px**；**到达上游的写请求 = 0**）；
+    控制台探针 **25/25**。
+- **4）`.infix` 的祈使句能稳定解析了**（用户原话「**部分 infix 需求无法被识别为指令，如"改为XXXX"
+  有时无法被解析到有效指令**」）：
+  - **背景**：日志里「这次没有执行任何操作：模型没有给出可执行的指令」**共出现 65 次**，是高频问题。
+  - **改法**：新增纯函数 **`InfixIntent`**——识别 `改为 / 改成 / 换成 / 替换为 X`、
+    `正向 / 反向改为 X`、`把 X 改成 Y`、`加上 / 加入 / 添加 X`、`删掉 / 去掉 / 移除 X`、
+    `反向删掉 X` 等句式（容忍全半角 / 空格 / 顿号逗号 / 和与跟 / 换行，剥掉句尾"这几项 / 谢谢 / 吧"）。
+    **内容是英文词条就确定性直接落地（不花模型额度）**；**含中文描述一律转交模型翻译**
+    （项目硬规矩：提示词里不许出现中文，有测试钉住）；只有动词没内容、多步 / 条件 / 问句 /
+    纯画面描述、词条 **>8** 或整条 **>200 字** → 交回模型。模型没产出可执行指令时：
+    先用**确定性解析兜底**，中文描述型**再严格重试一次**，仍失败就回一句**说清哪一步没懂**的话
+    （并给形式示例）。
+  - **实测**：`InfixIntentTest` **91 条断言**；线上 `.infix 加入 fishnet pantyhose` → **14 ms、
+    0 次模型调用**，回执「已按祈使句直接修改（没有使用模型，也没有花 DeepSeek 额度）：
+    正向：新增 fishnet pantyhose … 识别为：向正向提示词追加」；线上 `.infix 加入渔网袜` →
+    交给模型翻成 `fishnet stockings` 再落地，提示词里 **0 个汉字**。
+- **5）图片不再被异常压缩**（用户原话「**出图的"最近生成"以及回执的图片在预览界面被异常压缩，解决**」）：
+  - **两个根因**：控制台这边，v1.5.2 给 `<img>` 加的 `width="1664" height="1216"` **属性**占位，
+    在「最近生成」这种**列宽被 CSS 定死、又没有 CSS 高度**的格子里被浏览器当成**实际像素高度**
+    （`height=1216`）→ 盒子变成 **141×1216 的竖条**，再被 `object-fit: cover` 裁掉一大半；
+    手机端这边，格子被钉成 **1:1 方块** + `object-fit: contain` → 非方图缩成方块里的一小条、
+    四周一大片空白。
+  - **改法**：占位比例改由 **CSS `aspect-ratio`** 承担（加载前 `4 / 3`，图片 `load` 后用
+    `naturalWidth` / `naturalHeight` 换成真实比例，缓存命中立即换）；图集与「最近生成」
+    **去掉 `object-fit: cover`**，`<img>` 改成 `width:100%; height:auto`、行高由图片撑开；
+    手机端删掉 `.mx-contain` hack、改用**真实比例宿主**；缩略图 `&w=` **保留**，
+    **查看器与 `<a href>` 继续拿不带 `w=` 的原图**。
+  - **实测**：控制台「最近生成」变形 **6/60 → 0/60**、渲染盒 **141×1216 → 141×193 /
+    141×206（各按原图比例）**、`object-fit: cover` **60 → 0**、查看器仍为原图（不带 `w=`、
+    偏差 0.1%）；手机端出图屏变形 **18/24 → 0/24**、回执图集 **1/1 → 0/1（+36.8% → 0%）**、
+    气泡横竖图 **全 0%**；断言：控制台 **7/7** + 图集注入 **8/8**、手机端 **13/13** + 气泡 **6/6**；
+    回归 `probe-m3` **58/60**（仅剩既有 A4 / A5：提示词屏每块只渲染 40 个 chip 而用户有 96 条，
+    **与本版无关**）、`probe-m5` **58/0 PASS**。
+- **6）APK 每次构建自动烧入本机局域网地址**（用户原话「**apk 每次编译时自动将本机局域网 ip 作为服务器
+  链接（作为测试）**」）：
+  - `android/build-apk.ps1` 新增「探测本机局域网地址」：端口取 `config.json` 的 `webui.port`
+    （显式 UTF-8 读）；候选网卡排除 `127/8`、`169.254/16`、`198.18/15`（代理 fake-IP）等网段，
+    以及 virtualbox / vmware / hyper-v / wsl / docker / tap / tun / wireguard / openvpn / tailscale /
+    clash / mihomo / VPN / 虚拟 / 隧道 等虚拟网卡；打分「**能 HTTP 应答 `/healthz`** ＞ 有默认路由
+    ＞ RFC1918 私网」。
+  - **可达性必须真发 `GET /healthz` 判定**：一开始用"TCP 连得上"，被本机 TUN 代理解析任意远端 IP
+    的**假握手**骗过（`10.1.2.3:9999` 也报连得上），已修。
+  - 新参数 **`-DefaultHost '<ip:port>'`**、**`-NoDefaultHost`**、**`-ConfigPath`**；探测失败
+    **不会让构建失败**（只警告）。
+  - `BuildConfig.PIXIKO_DEFAULT_HOST`（没传属性＝**空串**；**源码里不写死任何 IP**）；
+    App **首次运行且没有已保存服务器**时把地址**预填**到输入框（**不自动连接、不绕过令牌、
+    已有保存值绝不覆盖**），旁边一行小字说明"这是构建时烧进去的测试地址"。
+  - **实测**：本机探测到 **172.30.204.50:8787**（网卡「以太网 4」Intel I226-V；跳过了几张
+    `169.254.x` 废网卡、TAP-Windows、以及 `8.8.8.8` 默认路由实际走的 TAG Wintun `198.18.0.1`）；
+    `BuildConfig.java` 真带该值、APK 的 `classes3.dex` 里能搜到（offset 61530）；
+    **`-NoDefaultHost` 包 0 命中**（对照组 `cn.szu.bot.app` 命中，证明搜法有效）。
+    **发布附件用的是 `-NoDefaultHost` 包（不含任何本机私网地址）**；带地址的那个包留在
+    `F:\Bot\android\dist\` 供本机测试（`pixiko-1.6.0-debug.apk`）。
+- **7）发布历史：补发 v1.0.7–v1.5.3**：这 **18 个版本**此前**只有 tag、没有 GitHub Release**，
+  本次一并补齐（每个版本 **2 个 zip**（源码包 + 开箱即用包）+ **2 个 `.sha256`**，
+  **v1.4.0 起附 Android 客户端 APK**），**共 25 个 Release 在库**。
+  - **打包踩过的坑（如实写）**：用 Windows 自带的 `tar.exe` 去解 `git archive` 出来的包，
+    会把中文名按 **CP936** 解成乱码（例如 `maps/liv/放丽湖地图到这里.txt`）——必须用
+    **`git archive --format=zip` + `ZipFile::ExtractToDirectory`**；开箱包的条目名要统一成**正斜杠 `/`**，
+    否则 macOS 的归档工具解不出来。
+- **8）一次真实事故：切预设残留额外模块 → 全灰图**（本版最值得记的一条，如实写）：
+  - **现象**：用户「**全都生成灰图**」。实测那 4 张是**纯灰**——像素**标准差 `0.00`**、
+    **只有 1 种颜色**、只有 **11 KB**（正常图的标准差是 **10–70**）。
+  - **根因**：切 Forge 预设（`xl` → `anima` → 回到 `xl`）时，**该预设的 `forge_additional_modules`
+    没有被一起切换**：SD 里的检查点已经是 SDXL 的 `waiIllustriousSDXL_v170`，却还挂着 anima（Qwen）的
+    `qwen_image_vae.safetensors` + `qwen_3_06b_base.safetensors` → **VAE / 文本编码器与检查点不同族**
+    → **纯灰**。
+  - **修法**：`setForgePreset` 现在**一次请求里同时写 `forge_preset` 与 `forge_additional_modules`**
+    （**空数组也写＝清残留**），并**回读校验**；写失败按 `preset+modules` → `preset` → `checkpoint` →
+    单独补 `modules` 的顺序重试（适配这台"不认 `forge_preset`"的构建）。
+  - **同一事故暴露的机器侧隐患**（这是**本机 Forge 配置**的问题，不是代码缺陷，如实写）：
+    `config.json` 里 **`forge_additional_modules_sd` 也是那对 qwen 模块**，而 `forge_checkpoint_sd`
+    为空 → **`sd` 预设本身被污染**；现在切过去会**报出来**（`conflict=block` + `applied` 里的 ⚠ 行），
+    **不再静默出灰图**。
+- **9）VAE 可选 + 冲突检测（防呆）**（用户原话「**加入 vae 的可选选项，并检测 vae 是否与当前模型冲突**」
+  「**意思是能防呆自动检测**」）：
+  - **指令 `.vae`**：`status`（当前 VAE / 是否 Automatic / 冲突判定 / 可用列表）、`list`、
+    `set <名字>`、`auto`、`none`、`check`（只查不改，列出修复动作）、`fix`（执行修复）；
+    **权限与 `.sampler` / `.size` 一致**。
+  - **四个网页接口**：`POST /api/sd/vae`（快照）、`/api/sd/vae/list`、`/api/sd/vae/set`、`/api/sd/vae/fix`。
+  - **两个界面**：控制台「生成参数」卡里多一行 **VAE 选择 + 冲突横幅**（OK 不显示 / WARN 黄条 /
+    **BLOCK 红条 + 一键修复**，修前二次确认）；手机端同样有（系统 / 更多屏 + 出图屏顶部的红 / 黄条）。
+  - **判定表**（族：SD1.5 / SDXL（含 Illustrious、NoobAI、Pony）/ Flux / Qwen-Anima / SD3 / …）：
+    **事故组合 → BLOCK**；**同族或 `Automatic` → OK**；**认不出的名字 → WARN 且不自动删**
+    （不确定就不许动）。
+  - **出图前防呆**：`BLOCK` 且 VAE 是 `Automatic`（残留模块造成）→ **自动修复并继续**，回执明说
+    「检测到 VAE/额外模块与当前模型冲突，已自动修复」；`BLOCK` 且用户**显式**指定了冲突 VAE →
+    **拒绝这次生成**（**一次 SD 请求都不发**）并给出改法；`WARN` → 只提醒。
+  - **出图后的灰图自检（独立的第二道防线）**：每张新图判"纯色废图"（**标准差 ≤ 0.5 且 颜色数 ≤ 4**
+    双条件；正常素图实测 **标准差 49.79 / 2561 色 → 不误判**）→ 自动修复 + **只重试一次** →
+    成功则回执说明，仍失败则如实报失败并给 `.vae check` 建议；**废图从待领取列表移除**
+    （文件仍保留在 `data/generated`）。
+  - **实测（线上真机）**：把 VAE 设成 SD1.5 的 `animevae.pt` → 快照 `conflict=block`、
+    `culprits=[animevae.pt]`；此时 `.gen` **被拒绝**（任务回执「图片生成成功 0 次」+ 拒绝原因）；
+    `/api/sd/vae/fix` → 「已把 VAE 设回 Automatic」→ 真实状态回到
+    `vae=Automatic, modules=[], checkpoint=waiIllustriousSDXL_v170, preset=xl`，再真出图**正常**
+    （标准差 **12.41**、**626 色**、2.66 MB）。
+  - **可用 VAE 列表来源**：`GET /sdapi/v1/sd-modules`（`/sdapi/v1/sd-vae` 在这台是 **404**）；
+    线上实测列表 `[Automatic, None, qwen_image_vae.safetensors, animevae.pt,
+    vae-ft-mse-840000-ema-pruned.safetensors]`。
+  - **测试**：`VaeGuardTest` **317 条**、`VaeCommandTest` **194 条**、`VaeWebApiTest` **34 条**，全 exit 0。
+- **10）`.imgmode`：图片以"聊天记录 / 合并转发"还是单张发出**：指令名与别名
+  （`record` / `forward` / `聊天记录` / `合并转发` / `转发`、`single` / `plain` / `普通` / `单张` / `逐张`、
+  `auto` / `自动` / `默认`）；按会话存进 `config.json → image_send.modes.<会话键>`；
+  **`auto` 的行为一字未改**；测试 **`ImageSendModeTest` 171 条**。
+- **11）QQ 端 LoRA 搜索合并成一条聊天记录**：`.lora query` 的全部结果现在**一次 `sendRecord`**
+  （每个结果一个节点，含**编号 / 完整模型名 / 底模 / 下载量 / 触发词 / 大小 / 页面地址**，有封面就带图）；
+  **传输层不支持合并转发 → 逐条发送并如实说明**；**合并失败 → 回退逐条、一条不丢**；
+  **编号与 `.lora download #N` 的契约不变**。测试 **`LoraSearchRecordTest` 57 条**。
+- **12）"新出的图"幽灵占位（手机端 + 控制台都已修）**：根因是**每轮轮询整块重建**导致 `<img>`
+  反复销毁重建，加上刚出图那 **1–3 秒**缩略图还没到；改成**按图片路径增量同步**（复用 `<img>`）、
+  新格子**按已知生成尺寸预设比例**、`—` 空盒子**彻底删除**。
+  - **手机端（已核实）**：确定性竞态下空占位 **1 段 → 0**、新图 `<img>` 引用 **8 → 1**、
+    每拍重建 **59 条增删 → 2 条**；真实出图**幽灵 0 帧**、被重建格子 **0**（改前 **25**）。
+  - **控制台「最近生成」`#image-grid`**：`<img>` 引用 **60/60 全部复用**（改前 60 个节点全被替换）、
+    两轮之间**新图片请求「整批」→ 0**、`src` 重新赋值 **60 → 0**、MutationObserver
+    **added / removed 60 / 60 → 0 / 0**、插入时**既无 `src` 又无比例**的节点 **0**；
+    新格子**第一帧比例 `0.7308` = 生成比例 = 原图比例**；缩略图 `&w=520` 保留，
+    **`<a href>` 与查看器仍取不带 `w=` 的原图**（`hasW=false`、distort 0.1%）。
+- **13）四条收尾修复（全部已实测通过）**：
+  - **安卓端上滑误触发下拉刷新 → 已修**：根因是判据只看 `#m-main.scrollTop`，而回执 / 样式屏真正滚动的
+    是**内层列表**；另外被拒时**不重置** `armed`，上一次的武装状态会带到下一次手势。改法：三处
+    （外壳 / 回执屏 / 样式屏）统一成 **`PixikoM.ptrInstall(host, hooks)`**——认**手指起点所属的最近可滚动
+    祖先**（找不到才退回 `#m-main`）；起手 `scrollTop !== 0` **不武装**；手势期间该容器**滚过一次就永久
+    作废**（惯性 / 回弹也挡住）；**先向上超过 12px 一律作废**；**下拖 >56px 松手才刷**。
+    实测（真触摸，390×844，三个屏各一遍）：改前「列表中部下拖」chat / quest / styles **各 1 次**误刷、
+    「顶部下拖」quest / styles **各 2 次**（重复刷）、「中部零位移点一下」quest **2 次 + 1 次
+    `/api/quests/read`**、「`#m-main` 差 1px」quest **1 次** → **改后全部 0**，只有「顶部下拖」恰好
+    **1 次**；「松手刷新」提示条仍正常出现。**21 条断言 / 0 失败 / exit 0**。
+  - **回执屏把先前任务的图并进图集 → 已修**：根因 `pullLiveImages()` 拿的是**全站最近 6 张**
+    （`/api/images`），只按"这条回执还没有它"去重、**没有归属判断**。改法是 `belongsToRun()` 两条取或——
+    ① 图所在目录 == 这条回执**自己**的图片目录（来自 `/api/quest` 的 `messages/images`）；
+    ② 图的服务端 `modified` 时间 ≥ 本次开始时刻（`现在 − ageMillis`，每轮恒定）；**只在 running 时拉**；
+    都不成立就不并（宁可少并，下一轮从回执正文补回来）。实测：伪造「3 张先前任务（task-OLD，
+    2026-01-01）+ 2 张本次」→ **改前 3 张先前图真的进了图集**；**改后 先前 0 张、本次 2 张正常进**，
+    换新 task 目录那张也照样进。**5 条断言 / 0 失败**。
+  - **安卓端查看器「向右跳一张 / 向左按钮缺失」→ 已修**：两个真根因——① 翻页按钮的 click **和** stage 的
+    「点左右半屏翻页」**同时**执行 → 一次点按 **+2**（且 `pointerUp` 没校验 pointer 是否登记）；
+    ② `img` 上的 `will-change: transform` 让它自成层叠上下文，而 `.prev` 在 DOM 里排在 `img` **前面**、
+    `z-index:auto` → **图片把左按钮整个盖住**（实测 `prev.topmost="IMG"`，截图里 5/5 时左侧真的没有箭头）。
+    改法：两个按钮挪到 `<img>` **后面** + 显式 **`z-index:2`**；忽略未登记的 pointer；落点在 `.viewer-nav`
+    上不做半屏翻页。实测：`prev.topmost` → **`button`**；阶梯 `2/5→3/5→4/5→5/5→5/5`、
+    `4/5→3/5→2/5→1/5→1/5`，**每次手势 render 数 = 1**；鼠标 / 键盘 / 点右侧空白各 +1；
+    首张左键置灰（**不再缺块**）、末张反之；三个入口（回执图集 / 这一轮的图 / 最近的作品）点第 2 张
+    都 = 2/5。**26 条断言 / 0 失败**。
+  - **回执列表底部对齐「执行结果」底部 → 已修**：「回执列表」= `#panel-quest` 里的 `.quest-list-card`
+    （内含 `#quest-list`，`aria-label` 字面「回执列表」）；「执行结果」= 它的兄弟卡（卡头字面「执行结果」，
+    内容 `#quest-body`）——两者是同一个 grid 的两个项。根因：`.quest-split` 是 `align-items: start`
+    （两栏各缩到内容高：左列表 50 行、右结果很矮）。改法：`align-items: stretch` +
+    `grid-template-rows: minmax(0,1fr)` + 共用高度上限 `--quest-pane-h: min(76vh,760px)` +
+    grid 项 `min-height: 0` + `.quest-body` 内部滚动。实测底边差：1440×900 **508.55px → 0px**、
+    1280×800 **442.55px → 0px**；内容盒（`#quest-list` vs `#quest-body`）同样 **0px**；
+    空列表（两栏一起退到内容高，有 260px 地板）**0px**；`/logs` 全屏该页没有回执列表（断言了它该有的规则）。
+    **新增 38 条断言 / 0 失败**。
+- **14）三条收尾修复（已实测通过）**：
+  - **回执列表实时刷新（增量）**：根因 `renderList()` 每次 `clear(rows)` **整块重画**；轮询门是
+    「过期 15s 或有 busy 行」、间隔 **5s**。改法：列表轮询改成 **3 秒**；按 `data-number`
+    **复用行节点**（只建骨架 + 绑一次点击，只 append 新行、只摘消失的行）；有 busy 行时顺带读一次
+    `/api/progress` 拿实时百分比；**浮层开着 / 不在这一屏 / 上一轮未回** 三层让路（暂停轮询）。
+    实测（20 行列表停在 `scrollTop=220`，观察 12 秒）：改前 **125 条行节点增删事件**、
+    `sameRefs=false`、3 次请求（5s 间隔）、busy 行只写「进行中…」；改后 **1 条事件**、
+    `sameRefs=true`、**5 次请求（3 秒间隔）**、未读→已读**在原行更新**、busy 行显示「生成中 80%」、
+    **滚动位置从不往回跳**。**9 条断言 / 0 失败**。
+  - **正在生成的图集缓存**：改法是**会话级** `PixikoM.imageCache`
+    （`path → {url, nodes[], loaded, failed, width, height}`）——优先复用**当前没挂在文档里的旧
+    `<img>` 节点**（搬节点既不请求也不重新解码），`load` / `error` 结果写进缓存，真实比例与失败终态
+    都从缓存取；出图屏、回执详情、对话气泡**共用同一套**。实测：`IMG1` / `IMG2` **各请求 1 次**；
+    第三轮（数据不变）对已加载图 **0 新请求**；图集仍 2 格（**没为缓存漏图**）；重挂 / 刷新时
+    **被重新创建的格子 0 个**。**11 条断言 / 0 失败**。
+  - **「错误载入加载中的图集行为」——两种都复现了**：
+    - ① **假加载态**：每个新格子都挂 `loading`，但 `index>=4` 的图是 `loading=lazy`
+      （要滚进视口才发请求）→ 那些格子**永远挂着「加载中…」+ 骨架**。真机出图观察 100 秒：
+      **58 帧有格子处于加载态**。
+    - ② **非静默刷新把已画好的内容打回骨架**：`loadDetail(number,false)` 会清空 payload → 出骨架，
+      即使图集早就画好了。
+    - 改法：只有「**现在真会去取**」的格子（`index<4` 且未命中缓存）才挂加载态；缓存命中 / 已加载的
+      格子不再出现加载态；同一条回执的再次读取不再清空 payload。
+    - 实测（改后）：整段观察 **`IMG1` 处于加载态 0 帧**（改前 58 帧）、刷新 / 重挂**骨架帧 0**、
+      `naturalWidth` 始终 >0、图 1 **请求数 1**；取不到的图**只请求 1 次**、「图取不到」占位稳定
+      （**不再重试刷屏**）。
+- **15）仍在修的两条（用户随后追加，数字待补）**：
+  - **回执 / 执行结果两栏底部延长到与「对话」栏底部齐平**（把上一轮的
+    `--quest-pane-h: min(76vh,760px)` 上限放宽成**跟对话栏同高**）；
+  - **单图片生成缺 placeholder 与任务进度条**（疑似上一轮"只画真的存在的图"把 `total=1` 的
+    环形占位 / 进度条吃掉了）。
+  - **以上两条仍在修，实测数字待补**。
+- **验证与全局事实**：
+  - **本版全量门 75 个套件全部 exit 0**（**76 行 / 75 个套件全绿**；新增 `VaeGuardTest` **317**、
+    `VaeCommandTest` 194、`VaeWebApiTest` 34、`ImageSendModeTest` 171、`LoraSearchRecordTest` 57）。
+  - **新增探针（计入本节断言汇总）**：`list-probe` **9 / 0**、`gallery-cache-probe` **11 / 0**；
+    第 14 条里那支加载态探针是**按帧**观测（**58 帧 → 0 帧**）。
+  - 线上机器人**已用新 jar 重启**（脱离作业启动方式）。实测：`/api/lora/progress` 有
+    `active` / `cancellable` / `paused`；三个新接口 200；样式载入真的切预设与尺寸；
+    infix 确定性路径 **0 次模型调用**。用户自己改的生成参数（`Euler a` / 24 步 / CFG 4.5 /
+    1216×1664）**原样未动**（载入样式测试后用备份逐字段还原，`sd-settings.json` 只有
+    `updated_at` 不同）。
+  - **仍然没有真机 / 模拟器验证**（headless Chrome + CDP / 桌面 Chrome 154），如实写。
+- **已知遗留（如实写）**：手机端**同一行横竖混排**时行高取该行最高那张，短图下方会有一点空
+  （纯 CSS grid 行为，**未上 masonry**）；旧的 **`.webp` 缩略图仍退回原图**（JDK 无解码器）；
+  样式里 **`2048×2048` 这种"合法"尺寸**按"合法即原样"**未压缩**（要统一压到 ≤1536 是一行策略改动）。
+
+**前端**：本版改了 `webui/app.js` / `webui/app.css`（桌面控制台）与 `webui/m/`（手机端）；
+**本版未升 `?v=`**——`webui/index.html` 仍是 **`?v=1.5.2`**，因为 `/app.js` / `/app.css` 由服务端按
+**`no-store`** 发出，**与缓存无关**（升不升都不影响取到新文件）。
+
+<details>
+<summary>上一版（v1.5.3）</summary>
 
 ## 〇、本版新增（v1.5.3）
 
@@ -38,6 +305,8 @@
 
 **前端**：本版只改了手机端 `webui/m/app.css`，桌面控制台 `webui/index.html` 的 `?v=` **仍是 `?v=1.5.2`**
 （手机端 `/m` 的资源是 `no-store`、不带版本参数，所以这版没有 `?v=` 可升）。
+
+</details>
 
 <details>
 <summary>上一版（v1.5.2）</summary>
@@ -1192,7 +1461,7 @@ Danbooru 词条（↑↓ 选择、Esc 关闭；空词条上按 **Ctrl+Space** �
 
 ## 三、安装与启动（三步）
 
-### 开箱即用包 `pixiko-v1.5.3-runnable.zip`
+### 开箱即用包 `pixiko-v1.6.0-runnable.zip`
 
 1. 装好 **JDK 17+**。
 2. **双击 `start.bat`**。第一次运行会自动生成 `config.json`（照 `config.example.json` 起一份），
@@ -1202,7 +1471,7 @@ Danbooru 词条（↑↓ 选择、Esc 关闭；空词条上按 **Ctrl+Space** �
 
 > `start.bat` 跑的是包内已编译好的 `build/pixiko.jar`；只有需要改代码时才用 `build.ps1` + `run.bat`。
 
-### 源码包 `pixiko-v1.5.3.zip`
+### 源码包 `pixiko-v1.6.0.zip`
 
 1. 装好 **JDK 17+**。
 2. 在项目根目录准备好依赖 jar：`lib/gson-2.13.1.jar` 由 `build.ps1` **自动下载并校验**，
@@ -1215,7 +1484,7 @@ copy config.example.json config.json
 .\run.bat
 ```
 
-### Android 客户端 `pixiko-android-1.5.0-debug.apk`（v1.4.0 起）
+### Android 客户端 `pixiko-1.6.0-debug.apk`（v1.4.0 起）
 
 1. **不用装 JDK、也不用装 Android Studio**——直接把这个 APK 拷进手机点安装即可。
 2. 手机与电脑要在**同一个 Wi-Fi**，app 里填「电脑的局域网 IP:8787」+「访问令牌」
@@ -1225,8 +1494,9 @@ copy config.example.json config.json
    （完整控制台进去就是**完整的网页控制台**，13 栏全在）；**长按图片**可以存进相册 `Pictures/Pixiko`。
 4. 不想先装 APK？直接在电脑浏览器打开 `http://<电脑地址>:8787/android` 看**网页预览**（v1.4.1 起）。
 
-> 这是**用 Android SDK 现构建出来的 debug 签名包**（`cn.szu.bot.app` / **1.5.0**，`compileSdk 34`、`minSdk 26`，
-> **v1.5.1 / v1.5.2 / v1.5.3 都没有重新出包**，客户端仍是 **1.5.0**——这三版改的网页不在 APK 里），
+> 这是**用 Android SDK 现构建出来的 debug 签名包**（`cn.szu.bot.app` / **1.6.0** / `versionCode 160`，
+> `compileSdk 34`、`minSdk 26`）。本版**重新出包**了；**发布附件用的是 `-NoDefaultHost` 包**
+> （不含任何本机私网地址，见「本版新增」第 6 条与 [`android/README.md`](android/README.md)），
 > **不是官方签名的正式包**；想自己构建就用 `android/build-apk.ps1`（要 **JDK 21 + Android SDK**，
 > 跑 `assembleDebug` 并把 APK 复制到 `F:\Bot\android\dist\`）。安装时 Android 会要求允许
 > 「**安装未知来源应用**」。用法、构建步骤与安全提醒见 [`android/README.md`](android/README.md)。
@@ -1274,21 +1544,31 @@ copy config.example.json config.json
    属于个人信息，已移除）。**务必在配置页或 `config.json` 里设置 `owner_user_id`**，否则所有 owner 专属指令都会被拒绝。
 6. **`test.bat` 的行为依赖工作目录。** `WebUiTest` 通过「进程工作目录下的 `webui/`」找页面资源
    （见 `WebPageController` 的回退逻辑），所以请在**项目根目录**运行 `test.bat`，
-   不要从别的目录调用。在项目根目录运行，67 个测试套件全部通过（`build.ps1 -Test`）。
+   不要从别的目录调用。在项目根目录运行：**v1.6.0 的 75 个测试套件全部通过**
+   （**76 行 / 75 个套件全绿**，`build.ps1 -Test`）。
 7. **Logback 两个 jar 内不含许可文本**（上游如此），其 EPL-1.0 / LGPL-2.1 全文需查
    `THIRD-PARTY-LICENSES.md` 里给出的官方链接；`gson` 与 `snakeyaml` 的 jar 内同样没有许可文件，
    但二者均为 Apache-2.0，文本已随包提供。
+8. **手机端图集在"横竖混排"时行高按该行最高那张算**（v1.6.0 起如实现状）：同一行里短图下方会留一点空——
+   这是纯 CSS grid 的行为，**没有上 masonry**；要完全贴合得改成瀑布流布局。
+9. **旧的 `.webp` 缩略图仍会退回原图**（v1.6.0 起如实现状）：服务端缩略图需要解码器，
+   而 `ImageThumbs` 跑在 JDK 上、**没有 WebP 解码器**，所以 `.webp` 源的 `w=` 请求会**回退原图字节**
+   （行为正确、只是不省流量）。
+10. **样式里"合法"的大尺寸不会被压缩**（v1.6.0 起如实现状）：只有超限或不是 8 的倍数的尺寸才同比例缩放，
+   像 `2048×2048` 这种本来合法的值**原样使用**（要统一压到 ≤1536 是一行策略改动，本版没做）。
 
 ---
 
 ## 六、在 GitHub Releases 里发布这个 zip
 
-1. 打开仓库 → 右侧 **Releases** → **Draft a new release**，Tag 填 `v1.5.3`（新建 tag），标题填 `Pixiko v1.5.3`。
-2. 把 `pixiko-v1.5.3.zip` 与 `pixiko-v1.5.3-runnable.zip`（以及各自的 `.sha256`），
-   外加 Android 客户端 `pixiko-android-1.5.0-debug.apk`（**debug 签名**，由 `android/build-apk.ps1` 跑
-   `assembleDebug` 产出、复制到 `F:\Bot\android\dist\`；脚本给的原名是 `pixiko-1.5.0-debug.apk`，
-   内容是同一个文件；**v1.5.1 / v1.5.2 / v1.5.3 都没有重新出包**，客户端自身版本仍是 **1.5.0**——
-   APK 只是外壳，网页（含这三版改的 `/m` 排版、图集缩略图与系统行对齐）不在里面），一共三个附件拖进附件区，
+1. 打开仓库 → 右侧 **Releases** → **Draft a new release**，Tag 填 `v1.6.0`（新建 tag），标题填 `Pixiko v1.6.0`。
+2. 把 `pixiko-v1.6.0.zip` 与 `pixiko-v1.6.0-runnable.zip`（以及各自的 `.sha256`），
+   外加 Android 客户端 `pixiko-1.6.0-debug.apk`（**debug 签名**，由 `android/build-apk.ps1` 跑
+   `assembleDebug` 产出、复制到 `F:\Bot\android\dist\`；**发布附件要用 `-NoDefaultHost` 构建的那一份**
+   ——不含任何本机私网地址；客户端自身版本 **1.6.0 / versionCode 160**），一共三个附件拖进附件区，
    正文粘贴本文件内容后点 **Publish release**。
+3. **本版还补发了历史 Release**：**v1.0.7–v1.5.3**（18 个版本）此前只有 tag、没有 Release，
+   本次一并补上（每版 2 个 zip + 2 个 `.sha256`，v1.4.0 起附 Android APK），**共 25 个 Release 在库**；
+   打包与解包的坑见「本版新增」第 7 条。
 
 > 建仓库时 License 请选 **None**（本项目保留所有权利，不使用开源许可证）。

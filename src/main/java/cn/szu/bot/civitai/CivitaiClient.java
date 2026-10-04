@@ -382,11 +382,20 @@ public final class CivitaiClient {
     }
 
     public synchronized DownloadedLora download(String url, Consumer<String> progress) throws Exception {
-        return download(url, progress, null);
+        return download(url, progress, null, null);
     }
     /** meter receives live byte counts so a caller can report MiB/total/percent/ETA. */
     public synchronized DownloadedLora download(String url, Consumer<String> progress, Progress meter) throws Exception {
-        try { return downloadVerified(url, progress, meter); }
+        return download(url, progress, meter, null);
+    }
+    /**
+     * meter 同前；{@code control} 让调用方在传输过程中暂停/取消（null = 不控制，老调用方行为不变）。
+     * 取消抛 {@link DownloadControl.CancelledException}（不是 IOException，调用方能区分开），
+     * 半截临时文件由 {@link #downloadVerified} 的 finally 删掉——取消后 LoRA 目录里不留 .part。
+     */
+    public synchronized DownloadedLora download(String url, Consumer<String> progress, Progress meter, DownloadControl control) throws Exception {
+        try { return downloadVerified(url, progress, meter, control); }
+        catch (DownloadControl.CancelledException cancelled) { throw cancelled; }
         catch (Exception e) {
             String message = e.getMessage();
             if (message == null || message.isBlank()) message = "Civitai 下载失败，请检查配置及网络后重试。";
@@ -397,7 +406,7 @@ public final class CivitaiClient {
         }
     }
 
-    private DownloadedLora downloadVerified(String url, Consumer<String> progress, Progress meter) throws Exception {
+    private DownloadedLora downloadVerified(String url, Consumer<String> progress, Progress meter, DownloadControl control) throws Exception {
         Link link = parseLink(url);
         long deadline = System.nanoTime() + timeoutNanos;
         emit(progress, "正在读取 Civitai 模型与版本信息。");
@@ -434,11 +443,14 @@ public final class CivitaiClient {
             URI download = safeUri(requiredString(file, "downloadUrl"));
             Path part = Files.createTempFile(loraDir, ".civitai-", ".part");
             try {
+                if (control != null) control.checkCancelled();
                 emit(progress, "正在下载 LoRA 文件。");
-                downloadWithResume(download, part, hash, maxBytes, progress, meter);
+                downloadWithResume(download, part, hash, maxBytes, progress, meter, control);
                 emit(progress, "下载完成，正在检查 safetensors 文件结构。");
                 validateSafetensors(part);
-                remaining(deadline);
+                remaining(pauseAdjusted(deadline, control));
+                // 取消在"传输刚好读完"这一刻到：文件虽然完整，但用户要求停，就不发布（finally 删掉临时文件）。
+                if (control != null) control.checkCancelled();
                 // Same-volume hard-link publication is atomic and fails if a
                 // concurrent process creates the destination: never overwrite.
                 try { Files.createLink(target, part); }
@@ -980,7 +992,7 @@ public final class CivitaiClient {
      * LoRA files over a flaky link would otherwise fail outright after minutes of transfer.
      */
     private void downloadWithResume(URI download, Path part, String hash, long maxBytes,
-                                    Consumer<String> progress, Progress meter) throws Exception {
+                                    Consumer<String> progress, Progress meter, DownloadControl control) throws Exception {
         long total = -1;
         for (int attempt = 1; ; attempt++) {
             long deadline = System.nanoTime() + timeoutNanos;
@@ -1003,7 +1015,7 @@ public final class CivitaiClient {
                 if (appended) hashFile(part, digest);
                 try (OutputStream output = Files.newOutputStream(part, appended
                         ? StandardOpenOption.APPEND : StandardOpenOption.TRUNCATE_EXISTING)) {
-                    transfer(response.body(), output, digest, maxBytes, deadline, progress, meter, already, total);
+                    transfer(response.body(), output, digest, maxBytes, deadline, progress, meter, already, total, control);
                 }
                 long downloaded = Files.size(part);
                 if (total >= 0 && downloaded != total) throw new IOException("LoRA 下载被截断，文件长度与服务器响应不符。");
@@ -1011,6 +1023,8 @@ public final class CivitaiClient {
                 if (meter != null) meter.update(downloaded, total);
                 return;
             } catch (IOException failure) {
+                // 取消不是"传输断了"：绝不能续传，直接抛出去让调用方回"已取消"。
+                if (control != null) control.checkCancelled();
                 String message = failure.getMessage() == null ? "" : failure.getMessage();
                 // Only a broken transfer is worth resuming: configuration, redirect, auth, size and hash
                 // problems will fail identically on a retry (and redirect loops must stay bounded).
@@ -1035,19 +1049,34 @@ public final class CivitaiClient {
     }
     private static long transfer(InputStream input, OutputStream output, MessageDigest digest, long limit,
                                  long deadline, Consumer<String> progress) throws IOException {
-        return transfer(input, output, digest, limit, deadline, progress, null, 0, -1);
+        try { return transfer(input, output, digest, limit, deadline, progress, null, 0, -1, null); }
+        catch (DownloadControl.CancelledException impossible) { throw new IOException(impossible.getMessage()); }
     }
+    /**
+     * 流式拷贝。{@code control} 非空时每读一块（64 KB）查一次暂停/取消：
+     * 取消 → {@link DownloadControl.CancelledException}；暂停 → 阻塞在 {@code awaitResume()}（stage 报"已暂停"）。
+     */
     private static long transfer(InputStream input, OutputStream output, MessageDigest digest, long limit,
-                                 long deadline, Consumer<String> progress, Progress meter, long base, long total) throws IOException {
+                                 long deadline, Consumer<String> progress, Progress meter, long base, long total,
+                                 DownloadControl control) throws IOException, DownloadControl.CancelledException {
         AtomicBoolean timedOut = new AtomicBoolean();
-        ScheduledFuture<?> alarm = DEADLINES.schedule(() -> {
-            timedOut.set(true); try { input.close(); } catch (IOException ignored) { }
-        }, remaining(deadline).toNanos(), TimeUnit.NANOSECONDS);
+        DeadlineAlarm alarm = new DeadlineAlarm(input, timedOut, deadline, control);
+        alarm.start();
         long count = 0, reportedAt = System.nanoTime();
         try {
+            if (control != null) control.attach(input);
             byte[] bytes = new byte[64 * 1024];
             for (int read; (read = input.read(bytes)) >= 0;) {
-                remaining(deadline);
+                if (control != null) {
+                    control.checkCancelled();
+                    if (control.isPaused()) {
+                        emit(progress, "已暂停 LoRA 下载（用 .lora resume / /api/lora/resume 继续，.lora cancel / /api/lora/cancel 取消）。");
+                        control.awaitResume();
+                        control.checkCancelled();
+                        emit(progress, "已继续下载 LoRA。");
+                    }
+                }
+                remaining(pauseAdjusted(deadline, control));
                 if (read == 0) continue;
                 if (read > limit - count) throw new IOException("Civitai 响应超过下载大小限制，已停止并清理临时文件。");
                 output.write(bytes, 0, read); if (digest != null) digest.update(bytes, 0, read); count += read;
@@ -1056,13 +1085,52 @@ public final class CivitaiClient {
                     emit(progress, "已下载 " + (base + count) / (1024 * 1024) + " MiB。"); reportedAt = System.nanoTime();
                 }
             }
-            remaining(deadline);
+            remaining(pauseAdjusted(deadline, control));
             return count;
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+            if (control != null) control.checkCancelled();
+            throw new IOException("Civitai 文件传输被中断，已清理临时文件；请稍后重试。");
         } catch (IOException e) {
-            if (timedOut.get() || deadline - System.nanoTime() <= 0) throw new IOException("Civitai 下载超过总时间限制，已停止并清理临时文件。");
+            // 取消（或取消时被关流）不是传输故障：先认取消，免得把"已取消"说成"网络断了"。
+            if (control != null) control.checkCancelled();
+            if (timedOut.get() || pauseAdjusted(deadline, control) - System.nanoTime() <= 0)
+                throw new IOException("Civitai 下载超过总时间限制，已停止并清理临时文件。");
             if (e.getMessage() != null && e.getMessage().startsWith("Civitai 响应超过")) throw e;
             throw new IOException("Civitai 文件传输中断，已清理临时文件；请稍后重试。");
-        } finally { alarm.cancel(false); }
+        } finally {
+            if (control != null) control.attach(null);
+            alarm.cancel();
+        }
+    }
+    /** 暂停的时间不算进下载总超时：顺延回去，长时间暂停不会被误判成"超时"。 */
+    private static long pauseAdjusted(long deadline, DownloadControl control) {
+        return control == null ? deadline : deadline + control.pausedNanos();
+    }
+    /**
+     * 总超时看门狗：到点关流，让卡住的 {@code read} 立刻失败（不然线程要等到 socket 自己超时）。
+     * 到点时若还在暂停，就按顺延后的剩余时间再看一次——暂停期间不倒数。
+     */
+    private static final class DeadlineAlarm {
+        private final InputStream input;
+        private final AtomicBoolean timedOut;
+        private final long deadline;
+        private final DownloadControl control;
+        private volatile ScheduledFuture<?> future;
+        DeadlineAlarm(InputStream input, AtomicBoolean timedOut, long deadline, DownloadControl control) {
+            this.input = input; this.timedOut = timedOut; this.deadline = deadline; this.control = control;
+        }
+        void start() { future = DEADLINES.schedule(this::tick, Math.max(0, deadline - System.nanoTime()), TimeUnit.NANOSECONDS); }
+        private void tick() {
+            long remaining = pauseAdjusted(deadline, control) - System.nanoTime();
+            if (remaining <= 0) {
+                timedOut.set(true);
+                try { input.close(); } catch (IOException ignored) { }
+                return;
+            }
+            future = DEADLINES.schedule(this::tick, Math.max(remaining, TimeUnit.MILLISECONDS.toNanos(50)), TimeUnit.NANOSECONDS);
+        }
+        void cancel() { ScheduledFuture<?> current = future; if (current != null) current.cancel(false); }
     }
 
     private void verifyExisting(Path path, String expectedHash, long deadline) throws Exception {
