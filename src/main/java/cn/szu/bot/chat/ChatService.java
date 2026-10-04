@@ -124,6 +124,27 @@ public final class ChatService implements AutoCloseable {
         return java.util.regex.Pattern.compile("\\[CQ:at,qq="+java.util.regex.Pattern.quote(self)+"(?:,[^\\]]*)?\\]").matcher(raw).find();
     }
     /**
+     * 这条消息现在会不会得到回复：私聊恒真；群聊 = 被 @/叫名字（现成的 {@link #addressed}）或该用户已经在
+     * chatContextSeconds() 的对话窗口里。只读：不写 activeUsers、不入队、不占每分钟额度、不规划。
+     */
+    public synchronized boolean addressedOrContinuing(JsonObject event, String text) {
+        return gate(sessions.get(conversationKey(event)), event, text, clock.getAsLong()).open();
+    }
+    /** 群聊回复闸门的判据：被点名（explicit）或还在对话窗口里（continuation）。 */
+    private record Gate(boolean explicit, boolean continuation) { boolean open() { return explicit || continuation; } }
+    /**
+     * accept(...) 与 {@link #addressedOrContinuing} 共用的唯一判据，避免两处逻辑各写一份走偏。
+     * 只读：不写 activeUsers、不碰 pending、不占额度。
+     */
+    private Gate gate(Session session, JsonObject event, String text, long now) {
+        boolean group="group".equals(Json.str(event,"message_type",""));
+        boolean explicit=addressed(event,text);
+        long window=TimeUnit.SECONDS.toNanos(settings.chatContextSeconds());
+        boolean continuation=group && session!=null && session.activeUsers.containsKey(user(event))
+                && now-session.activeUsers.get(user(event))<window;
+        return new Gate(explicit,continuation);
+    }
+    /**
      * Character-bigram overlap between the new message and the last few user messages. Below the threshold
      * the subject has visibly changed, so the old window no longer applies.
      */
@@ -166,10 +187,9 @@ public final class ChatService implements AutoCloseable {
             Log.info("忽略自己发出的消息（"+conversationKey(event)+"）："+Log.text(text)); return;
         }
         Session session=sessions.get(key); long now=clock.getAsLong(); String user=user(event);
-        boolean explicit=addressed(event,text);
-        long window=TimeUnit.SECONDS.toNanos(settings.chatContextSeconds());
-        boolean continuation=group && session!=null && session.activeUsers.containsKey(user)
-                && now-session.activeUsers.get(user)<window;
+        // 闸门判据由 gate(...) 统一给出，Bot 侧的 addressedOrContinuing(...) 调的是同一个方法。
+        Gate verdict=gate(session,event,text,now);
+        boolean explicit=verdict.explicit(), continuation=verdict.continuation();
         // 主动插话已彻底删除：群里既没被 @/提及、也不在对话窗口里的消息一律不回复——
         // 不规划、不入队、不占每分钟额度、也不写进历史（旁听路径整条删掉）。
         if(group && !explicit && !continuation) {

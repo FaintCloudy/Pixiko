@@ -5,7 +5,7 @@ Pixiko 是一个自用的 QQ 机器人：接 **NapCat** 收消息，接 **Stable
 领图；机器人自己把生成好的图片发回对话。
 
 - **作者**：loriko（deloriko@outlook.com）
-- **版本**：v1.2.2（发行说明见 [`RELEASE.md`](RELEASE.md)）
+- **版本**：v1.2.3（发行说明见 [`RELEASE.md`](RELEASE.md)）
 - **版本号规则**：**大改动更新中间位**（`1.1.x` → `1.2.0`），**小修小补更新最后一位**（`1.1.1` → `1.1.2`）
 - **当前实现**：**Java 版**（`src/`）——这是线上一直在跑的那一份
 - **网页控制台**：`webui/`（纯静态 HTML/CSS/JS，随机器人一起由内嵌 Spring Boot 提供）
@@ -237,6 +237,12 @@ run.bat --set-map yh "路径"       # 命令行设置地图（需先停止机器
   **要不要把你拉进 30 分钟的「对话窗口」**（`chat.context_seconds`，默认 1800 秒）。进了窗口，
   你在该会话里**不 @ 也能继续聊**；没进窗口就只回这一句，下一条不 @ 的消息不再回复。
   窗口内继续聊时，仍会按"话题是否变化"自然收尾（原行为保留）。
+- **「下载 #编号」这类引导也要过同一道闸门（v1.2.3 起）**：群里没被 @ 也没叫名字时，
+  **连"这次没有可用的搜索结果…"这种引导性回复也不会回**——以前群里随便谁说「下载 #3」
+  （消息里同时含「下载/download」和「#编号」、而机器人当前没有活的 Civitai 搜索结果）都会收到它。
+  现在这条引导**先过"会不会得到回复"的同一道闸门**：私聊照旧；群聊只在**被 @／叫名字
+  （小鸟・小鳥・ことり・kotori）**或**该用户已经在这个会话的 30 分钟对话窗口里**时才回，
+  否则**完全不回**（不回复、不规划、不消耗模型额度、不进对话历史）。
 - **删掉 7 个配置键**：`chat.wake_probability`、`chat.reply_base_probability`、`chat.reply_probability_scale`、
   `chat.chime_cooldown_seconds`、`chat.topic_gap_seconds`、`chat.base_min_interest`、`chat.chime_high_interest`
   都不再被读取——`config.example.json` 里已删除这些键，**老 `config.json` 里如果还留着会被直接忽略**
@@ -603,6 +609,12 @@ Forge／Forge Neo 把「底模 + VAE + 文本编码器」按预设分成一栈�
 | `.lora delete <名称\|#编号>` | 删除本地 LoRA（只允许 LoRA 目录下的文件；**未列在 `--help` 输出里，但代码中可用**） |
 | `.char <角色名或关键词>` | 在本机 LoRA 与 WebUI 样式里查角色候选 |
 
+**一批多图走一条合并转发，失败也不会丢图（v1.2.3 起）**：一批**多于 1 张**的图片走**一条合并转发**
+（每张一个节点），日志会明确写 `图片发送方式（<会话>）：合并转发 N 张`；单张走普通发送，日志写
+`…：单张普通发送`；地图（`.yh` / `.liv`）同理写 `地图发送方式（<会话>）：…`。
+**合并转发失败会自动回退成普通发送**（例如 NapCat 不支持 `send_group_forward_msg`、或节点格式被拒），
+并写一条 warn 日志说明原因；回退成功就照常确认已领取，**只有回退也失败才不确认并报错**——图片不会丢。
+
 ### 群互动与地图
 
 | 指令 | 作用 |
@@ -640,7 +652,7 @@ Civitai 下载记录里的 `base_model` → Forge 的 LoRA 元数据（`/sdapi/v
 ```
 pixiko\
 ├─ README.md                       本文件
-├─ RELEASE.md                      v1.2.2 发行说明（含版权声明与已知限制）
+├─ RELEASE.md                      v1.2.3 发行说明（含版权声明与已知限制）
 ├─ THIRD-PARTY-LICENSES.md         随二进制包分发的第三方组件与许可
 ├─ config.example.json             脱敏配置模板（复制成 config.json 再改）
 ├─ .gitignore                      config.json / data / logs / lib jar 等一律不入库

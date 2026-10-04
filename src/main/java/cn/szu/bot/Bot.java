@@ -1329,8 +1329,14 @@ public final class Bot implements AutoCloseable {
                 String mutedGroup = Json.str(event, "group_id", "");
                 if (!mutedGroup.isEmpty() && mute.skip(mutedGroup, "聊天回复")) return;
                 // "下载第一个" 但搜索结果已失效时如实说明，不要改派给本机 LoRA 列表。
+                // 但群里没被点名、也不在对话窗口的用户不该拿到这句回复：先过 ChatService 那道同一个闸门，
+                // 没被点名就完全不回，继续往下走 primeNumberedSelections + chat.accept（它自己会丢掉这条消息）。
                 String stale = staleDownloadGuidance(event, text);
-                if (stale != null) { reply(event, stale); return; }
+                if (stale != null) {
+                    if (chat.addressedOrContinuing(event, text)) { reply(event, stale); return; }
+                    Log.info("失效搜索引导已静音（" + describeConversation(event) + "，用户 " + Json.str(event, "user_id", "")
+                            + "）：群里未被点名且不在对话窗口，不回复");
+                }
                 primeNumberedSelections(event, text);
                 chat.accept(event, speakableNumbers(quoted.isEmpty() ? text : "[引用] " + quoted + "\n" + REQUEST_MARK + text));
                 return;
@@ -4864,11 +4870,27 @@ public final class Bot implements AutoCloseable {
      * 返回的 future 在传输层确认之后才完成——调用方据此决定是否 acknowledge。
      */
     private CompletableFuture<Void> sendBatch(JsonObject event, List<Path> batch) throws IOException {
-        if (batch.size() <= 1 || !forwardRecords) return sender.send(event, Maps.localImages(batch));
+        if (batch.size() <= 1) {
+            Log.info("图片发送方式（" + describeConversation(event) + "）：单张普通发送");
+            return sender.send(event, Maps.localImages(batch));
+        }
+        if (!forwardRecords) {
+            Log.info("图片发送方式（" + describeConversation(event) + "）：普通发送 " + batch.size() + " 张（传输层不支持合并转发）");
+            return sender.send(event, Maps.localImages(batch));
+        }
+        Log.info("图片发送方式（" + describeConversation(event) + "）：合并转发 " + batch.size() + " 张");
         // 每个节点只含一张图；仍用本地文件引用（不把图片字节塞进 JSON），顺序与 batch 一致。
         List<JsonArray> nodes = new ArrayList<>(batch.size());
         for (Path path : batch) nodes.add(Maps.localImages(List.of(path)));
-        return sender.sendRecord(event, nodes);
+        // 合并转发失败（比如 NapCat 不支持 send_group_forward_msg、节点格式被拒）绝不能把图丢了：
+        // 回退到普通发送，且返回的 future 就是回退那次发送的结果——回退成功调用方照常 acknowledge，
+        // 回退也失败才把失败抛给调用方（不 acknowledge）。这里只回退一次，不会重试。
+        return sender.sendRecord(event, nodes).handle((ignored, failure) -> {
+            if (failure == null) return CompletableFuture.<Void>completedFuture(null);
+            Log.warn("合并转发失败，已改为普通发送 " + batch.size() + " 张（" + describeConversation(event) + "）：" + error(failure));
+            try { return sender.send(event, Maps.localImages(batch)); }
+            catch (Exception fallbackFailure) { return CompletableFuture.<Void>failedFuture(fallbackFailure); }
+        }).thenCompose(future -> future);
     }
     static List<List<Path>> imageBatches(List<Path> paths, int limit) {
         if (limit < 1) throw new IllegalArgumentException("图片上限须为正整数。");
@@ -7093,26 +7115,39 @@ public final class Bot implements AutoCloseable {
         try {
             if (paths.size() > 1 && forwardRecords) {
                 // 多于一张：合成一条合并转发（每张图一个节点），图片在 imageIO 上读好后一次发出。
+                Log.info("地图发送方式（" + describeConversation(event) + "）：合并转发 " + paths.size() + " 张");
                 sent = CompletableFuture.completedFuture(paths).thenComposeAsync(batch -> {
                     try {
                         List<JsonArray> built = new ArrayList<>(batch.size());
                         for (Path path : batch) built.add(Maps.image(path));
                         return sender.sendRecord(event, built);
                     } catch (Exception e) { return CompletableFuture.<Void>failedFuture(e); }
-                }, imageIO);
+                }, imageIO).handle((ignored, failure) -> {
+                    // 合并转发失败不能丢图：回退成逐张普通发送；回退成败决定 whenComplete 里的报错与信号量释放。
+                    if (failure == null) return CompletableFuture.<Void>completedFuture(null);
+                    Log.warn("合并转发失败，已改为普通发送 " + paths.size() + " 张（" + describeConversation(event) + "）：" + error(failure));
+                    return sendImagesIndividually(event, paths);
+                }).thenCompose(future -> future);
             } else {
                 // 单张，或传输层不会发合并转发：照旧逐张普通发送（读下一张要等前一张确认）。
-                sent = CompletableFuture.completedFuture(null);
-                for (Path path : paths) sent = sent.thenComposeAsync(v -> {
-                    try { return sender.sendMap(event, Maps.image(path)); }
-                    catch (Exception e) { return CompletableFuture.failedFuture(e); }
-                }, imageIO);
+                Log.info("地图发送方式（" + describeConversation(event) + "）：" + (paths.size() <= 1
+                        ? "单张普通发送" : "普通发送 " + paths.size() + " 张（传输层不支持合并转发）"));
+                sent = sendImagesIndividually(event, paths);
             }
             sent.whenComplete((v, e) -> {
                 imageBatches.release();
                 if (e != null) { Log.error("图片发送失败（" + describeConversation(event) + "）", e); reply(event, "图片发送失败：" + error(e)); }
             });
         } catch (Exception e) { imageBatches.release(); throw e; }
+    }
+    /** 逐张普通发送（单张/传输层不支持合并转发/合并转发失败回退）：读下一张要等前一张确认。 */
+    private CompletableFuture<Void> sendImagesIndividually(JsonObject event, List<Path> paths) {
+        CompletableFuture<Void> chain = CompletableFuture.completedFuture(null);
+        for (Path path : paths) chain = chain.thenComposeAsync(v -> {
+            try { return sender.sendMap(event, Maps.image(path)); }
+            catch (Exception e) { return CompletableFuture.<Void>failedFuture(e); }
+        }, imageIO);
+        return chain;
     }
     public static String messageText(JsonElement value) {
         if (value == null || value.isJsonNull()) return "";
