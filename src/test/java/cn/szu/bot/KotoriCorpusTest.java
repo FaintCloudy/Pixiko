@@ -152,9 +152,7 @@ public final class KotoriCorpusTest {
         KotoriCorpus.Reference missRef = corpus.reference("帮我看看这个季度的财务报表吧", 3);
         String turn0 = corpus.injectText(missRef, 0), turn2 = corpus.injectText(missRef, 2);
         check(!turn0.equals(turn2), "未命中时的样板要按会话轮数轮换");
-        // 旁听极简版：不注入整段
-        String brief = corpus.briefText(multi);
-        check(brief.length() < 120 && !brief.contains("【瑚太朗】"), "旁听那次只给极简提示：" + brief);
+        // 旁听（窗口外插话）整条路径已删除，KotoriCorpus.briefFor/briefText 也随之删除：不再断言。
 
         // 10) 任务 I：断言/语气词/标点素材库全部取自语料原句，并带 seen 出处
         check(corpus.assertionCount() > 0, "断言素材库非空：" + corpus.assertionCount());

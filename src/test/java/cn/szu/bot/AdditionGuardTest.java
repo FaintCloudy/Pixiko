@@ -22,7 +22,7 @@ public final class AdditionGuardTest {
     static void check(boolean ok, String what) { checks++; if (!ok) throw new AssertionError("FAIL: " + what); }
 
     static ChatActions.Plan plan(String reply, List<String> commands) {
-        return new ChatActions.Plan(reply, commands, "", 90, 0, false, true);
+        return new ChatActions.Plan(reply, commands, "", 90, false, true);
     }
     /** 指令里有没有汉字。 */
     static boolean hasHan(String text) {

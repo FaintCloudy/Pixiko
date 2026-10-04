@@ -49,10 +49,12 @@ public final class ChatActionsTest {
         var workflow=ChatActions.parse("{\"reply\":\"按顺序处理。\",\"execute\":true,\"commands\":[\".lora load exact_name\",\".infix change scene\",\".size set 768 512\",\".gen 2\"],\"search_query\":\"\"}");
         assert workflow.commands().size()==4 && workflow.commands().get(3).equals(".gen 2");
         var adjusted=ChatActions.parse("{\"reply\":\"好\",\"execute\":false,\"commands\":[],\"search_query\":\"\",\"interest\":30,\"wake_adjust\":-20}");
-        assert adjusted.wakeAdjust()==-20 && adjusted.interest()==30 : "wake_adjust is parsed with interest";
-        assert ChatActions.parse("{\"reply\":\"好\",\"execute\":false,\"commands\":[],\"search_query\":\"\"}").wakeAdjust()==0 : "wake_adjust defaults to zero";
-        try { ChatActions.parse("{\"reply\":\"x\",\"execute\":false,\"commands\":[],\"search_query\":\"\",\"wake_adjust\":80}"); throw new AssertionError("out-of-range wake_adjust accepted"); }
-        catch(IOException expected) {}        var search=ChatActions.parse("{\"reply\":\"我先查证。\",\"execute\":false,\"commands\":[],\"search_query\":\"current topic\"}");
+        // wake_adjust 字段已废弃：模型仍返回它时必须被静默忽略——解析照常成功，也不影响其它字段。
+        assert adjusted.interest()==30 && adjusted.commands().isEmpty() : "已废弃的 wake_adjust 不得影响其它字段的解析";
+        assert ChatActions.parse("{\"reply\":\"好\",\"execute\":false,\"commands\":[],\"search_query\":\"\"}").interest()==100 : "没有 wake_adjust 时按默认值解析";
+        try { ChatActions.parse("{\"reply\":\"x\",\"execute\":false,\"commands\":[],\"search_query\":\"\",\"wake_adjust\":80}"); }
+        catch(IOException error) { throw new AssertionError("已废弃的 wake_adjust 不该让整条计划解析失败", error); }
+        var search=ChatActions.parse("{\"reply\":\"我先查证。\",\"execute\":false,\"commands\":[],\"search_query\":\"current topic\"}");
         assert search.searchQuery().equals("current topic");
         try { ChatActions.parse("{\"reply\":\"bad\",\"execute\":true,\"commands\":[\".gen\"],\"search_query\":\"topic\"}");throw new AssertionError("search and command accepted"); }
         catch(IOException expected) {}
@@ -77,18 +79,17 @@ public final class ChatActionsTest {
             AtomicInteger planned=new AtomicInteger();
             try(ChatService service=new ChatService(settings, (ev,segments)->{f.replies.add(Bot.messageText(segments));return CompletableFuture.completedFuture(null);},
                     (personality,history,message,options,speaker)->{planned.incrementAndGet();
-                        // 旁听消息也要规划（模型据此判断要不要插话），但 join=false 时必须保持沉默。
-                        if(message.contains("ordinary")) return new ChatActions.Plan("……",List.of(),"",20,0,false,true);
-                        return new ChatActions.Plan("尺寸我去改一下。",List.of(".size set 896 512"));},
+                        // 群里被点名才可能被规划；窗口外未点名的消息根本不会走到规划器。
+                        return new ChatActions.Plan("尺寸我去改一下。",List.of(".size set 896 512"),"",90,true,true);},
                     f.bot::executeChatCommands,f.bot::selectionContext,System::nanoTime)) {
                 JsonObject group=event("group","2"); group.addProperty("message","ordinary");
                 service.accept(group,"ordinary");waitIdle(service);
-                // N1：窗口外消息允许规划（join=false 时静默），但绝不能执行它带来的指令。
-                assert planned.get()==1 : "窗口外的旁听消息允许规划（由模型判断要不要自然接一句）";
-                assert f.replies.isEmpty() && f.sd.settings().width()!=896 : "join=false 的旁听消息不得回复、不得执行指令";
+                // 主动插话已删除：没被 @ / 没叫名字的群消息不回复、不规划、不执行任何指令。
+                assert planned.get()==0 : "窗口外未被点名的群消息不得调用规划器（实际 "+planned.get()+" 次）";
+                assert f.replies.isEmpty() && f.sd.settings().width()!=896 : "未被点名的群消息不得回复、不得执行指令";
                 group.addProperty("message","小鸟，把尺寸改成896×512");
                 service.accept(group,"小鸟，把尺寸改成896×512");waitIdle(service);
-                assert f.sd.settings().width()==896 && planned.get()==2 : "被点名时才执行";
+                assert f.sd.settings().width()==896 && planned.get()==1 : "被点名时才执行";
             }
             f.replies.clear();
             f.command("private",".prompt set base, red hair, blue eyes");
@@ -254,19 +255,19 @@ public final class ChatActionsTest {
                     + Bot.REQUEST_MARK + "选择#65，然后清空所有视角词，环境词，infix电车痴汉被性骚扰，性交，臀部为主要视角，生成。";
             assert DeepSeekPrompts.currentRequest(composed).startsWith("选择#65") : "只取本次请求正文";
             // 引用里的旧编号不能当成本次要求：加载 #65 是合法的。
-            ChatActions.Plan right = new ChatActions.Plan("好，先载入那份样式。", List.of(".style list", ".style load #65", ".infix 电车痴汉", ".gen"), "", 90, 0);
+            ChatActions.Plan right = new ChatActions.Plan("好，先载入那份样式。", List.of(".style list", ".style load #65", ".infix 电车痴汉", ".gen"), "", 90);
             assert DeepSeekPrompts.mismatchedSelection(right, composed) == null : DeepSeekPrompts.mismatchedSelection(right, composed);
             // 沿用引用/历史里的旧编号则必须拒绝。
-            ChatActions.Plan wrong = new ChatActions.Plan("好，先载入那份样式。", List.of(".style list", ".style load #20", ".infix 电车痴汉", ".gen"), "", 90, 0);
+            ChatActions.Plan wrong = new ChatActions.Plan("好，先载入那份样式。", List.of(".style list", ".style load #20", ".infix 电车痴汉", ".gen"), "", 90);
             String rejected = DeepSeekPrompts.mismatchedSelection(wrong, composed);
             assert rejected != null && rejected.contains("#65") && rejected.contains("#20") : rejected;
             // 没有编号句子的普通请求不受影响。
-            ChatActions.Plan plain = new ChatActions.Plan("好。", List.of(".style load #2"), "", 90, 0);
+            ChatActions.Plan plain = new ChatActions.Plan("好。", List.of(".style load #2"), "", 90);
             assert DeepSeekPrompts.mismatchedSelection(plain, "把第二个样式载进来") == null : "没有 #编号 时不该触发编号守卫";
             assert DeepSeekPrompts.mismatchedSelection(plain, Bot.REQUEST_MARK + "把 #2 样式载进来") == null : "用户给的编号要放行";
             // 引用消息不能驱动基底守卫（引用里出现样式名不算用户这次指名）。
             JsonObject quotedSelections = Json.parse("{\"style\":[\"草莓\",\"小鸟沙滩侧卧\"]}");
-            ChatActions.Plan load65 = new ChatActions.Plan("好。", List.of(".style load #65"), "", 90, 0);
+            ChatActions.Plan load65 = new ChatActions.Plan("好。", List.of(".style load #65"), "", 90);
             String viaQuote = "[引用] 当前载入样式：小鸟沙滩侧卧（WebUI 样式）\n" + Bot.REQUEST_MARK + "选择#65";
             assert DeepSeekPrompts.missingBasis(load65, quotedSelections, viaQuote) == null
                     : "引用里的样式名不该被当成这次点名的基底：" + DeepSeekPrompts.missingBasis(load65, quotedSelections, viaQuote);
@@ -368,7 +369,7 @@ public final class ChatActionsTest {
             AtomicInteger planned = new AtomicInteger();
             try (ChatService service = new ChatService(new Settings(f.root),
                     (ev, segments) -> { f.replies.add(Bot.messageText(segments)); return CompletableFuture.completedFuture(null); },
-                    (personality, history, message, choices, speaker) -> { planned.incrementAndGet(); return new ChatActions.Plan("嗯。", List.of(".style list"), "", 90, 0); },
+                    (personality, history, message, choices, speaker) -> { planned.incrementAndGet(); return new ChatActions.Plan("嗯。", List.of(".style list"), "", 90); },
                     f.bot::executeChatCommands, f.bot::selectionContext, System::nanoTime)) {
                 service.accept(shortcut, "第一个");
                 waitIdle(service);
@@ -378,7 +379,7 @@ public final class ChatActionsTest {
             for (String part = f.replies.poll(); part != null; part = f.replies.poll()) shortcutReply += part + "\n";
             assert shortcutReply.contains("竖图参数") : "回执与回复都要点明指的那一项：" + shortcutReply;
             // 这条计划必须通过两道一致性校验：它是"下载搜索结果的第 2 项"，不是"加载本地 LoRA"。
-            ChatActions.Plan plan = new ChatActions.Plan("好，下载第二个。", List.of(".lora download #2"), "", 90, 0);
+            ChatActions.Plan plan = new ChatActions.Plan("好，下载第二个。", List.of(".lora download #2"), "", 90);
             assert DeepSeekPrompts.missingBasis(plan, searchContext, "第二个") == null
                     : DeepSeekPrompts.missingBasis(plan, searchContext, "第二个");
             assert DeepSeekPrompts.unrequestedBasis(plan, searchContext, "第二个") == null

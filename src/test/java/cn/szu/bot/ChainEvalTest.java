@@ -114,8 +114,11 @@ public final class ChainEvalTest {
         // The planner prompt reaches the model through Bot.publicCommands, so the model only ever sees the
         // user-facing '.' form; the chain rules must survive that rewrite verbatim.
         for (String rule : List.of(".char apply", ".style rename #6-#9", ".style delete #17-#25", ".batch",
-                "禁止拆成", "不得声称", "[引用]", "join_reason", "join=false", "owner", "admin"))
+                "禁止拆成", "不得声称", "[引用]", "join_reason", "join=false", "owner", "admin",
+                "没有被直接点名", "不要输出任何指令"))
             record(system[0].contains(rule), "规划提示词包含规则片段「" + rule + "」");
+        record(!system[0].contains("wake_adjust") && !system[0].contains("唤醒基数"),
+                "已废弃的 wake_adjust / 唤醒基数说法不再出现在规划提示词里");
         // Drift guard: every command the bot answers to must be advertised with '.', never with '/'.
         List<String> commands = List.of("help", "yh", "liv", "get", "settings", "chat", "admin", "char", "batch",
                 "sampler", "style", "size", "steps", "cfg", "seed", "model", "promptR", "prompt", "preset",
@@ -141,32 +144,32 @@ public final class ChainEvalTest {
         ChatActions.Plan filled = cn.szu.bot.chat.DeepSeekPrompts.withRequestedCount(bare, "改好之后出3张");
         record(filled.commands().contains(".gen 3"), "用户说 3 张时确定性补成 .gen 3：" + filled.commands());
         // 查看清单必须落到真正的列表指令上，编号才会以指令回执为准（模型自己罗列会数错、还会压缩成区间）。
-        ChatActions.Plan empty = new ChatActions.Plan("好", List.of(), "", 80, 0);
+        ChatActions.Plan empty = new ChatActions.Plan("好", List.of(), "", 80);
         record(DeepSeekPrompts.withListCommand(empty, "查看styles").commands().equals(List.of(".style list")),
                 "查看styles → 补上 .style list：" + DeepSeekPrompts.withListCommand(empty, "查看styles").commands());
         record(DeepSeekPrompts.withListCommand(empty, "列出有哪些 LoRA").commands().equals(List.of(".lora list")),
                 "列出 LoRA → 补上 .lora list：" + DeepSeekPrompts.withListCommand(empty, "列出有哪些 LoRA").commands());
-        record(DeepSeekPrompts.withListCommand(new ChatActions.Plan("好", List.of(".style list"), "", 80, 0), "查看样式").commands()
+        record(DeepSeekPrompts.withListCommand(new ChatActions.Plan("好", List.of(".style list"), "", 80), "查看样式").commands()
                         .equals(List.of(".style list")),
                 "已有列表指令时不重复补");
-        record(DeepSeekPrompts.withListCommand(new ChatActions.Plan("好", List.of(".gen 1"), "", 80, 0), "出一张图").commands()
+        record(DeepSeekPrompts.withListCommand(new ChatActions.Plan("好", List.of(".gen 1"), "", 80), "出一张图").commands()
                         .equals(List.of(".gen 1")),
                 "非查看请求不改动计划");
         ChatActions.Plan mixed = DeepSeekPrompts.withListCommand(
-                new ChatActions.Plan("好", List.of(".infix 把地点换成草地", ".gen 1"), "", 80, 0), "查看样式，然后把地点换成草地再生一张");
+                new ChatActions.Plan("好", List.of(".infix 把地点换成草地", ".gen 1"), "", 80), "查看样式，然后把地点换成草地再生一张");
         record(mixed.commands().get(0).equals(".style list") && mixed.commands().contains(".gen 1") && mixed.commands().contains(".infix 把地点换成草地"),
                 "查看+改动时列表指令排在最前且保留其余步骤：" + mixed.commands());
         // 任务说谎：编号对应的名称必须由程序核对，回复里说错就被删掉并附上真实名称。
-        ChatActions.Plan load57 = new ChatActions.Plan("好，#3 是「高岛柘榴 | NoobAI 2」——这就加载成基底。", List.of(".style load #3"), "", 90, 0);
+        ChatActions.Plan load57 = new ChatActions.Plan("好，#3 是「高岛柘榴 | NoobAI 2」——这就加载成基底。", List.of(".style load #3"), "", 90);
         JsonObject selections = Json.parse("{\"style\":[\"小鸟\",\"白河\",\"ami ichigo(天衣 いちご)|イノセントガール|(Illustrious) 1\"]}");
         ChatActions.Plan fixedPlan = DeepSeekPrompts.withVerifiedNumbers(load57, selections);
         record(fixedPlan.reply().contains("编号核对：#3 = ami ichigo") && !fixedPlan.reply().contains("高岛柘榴"),
                 "编号配错名称的那句被删掉并附上真实名称：" + fixedPlan.reply());
         record(fixedPlan.commands().equals(List.of(".style load #3")), "更正回复不影响已安排的指令：" + fixedPlan.commands());
-        ChatActions.Plan correct = new ChatActions.Plan("好，#3 是 ami ichigo，这就加载。", List.of(".style load #3"), "", 90, 0);
+        ChatActions.Plan correct = new ChatActions.Plan("好，#3 是 ami ichigo，这就加载。", List.of(".style load #3"), "", 90);
         record(DeepSeekPrompts.withVerifiedNumbers(correct, selections).reply().equals(correct.reply()),
                 "编号对应正确时不改动回复：" + DeepSeekPrompts.withVerifiedNumbers(correct, selections).reply());
-        ChatActions.Plan plain = new ChatActions.Plan("好，#3 我看看。", List.of(".style load #3"), "", 90, 0);
+        ChatActions.Plan plain = new ChatActions.Plan("好，#3 我看看。", List.of(".style load #3"), "", 90);
         record(DeepSeekPrompts.withVerifiedNumbers(plain, selections).reply().equals(plain.reply()),
                 "只是提到编号、没说名称时不误伤：" + DeepSeekPrompts.withVerifiedNumbers(plain, selections).reply());
         // 没有任何指令却宣布"已经做完"：属于说谎，必须拦住。
@@ -187,21 +190,21 @@ public final class ChainEvalTest {
         record(!DeepSeekPrompts.namedInMessage(sexRequest, "sy"), "pussy 里的 sy 不算用户点名了样式 sy");
         record(DeepSeekPrompts.namedInMessage("用 sy 当基底", "sy") && DeepSeekPrompts.namedInMessage("用sy做底座", "sy"),
                 "独立的 sy 仍能被识别为点名");
-        record(DeepSeekPrompts.missingBasis(new ChatActions.Plan("好", List.of(".infix 加性交", ".gen 1"), "", 90, 0), styleList, sexRequest) == null,
+        record(DeepSeekPrompts.missingBasis(new ChatActions.Plan("好", List.of(".infix 加性交", ".gen 1"), "", 90), styleList, sexRequest) == null,
                 "用户没提样式时不会强行要求加载基底");
         String invented = DeepSeekPrompts.unrequestedBasis(
-                new ChatActions.Plan("好", List.of(".style load sy", ".infix 加性交", ".gen 1"), "", 90, 0), styleList, sexRequest);
+                new ChatActions.Plan("好", List.of(".style load sy", ".infix 加性交", ".gen 1"), "", 90), styleList, sexRequest);
         record(invented != null && invented.contains("没有要求加载"), "用户没要求却加载样式会被拒绝重试：" + invented);
-        record(DeepSeekPrompts.unrequestedBasis(new ChatActions.Plan("好", List.of(".style load sy"), "", 90, 0), styleList, "用 sy 当基底") == null,
+        record(DeepSeekPrompts.unrequestedBasis(new ChatActions.Plan("好", List.of(".style load sy"), "", 90), styleList, "用 sy 当基底") == null,
                 "用户点名样式时允许加载");
-        record(DeepSeekPrompts.unrequestedBasis(new ChatActions.Plan("好", List.of(".style load #1"), "", 90, 0), styleList, "选 #1") == null,
+        record(DeepSeekPrompts.unrequestedBasis(new ChatActions.Plan("好", List.of(".style load #1"), "", 90), styleList, "选 #1") == null,
                 "#编号加载被允许");
-        record(DeepSeekPrompts.unrequestedBasis(new ChatActions.Plan("好", List.of(".style load #1"), "", 90, 0), styleList, "继续用刚才那个样式") == null,
+        record(DeepSeekPrompts.unrequestedBasis(new ChatActions.Plan("好", List.of(".style load #1"), "", 90), styleList, "继续用刚才那个样式") == null,
                 "指代之前挑的样式时允许加载");
-        record(DeepSeekPrompts.unrequestedBasis(new ChatActions.Plan("好", List.of(".style load #1"), "", 90, 0), styleList, "再生成一张") != null,
+        record(DeepSeekPrompts.unrequestedBasis(new ChatActions.Plan("好", List.of(".style load #1"), "", 90), styleList, "再生成一张") != null,
                 "没有点名也没有指代时不允许凭空加载");
         record(DeepSeekPrompts.unrequestedBasis(
-                new ChatActions.Plan("好", List.of(".style load \"ami ichigo(天衣 いちご)|イノセントガール 1\""), "", 90, 0),
+                new ChatActions.Plan("好", List.of(".style load \"ami ichigo(天衣 いちご)|イノセントガール 1\""), "", 90),
                 styleList, "用 ami ichigo 当基底") == null,
                 "只报主名（ami ichigo）时允许加载对应样式");
         // "回复了好，删掉列表里第 12 到第 16 项，然后什么都不干"：正确的管理类指令不能被判成"没有改写指令"。
@@ -265,13 +268,16 @@ public final class ChainEvalTest {
     private static void questionAndAdjustParsing() throws Exception {
         ChatActions.Plan adjusted = ChatActions.parse(
                 "{\"reply\":\"嗯，我收着点。\",\"execute\":false,\"commands\":[],\"search_query\":\"\",\"interest\":30,\"wake_adjust\":-20}");
-        record(adjusted.wakeAdjust() == -20, "已废弃的 wake_adjust 仍能被解析（-20），只是不再影响判定");
+        record(adjusted.interest() == 30 && adjusted.commands().isEmpty(),
+                "已废弃的 wake_adjust 被静默忽略，不影响其它字段（interest=30）");
+        try { ChatActions.parse("{\"reply\":\"x\",\"commands\":[],\"wake_adjust\":80}"); record(true, "越界的 wake_adjust 也不再报错（字段已废弃）"); }
+        catch (java.io.IOException error) { record(false, "已废弃的 wake_adjust 不该让整条计划解析失败：" + error.getMessage()); }
         ChatActions.Plan joined = ChatActions.parse(
                 "{\"reply\":\"嗯——\",\"execute\":false,\"commands\":[],\"search_query\":\"\",\"interest\":40,\"join\":true,\"join_reason\":\"接得上\"}");
-        record(joined.join() && joined.joinGiven(), "join / join_reason 被解析：模型判断现在插话自然");
+        record(joined.join() && joined.joinGiven(), "join / join_reason 被解析：模型判断要不要把对方拉进对话窗口");
         ChatActions.Plan silent = ChatActions.parse(
                 "{\"reply\":\"……\",\"execute\":false,\"commands\":[],\"search_query\":\"\",\"interest\":95,\"join\":false}");
-        record(!silent.join() && silent.joinGiven(), "join=false 即使相关度 95 也记为不插话");
+        record(!silent.join() && silent.joinGiven(), "join=false 即使相关度 95 也只答这一句（不进对话窗口）");
         ChatActions.Plan noJoin = ChatActions.parse(
                 "{\"reply\":\"嗯\",\"execute\":false,\"commands\":[],\"search_query\":\"\",\"interest\":95}");
         record(!noJoin.joinGiven(), "没有 join 字段时 joinGiven=false，交给相关度兜底");

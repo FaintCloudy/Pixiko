@@ -151,9 +151,7 @@ public final class BotTest {
             };
             assert Bot.quotedText(Json.parse("{\"message\":[{\"type\":\"reply\",\"data\":{\"id\":\"9\"}}]}"), quotedLookup)
                     .equals("从 get_msg 取回的原文") : "the quoted body is fetched with get_msg";
-            assert Bot.aimedAtAnother(Json.parse("{\"self_id\":\"1\",\"message\":[{\"type\":\"at\",\"data\":{\"qq\":\"456\"}}]}")) : "an at aimed at another member is detected";
-            assert !Bot.aimedAtAnother(Json.parse("{\"self_id\":\"456\",\"message\":[{\"type\":\"at\",\"data\":{\"qq\":\"456\"}}]}")) : "an at aimed at the bot itself is not";
-            assert !Bot.aimedAtAnother(Json.parse("{\"self_id\":\"1\",\"raw_message\":\"[CQ:at,qq=all] hi\"}")) : "at-all is not a member";
+            // aimedAtAnother / chat_third_party 随"主动插话"一起删除（第三人称门槛只服务插话），不再断言。
             assert Bot.mentionedUser(Json.parse("{\"self_id\":\"1\",\"raw_message\":\"[CQ:at,qq=789] hi\"}")).equals("789");
             assert Bot.mentionedUser(Json.parse("{\"self_id\":\"1\",\"message\":[{\"type\":\"at\",\"data\":{\"qq\":\"all\"}}]}"))==null : "at-all is not a target";
             assert new Settings(root).ownerId().equals("123") : "the configured owner is authoritative";

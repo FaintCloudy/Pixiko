@@ -94,79 +94,6 @@ public final class Settings {
                 if (item.isJsonPrimitive() && item.getAsJsonPrimitive().isString()) keys.add(item.getAsString());
         return keys;
     }
-    /** Probability multiplier applied to the model's topic interest (0–100) when deciding to answer. */    public synchronized double chatReplyProbabilityScale() {
-        JsonElement value = Json.obj(data, "chat").get("reply_probability_scale");
-        double scale = value != null && value.isJsonPrimitive() && value.getAsJsonPrimitive().isNumber() ? value.getAsDouble() : 1.0;
-        if (!Double.isFinite(scale)) return 1.0;
-        return Math.max(0, Math.min(1, scale));
-    }
-    /**
-     * 主动插话的总静音开关：0 = 永不主动插话（被点名、窗口续话与带指令的请求照常回复），
-     * 非 0 只表示"允许插话"，不再当作概率使用——是否插话由聊天模型按上下文判断（见 {@link ChatService}）。
-     * 旧配置里的 reply_base_probability / base_probability / wake_probability / reply_probability_scale
-     * 仍然能被读取：读取时只在日志里说明已废弃，不报错，也不再影响判定。
-     */
-    public synchronized boolean chatChimeMuted() {
-        JsonObject chat = Json.obj(data, "chat");
-        JsonElement value = chat.get("reply_base_probability");
-        if (value != null && value.isJsonPrimitive() && value.getAsJsonPrimitive().isNumber()) return value.getAsDouble() <= 0;
-        JsonElement bases = chat.get("base_probability");
-        if (bases != null && bases.isJsonObject()) {
-            for (java.util.Map.Entry<String, JsonElement> entry : bases.getAsJsonObject().entrySet()) {
-                JsonElement item = entry.getValue();
-                if (item != null && item.isJsonPrimitive() && item.getAsJsonPrimitive().isNumber() && item.getAsDouble() <= 0) return true;
-            }
-        }
-        JsonElement wakes = chat.get("wake_probability");
-        if (wakes != null && wakes.isJsonObject()) {
-            for (java.util.Map.Entry<String, JsonElement> entry : wakes.getAsJsonObject().entrySet()) {
-                JsonElement item = entry.getValue();
-                if (item != null && item.isJsonPrimitive() && item.getAsJsonPrimitive().isNumber() && item.getAsDouble() <= 0) return true;
-            }
-        }
-        return false;
-    }
-    /** 主动插话的总开关：1 = 允许按上下文插话，0 = 永不主动插话。 */
-    public synchronized double chatBaseProbability() { return chatChimeMuted() ? 0 : 1; }
-    public synchronized double setChatBaseProbability(double value) throws IOException {
-        if (!Double.isFinite(value) || value < 0 || value > 1) throw new IllegalArgumentException("插话开关须为 0–1（0 = 永不主动插话）。");
-        JsonObject next = freshSnapshot(), chat = Json.obj(next, "chat");
-        chat.addProperty("reply_base_probability", value <= 0 ? 0 : 1); next.add("chat", chat);
-        Json.atomicWrite(root.resolve("config.json"), next); data = next; return value <= 0 ? 0 : 1;
-    }
-    /** 兼容旧调用：同上，conversation 参数保留只为不改调用点。 */
-    public synchronized double chatBaseProbability(String conversation) { return chatBaseProbability(); }
-    /** 旧配置里的唤醒基数已废弃：读取时记一行日志，绝不再影响判定。 */
-    public synchronized void warnDeprecatedWakeSettings() {
-        JsonObject chat = Json.obj(data, "chat");
-        boolean wakes = chat.has("wake_probability") && chat.get("wake_probability").isJsonObject()
-                && !chat.getAsJsonObject("wake_probability").isEmpty();
-        boolean bases = chat.has("base_probability") && chat.get("base_probability").isJsonObject()
-                && !chat.getAsJsonObject("base_probability").isEmpty();
-        boolean scale = chat.has("reply_probability_scale");
-        if (!wakes && !bases && !scale) return;
-        Log.info("config.json 里的唤醒基数配置已废弃（"
-                + (wakes ? "chat.wake_probability " : "") + (bases ? "chat.base_probability " : "")
-                + (scale ? "chat.reply_probability_scale " : "")
-                + "）：是否插话现在由聊天模型按上下文判断，这些字段已忽略；"
-                + "reply_base_probability=0 仍保留为「永不主动插话」的总静音开关。");
-    }
-    /** A chime-in still requires this much topic relevance, so it never barges into unrelated talk. */
-    public synchronized int chatBaseMinInterest() {
-        return Math.max(0, Math.min(100, (int) Json.num(Json.obj(data, "chat"), "base_min_interest", 40)));
-    }
-    /** Relevance needed to join a conversation that is aimed at another member; much higher than the normal floor. */
-    public synchronized int chatChimeHighInterest() {
-        return Math.max(0, Math.min(100, (int) Json.num(Json.obj(data, "chat"), "chime_high_interest", 85)));
-    }
-    /** Idle gap that ends a topic: after this the bot stops acting as if it were mid-conversation. */
-    public synchronized int chatTopicGapSeconds() {
-        return Math.max(1, Math.min(3600, (int) Json.num(Json.obj(data, "chat"), "topic_gap_seconds", 15)));
-    }
-    /** Minimum seconds between two unsolicited chime-ins in the same conversation. */
-    public synchronized int chatChimeCooldownSeconds() {
-        return Math.max(0, Math.min(86400, (int) Json.num(Json.obj(data, "chat"), "chime_cooldown_seconds", 15)));
-    }
     /**
      * How long a numbered list stays usable for "#编号". This is separate from the chat topic window on
      * purpose: planning a multi-step request takes seconds, and a list the user just asked for must not
@@ -265,11 +192,6 @@ public final class Settings {
         JsonObject next = freshSnapshot(), api = Json.obj(next, "chat_api");
         api.add(key, value); next.add("chat_api", api);
         Json.atomicWrite(root.resolve("config.json"), next); data = next;
-    }
-    private static double fraction(JsonElement value, double fallback) {
-        if (value == null || !value.isJsonPrimitive() || !value.getAsJsonPrimitive().isNumber()) return fallback;
-        double number = value.getAsDouble();
-        return Double.isFinite(number) ? Math.max(0, Math.min(1, number)) : fallback;
     }
     public synchronized int chatFrequency() { return (int) Json.num(Json.obj(data, "chat"), "frequency", 6); }
     /** 原作文本复现开关（chat.corpus_replay，默认开）：命中原作问答时参考原句。 */

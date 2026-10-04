@@ -78,7 +78,7 @@ install-webui-bridge.ps1         安装/更新 SD 桥接扩展（保留）
 - [x] `tsc --noEmit` 通过；`next build` + 8788 端口冒烟通过（`/healthz` 200、`/api/status` 读到真实配置、
       `/api/nope` 404、首页 200）
 - [x] `tests/settings.test.ts` 7 条对照用例全绿（序列化格式、并发写不丢键、freshSnapshot 语义、
-      web scope 迁移、权限与概率边界）
+      web scope 迁移、权限与概率边界）（插话与概率配置已于 v1.2.0 删除）
 
 **构建注意事项**：`next build` 必须走 webpack（`npm run build` 已经写好 `--webpack`）。
 Turbopack 会对 `instrumentation` 端点做文件追踪，撞上被占用的 `data/bot.lock` 会直接 panic
@@ -156,7 +156,7 @@ Turbopack 会对 `instrumentation` 端点做文件追踪，撞上被占用的 `d
 - [x] `generation.ts`（891 行 / 18 个用例：队列、挂起/继续/取消/置顶、结算、`tasksJson`/`taskActionJson`/
       `generationJson`/`progressJson`/`generationSummary`）
 - [x] `lora.ts`（991 行）+ `images.ts`（323 行）——共 31 个用例（`.lora` 各子命令、Civitai 搜索编号、下载进度、出图投递与 ack）
-- [x] `chat-service.ts`（993 行 / 28 个用例：会话键、角色分层、兴趣度与插话、冷却、上下文窗口、聊天频道失败降级）
+- [x] `chat-service.ts`（993 行 / 28 个用例：会话键、角色分层、兴趣度与插话、冷却、上下文窗口、聊天频道失败降级）（插话与概率配置已于 v1.2.0 删除）
 - [x] `web-console.ts` 的纯本机那半（~940 行 / 22 个用例：`webPrompt`/`webMeanings`/`webPromptEdit`/`webFunctions*`/
       `webStyles*`/`webPresets*`/`webOptions`/`webUsage`/`webEvent`/Civitai 账号与一次性登录令牌）
 - [x] `chains.ts`（1,715 行 / 26 个用例：入口、分发骨架、`ChainRecord` 多步回执合成一条聊天记录、

@@ -29,7 +29,8 @@ public final class ChatServiceTest {
   group.add("message",JsonParser.parseString("[{\"type\":\"text\",\"data\":{\"text\":\"[CQ:at,qq=bot]\"}}]"));assert !ChatService.addressed(group,"hi");
   assert ChatService.addressed(event("private","test"),"ordinary");
   Path root=Files.createTempDirectory(Path.of(System.getProperty("bot.test.work","work")),"chat-test-");Json.atomicWrite(root.resolve("config.json"),new JsonObject());
-  Settings settings=new Settings(root);assert settings.chatEnabled();assert settings.chatFrequency()==6;settings.chatSetting("topic_gap_seconds",new JsonPrimitive(3600));
+  Settings settings=new Settings(root);assert settings.chatEnabled();assert settings.chatFrequency()==6;
+  assert settings.chatContextSeconds()==1800 : "对话窗口仍是 30 分钟（chat.context_seconds）："+settings.chatContextSeconds();
   settings.chatSetting("frequency",new JsonPrimitive(2));assert new Settings(root).chatFrequency()==2;
   AtomicLong now=new AtomicLong();List<String> replies=new CopyOnWriteArrayList<>();List<JsonArray> histories=new CopyOnWriteArrayList<>();
   try(ChatService service=new ChatService(settings,(e,segs)->{replies.add(Bot.messageText(segs));return CompletableFuture.completedFuture(null);},(p,h,m)->{histories.add(h);return "reply "+m;},now::get)) {
@@ -53,26 +54,28 @@ public final class ChatServiceTest {
   }
   settings.chatSetting("enabled",new JsonPrimitive(true));settings.chatSetting("frequency",new JsonPrimitive(10));
   AtomicInteger calls=new AtomicInteger();CountDownLatch firstEntered=new CountDownLatch(1),releaseFirst=new CountDownLatch(1);
-  settings.chatSetting("topic_gap_seconds",new JsonPrimitive(3600));replies.clear();histories.clear();
+  replies.clear();histories.clear();
   Map<String,JsonArray> snapshots=new ConcurrentHashMap<>();
   try(ChatService service=new ChatService(settings,(e,segs)->{replies.add(Bot.messageText(segs));return CompletableFuture.completedFuture(null);},
           (p,h,m,o,s)->{histories.add(h);snapshots.put(m,h);
-              if(calls.incrementAndGet()==1){firstEntered.countDown();releaseFirst.await();}
-              // 旁听消息一律 join=false：模型判断"这句话不是对我说的"。
-              return new ChatActions.Plan("reply "+m,List.of(),"",100,0,false,true);},
+              if(calls.incrementAndGet()==2){firstEntered.countDown();releaseFirst.await();}
+              // 被点名时模型判定这段对话值得继续：join=true 把对方拉进 30 分钟对话窗口。
+              return new ChatActions.Plan("reply "+m,List.of(),"",100,true,true);},
           (e,c,o)->{},e->new JsonObject(),now::get)) {
    var f=ChatService.class.getDeclaredField("executor");f.setAccessible(true);assert ((ThreadPoolExecutor)f.get(service)).getMaximumPoolSize()==1;
-   // N1：窗口外的旁听消息允许规划（模型据此决定要不要自然接一句），但绝不执行它的指令。
-   service.accept(ordinary("C","bob","我喜欢红色"),"我喜欢红色");
-   assert firstEntered.await(3,TimeUnit.SECONDS) : "窗口外的旁听消息允许规划";
-   JsonObject first=event("group","C");first.addProperty("user_id","alice");service.accept(first,"小鸟小姐，接着聊");
+   // 新契约：主动插话已删除——窗口外、没被 @ 也没叫名字的消息不回复、不规划、不进历史；
+   // 被点名一定回复一次，之后由模型计划里的 join 决定要不要把对方拉进 30 分钟对话窗口。
+   JsonObject first=event("group","C");first.addProperty("user_id","alice");
+   service.accept(first,"小鸟，在吗");idle(service);
+   assert replies.size()==1 && calls.get()==1 : "被点名必答一次：" + replies;
+   service.accept(first,"小鸟小姐，接着聊");
+   assert firstEntered.await(3,TimeUnit.SECONDS) : "第二条被点名的消息进入规划并占住 worker";
    service.accept(ordinary("C","alice","上一句后面的补充"),"上一句后面的补充");
    service.accept(ordinary("C","bob","别人的普通消息"),"别人的普通消息");
    now.addAndGet(TimeUnit.MINUTES.toNanos(31));releaseFirst.countDown();idle(service);
-   assert replies.size()==2 && replies.stream().noneMatch(r -> r.contains("我喜欢红色")) && replies.stream().noneMatch(r -> r.contains("别人的普通消息"))
-           : "busy follow-up must queue, unrelated user must stay silent: " + replies;
-   JsonArray context=snapshots.get("小鸟小姐，接着聊");
-   assert context!=null && context.size()==1 && speaker(context,0).equals("bob") : "passive preceding speaker context";
+   assert replies.size()==3 && replies.stream().noneMatch(r -> r.contains("别人的普通消息"))
+           : "忙时窗口内续话排队，窗口外未点名的消息绝不出声：" + replies;
+   assert calls.get()==3 : "窗口外未点名的消息一次都不该规划（实际 " + calls.get() + " 次）";
    JsonArray queued=snapshots.get("上一句后面的补充");
    boolean hasBob=false, hasAlice=false;
    if(queued!=null) for(JsonElement item:queued) {
@@ -82,20 +85,11 @@ public final class ChatServiceTest {
        if("bob".equals(id)) hasBob=true;
        if("alice".equals(id)) hasAlice=true;
    }
-   assert hasBob && hasAlice : "queued follow-up must preserve speaker identity（bob=" + hasBob + " alice=" + hasAlice + "）";
-   service.accept(ordinary("C","alice","回复后继续"),"回复后继续");idle(service);assert replies.size()==3 : "successful reply renews activation";
-   JsonArray renewed=snapshots.get("回复后继续");
-   boolean bobInContext=false;
-   if(renewed!=null) for(JsonElement item:renewed) {
-       JsonObject entry=item.getAsJsonObject();
-       if(!"user".equals(Json.str(entry,"role",""))) continue;
-       String id=Json.parse(entry.get("content").getAsString()).getAsJsonObject("speaker").get("id").getAsString();
-       if("bob".equals(id)) bobInContext=true;
-   }
-   // 决定 3 之后旁听消息不再规划，但仍会作为上下文留在历史里。
-   assert bobInContext : "别人（旁听）的发言必须留作上下文：" + renewed;
+   assert hasAlice && !hasBob : "排队续话保留说话人身份，未点名的旁听发言不进历史（alice=" + hasAlice + " bob=" + hasBob + "）";
+   service.accept(ordinary("C","alice","回复后继续"),"回复后继续");idle(service);assert replies.size()==4 : "成功回复续期对话窗口";
    now.addAndGet(TimeUnit.MINUTES.toNanos(31));service.accept(ordinary("C","alice","长时间无互动"),"长时间无互动");idle(service);
-   assert replies.size()==3 : "rolling inactivity expiry";
+   assert replies.size()==4 : "rolling inactivity expiry";
+   assert calls.get()==4 : "离开对话窗口后不再规划（实际 " + calls.get() + " 次）";
   }
   CountDownLatch burstEntered=new CountDownLatch(1),burstRelease=new CountDownLatch(1);AtomicInteger burstCalls=new AtomicInteger();replies.clear();
   try(ChatService service=new ChatService(settings,(e,segs)->{replies.add(Bot.messageText(segs));return CompletableFuture.completedFuture(null);},(p,h,m)->{
@@ -110,7 +104,9 @@ public final class ChatServiceTest {
   settings.chatSetting("enabled",new JsonPrimitive(true));settings.chatSetting("frequency",new JsonPrimitive(10));
   AtomicInteger planned=new AtomicInteger();replies.clear();
   try(ChatService service=new ChatService(settings,(e,segs)->{replies.add(Bot.messageText(segs));return CompletableFuture.completedFuture(null);},
-          (p,h,m,o,s)->{planned.incrementAndGet();return new ChatActions.Plan("低相关度回应",List.of(),"",10);},(e,c,o)->{},e->new JsonObject(),now::get)) {
+          (p,h,m,o,s)->{boolean first=planned.incrementAndGet()==1;
+              // 被点名那次模型说 join=true（进窗）；窗口内的续话相关度只有 10，低于 50 的续话门槛。
+              return new ChatActions.Plan("低相关度回应",List.of(),"",first?90:10,first,first);},(e,c,o)->{},e->new JsonObject(),now::get)) {
    JsonObject wake=event("group","D");wake.addProperty("user_id","alice");
    service.accept(wake,"小鸟，在吗");idle(service);
    assert replies.size()==1 && planned.get()==1 : "explicit address must always answer";
@@ -130,7 +126,7 @@ public final class ChatServiceTest {
   }
   replies.clear();AtomicLong nowHigh=new AtomicLong(now.get());
   try(ChatService service=new ChatService(settings,(e,segs)->{replies.add(Bot.messageText(segs));return CompletableFuture.completedFuture(null);},
-          (p,h,m,o,s)->new ChatActions.Plan("高相关度回应",List.of(),"",100),(e,c,o)->{},e->new JsonObject(),nowHigh::get)) {
+          (p,h,m,o,s)->new ChatActions.Plan("高相关度回应",List.of(),"",100,true,true),(e,c,o)->{},e->new JsonObject(),nowHigh::get)) {
    JsonObject wake=event("group","F");wake.addProperty("user_id","carol");
    service.accept(wake,"小鸟，在吗");idle(service);service.accept(ordinary("F","carol","窗口内的高相关度消息"),"窗口内的高相关度消息");idle(service);
    assert replies.size()==2 : "a high-interest continuation must answer";
@@ -156,9 +152,8 @@ public final class ChatServiceTest {
    service.accept(event("private","456"),"在吗");idle(service);
    assert "user".equals(seenSpeaker.get().get("role").getAsString()) : "everyone else is a plain user: " + seenSpeaker.get();
   }
-  // 决定 3（owner 2026-09-27）取代了 join 时代的"窗口外主动插话"行为：
-  // 窗口外未点名的消息不再规划，因此这里不再保留 join/冷却/总静音/第三人称那些用例；
-  // 总静音开关与显式唤醒的覆盖见下面「决定 3」一节与该文件其余用例。
+  // 新契约（owner 2026-10-04）：主动插话彻底删除——窗口外未点名的群消息不回复、不规划、不进历史，
+  // 因此这里不再保留 join/冷却/总静音/第三人称那些旁听用例；被点名必答与 join 决定的对话窗口见下节。
   // 机器自己发出的消息（含 .help 的播报）绝不能再被当成用户消息规划一遍。
   replies.clear();histories.clear();
   try(ChatService service=new ChatService(settings,(e,segs)->{replies.add(Bot.messageText(segs));return CompletableFuture.completedFuture(null);},
@@ -167,51 +162,85 @@ public final class ChatServiceTest {
    service.accept(own,"我上线啦，随时可以叫我。发送 .help 查看指令。");idle(service);
    assert replies.isEmpty() && histories.isEmpty() : "机器人自己的消息必须被忽略：" + replies;
   }
-  // N1（owner 2026-09-27 折中）：窗口外允许"自然接一句"，但绝不执行指令。
+  // 新契约（本次改造的核心验收）：主动插话彻底删除——窗口外未被 @/没叫名字的群消息不回复、不规划、不进历史；
+  // 被 @/叫名字一定回复一次，是否把对方拉进 30 分钟对话窗口由模型计划里的 join 决定。
   Path gateRoot=Files.createTempDirectory(Path.of(System.getProperty("bot.test.work","work")),"chat-gate-");
   Json.atomicWrite(gateRoot.resolve("config.json"),new JsonObject());
   Settings gateSettings=new Settings(gateRoot);
   gateSettings.chatSetting("enabled",new JsonPrimitive(true));gateSettings.chatSetting("frequency",new JsonPrimitive(10));
-  gateSettings.chatSetting("topic_gap_seconds",new JsonPrimitive(3600));
-  gateSettings.chatSetting("chime_cooldown_seconds",new JsonPrimitive(0));
+  assert gateSettings.chatContextSeconds()==1800 : "对话窗口仍是 30 分钟";
   replies.clear();histories.clear();AtomicInteger gateCalls=new AtomicInteger();AtomicInteger gateExecuted=new AtomicInteger();
-  // ① 窗口外 join=true 且**无指令** → 只回一句、不执行
+  // ① 窗口外、未被 @ 的普通群消息 → 规划器一次都没被调用、没有任何出站消息、历史里没有这条。
   try(ChatService service=new ChatService(gateSettings,(e,segs)->{replies.add(Bot.messageText(segs));return CompletableFuture.completedFuture(null);},
-          (p,h,m,o,s)->{gateCalls.incrementAndGet();return new ChatActions.Plan("嗯——接得上呀。",List.of(),"",90,0,true,true);},
+          (p,h,m,o,s)->{histories.add(h);gateCalls.incrementAndGet();return new ChatActions.Plan("我不该被叫到。",List.of(),"",90,true,true);},
           (e,commands,o)->gateExecuted.addAndGet(commands.size()),e->new JsonObject(),now::get)) {
    service.accept(ordinary("W","zed","今天天气不错"),"今天天气不错");idle(service);
-   assert replies.size()==1 && gateExecuted.get()==0 : "窗口外 join=true 且无指令时只自然接一句：" + replies;
+   assert gateCalls.get()==0 : "窗口外未被点名的群消息不得调用规划器（实际 "+gateCalls.get()+" 次）";
+   assert replies.isEmpty() : "窗口外未被点名的群消息不得回复：" + replies;
+   assert gateExecuted.get()==0 : "窗口外未被点名的群消息不得执行任何指令";
+   JsonObject talk=event("group","W");talk.addProperty("user_id","zed");
+   service.accept(talk,"小鸟，在吗");idle(service);
+   assert gateCalls.get()==1 && replies.size()==1 : "被点名一定回复一次：" + replies;
+   assert histories.size()==1 && !histories.get(0).toString().contains("今天天气不错")
+           : "未被点名的旁听消息不得进入对话历史：" + histories.get(0);
   }
-  // ② 窗口外 join=true 但**计划含指令** → 不回复、不执行（关键用例）
+  // ② 被 @ 且模型 join=true → 回复一次并进入窗口；随后同一用户不 @ 的消息也会被回复（continuation）。
+  replies.clear();histories.clear();gateCalls.set(0);gateExecuted.set(0);
+  try(ChatService service=new ChatService(gateSettings,(e,segs)->{replies.add(Bot.messageText(segs));return CompletableFuture.completedFuture(null);},
+          (p,h,m,o,s)->{histories.add(h);gateCalls.incrementAndGet();return new ChatActions.Plan("回复 "+m,List.of(),"",90,true,true);},
+          (e,commands,o)->gateExecuted.addAndGet(commands.size()),e->new JsonObject(),now::get)) {
+   JsonObject joined=event("group","X");joined.addProperty("user_id","zed");
+   service.accept(joined,"小鸟，在吗");idle(service);
+   assert replies.size()==1 && gateCalls.get()==1 : "被点名必回一次：" + replies;
+   service.accept(ordinary("X","zed","不点名接着说"),"不点名接着说");idle(service);
+   assert replies.size()==2 && gateCalls.get()==2 : "join=true 后同一用户不 @ 也要回复（continuation）：" + replies;
+  }
+  // ③ 被 @ 但模型 join=false → 只回这一句；随后同一用户不 @ 的消息既不回复也不再规划。
+  replies.clear();histories.clear();gateCalls.set(0);gateExecuted.set(0);
+  try(ChatService service=new ChatService(gateSettings,(e,segs)->{replies.add(Bot.messageText(segs));return CompletableFuture.completedFuture(null);},
+          (p,h,m,o,s)->{histories.add(h);gateCalls.incrementAndGet();return new ChatActions.Plan("只答这一句。",List.of(),"",90,false,true);},
+          (e,commands,o)->gateExecuted.addAndGet(commands.size()),e->new JsonObject(),now::get)) {
+   JsonObject once=event("group","Y");once.addProperty("user_id","zed");
+   service.accept(once,"小鸟，在吗");idle(service);
+   assert replies.size()==1 && gateCalls.get()==1 : "被点名必回一次：" + replies;
+   service.accept(ordinary("Y","zed","不点名再说一句"),"不点名再说一句");idle(service);
+   assert replies.size()==1 : "join=false 只回这一句，不得进入对话窗口：" + replies;
+   assert gateCalls.get()==1 : "join=false 后同一用户不 @ 的消息不该再规划（实际 "+gateCalls.get()+" 次）";
+   service.accept(once,"小鸟，再问一句");idle(service);
+   assert !histories.get(histories.size()-1).toString().contains("不点名再说一句")
+           : "join=false 后未被点名的消息不得进入对话历史：" + histories.get(histories.size()-1);
+  }
+  // ④ 计划不含 join（joinGiven=false）且 interest=90 → 按"续话门槛"兜底算进窗：随后不 @ 的消息照旧回复。
+  replies.clear();histories.clear();gateCalls.set(0);gateExecuted.set(0);
+  try(ChatService service=new ChatService(gateSettings,(e,segs)->{replies.add(Bot.messageText(segs));return CompletableFuture.completedFuture(null);},
+          (p,h,m,o,s)->{histories.add(h);gateCalls.incrementAndGet();return new ChatActions.Plan("兜底进窗。",List.of(),"",90);},
+          (e,commands,o)->gateExecuted.addAndGet(commands.size()),e->new JsonObject(),now::get)) {
+   JsonObject high=event("group","P");high.addProperty("user_id","zed");
+   service.accept(high,"小鸟，在吗");idle(service);
+   assert replies.size()==1 && gateCalls.get()==1 : "被点名必回一次：" + replies;
+   service.accept(ordinary("P","zed","不点名接着聊"),"不点名接着聊");idle(service);
+   assert replies.size()==2 && gateCalls.get()==2
+           : "joinGiven=false 且 interest=90 时按 interest>=50 兜底进窗，continuation 必须回复：" + replies;
+  }
+  // ⑤ 计划不含 join（joinGiven=false）且 interest=10 → 兜底算不进窗：随后不 @ 的消息不回复也不再规划。
+  replies.clear();histories.clear();gateCalls.set(0);gateExecuted.set(0);
+  try(ChatService service=new ChatService(gateSettings,(e,segs)->{replies.add(Bot.messageText(segs));return CompletableFuture.completedFuture(null);},
+          (p,h,m,o,s)->{histories.add(h);gateCalls.incrementAndGet();return new ChatActions.Plan("兜底只答这一句。",List.of(),"",10);},
+          (e,commands,o)->gateExecuted.addAndGet(commands.size()),e->new JsonObject(),now::get)) {
+   JsonObject low=event("group","Q");low.addProperty("user_id","zed");
+   service.accept(low,"小鸟，在吗");idle(service);
+   assert replies.size()==1 && gateCalls.get()==1 : "被点名必回一次（相关度低也照答）：" + replies;
+   service.accept(ordinary("Q","zed","不点名再说一句"),"不点名再说一句");idle(service);
+   assert replies.size()==1 : "joinGiven=false 且 interest=10 时兜底不进窗，不得继续回复：" + replies;
+   assert gateCalls.get()==1 : "兜底不进窗后同一用户不 @ 的消息不该再规划（实际 "+gateCalls.get()+" 次）";
+   service.accept(low,"小鸟，再问一句");idle(service);
+   assert !histories.get(histories.size()-1).toString().contains("不点名再说一句")
+           : "兜底不进窗时未被点名的消息不得进入对话历史：" + histories.get(histories.size()-1);
+  }
+  // ⑥ 被点名必答并执行；join=true 进窗后，同一用户不 @ 的续话照旧回复并执行
   replies.clear();gateCalls.set(0);gateExecuted.set(0);
   try(ChatService service=new ChatService(gateSettings,(e,segs)->{replies.add(Bot.messageText(segs));return CompletableFuture.completedFuture(null);},
-          (p,h,m,o,s)->{gateCalls.incrementAndGet();return new ChatActions.Plan("好，这就改。",List.of(".size set 896 512"),"",90,0,true,true);},
-          (e,commands,o)->gateExecuted.addAndGet(commands.size()),e->new JsonObject(),now::get)) {
-   service.accept(ordinary("X","zed","把尺寸改成 896 512"),"把尺寸改成 896 512");idle(service);
-   assert gateCalls.get()==1 : "窗口外的消息允许规划";
-   assert replies.isEmpty() && gateExecuted.get()==0
-           : "窗口外带指令的计划不得回复、不得执行：" + replies + " executed=" + gateExecuted.get();
-  }
-  // ③ 窗口外 join=false → 静默
-  replies.clear();gateCalls.set(0);
-  try(ChatService service=new ChatService(gateSettings,(e,segs)->{replies.add(Bot.messageText(segs));return CompletableFuture.completedFuture(null);},
-          (p,h,m,o,s)->{gateCalls.incrementAndGet();return new ChatActions.Plan("……",List.of(),"",90,0,false,true);},
-          (e,commands,o)->gateExecuted.addAndGet(commands.size()),e->new JsonObject(),now::get)) {
-   service.accept(ordinary("Y","zed","哈哈哈哈"),"哈哈哈哈");idle(service);
-   assert replies.isEmpty() : "窗口外 join=false 必须静默：" + replies;
-  }
-  // ④ 相关度下限仍然拦住（join=true 但 interest 低于门槛）
-  replies.clear();
-  try(ChatService service=new ChatService(gateSettings,(e,segs)->{replies.add(Bot.messageText(segs));return CompletableFuture.completedFuture(null);},
-          (p,h,m,o,s)->new ChatActions.Plan("嗯。",List.of(),"",5,0,true,true),
-          (e,commands,o)->gateExecuted.addAndGet(commands.size()),e->new JsonObject(),now::get)) {
-   service.accept(ordinary("Z","zed","随便说点什么"),"随便说点什么");idle(service);
-   assert replies.isEmpty() : "相关度低于下限时不得插话：" + replies;
-  }
-  // ⑤ 被点名 / 窗口内 continuation 仍可执行
-  replies.clear();gateCalls.set(0);gateExecuted.set(0);
-  try(ChatService service=new ChatService(gateSettings,(e,segs)->{replies.add(Bot.messageText(segs));return CompletableFuture.completedFuture(null);},
-          (p,h,m,o,s)->{gateCalls.incrementAndGet();return new ChatActions.Plan("好，这就改。",List.of(".size set 896 512"),"",90,0,false,true);},
+          (p,h,m,o,s)->{gateCalls.incrementAndGet();return new ChatActions.Plan("好，这就改。",List.of(".size set 896 512"),"",90,true,true);},
           (e,commands,o)->gateExecuted.addAndGet(commands.size()),e->new JsonObject(),now::get)) {
    JsonObject call=event("group","V");call.addProperty("user_id","zed");
    service.accept(call,"小鸟，把尺寸改成 896 512");idle(service);
@@ -224,10 +253,10 @@ public final class ChatServiceTest {
            : "窗口内的好感度照常更新：" + gateBefore;
   }
   // Drifting away from the woken topic ends the thread instead of answering every unrelated line.
-  settings.chatSetting("enabled",new JsonPrimitive(true));settings.setChatBaseProbability(1);
+  settings.chatSetting("enabled",new JsonPrimitive(true));
   replies.clear();AtomicLong nowDrift=new AtomicLong(now.get());AtomicInteger driftCalls=new AtomicInteger();
   try(ChatService service=new ChatService(settings,(e,segs)->{replies.add(Bot.messageText(segs));return CompletableFuture.completedFuture(null);},
-          (p,h,m,o,s)->{int call=driftCalls.incrementAndGet();return new ChatActions.Plan("回应",List.of(),"",call==1?90:5);},
+          (p,h,m,o,s)->{boolean first=driftCalls.incrementAndGet()==1;return new ChatActions.Plan("回应",List.of(),"",first?90:5,first,first);},
           (e,c,o)->{},e->new JsonObject(),nowDrift::get)) {
    JsonObject wake=event("group","H");wake.addProperty("user_id","erin");
    service.accept(wake,"小鸟，在吗");idle(service);
@@ -251,10 +280,11 @@ public final class ChatServiceTest {
    assert !new Settings(f.root).chatEnabled() && !new Settings(f.root).chatEnabled("1:group:3") : "global off overrides sessions";
    assert f.command("group",".chat global on").contains("全局聊天开关已开启");
    assert new Settings(f.root).chatEnabled("1:group:3") && new Settings(f.root).chatEnabled("1:private:2");
-   assert f.command("private",".chat").contains("本会话 开启") && f.command("private",".chat").contains("主动插话总开关");
-   assert f.command("private",".chat wake 50").contains("唤醒基数已移除") : "已移除的 /chat wake 必须给出用法提示而不是生效";
-   assert f.command("private",".chat base 0").contains("主动插话总开关已设为 0") : "/chat base 0 是插话总静音开关";
-   assert new Settings(f.root).chatChimeMuted() : "base 0 之后必须处于静音状态";
+   assert f.command("private",".chat").contains("本会话 开启") && !f.command("private",".chat").contains("主动插话总开关");
+   String wakeUsage=f.command("private",".chat wake 50");
+   assert wakeUsage.contains("用法：.chat") && !wakeUsage.contains("唤醒基数") : "已删除的 /chat wake 必须被拒绝并给出用法提示：" + wakeUsage;
+   String baseUsage=f.command("private",".chat base 0");
+   assert baseUsage.contains("用法：.chat") && !baseUsage.contains("主动插话总开关") : "已删除的 /chat base 必须被拒绝：" + baseUsage;
    assert new Settings(f.root).chatPersonality().equals("温柔简洁\n喜欢照料花草");
    assert f.command("private",".chat frequency -1").contains("非负整数");
    String help=f.command("private",".help");assert help.contains(".chat add <内容>") && !help.contains("/chat");

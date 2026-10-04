@@ -92,10 +92,8 @@ public final class Main {
                 Runtime.getRuntime().addShutdownHook(hook);
                 Log.info(settings.botName() + " 机器人已启动。群聊和私聊发送 .help 查看指令。按 Ctrl+C 退出。");
                 Log.info("粤海地图：" + settings.mapPath("yh") + "；丽湖地图：" + settings.mapPath("liv"));
-                Log.info("聊天：全局 " + (settings.chatEnabled() ? "开启" : "关闭") + "，主动插话 "
-                        + (settings.chatChimeMuted() ? "关闭（/chat base 0）" : "由模型按上下文判断")
-                        + "，每会话每分钟上限 " + settings.chatFrequency() + " 次。");
-                settings.warnDeprecatedWakeSettings();   // 旧 config.json 里的唤醒基数：只记日志，不报错
+                Log.info("聊天：全局 " + (settings.chatEnabled() ? "开启" : "关闭") + "，每会话每分钟上限 " + settings.chatFrequency()
+                        + " 次；群里被 @ 或叫名字才回复（回复后 30 分钟内可继续对话）。");
                 bot.startSdOnBoot();   // sd.start_on_boot：需要时顺带把 SD WebUI 拉起来（默认关）
                 transport.start(bot::accept);
                 announce(transport, noticeConfig, true, noticeSettings);

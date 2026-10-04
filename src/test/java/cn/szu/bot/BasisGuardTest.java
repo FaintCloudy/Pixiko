@@ -19,7 +19,7 @@ public final class BasisGuardTest {
     private static final JsonObject TWO = Json.parse("{\"style\":[\"replace\",\"second\"]}");
 
     static ChatActions.Plan load(String command) {
-        return new ChatActions.Plan("好", List.of(command), "", 90, 0);
+        return new ChatActions.Plan("好", List.of(command), "", 90);
     }
 
     public static void main(String[] args) {

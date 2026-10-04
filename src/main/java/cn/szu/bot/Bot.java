@@ -320,7 +320,7 @@ public final class Bot implements AutoCloseable {
         commands.add(direct.command());
         commands.addAll(followUp.commands());
         return new ChatActions.Plan("好，就按你刚看过的列表来：" + direct.label() + "；" + followUp.reply(),
-                commands, "", 100, 0);
+                commands, "", 100);
     }
 
     /** 名字比对用的归一化：去掉空格/下划线/标点，统一小写。 */
@@ -1073,7 +1073,7 @@ public final class Bot implements AutoCloseable {
         神户小鸟 · Pixiko（SD 生图机器人）　群聊、私聊均可
         群聊先用 @机器人或小鸟名字唤醒；同一用户此后 30 分钟内可连续对话并滚动续期。私聊无需唤名，指令仍直接响应。
         日常聊天可执行明确提出的 help 指令操作，沿用原权限；只讨论操作方法时不执行。
-        是否接话由我按上下文判断（接得上、不打断、不突兀才开口）；被 @/唤名、被回复或需要执行指令时必定回复。
+        群里只有被 @ 或叫名字（小鸟/小鳥/ことり/kotori）时才会回复；被点名后如果我愿意继续这段对话，30 分钟内你在这个会话里不 @ 也能接着聊。
         /chat — 查看聊天设置（仅 owner/admin）
         /chat toggle — 开关当前群/当前私聊的日常聊天，持久保存（仅 owner/admin；只影响聊天频道，不影响生图）
         /chat global on|off — 全局总开关（仅 owner；只影响聊天频道，生图指令始终可用）
@@ -1082,10 +1082,8 @@ public final class Bot implements AutoCloseable {
         /chat personality <基础性格设定> — 保存性格设定（仅 owner）
         /chat add <内容> — 将内容追加到当前性格设定末尾（仅 owner）
         /chat frequency <每分钟发言次数> — 聊天回复频率上限，0 为静默（仅 owner）
-        /chat wake 已移除：是否主动插话改由我按上下文判断（用 /chat base 0 可彻底关掉主动插话）
    /chat notice on|off — 开关上/下线播报是否发到主群（仅 owner/admin）
    /chat log on|off — 开关把 WARN/ERROR 日志同步到主群，便于远程观察（仅 owner/admin）
-        /chat base [0|1] — 主动插话总开关：0 永不主动插话，1 由我按上下文判断（查看任何人可；设置仅 owner）
          /chat corpus on|off — 原作语料复现开关：命中原作问答时照搬小鸟那一句（仅 owner）
          /affinity — 查看你与我的好感度与分档；/affinity <QQ号> 查看某人（仅 owner）
         /batch <指令1> ; <指令2> ; … — 一条消息按顺序执行多条指令，逐条回执并汇总（最多 20 条）
@@ -1319,7 +1317,6 @@ public final class Bot implements AutoCloseable {
             String text = messageText(event.has("message") ? event.get("message") : event.get("raw_message"));
             if (duplicate(event)) { Log.info("忽略重复事件：" + describeConversation(event)); return; }
             text=internalCommand(text);
-            if (aimedAtAnother(event)) event.addProperty("chat_third_party", true);
             String quoted = quotedText(event, sender);
             if (!quoted.isEmpty()) {
                 Log.info("引用消息（" + describeConversation(event) + "）：" + Log.text(quoted));
@@ -1577,11 +1574,6 @@ public final class Bot implements AutoCloseable {
             reply(event,"全局聊天开关已"+(enabled?"开启":"关闭")+"（已保存）。\n各会话可用 /chat toggle 单独关闭（owner/admin）；全局关闭时所有会话都不回复。");
             return;
         }
-        if(lower.startsWith("wake")) {
-            // 唤醒基数已移除：明确告知用法，绝不静默生效，也不写回任何配置。
-            throw new IllegalArgumentException("唤醒基数已移除：是否主动插话现在由我按上下文判断。"
-                    + "要彻底禁止主动插话用 /chat base 0；回复频率上限用 /chat frequency <次数>。");
-        }
         if(lower.startsWith("corpus")) {
             requireOwner(event, "/chat corpus");
             String raw=arguments.substring("corpus".length()).strip();
@@ -1620,21 +1612,6 @@ public final class Bot implements AutoCloseable {
             else { reply(event,"用法：/chat log on|off（当前 "+(settings.logMirrorEnabled()?"开":"关")+"）——开启后把 WARN/ERROR 日志同步到主群，便于远程观察。"); return; }
             settings.setLogMirrorEnabled(on);
             reply(event,"日志同步到主群已"+(on?"开启":"关闭")+"（已保存，只同步警告与错误，最多每 3 秒一条）。");
-            return;
-        }
-        if(lower.startsWith("base")) {
-            String raw=arguments.substring("base".length()).strip();
-            boolean muted=settings.chatChimeMuted();
-            if(raw.isEmpty()) {
-                reply(event,"主动插话总开关："+(muted?"0（永不主动插话）":"1（按上下文判断）")
-                        +"\n不再有「回复基数/唤醒基数」这类概率：是否接话由我读上下文决定，接得上才开口。"
-                        +"用 /chat base 0 可彻底关掉主动插话（被点名、窗口内续话与带指令的请求不受影响）。");
-                return;
-            }
-            requireOwner(event, "/chat base");
-            double value=parsePercent("/chat base",raw);
-            settings.setChatBaseProbability(value);
-            reply(event,"主动插话总开关已设为 "+(value<=0?"0（永不主动插话）":"1（按上下文判断）")+"（已保存）。");
             return;
         }
         if(lower.equals("infix") || lower.startsWith("infix ")) {
@@ -1682,7 +1659,7 @@ public final class Bot implements AutoCloseable {
             if(value<0) throw new IllegalArgumentException("频率须为非负整数。");
             settings.chatSetting("frequency",new JsonPrimitive(value)); chat.changed(false);
             Log.info("聊天频率上限："+value+" 次/分钟/会话");
-        } else if(!arguments.isEmpty()) throw new IllegalArgumentException("用法：/chat、/chat toggle、/chat global on|off（owner）、/chat model [名称]（owner）、/chat infix <修改要求>（owner）、/chat personality <基础性格设定>（owner）、/chat add <内容>（owner）、/chat frequency <每分钟次数>（owner）、/chat base 0|1（owner）");
+        } else if(!arguments.isEmpty()) throw new IllegalArgumentException("用法：/chat、/chat toggle、/chat global on|off（owner）、/chat model [名称]（owner）、/chat infix <修改要求>（owner）、/chat personality <基础性格设定>（owner）、/chat add <内容>（owner）、/chat frequency <每分钟次数>（owner）");
         requireStaff(event, "/chat");
         reply(event,"聊天功能：全局 "+(settings.chatEnabled()?"开启":"关闭")+"，本会话 "+(settings.chatEnabled(conversation)?"开启":"关闭")
                 +"\n本开关只控制聊天频道：关闭后不回复自然语言对话，也不做自然语言指令规划；"
@@ -1691,12 +1668,9 @@ public final class Bot implements AutoCloseable {
                 +"\n· "+channelStatus(DeepSeekPrompts.Channel.CHAT)
                 +"\n· "+channelStatus(DeepSeekPrompts.Channel.IMAGE)
                 +"\n群聊先由 @机器人或小鸟名字唤醒；同一用户连续对话窗口："+settings.chatContextSeconds()+" 秒（每次消息和回复后续期）。"
-                +"\n是否插话由我按上下文判断（接得上、不打断、不突兀才开口）：被 @ 或唤名、窗口内续话、需要执行指令时必定回复。"
-                +"\n主动插话总开关："+(settings.chatChimeMuted()?"0（永不主动插话）":"1（按上下文判断）")+"（/chat base 0|1，设置仅 owner）"
+                +"\n只有被 @ 或叫名字（小鸟/小鳥/ことり/kotori）时才会回复；被点名后如果我愿意继续这段对话，30 分钟内你在这个会话里不 @ 也能接着聊。"
                 +"\n聊天使用独立单线程，不占用 SD 生成队列。"
                 +"\n每个会话每分钟最多回复："+settings.chatFrequency()+" 次"
-                +"\n每两次主动插话至少间隔："+settings.chatChimeCooldownSeconds()+" 秒；插话相关度下限："+settings.chatBaseMinInterest()
-                +"（别人之间的对话为 "+settings.chatChimeHighInterest()+"）"
                 +"\n基础性格（仅 owner 可修改，含对 owner 的专属规则）：\n"+settings.chatPersonality());
     }
     /**
@@ -4434,22 +4408,6 @@ public final class Bot implements AutoCloseable {
         quoted = quoted.replaceAll("[\\p{Cntrl}\\p{Cf}]+", " ").replaceAll("\\s+", " ").strip();
         return quoted.length() > 300 ? quoted.substring(0, 300) + "…" : quoted;
     }
-    /** True when the message is aimed at another member: it is a two-person exchange the bot is not part of. */
-    static boolean aimedAtAnother(JsonObject event) {
-        String self = Json.str(event, "self_id", "");
-        JsonElement message = event.get("message");
-        if (message != null && message.isJsonArray())
-            for (JsonElement item : message.getAsJsonArray()) {
-                if (!item.isJsonObject()) continue;
-                JsonObject segment = item.getAsJsonObject();
-                if (!"at".equals(Json.str(segment, "type", ""))) continue;
-                String qq = Json.str(Json.obj(segment, "data"), "qq", "").strip();
-                if (Settings.isUserId(qq) && !qq.equals(self)) return true;
-            }
-        Matcher matcher = Pattern.compile("\\[CQ:at,qq=([1-9][0-9]{0,19})\\]").matcher(Json.str(event, "raw_message", ""));
-        while (matcher.find()) if (!matcher.group(1).equals(self)) return true;
-        return false;
-    }
     /** The single @target of a message, ignoring @全体成员 and the bot itself. */
     static String mentionedUser(JsonObject event) {
         Set<String> found = new LinkedHashSet<>();
@@ -5731,7 +5689,7 @@ public final class Bot implements AutoCloseable {
             ShownSelection direct = chained == null ? resolveShownSelection(selectionContext(event), message) : null;
             ChatActions.Plan surgery = categorySurgeryPlan(message);
             if (stale != null) {
-                plan = new ChatActions.Plan(stale, List.of(), "", 100, 0);
+                plan = new ChatActions.Plan(stale, List.of(), "", 100);
             } else if (surgery != null) {
                 plan = surgery;
             } else if (chained != null) {
@@ -5740,9 +5698,9 @@ public final class Bot implements AutoCloseable {
             } else if (direct != null && direct.clarification()) {
                 // 编号与名字对不上（或名字有歧义）：程序直接问清楚，绝不执行。
                 Log.info("编号与用户说法对不上，改为澄清：" + direct.label());
-                plan = new ChatActions.Plan(direct.label(), List.of(), "", 100, 0);
+                plan = new ChatActions.Plan(direct.label(), List.of(), "", 100);
             } else if (direct != null) {
-                plan = new ChatActions.Plan("好，就按你刚看过的列表来：" + direct.label(), List.of(direct.command()), "", 100, 0);
+                plan = new ChatActions.Plan("好，就按你刚看过的列表来：" + direct.label(), List.of(direct.command()), "", 100);
             } else {
                 // K2/K3/K4：网页端与 QQ 同源——把好感度分档、情绪与这轮该用的敏感话题反应一起交给规划层。
                 String stateHint = chat.personaHint(scope, message);
@@ -7042,7 +7000,7 @@ public final class Bot implements AutoCloseable {
         String reply = "好，" + (keep ? "只保留 " : "删掉 ") + String.join("、", categories)
                 + (keep ? "，其余词条清空（LoRA/嵌入标签保留）" : " 这几类词条") + "。";
         Log.info("按类别筛选的聊天请求，程序直接执行：" + command);
-        return new ChatActions.Plan(reply, List.of(command), "", 100, 0);
+        return new ChatActions.Plan(reply, List.of(command), "", 100);
     }
     /**
      * QQ 侧的聊天规划入口（{@link ChatService.Planner}）：纯"按类别筛选词条"的要求先由程序直接执行，

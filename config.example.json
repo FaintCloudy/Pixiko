@@ -49,14 +49,8 @@
     "corpus_replay": true,
     "corpus_top_k": 3,
     "enabled": true,
-    "reply_probability_scale": 1,
-    "disabled_conversations": [],
-    "reply_base_probability": 0.02,
-    "wake_probability": {},
-    "chime_cooldown_seconds": 15,
-    "topic_gap_seconds": 15,
-    "base_min_interest": 40,
-    "chime_high_interest": 85
+    "context_seconds": 1800,
+    "disabled_conversations": []
   },
   "progen": {
     "model": "deepseek-flash",

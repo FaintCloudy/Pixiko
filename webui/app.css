@@ -164,6 +164,43 @@ code { background: rgba(120, 160, 220, .14); padding: 1px 5px; border-radius: 6p
 .composer textarea { flex: 1; }
 .composer button { flex: 0 0 auto; min-width: 78px; }
 
+/* ---------------------------------------------------------------- 对话面板：铺满可视高度，输入框常驻面板底部
+   以前 .messages 有 min-height:40vh，输入框排在对话历史下面，得把整页滚到底才看得见。
+   现在：#panel-chat 撑满「页头 .bar + 页签 .tabs」以下的可视高度（.panel 本来就是 flex 纵向布局），
+   #chat-log 吃掉剩下的高度并**自己滚动**（它仍是唯一的内部滚动容器 —— app.js 里的
+   scrollTop / scrollHeight / nodeAtBottom 语义一个字没变），#chat-form 与它下面那一行
+   （允许执行指令 / 清空对话 / 兴趣度）固定在面板底部、不收缩、始终可见。
+   只作用于 #panel-chat：.composer 还被「系统」栏目的 #console-form 复用，
+   所以这里的选择器一律带 #panel-chat 前缀，通用类 .messages / .composer 一个字没改。 */
+#panel-chat {
+  /* 页头 .bar（实测 62.25px：上下各 10px 内边距 + 1px 下边框）+ 页签 .tabs（实测 55.25px）
+     + .tabs 的 6px 下外边距 + #app 上内边距 12px ≈ 135.5px，这里取 140px 留约 4px 余量：
+     页头文案/字体一变，上面这一串就会高几个像素。宁可多减 —— 面板略矮只是对话区矮几像素；
+     少减了，底部那一行（允许执行指令 / 清空对话）就会被屏幕底边裁掉。
+     再让出 env(safe-area-inset-*)：.bar 的上内边距本身就带 safe-area-inset-top，
+     有刘海/小白条的机器上页头会更高、底边也会被占一条，两个都减掉才准。 */
+  --chat-chrome: 140px;
+  height: calc(100vh - var(--chat-chrome) - env(safe-area-inset-top, 0px) - env(safe-area-inset-bottom, 0px));
+  /* 地址栏伸缩时跟着变；不认 dvh 的浏览器用上面那行 100vh */
+  height: calc(100dvh - var(--chat-chrome) - env(safe-area-inset-top, 0px) - env(safe-area-inset-bottom, 0px));
+  min-height: 0;
+}
+#panel-chat #chat-log {
+  flex: 1 1 auto;
+  min-height: 0;                 /* 盖掉通用 .messages 的 min-height:40vh：否则面板又被撑高、输入框又跑到屏幕外 */
+  overflow-y: auto;              /* 对话历史自己滚：滚动位置记忆（scrollTop）照旧 */
+  overflow-x: hidden;
+  overscroll-behavior: contain;  /* 滚到尽头不要把整页带着一起滚 */
+  padding-right: 2px;            /* 给滚动条留一条缝，气泡不贴滚动条 */
+}
+/* 输入框与它下面那一行：固定高度、不收缩，永远留在面板底部 */
+#panel-chat #chat-form,
+#panel-chat > .row { flex: 0 0 auto; }
+@media (max-width: 620px) {
+  /* 窄屏 #app 的上内边距是 8px（见下面 620px 的断点），页头/页签高度不变 */
+  #panel-chat { --chat-chrome: 136px; }
+}
+
 .receipts { display: flex; flex-direction: column; gap: 8px; }
 .receipt {
   background: linear-gradient(135deg, rgba(31, 44, 66, .78), rgba(23, 33, 51, .6));

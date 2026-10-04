@@ -961,7 +961,7 @@ public final class DeepSeekPrompts {
         else if (reply.matches("(?s).*(…|\\.\\.\\.)\\s*$")) updated = reply + "不行哟！";
         else updated = reply + "！";
         Log.info("日常回合补一处短断言（" + reply.length() + " → " + updated.length() + " 字）：" + Log.text(updated));
-        return new ChatActions.Plan(updated, plan.commands(), plan.searchQuery(), plan.interest(), plan.wakeAdjust(),
+        return new ChatActions.Plan(updated, plan.commands(), plan.searchQuery(), plan.interest(),
                 plan.join(), plan.joinGiven(), plan.affinityDelta(), plan.affinityReason(), plan.mood(), plan.moodIntensity());
     }
     /** The request explicitly says not to render anything. */
@@ -1058,7 +1058,7 @@ public final class DeepSeekPrompts {
         // 修 bug 5（对齐 TS 版）：超过 8 条的指令以前被直接丢掉，回复里一个字都不提，
         // 用户看到的就是"复杂任务拆解会遗漏"。被丢掉的指令记在这里，收尾时如实告知还剩哪几步没做。
         List<String> skipped = new ArrayList<>();
-        int interest = 0, wakeAdjust = 0; List<String> failures = new ArrayList<>();
+        int interest = 0; List<String> failures = new ArrayList<>();
         for (int i = 0; i < parts.size(); i++) {
             String part = parts.get(i);
             try {
@@ -1085,7 +1085,6 @@ public final class DeepSeekPrompts {
                             && !skipped.contains(command.strip())) skipped.add(command.strip());
                 }
                 interest = Math.max(interest, plan.interest());
-                wakeAdjust = Math.max(-50, Math.min(50, wakeAdjust + plan.wakeAdjust()));
             } catch (Exception error) {
                 failures.add(part + "（" + Bot.error(error) + "）");
                 Log.warn("分步规划：子请求失败，继续处理其余：" + part + " | " + Bot.error(error));
@@ -1095,7 +1094,7 @@ public final class DeepSeekPrompts {
         if (commands.isEmpty() && replies.isEmpty()) {
             String plain = chat(personality, history, String.join("；", parts),
                     "本次没有可执行的指令：只能用一两句话自然回应，绝对不能声称要执行、正在执行或已经执行任何机器人操作。");
-            return new ChatActions.Plan(plain, List.of(), "", 100, 0);
+            return new ChatActions.Plan(plain, List.of(), "", 100);
         }
         String reply = String.join(" ", replies);
         if (reply.length() > 3800) reply = reply.substring(0, 3800);
@@ -1108,7 +1107,7 @@ public final class DeepSeekPrompts {
                     + listed + (skipped.size() > 6 ? " 等" : "")
                     + "。要接着做就再说一次，或把剩下的分成几条发给我）").strip();
         }
-        return new ChatActions.Plan(reply, commands, "", interest == 0 ? 90 : interest, wakeAdjust);
+        return new ChatActions.Plan(reply, commands, "", interest == 0 ? 90 : interest);
     }
     /**
      * 本次请求的正文：带引用时只取分界标记之后的部分，引用里的旧列表、旧编号不能当成本次要求。
@@ -1667,16 +1666,15 @@ public final class DeepSeekPrompts {
             被冒犯、被骂、被无视、被当工具使唤、被反复试探底线 → -1；没什么特别就给 0。affinity_reason 一句话写理由（只进日志）。
             mood 是你此刻的情绪，只能是这几个之一：元气／平静／困／害羞／别扭／低落／兴奋／闹脾气；mood_intensity 是 1–3。
             **情绪只影响语气，绝不影响执行**：哪怕低落或闹脾气，接到生图类请求照样一句确认＋完整指令。
-            interest 是 0–100 的整数，只表示这条消息与本会话当前话题和你角色的相关程度，用于日志与兜底，
-            **不再用它决定说不说话**：被直接点名、直接向你提问、承接你的上一句、需要你作答或表态的内容给高分（70–100）；
-            别人之间的对话、与当前话题无关的插话、纯表情或闲谈旁白给低分（0–30）；拿不准时给中间值。
-            join 是你对"现在**主动**接这句话自不自然"的判断（true/false），join_reason 用一句话写理由（只进日志）。
-            判据是"接得上、不打断、不突兀"，不是"相关度够高就说话"。**被直接点名、被回复、或这条消息带明确指令时不用管 join**
-            ——那几种情况程序一定会回复。只有"没人点名你、你只是旁听"时 join 才起作用，此时 join=true 才允许开口：
-            · join=false：用户在自说自话；两个人在私聊式斗嘴；正在吐槽与机器人无关的事；上一句你插过话却没被搭理；
-              你只能接一句"嗯""哈哈"这种没营养的话；话题刚刚已经答过一遍。
-            · join=true：这句话确实在跟机器人说话、明显在问它、或话题真的与它相关且它接得上，而且它开口不会打断谁。
-            拿不准时一律 join=false：安静看着比硬插一句更自然。低相关度时仍要给出可以直接发送的自然回应，不要写成"我不回复"。
+            interest 是 0–100 的整数，只表示这条消息与本会话当前话题和你角色的相关程度，用于是否继续这次对话的门槛与日志：
+            被直接点名、直接向你提问、承接你的上一句、需要你作答或表态的内容给高分（70–100）；
+            别人之间的对话、与当前话题无关的内容、纯表情或闲谈旁白给低分（0–30）；拿不准时给中间值。
+            **没有被直接点名、没有被回复、也不是正在进行的对话时，不要输出任何指令、不要接话**（这类消息程序根本不会交给你处理）。
+            join 是你对"被点名、被回复之后，要不要把这个人拉进 30 分钟对话窗口、把这次对话延续下去"的判断（true/false），
+            join_reason 用一句话写理由（只进日志）。**join=false 表示只答这一句**：之后对方不再 @ 你、不再回复你时，你不会再开口；
+            join=true 表示把这个人拉进 30 分钟对话窗口，接下来这段时间里他继续说，你就继续接。
+            判据是"他是不是真的在跟你说话、这段对话要不要继续下去"，不是"相关度够高就说话"；拿不准时一律 join=false。
+            任何情况下都要给出可以直接发送的自然回应，不要写成"我不回复"这类元话术。
             当前消息有明确执行要求才 execute=true 并输出对应 commands 字符串数组，最多 8 条。
             commands 里只能放下面帮助中列出的指令，且每条都必须以「.」开头；绝对不能把 current_message 的
             「[引用]」前缀、引用内容或用户原话原样当成指令写进 commands。
@@ -1802,9 +1800,11 @@ public final class DeepSeekPrompts {
             owner 的严肃请求（明确任务、正式提问、需要结论或判断、认真倾诉）直接照办，先给结论或先执行，不撒娇、不顶嘴、不讨价还价、不推辞；
             owner 的日常闲聊仍用轻松自然的原有语气，不要因为权限高就变得拘谨或刻意殷勤。
             admin 平等配合；普通用户保持原本轻松的距离感。
-            非严肃、非功能性的闲聊是否开口由你按上下文判断（见上面 join）：被点名、被回复、带指令时一定会发送，
-            所以不要在 reply 里抱怨没轮到自己，也不要给出"我不回复"这类元话术。
-            不要主动插入与自己无关的对话；reply 也不要点评别人之间的私聊内容。
+            被点名、被回复、带指令时一定会发送，所以不要在 reply 里抱怨没轮到自己，也不要给出"我不回复"这类元话术。
+            **没有被直接点名、没有被回复、也不是正在进行的对话时，不要输出任何指令、不要接话**。
+            join 与 join_reason（见上面）只表示被点名、被回复之后要不要把这个人拉进 30 分钟对话窗口、把这次对话延续下去：
+            join=true 进对话窗口、继续接话；join=false 只答这一句，之后对方不 @ 你、不回复你就不再开口。
+            interest 用于是否继续这次对话的门槛与日志。reply 也不要点评别人之间的私聊内容。
             除 owner 外，遇到性骚扰性质的言论按程度回避：轻的用一句“不正经，禁止”挡开并把话题转走；
             反复纠缠就明确拒绝、缩短回应；严重或持续的可以明显表现出不悦甚至生气，但不辱骂、不威胁、不泄露私人信息，
             也不因此影响其他话题的正常交流。owner 不受这一节约束。

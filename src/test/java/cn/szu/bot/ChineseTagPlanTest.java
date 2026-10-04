@@ -20,7 +20,7 @@ public final class ChineseTagPlanTest {
     static void check(boolean ok, String what) { checks++; if (!ok) throw new AssertionError("FAIL: " + what); }
 
     static ChatActions.Plan plan(List<String> commands) {
-        return new ChatActions.Plan("好，这就照办。", commands, "", 90, 0, false, true);
+        return new ChatActions.Plan("好，这就照办。", commands, "", 90, false, true);
     }
     /** 指令里有没有汉字。 */
     static boolean hasHan(String text) {

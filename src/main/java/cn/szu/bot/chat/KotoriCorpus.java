@@ -589,15 +589,6 @@ public final class KotoriCorpus {
         if (result.isEmpty() && !reference.anchors().isEmpty()) result.addAll(reference.anchors());
         return result;
     }
-    /** 旁听（只为拿 join）那次调用用的极简版：只给两句味道参考，不注入整段，省 token。 */
-    public String briefText(Reference reference) {
-        if (reference == null) return "";
-        List<String> lines = reference.matched() && !reference.hits().isEmpty()
-                ? List.of(reference.hits().get(0).reply())
-                : (reference.anchors().isEmpty() ? List.of() : reference.anchors().subList(0, Math.min(2, reference.anchors().size())));
-        if (lines.isEmpty()) return "";
-        return "她说话的味道（极简提示）：" + String.join("／", lines) + "\n";
-    }
     private static volatile KotoriCorpus cached;
     private static volatile long cachedStamp = -1;
     /**
@@ -619,17 +610,6 @@ public final class KotoriCorpus {
     /** 保留两参重载（测试与不需要轮换的调用点用）。 */
     public static String referenceFor(cn.szu.bot.Settings settings, String message) {
         return referenceFor(settings, message, 0);
-    }
-    /** 旁听（只为拿 join）那次调用：只给极简味道提示，不注入整段对白。 */
-    public static String briefFor(cn.szu.bot.Settings settings, String message) {
-        try {
-            KotoriCorpus corpus = load(settings);
-            if (corpus == null) return "";
-            if (corpus.pairCount() == 0 && corpus.anchorCount() == 0) return "";
-            return corpus.briefText(corpus.reference(message, settings.corpusTopK()));
-        } catch (Exception error) {
-            return "";
-        }
     }
     /** 需要时才读语料（含按修改时间失效），失败返回 null。 */
     private static KotoriCorpus load(cn.szu.bot.Settings settings) {

@@ -10,31 +10,31 @@ import cn.szu.bot.Settings;
 /** Model output is data; only the existing bot command language can be dispatched. */
 public final class ChatActions {
     /**
-     * interest 是模型对"这条消息与本会话话题/设定有多相关"的 0–100 判断，现在只用于日志与兜底；
-     * join 是模型对"现在插话自不自然"的判断（true 才允许主动插话），joinGiven 表示模型确实给了这个字段
-     * （没给时上层退回按 interest 门槛的保守兜底，绝不掷随机数）；wakeAdjust 是旧字段，已不再使用。
+     * interest 是模型对"这条消息与本会话话题/设定有多相关"的 0–100 判断，现在只用于"要不要继续这次对话"的门槛与日志；
+     * join 是模型对"被点名/被回复之后，要不要把这个人拉进 30 分钟对话窗口（继续聊下去）"的判断
+     * （join=true 才进入对话窗口；join=false 表示只答这一句，之后不 @ 不再回），joinGiven 表示模型确实给了这个字段
+     * （没给时上层退回按 interest 门槛的保守兜底，绝不掷随机数）。
      */
-    public record Plan(String reply, List<String> commands, String searchQuery, int interest, int wakeAdjust,
+    public record Plan(String reply, List<String> commands, String searchQuery, int interest,
                        boolean join, boolean joinGiven, int affinityDelta, String affinityReason,
                        String mood, int moodIntensity) {
-        public Plan(String reply,List<String> commands) { this(reply,commands,"",100,0); }
-        public Plan(String reply,List<String> commands,String searchQuery) { this(reply,commands,searchQuery,100,0); }
-        public Plan(String reply,List<String> commands,String searchQuery,int interest) { this(reply,commands,searchQuery,interest,0); }
-        public Plan(String reply,List<String> commands,String searchQuery,int interest,int wakeAdjust) {
-            this(reply,commands,searchQuery,interest,wakeAdjust,false,false);
+        public Plan(String reply,List<String> commands) { this(reply,commands,"",100); }
+        public Plan(String reply,List<String> commands,String searchQuery) { this(reply,commands,searchQuery,100); }
+        public Plan(String reply,List<String> commands,String searchQuery,int interest) {
+            this(reply,commands,searchQuery,interest,false,false);
         }
-        public Plan(String reply,List<String> commands,String searchQuery,int interest,int wakeAdjust,
+        public Plan(String reply,List<String> commands,String searchQuery,int interest,
                     boolean join, boolean joinGiven) {
-            this(reply,commands,searchQuery,interest,wakeAdjust,join,joinGiven,0,"","",0);
+            this(reply,commands,searchQuery,interest,join,joinGiven,0,"","",0);
         }
         public Plan { commands = List.copyOf(commands); searchQuery=searchQuery==null ? "" : searchQuery.strip();
-                interest=Math.max(0,Math.min(100,interest)); wakeAdjust=Math.max(-50,Math.min(50,wakeAdjust));
+                interest=Math.max(0,Math.min(100,interest));
                 affinityDelta=Math.max(-3,Math.min(3,affinityDelta));
                 affinityReason=affinityReason==null ? "" : affinityReason.strip();
                 mood=mood==null ? "" : mood.strip(); moodIntensity=Math.max(0,Math.min(3,moodIntensity)); }
         /** 只换回复/指令/检索词，保留 join 与好感度/情绪这些"人格状态"字段（K3/K4 不能被派生计划丢掉）。 */
         public Plan copy(String newReply, List<String> newCommands, String newQuery) {
-            return new Plan(newReply, newCommands, newQuery, interest, wakeAdjust, join, joinGiven,
+            return new Plan(newReply, newCommands, newQuery, interest, join, joinGiven,
                     affinityDelta, affinityReason, mood, moodIntensity);
         }
     }
@@ -181,14 +181,9 @@ public final class ChatActions {
                 interest=output.get("interest").getAsInt();
                 if(interest<0 || interest>100) throw new IllegalArgumentException();
             }
-            int wakeAdjust=0;
-            if(output.has("wake_adjust") && !output.get("wake_adjust").isJsonNull()) {
-                if(!output.get("wake_adjust").isJsonPrimitive() || !output.get("wake_adjust").getAsJsonPrimitive().isNumber())
-                    throw new IllegalArgumentException();
-                wakeAdjust=output.get("wake_adjust").getAsInt();
-                if(wakeAdjust<-50 || wakeAdjust>50) throw new IllegalArgumentException();
-            }
-            // 是否插话由模型按上下文判断；老提示词没给这个字段时 joinGiven=false，上层走保守兜底。
+            // 是否延续这次对话由模型按上下文判断（被点名/被回复之后要不要进 30 分钟对话窗口）；
+            // 老提示词没给这个字段时 joinGiven=false，上层走保守兜底。
+            // wake_adjust 是已彻底废弃的旧字段：模型若仍返回它，这里不解析、不报错，一律静默忽略。
             boolean join=false, joinGiven=false;
             if(output.has("join") && !output.get("join").isJsonNull()) {
                 if(!output.get("join").isJsonPrimitive() || !output.get("join").getAsJsonPrimitive().isBoolean())
@@ -211,7 +206,7 @@ public final class ChatActions {
             if(output.has("mood_intensity") && !output.get("mood_intensity").isJsonNull()
                     && output.get("mood_intensity").isJsonPrimitive() && output.get("mood_intensity").getAsJsonPrimitive().isNumber())
                 moodIntensity=output.get("mood_intensity").getAsInt();
-            return new Plan(reply, commands, searchQuery, interest, wakeAdjust, join, joinGiven,
+            return new Plan(reply, commands, searchQuery, interest, join, joinGiven,
                     affinityDelta, affinityReason, mood, moodIntensity);
         } catch (Exception e) { throw new IOException("DeepSeek 返回的聊天操作无效，本次未执行指令。"); }
     }

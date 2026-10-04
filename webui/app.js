@@ -582,7 +582,9 @@
     number: 0, timer: null, ticked: false, openAt: 0,
     questRunning: false, tasksRunning: false, progressRunning: false,
     command: '', latest: 0, dir: '',
-    card: null, head: null, fill: null, note: null,
+    card: null, head: null, fill: null, note: null, cancelBtn: null,
+    // 进度卡上那条任务：号（取消时发给 /api/tasks/action）、最后一次画出的百分比、以及本地点过取消。
+    taskNumber: '', percent: 0, cancelled: false,
     gallery: null, single: null, singleFile: '', base: '',
     files: new Set(), extras: [], baseline: null, startedAt: 0,
   };
@@ -648,10 +650,22 @@
     const track = el('div', 'quest-progress-bar');
     const fill = el('div', 'quest-progress-fill');
     const note = el('div', 'quest-progress-note');
+    // 「取消」按钮：与出图页同一个任务动作接口，二次确认后才发（见 questCancelTask）。
+    const acts = el('div', 'quest-progress-acts');
+    const cancel = el('button', 'danger quest-progress-cancel', '取消');
+    cancel.type = 'button';
+    cancel.onclick = () => { questCancelTask(); };
+    cancel.style.padding = '5px 11px';
+    cancel.style.minHeight = '32px';
+    cancel.style.fontSize = '12.5px';
+    acts.appendChild(cancel);
+    acts.style.display = 'flex';
+    acts.style.justifyContent = 'flex-end';
     track.appendChild(fill);
     card.appendChild(head);
     card.appendChild(track);
     card.appendChild(note);
+    card.appendChild(acts);
     note.hidden = true;
     // 这一类名 CSS 里还没有规则：卡片与进度条给最小内联样式，免得条高 0 看不见（后面有 CSS 也能盖外观）。
     card.style.border = '1px solid var(--line, rgba(120, 160, 220, .28))';
@@ -674,10 +688,36 @@
     note.style.fontSize = '12px';
     note.style.color = 'var(--muted, #8fa4bf)';
     questLive.card = card; questLive.head = head; questLive.fill = fill; questLive.note = note;
+    questLive.cancelBtn = cancel;
     return card;
   }
 
-  /** 进度卡文案与宽度：主条看图片级 done/total/percent，副标题看单张图内部的采样进度。 */
+  /**
+   * 当前这一张的采样百分比（0–100）：只有 SD 真在这张图上采样时才算数。
+   * `/api/progress.running=false`（没在跑）或 `reachable=false`（SD 读不到）都返回 0，
+   * 也就是「当前这张贡献 0」——总进度退回已完成的图片数。
+   */
+  function questSamplePercent(progress) {
+    if (!progress || progress.reachable === false || !progress.running) return 0;
+    const percent = Number(progress.percent);
+    if (!Number.isFinite(percent)) return 0;
+    return Math.max(0, Math.min(100, percent));
+  }
+
+  /**
+   * 总进度百分比：`(已生成图片数 + 当前这张的采样百分比/100) / 总图片数 × 100`。
+   * 例：done=9、total=20、当前那张 41% → (9 + 0.41)/20 = 47.05%。单张任务（total=1、done=0）算出来
+   * 就是这一张的采样百分比。`total<=0`（或 /api/tasks 里没有这一条）时退回只用采样百分比。
+   */
+  function questTotalPercent(done, total, sample) {
+    const value = total > 0 ? (done + sample / 100) / total * 100 : sample;
+    return Number.isFinite(value) ? Math.max(0, Math.min(100, value)) : 0;
+  }
+
+  /**
+   * 进度卡文案与宽度：主条用「已生成图片数 + 当前那张采样百分比」合起来的总进度，
+   * 副标题仍然是当前这张图内部的采样细节（采样中 8/20（41%）· 预计 14 秒）。
+   */
   function questPaintCard(task, progress) {
     const card = questLive.card, head = questLive.head, fill = questLive.fill, note = questLive.note;
     if (!card || !head || !fill || !note) return;
@@ -685,18 +725,34 @@
     const running = questGenerating();
     const done = task ? questCount(task.done) : 0;
     const total = task ? questCount(task.total) : 0;
-    let percent = task && Number.isFinite(Number(task.percent)) ? Number(task.percent) : (total ? Math.round(100 * done / total) : 0);
-    percent = Math.max(0, Math.min(100, Math.round(percent)));
-    let text = task
-      ? '任务 #' + (Number(task.number) || number) + ' · 已生成 ' + done + '/' + total + ' 张 · ' + percent + '%'
-      : '任务 #' + number + (running ? ' · 生成中…' : '');
-    if (!running) {
-      if (!task || (total > 0 && done >= total)) percent = 100;   // 真跑满了才把条推满（被取消的不假装 100%）
-      text += ' · 已完成';
-    }
+    // 取消过（/api/tasks 那条带 cancelled，或本地点过取消）就不再把条推满。
+    const cancelled = !!(task && task.cancelled) || questLive.cancelled;
+    const sample = questSamplePercent(progress);
+    let percent = Math.round(questTotalPercent(done, total, sample));
+    // 真跑满了才把条推满（被取消的不假装 100%）。
+    if (!running && !cancelled && (!task || (total > 0 && done >= total))) percent = 100;
+    // 取消之后进度只前进不后退：采样停了也不会从 47% 缩回 45%（更不会跳回 0 / 100）。
+    if (cancelled) percent = Math.max(percent, questLive.percent);
+    percent = Math.max(0, Math.min(100, percent));
+    questLive.percent = percent;
+    if (task && task.number !== undefined && task.number !== null) questLive.taskNumber = String(task.number);
+    // 文案：有 total 就是「已生成 done/total 张 · 进度%」；拿不到 /api/tasks（或 total<=0）时退回只报采样进度。
+    const label = total > 0 ? '已生成 ' + done + '/' + total + ' 张' : '采样进度';
+    let text = (task ? '任务 #' + (Number(task.number) || number) : '任务 #' + number)
+      + ' · ' + label + ' · ' + percent + '%';
+    if (!task && running) text += '（生成中…）';
+    if (cancelled) text += ' · 已取消（正在下发的这一张会跑完）';
+    else if (!running) text += ' · 已完成';
     head.textContent = text;
     fill.style.width = percent + '%';
     card.classList.toggle('done', !running);
+    // 取消按钮：跑着时可点；已取消 → 禁用并标「已取消」；跑完（没取消过）→ 收起来。
+    const cancel = questLive.cancelBtn;
+    if (cancel) {
+      cancel.hidden = !running && !cancelled;
+      cancel.disabled = cancelled || !running;
+      cancel.textContent = cancelled ? '已取消' : '取消';
+    }
     // 副标题只放「单张图内部」的采样进度；SD 读不到（reachable=false）就不显示，免得拿它冒充任务进度。
     const steps = progress ? questCount(progress.steps) : 0;
     if (running && progress && progress.reachable !== false && steps > 0) {
@@ -708,6 +764,29 @@
     } else {
       note.textContent = '';
       note.hidden = true;
+    }
+  }
+
+  /**
+   * 进度卡上的「取消」：二次确认后调与出图页同一个接口 `POST /api/tasks/action`
+   * （body `{action:"cancel", number:"<任务号>"}`），再立刻重拉 /api/tasks + /api/progress
+   * 并就地重画进度卡（就这一轮，不等 1.5 秒的定时轮询；两者不冲突，谁后到谁画最后一笔）。
+   * 出图页那份任务列表也顺手刷新（回执页没有 #task-list，loadTasks 自己会跳过），左栏回执列表也跟着刷一次。
+   */
+  async function questCancelTask() {
+    const target = String(questLive.taskNumber || '');
+    if (!target) return;
+    try {
+      if (!await askConfirm('取消任务 #' + target + '？已经生成的图片仍可领取。',
+          { title: '取消任务', confirmText: '取消任务', danger: true })) return;
+      const result = await api('/api/tasks/action', { body: { action: 'cancel', number: target } });
+      questLive.cancelled = true;                                  // 先记住：即使这一轮 /api/tasks 还没反映出来，卡片也不再假装在跑
+      if (result && result.message) toast(String(result.message).split('\n')[0]);
+      await loadTasks().catch(() => {});
+      await questLiveTick();                                       // /api/tasks + /api/progress 重拉一次，卡片就地变「已取消」
+      refreshQuestListQuietly().catch(() => {});                    // 左栏那条「进行中…」跟着刷（不等它，卡片已经先画好了）
+    } catch (error) {
+      if (String(error.message) !== 'unauthorized') toast(error.message);
     }
   }
 
@@ -872,6 +951,7 @@
     const card = questLive.card;
     if (card && card.parentNode) card.parentNode.removeChild(card);
     questLive.card = null; questLive.head = null; questLive.fill = null; questLive.note = null;
+    questLive.cancelBtn = null;
   }
 
   /** 不合格的实时视图：进度卡撤掉、表停掉，实时图也不再追加。 */
@@ -895,6 +975,7 @@
     questLive.latest = 0;
     questLive.dir = '';
     questLive.card = null; questLive.head = null; questLive.fill = null; questLive.note = null;
+    questLive.cancelBtn = null; questLive.taskNumber = ''; questLive.percent = 0; questLive.cancelled = false;
     questLive.gallery = null; questLive.single = null; questLive.singleFile = '';
     questLive.files = new Set();
     questLive.extras = [];

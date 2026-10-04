@@ -5,7 +5,7 @@ Pixiko 是一个自用的 QQ 机器人：接 **NapCat** 收消息，接 **Stable
 领图；机器人自己把生成好的图片发回对话。
 
 - **作者**：loriko（deloriko@outlook.com）
-- **版本**：v1.1.2（发行说明见 [`RELEASE.md`](RELEASE.md)）
+- **版本**：v1.2.0（发行说明见 [`RELEASE.md`](RELEASE.md)）
 - **版本号规则**：**大改动更新中间位**（`1.1.x` → `1.2.0`），**小修小补更新最后一位**（`1.1.1` → `1.1.2`）
 - **当前实现**：**Java 版**（`src/`）——这是线上一直在跑的那一份
 - **网页控制台**：`webui/`（纯静态 HTML/CSS/JS，随机器人一起由内嵌 Spring Boot 提供）
@@ -176,10 +176,7 @@ run.bat --set-map yh "路径"       # 命令行设置地图（需先停止机器
 | `progen` | `model` / `thinking` / `reasoning_effort` / `max_tokens` / `timeout_seconds` / `api_key_file` | **生图频道**的 DeepSeek 设置，密钥文件默认 `data/deepseek-api-key.txt` |
 | `chat_api` | 同上 | **聊天频道**的 DeepSeek 设置，密钥文件默认 `data/deepseek-chat-api-key.txt`。两条通道完全独立：模型、思考开关、密钥各管各的 |
 | `chat` | `personality` | 人格设定。**示例里只有 3～5 行占位文本**，真实人格由 owner 自己写（`.chat personality` 整段替换、`.chat add` 追加、`.chat infix` 让模型改） |
-| | `enabled` / `frequency` / `reply_base_probability` / `reply_probability_scale` | 聊天总开关、回复频率上限、主动插话概率 |
-| | `wake_probability` / `chime_cooldown_seconds` / `topic_gap_seconds` / `base_min_interest` / `chime_high_interest` | 主动插话的按会话权重与冷却（示例里是 `{}`） |
-| | `corpus_replay` / `corpus_top_k` | 原作语料复现开关与召回条数，见下面的版权说明 |
-| | `disabled_conversations` | 已关掉日常聊天的会话列表 |
+| | `enabled` / `frequency` / `context_seconds` / `corpus_replay` / `corpus_top_k` / `disabled_conversations` | 聊天总开关、回复频率上限（**`frequency: 0` 表示这个会话完全不回**）、30 分钟「对话窗口」的秒数（默认 `1800`）、原作语料复现开关与召回条数（见下面的版权说明）、已关掉日常聊天的会话列表。**主动插话相关的 7 个键（`wake_probability`、`reply_base_probability`、`reply_probability_scale`、`chime_cooldown_seconds`、`topic_gap_seconds`、`base_min_interest`、`chime_high_interest`）已删除，老配置里留着会被直接忽略**（不报错、不改写、不迁移） |
 | `infix` | `filter_enabled_conversations` | 已开启「标准词库约束」的会话（默认空 = 全部自由改写） |
 
 ### Civitai 登录：用一次性链接，不要手抄 Cookie
@@ -199,7 +196,9 @@ run.bat --set-map yh "路径"       # 命令行设置地图（需先停止机器
 
 ## 五、指令总表
 
-群聊先 @机器人或叫她的名字唤醒，同一用户之后 **30 分钟内**可连续对话；私聊不用唤名。
+群聊里**只有被 @ 或叫她的名字（小鸟・小鳥・ことり・kotori）才会回复**；被点名回了一次之后，
+**要不要把你留在 30 分钟的「对话窗口」里由她按这次对话决定**——留在窗口里就可以不 @ 继续聊。
+私聊不用唤名，每条都回。
 以 `.` 开头的消息只走指令系统，不进入日常聊天。列表条目可以用 `#编号` 引用，
 编号以**你本人在本会话最近一次看到的那份列表**为准。
 
@@ -219,7 +218,6 @@ run.bat --set-map yh "路径"       # 命令行设置地图（需先停止机器
 | `.chat add <内容>` | 追加到当前人格设定末尾（仅 owner） |
 | `.chat infix <修改要求>` | 让 DeepSeek 智能修改人格设定（仅 owner） |
 | `.chat frequency <每分钟发言次数>` | 回复频率上限，0 为静默（仅 owner） |
-| `.chat base [0\|1]` | 主动插话总开关：0 永不主动插话，1 由模型按上下文判断 |
 | `.chat corpus on\|off` | 原作语料复现开关（仅 owner） |
 | `.chat notice on\|off` | 开关上／下线播报是否发到主群（仅 owner/admin） |
 | `.chat log on\|off` | 开关把 WARN/ERROR 同步到主群（仅 owner/admin） |
@@ -228,6 +226,28 @@ run.bat --set-map yh "路径"       # 命令行设置地图（需先停止机器
 | `.admin add <@成员\|QQ号\|群名片>` | 添加 admin（仅 owner） |
 | `.admin remove <@成员\|QQ号\|群名片>` | 移除 admin（仅 owner） |
 | `.batch <指令1> ; <指令2> ; …` | 一条消息顺序执行多条指令（最多 20 条） |
+
+### 只回应 @／提及：插话功能已删除（v1.2.0）
+
+**主动插话（群聊里没被 @ 时由模型判断要不要插一句）已经彻底删除。** 现在群聊里**只有被 @ 或叫她的名字
+（小鸟・小鳥・ことり・kotori）才会回复**——其它群消息**不回复、不规划、不消耗模型额度、不进对话历史**；
+私聊行为不变（每条都回）。
+
+- **回不回由"这次对话"决定**：被 @ 之后机器人**一定回一次**，然后由模型按这次对话判断
+  **要不要把你拉进 30 分钟的「对话窗口」**（`chat.context_seconds`，默认 1800 秒）。进了窗口，
+  你在该会话里**不 @ 也能继续聊**；没进窗口就只回这一句，下一条不 @ 的消息不再回复。
+  窗口内继续聊时，仍会按"话题是否变化"自然收尾（原行为保留）。
+- **删掉 7 个配置键**：`chat.wake_probability`、`chat.reply_base_probability`、`chat.reply_probability_scale`、
+  `chat.chime_cooldown_seconds`、`chat.topic_gap_seconds`、`chat.base_min_interest`、`chat.chime_high_interest`
+  都不再被读取——`config.example.json` 里已删除这些键，**老 `config.json` 里如果还留着会被直接忽略**
+  （不报错、不改写、不迁移）。想"这个会话完全不回"用已有的 **`chat.frequency: 0`**。
+  保留的键：`personality`、`frequency`、`context_seconds`（窗口）、`corpus_replay`、`corpus_top_k`、
+  `enabled`、`disabled_conversations`、`selection_gap_seconds`。
+- **命令面**：`/chat wake …` 与 `/chat base …` 两条子命令已删除（`/chat` 面板里"主动插话总开关 /
+  冷却 / 相关度下限"几行也一并去掉）；`/chat` 的其它子命令（开关、频率、人设）不变。
+- **对话页输入框固定在窗口底部（v1.2.0）**：对话页现在铺满窗口高度，**对话内容自己在中间滚动，
+  输入框（和「允许执行指令 / 清空对话」那行）始终贴在可见区域底部**——不用再滚到底才看得见输入框；
+  按会话 scope 记住滚动位置的行为照旧。
 
 ### 提示词与中文词库
 
@@ -382,10 +402,16 @@ run.bat --set-map yh "路径"       # 命令行设置地图（需先停止机器
 
 带生成指令的回执在生成期间会在回执页显示**进度条**，数据来自两处、每 **1.5 秒**刷新一次：
 
-- **主条**：任务队列的**图片级进度**（数据 `GET /api/tasks`），例如 `任务 #4 · 已生成 9/20 张 · 45%`；
-  **多图任务会显示「已生成 N/总数 张」**；
+- **主条**（v1.2.0 起是**总进度**，不再只是图片级）：数据同时来自 `GET /api/tasks` 与
+  `GET /api/progress`，公式是
+  **`(已生成图片数 + 当前那张的采样百分比 ÷ 100) ÷ 总图片数 × 100`**——20 张里已出 9 张、
+  当前那张采样到 41%，主条就是 `任务 #4 · 已生成 9/20 张 · 47%`；**单张任务同理**
+  （0/1 + 41% = 41%）。拿不到任务列表或总数时退回只报采样进度；
 - **副标题**：SD 单张图**内部**的采样进度与预计时间（数据 `GET /api/progress`），例如
   `采样中 8/20（41%）· 预计 14 秒`；
+- **运行中的任务可以直接取消**（v1.2.0 起）：进度卡上有「取消」按钮（二次确认，会说明"已经生成的
+  图片仍可领取"），走 `POST /api/tasks/action {action:"cancel", number:"<任务号>"}`；取消后按钮变
+  「已取消」并禁用、进度条**不再跳回 100%**（正在下发的这一张会跑完）。出图页原有的取消/挂起/优先按钮不变；
 - 空闲后进度条标**「已完成」并停止轮询**。
 
 **图集能在生成过程中提前预览**：生成期间前端轮询 `GET /api/images`，把这条回执开始时间**之后**
@@ -585,7 +611,7 @@ Civitai 下载记录里的 `base_model` → Forge 的 LoRA 元数据（`/sdapi/v
 ```
 pixiko\
 ├─ README.md                       本文件
-├─ RELEASE.md                      v1.1.2 发行说明（含版权声明与已知限制）
+├─ RELEASE.md                      v1.2.0 发行说明（含版权声明与已知限制）
 ├─ THIRD-PARTY-LICENSES.md         随二进制包分发的第三方组件与许可
 ├─ config.example.json             脱敏配置模板（复制成 config.json 再改）
 ├─ .gitignore                      config.json / data / logs / lib jar 等一律不入库

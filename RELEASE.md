@@ -1,11 +1,52 @@
-# Pixiko v1.1.2 发行说明
+# Pixiko v1.2.0 发行说明
 
-- **版本**：v1.1.2
+- **版本**：v1.2.0
 - **日期**：2026-10-04
 - **作者**：loriko（deloriko@outlook.com）
 - **当前实现**：Java 版（`src/`）。另有一次**未完成的** Next.js 重构，见 `nextjs-wip/`，**不可运行**。
 
 ---
+
+## 〇、本版新增（v1.2.0）
+
+**主动插话彻底删除：群聊里只有被 @ 或叫名字才会回复；要不要把你留在 30 分钟的「对话窗口」里，由模型按这次对话判断。**
+
+- **删掉主动插话**：以前群聊里没被 @ 时，模型会判断上下文决定要不要插一句。现在群聊里
+  **只有被 @ 或叫名字（小鸟・小鳥・ことり・kotori）才回复**，其它群消息**不回复、不规划、
+  不消耗模型额度、不进对话历史**。私聊行为不变（每条都回）。
+- **"要不要进入对话窗口"改为由模型决定**：被 @ 之后机器人**一定回一次**，然后它按这次对话判断
+  **要不要把这个人拉进 30 分钟的「对话窗口」**（`chat.context_seconds`，默认 1800 秒）。
+  进了窗口，这个人在该会话里**不 @ 也能继续聊**；没进窗口就只回这一句，下一条不 @ 的消息不再回复。
+  窗口内继续聊时仍会按"话题是否变化"自然收尾（原行为保留）。例如被 @ 后模型给出 `join=true`，
+  后续不 @ 也能接着聊；给出 `join=false`，就只回这一句。
+- **删掉 7 个配置键**：`chat.wake_probability`、`chat.reply_base_probability`、`chat.reply_probability_scale`、
+  `chat.chime_cooldown_seconds`、`chat.topic_gap_seconds`、`chat.base_min_interest`、`chat.chime_high_interest`
+  都不再被读取；`config.example.json` 里已删除这些键，**老 `config.json` 里如果还留着会被直接忽略**
+  （不报错、不改写、不迁移）。想"这个会话完全不回"用已有的 **`chat.frequency: 0`**。
+  保留的键：`personality`、`frequency`、`context_seconds`（窗口）、`corpus_replay`、`corpus_top_k`、
+  `enabled`、`disabled_conversations`、`selection_gap_seconds`。
+- **命令面**：`/chat wake …` 与 `/chat base …` 两条子命令已删除（`/chat` 面板里"主动插话总开关 /
+  冷却 / 相关度下限"几行也一并去掉）；`/chat` 的其它子命令（开关、频率、人设）不变。
+- **对话页输入框固定在窗口底部**：以前对话内容长了要滚到底才看得见输入框；现在对话页铺满窗口高度，
+  **对话内容自己在中间滚动，输入框（和「允许执行指令 / 清空对话」那行）始终贴在可见区域底部**
+  （按会话 scope 记住滚动位置的行为照旧）。
+- **回执页的进度改成"总进度"**：主进度条不再只显示图片级进度，而是
+  **`(已生成图片数 + 当前那张的采样百分比 ÷ 100) ÷ 总图片数 × 100`**——例如 20 张里已出 9 张、
+  当前那张采样到 41%，主条显示 `任务 #4 · 已生成 9/20 张 · 47%`；单张任务同理（0/1 + 41% = 41%）。
+  副标题仍保留当前这张的采样细节（`采样中 8/20（41%）· 预计 14 秒`）。
+- **运行中的任务可以在回执页直接取消**：进度卡上新增「取消」按钮（二次确认，提示"已经生成的图片仍可领取"），
+  走 `POST /api/tasks/action {action:"cancel", number:"<任务号>"}`；取消后按钮变「已取消」并禁用、
+  进度条不再跳回 100%（正在下发的这一张会跑完）。出图页原有的取消/挂起/优先按钮不变。
+- **前端**：`webui/index.html` 资源版本升到 **`?v=1.2.0`**。
+- **测试**：新增"窗口外不被 @ 的群消息不规划不回复"、"被 @ 且模型 `join=true` 则进窗、之后不 @ 也回"、
+  "被 @ 但 `join=false` 只回一句"、"模型没给 `join` 时按相关度 ≥50 兜底"等用例；`ChatServiceTest` /
+  `ChatActionsTest` / `ChainEvalTest` / `KotoriCorpusTest` 同步更新。
+
+**保证**：群聊里没被 @ 或被叫名字的消息**不规划、不回复、不消耗模型额度、不进对话历史**；
+被 @ 之后回不回、进不进 30 分钟窗口，只看这一次对话。
+
+<details>
+<summary>上一版（v1.1.2）</summary>
 
 ## 〇、本版新增（v1.1.2）
 
@@ -34,6 +75,8 @@
 
 **保证**：无论走哪条路径，**汉字都不会进入正向／反向 prompt**——中文要求只出现在 `.infix` 与回执说明里，
 落进 prompt 的标准英文词条由改写模型产出。
+
+</details>
 
 <details>
 <summary>上一版（v1.1.1）</summary>
@@ -581,7 +624,7 @@ Danbooru 词条（↑↓ 选择、Esc 关闭；空词条上按 **Ctrl+Space** �
 
 ## 三、安装与启动（三步）
 
-### 开箱即用包 `pixiko-v1.1.2-runnable.zip`
+### 开箱即用包 `pixiko-v1.2.0-runnable.zip`
 
 1. 装好 **JDK 17+**。
 2. **双击 `start.bat`**。第一次运行会自动生成 `config.json`（照 `config.example.json` 起一份），
@@ -591,7 +634,7 @@ Danbooru 词条（↑↓ 选择、Esc 关闭；空词条上按 **Ctrl+Space** �
 
 > `start.bat` 跑的是包内已编译好的 `build/pixiko.jar`；只有需要改代码时才用 `build.ps1` + `run.bat`。
 
-### 源码包 `pixiko-v1.1.2.zip`
+### 源码包 `pixiko-v1.2.0.zip`
 
 1. 装好 **JDK 17+**。
 2. 在项目根目录准备好依赖 jar：`lib/gson-2.13.1.jar` 由 `build.ps1` **自动下载并校验**，
@@ -656,8 +699,8 @@ copy config.example.json config.json
 
 ## 六、在 GitHub Releases 里发布这个 zip
 
-1. 打开仓库 → 右侧 **Releases** → **Draft a new release**，Tag 填 `v1.1.2`（新建 tag），标题填 `Pixiko v1.1.2`。
-2. 把 `pixiko-v1.1.2.zip` 与 `pixiko-v1.1.2-runnable.zip`（以及各自的 `.sha256`）拖进附件区，
+1. 打开仓库 → 右侧 **Releases** → **Draft a new release**，Tag 填 `v1.2.0`（新建 tag），标题填 `Pixiko v1.2.0`。
+2. 把 `pixiko-v1.2.0.zip` 与 `pixiko-v1.2.0-runnable.zip`（以及各自的 `.sha256`）拖进附件区，
    正文粘贴本文件内容后点 **Publish release**。
 
 > 建仓库时 License 请选 **None**（本项目保留所有权利，不使用开源许可证）。

@@ -109,7 +109,7 @@ public final class PersonaStateTest {
 
         // 7) 情绪不影响执行：低落/闹脾气时生图指令照样进计划（程序层不因情绪改指令）
         state.setMood("a:private:30", "闹脾气", 3, "被侮辱");
-        ChatActions.Plan plan = new ChatActions.Plan("好，排三张。", List.of(".gen 3"), "", 90, 0, false, true, 0, "", "闹脾气", 3);
+        ChatActions.Plan plan = new ChatActions.Plan("好，排三张。", List.of(".gen 3"), "", 90, false, true, 0, "", "闹脾气", 3);
         check(plan.commands().contains(".gen 3"), "情绪低落/闹脾气时 .gen 仍然保留");
         check(plan.copy(plan.reply(), plan.commands(), "").commands().contains(".gen 3"), "派生计划不丢指令");
         check(plan.copy(plan.reply(), plan.commands(), "").mood().equals("闹脾气"), "派生计划保留情绪字段");
@@ -138,7 +138,7 @@ public final class PersonaStateTest {
         String longReply = ("这是很长的一句话").repeat(4) + "。";
         check(CN.mark(plan(longReply, List.of()), "今天有点累").reply().equals(longReply), "超过 30 字的回复不修补");
         check(CN.mark(plan("………", List.of()), "你父母呢？").reply().equals("………"), "敏感话题回合不得修补");
-        ChatActions.Plan execPlan = new ChatActions.Plan("好，排三张。", List.of(".gen 3"), "", 90, 0, false, true);
+        ChatActions.Plan execPlan = new ChatActions.Plan("好，排三张。", List.of(".gen 3"), "", 90, false, true);
         check(CN.mark(execPlan, "帮我出三张图").reply().equals("好，排三张。"), "执行回合不得修补");
         check(CN.mark(execPlan, "帮我出三张图").commands().contains(".gen 3"), "修补不得动指令");
         check(CN.mark(plan("……", List.of()), "我最近很绝望").reply().equals("……"), "沉重倾诉回合不得修补");
@@ -155,7 +155,7 @@ public final class PersonaStateTest {
     }
     /** DeepSeekPrompts 的简写，避免长行。 */
     static ChatActions.Plan plan(String reply, List<String> commands) {
-        return new ChatActions.Plan(reply, commands, "", 90, 0, false, true);
+        return new ChatActions.Plan(reply, commands, "", 90, false, true);
     }
     static final class CN {
         static ChatActions.Plan mark(ChatActions.Plan plan, String message) {
