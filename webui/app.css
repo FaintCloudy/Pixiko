@@ -926,15 +926,17 @@ a.image-link img:hover { border-color: rgba(120, 160, 220, .55); }
    未查看（unread）的行：左边一条色条 + 圆点 + 加粗 + 高亮底色 + 「未读」徽标，四种标记一起上。
 
    **两栏底边与右栏「对话」的底边齐平**（用户要求：把「回执」与「执行结果」两栏的底部延长至与「对话」底部平齐）：
-   两个 grid 项都 `stretch`、行夹成 `minmax(0, 1fr)`，高度取 `--quest-pane-h + 20px`
+   两个 grid 项都 `stretch`、行夹成 `minmax(0, 1fr)`，高度取 `--quest-fit-h + 20px`
    （20px = 上下各 10px 呼吸；卡片因此正好落在容器内容框里）。
-   `--quest-pane-h` 由 `app.js` 的 `syncRailSpacing()` 量出来写进 `body.style`：
-     `--quest-pane-h = #agent-rail 的 rect.bottom - .quest-split 的 rect.top - 20`
-   也就是**跟着右栏的真实底边**（= 视口底 − `--rail-bottom` 24px），不再另写一份「100vh − …」的算式 ——
-   上一轮 `top` + `calc(100dvh - top - bottom)` 两份独立声明漂移过（底边只剩 12px），这次只有一处来源。
+   `--quest-fit-h` 由 `app.js` 的 `syncRailSpacing()` 量出来写进 `body.style`：
+   它 = 右栏 #agent-rail 的 rect.bottom − 本容器的 rect.top − 20
+   也就是**跟着右栏的真实底边**（= 视口底 − --rail-bottom 的 24px），不再另写一份「100vh 减 top 减 bottom」的算式 ——
+   上一轮那条 `top` 加 `calc(100dvh - top - bottom)` 两份独立声明漂移过（底边只剩 12px），这次只有一处来源。
    量不到 / 窄屏单列时退回 CSS 里的兜底 `min(76vh, 760px)`（竖排时「底边齐平」本来就不适用）。
-   注意：这段注释里**不能出现半角双引号** —— 它会把 `/* … */` 提前结束，整条 `.quest-split` 规则被当成垃圾丢掉
-   （实测过：`.quest-split` 变成 `display: block`，两栏叠成竖排、各 4 千多像素高）。 */
+   写入注意：这段注释里**不能出现注释结束标记本身**（星号加斜杠那两个字符连写）——它会把注释提前结束，
+   后面那些文字就变成游离的 CSS，解析器一路吞到下一个花括号，于是**整条 .quest-split 规则被丢掉**：
+   实测表现为 display 退回 block、两栏各占满整列（1440 下各 904px 宽），用户看到的就是「宽度被拉齐了」。
+   同理也别在里面写 `/*`（嵌套注释标记）。要提这两个标记就分开写，别连写。 */
 .quest-split {
   display: grid; grid-template-columns: minmax(250px, 340px) minmax(0, 1fr);
   /* 行也要一起夹住：只给容器 `height` 而让行是 `auto`，行会按内容的 min-content 撑出去
@@ -943,9 +945,14 @@ a.image-link img:hover { border-color: rgba(120, 160, 220, .55); }
   grid-template-rows: minmax(0, 1fr);
   gap: 12px;
   align-items: stretch;
-  /* 内高（不含上下各 10px 的呼吸）；JS 量得到就覆盖成"延长到对话栏底边"的那个高度 */
+  /* 兜底内高（不含上下各 10px 呼吸）：JS 量到右栏底边时会写 `--quest-fit-h`（写在 body 上）
+     把它覆盖成「延长到对话栏底边」的那个高度。
+     用**另一个变量名**（不是上面这个）：元素自身的声明优先级高于从 body 继承来的值，
+     如果 JS 也写 `--quest-pane-h`，本行的兜底值会把它盖掉（实测就是这样：JS 写了 720.5px，
+     这里仍是 min(76vh,760px)=704px，两栏就比对话栏短 36.5px）。 */
   --quest-pane-h: min(76vh, 760px);
-  height: calc(var(--quest-pane-h) + 20px);
+  --quest-fit-h: var(--quest-pane-h);
+  height: calc(var(--quest-fit-h) + 20px);
   min-height: 260px;
 }
 /* 列表卡：竖直排列「卡片头 / 状态行 / 列表」，列表吃掉剩余高度并可内部滚动。
@@ -1036,7 +1043,7 @@ a.image-link img:hover { border-color: rgba(120, 160, 220, .55); }
   .quest-list { max-height: min(64vh, 620px); }
   /* 竖排了，"底边与对话栏齐平"不适用：把 JS 量出来的"延长到对话栏底边"关掉，
      退回上面那条 max-height 的窄屏规则 */
-  .quest-split { --quest-pane-h: 0px; height: auto; min-height: 0; }
+  .quest-split { --quest-pane-h: 0px; --quest-fit-h: var(--quest-pane-h); height: auto; min-height: 0; }
   /* 窄屏：翻页按钮贴边收窄一点，别压住画面 */
   .viewer-nav { width: 38px; height: 62px; min-height: 62px; font-size: 22px; }
   #viewer-prev { left: 6px; }
