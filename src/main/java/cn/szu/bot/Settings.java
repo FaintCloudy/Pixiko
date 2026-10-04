@@ -95,6 +95,36 @@ public final class Settings {
         return keys;
     }
     /**
+     * Whether "/prompt drop|keep" may fall back to the composite-phrase classification model
+     * ({@link cn.szu.bot.prompt.CategoryModel}) for a phrase it cannot classify locally. On by default:
+     * the model only ever removes the fragments belonging to the requested category, its answers are cached
+     * on disk, and a failure leaves the phrase untouched. Off means every decision stays local.
+     *
+     * <p>按会话持久化，与 {@link #infixFilterEnabled} 同一套写法（存的是**关掉**的会话，默认开启）。
+     */
+    public synchronized boolean categoryModelEnabled(String conversation) {
+        return !disabledCategoryModel(Json.obj(data, "category_model")).contains(conversation);
+    }
+    /** Turns the fallback model on or off for one conversation; returns the new state. */
+    public synchronized boolean setCategoryModelEnabled(String conversation, boolean enabled) throws IOException {
+        JsonObject next = freshSnapshot(), section = Json.obj(next, "category_model");
+        java.util.TreeSet<String> keys = new java.util.TreeSet<>(disabledCategoryModel(section));
+        if (enabled) keys.remove(conversation); else keys.add(conversation);
+        JsonArray updated = new JsonArray();
+        for (String key : keys) updated.add(key);
+        section.add("disabled_conversations", updated); next.add("category_model", section);
+        Json.atomicWrite(root.resolve("config.json"), next); data = next;
+        return enabled;
+    }
+    private static java.util.List<String> disabledCategoryModel(JsonObject section) {
+        java.util.List<String> keys = new java.util.ArrayList<>();
+        JsonElement value = section.get("disabled_conversations");
+        if (value != null && value.isJsonArray())
+            for (JsonElement item : value.getAsJsonArray())
+                if (item.isJsonPrimitive() && item.getAsJsonPrimitive().isString()) keys.add(item.getAsString());
+        return keys;
+    }
+    /**
      * 出图的发送形式，按会话持久化（{@code image_send.modes.<会话键>}）。
      *
      * <p>{@link #AUTO} 是默认值，也是老配置（没有 {@code image_send} 段）读出来的样子：

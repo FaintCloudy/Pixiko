@@ -23,6 +23,7 @@ import cn.szu.bot.civitai.CivitaiClient;
 import cn.szu.bot.civitai.CivitaiLinkLogin;
 import cn.szu.bot.civitai.CivitaiStyleSync;
 import cn.szu.bot.civitai.DownloadControl;
+import cn.szu.bot.prompt.CategoryModel;
 import cn.szu.bot.prompt.PromptEditor;
 import cn.szu.bot.prompt.PromptFunctions;
 import cn.szu.bot.prompt.PromptUsage;
@@ -1087,7 +1088,7 @@ public final class Bot implements AutoCloseable {
         if(future!=null) future.complete(success);
     }
     private final Set<String> seen = new LinkedHashSet<>();
-    private static final Pattern PROMPT = Pattern.compile("^/(promptR|prompt)(?:\\s+(add|remove|set|clear|undo|classify|keep|drop)(?:\\s+([\\s\\S]*))?)?$", Pattern.CASE_INSENSITIVE);
+    private static final Pattern PROMPT = Pattern.compile("^/(promptR|prompt)(?:\\s+(add|remove|set|clear|undo|classify|keep|drop|category)(?:\\s+([\\s\\S]*))?)?$", Pattern.CASE_INSENSITIVE);
     private static final Pattern USAGE = Pattern.compile("^/usage(?:\\s+([\\s\\S]*))?$", Pattern.CASE_INSENSITIVE);
     private static final Pattern PROGEN = Pattern.compile("^/progen(?:\\s+([\\s\\S]*))?$", Pattern.CASE_INSENSITIVE);
     private static final Pattern SD_SETTINGS = Pattern.compile("^/(settings|sampler|style|size|preset|steps|cfg|seed|model|function|vae)(?:\\s+([\\s\\S]*))?$", Pattern.CASE_INSENSITIVE);
@@ -1141,6 +1142,7 @@ public final class Bot implements AutoCloseable {
         /prompt classify — 把当前正向 prompt 的每个词条按类别列出（人物/服装/动作/姿势/表情/场景/环境/镜头/画面/物品…）
         /prompt keep <类别…> — 只保留这些类别，其余词条清空，例如 /prompt keep 人物 服饰（LoRA/嵌入标签始终保留）
         /prompt drop <类别…> — 删掉这些类别，例如 /prompt drop 环境 物品（可用 环境/视角/画风/衣服 这类说法）
+        /prompt category [status|model on|off] — 复合短语兜底模型（DeepSeek）的开关与用量，默认开启，按会话保存
         /prompt undo — 正反向 prompt 一并回退，可连续回退多步（最多保留 20 步）
         /promptR set <whole-prompt> — 替换全部反向 prompt，必须提供内容
         /promptR clear — 清空反向 prompt
@@ -1532,6 +1534,12 @@ public final class Bot implements AutoCloseable {
                     if (op.equals("keep") || op.equals("drop")) {
                         if (negative) throw new IllegalArgumentException("按类别筛选只针对正向 prompt：请使用 /prompt keep 或 /prompt drop。");
                         reply(event, categoryFilter(scope, op.equals("keep"), value));
+                        return;
+                    }
+                    // 方案 B 的开关与用量（只展示，不设额度上限）：/prompt category model on|off、/prompt category status。
+                    if (op.equals("category")) {
+                        if (negative) throw new IllegalArgumentException("复合短语兜底模型只针对正向 prompt：请使用 /prompt category。");
+                        reply(event, categoryModelCommand(scope, value));
                         return;
                     }
                     if (op.equals("undo")) {
@@ -8231,11 +8239,61 @@ public final class Bot implements AutoCloseable {
     /** 应用类别筛选：返回新的正向提示词，并记录保留/移除的明细。 */
     static String applyCategorySurgery(String positive, CategorySurgery surgery, PromptUsage usage,
                                       List<String> kept, List<String> removed, List<String> protectedTerms) {
+        return applyCategorySurgery(positive, surgery, usage, kept, removed, protectedTerms, null);
+    }
+    /**
+     * 同 {@link #applyCategorySurgery}，外加方案 B 的兜底模型：本地判不出来的**复合短语**（多词、本地归类为
+     * "其他"）由模型切片段（结果有缓存），程序只删属于目标类别的片段。模型参与的短语不再退回本地的片段
+     * 判定——判不出来时这条短语一个字都不动，免得又把复合短语的一部分草率吃掉（见 {@link CategoryModel}）。
+     */
+    static String applyCategorySurgery(String positive, CategorySurgery surgery, PromptUsage usage,
+                                      List<String> kept, List<String> removed, List<String> protectedTerms,
+                                      CategoryModel model) {
         List<String> result = new ArrayList<>();
+        // 方案 B：先把这条命令里**本地判不出来**的复合短语收集起来，一次性批量问模型（缓存命中不发请求）。
+        // 一条命令只发这一批请求；失败的短语没有任何判定，下面按"一个字都不动"处理。
+        Map<String, List<CategoryModel.Segment>> verdicts = Map.of();
+        if (!surgery.keepOnly() && model != null && model.enabled()) {
+            List<String> suspects = new ArrayList<>();
+            for (String term : PromptEditor.parts(positive == null ? "" : positive)) {
+                if (TermCategories.isLoraOrEmbedding(term)) continue;
+                if (CategoryModel.needsModel(usage, term) && !suspects.contains(term)) suspects.add(term);
+            }
+            if (!suspects.isEmpty()) verdicts = model.resolve(suspects);
+        }
         for (String term : PromptEditor.parts(positive == null ? "" : positive)) {
             if (TermCategories.isLoraOrEmbedding(term)) { result.add(term); if (protectedTerms != null && !protectedTerms.contains(term)) protectedTerms.add(term); continue; }
             String category = TermCategories.categoryOf(usage, term);
             boolean unknown = TermCategories.OTHER.equals(category);
+            // 方案 B：本地判不出来的复合短语按模型的片段判定只删目标类别的片段；模型没给出可采信的
+            // 切分（关闭/失败/拼不回原短语）时整条原样保留，不再退回本地的部分片段判定去删。
+            if (!surgery.keepOnly() && model != null && model.enabled() && CategoryModel.needsModel(usage, term)) {
+                String left = CategoryModel.dropFragments(term, surgery.remove(), usage, verdicts.get(term.strip()));
+                if (!left.equals(term)) {
+                    if (removed != null) removed.add(term + "（模型判定：只删" + String.join("、", surgery.remove()) + "片段）");
+                    if (left.isBlank()) continue;
+                    if (kept != null) kept.add(left + "（" + category + "·保留其余片段）");
+                    result.add(left);
+                    continue;
+                }
+                if (kept != null) kept.add(term + "（" + (unknown ? "未分类" : category) + "）");
+                result.add(term);
+                continue;
+            }
+            // 只删某几类时按**片段**删：复合短语里只有属于该类的那一段会被摘掉
+            // （standing sex from behind → standing sex），其余片段原样拼回；
+            // 整条都属于该类（multiple views）时才整条删除；没有目标片段时一个字都不动。
+            String shrunk = surgery.keepOnly() ? term : TermCategories.withoutCategories(term, surgery.remove());
+            if (!surgery.keepOnly() && shrunk.isBlank()) {
+                if (removed != null) removed.add(term + (unknown ? "（未分类）" : "（" + category + "）"));
+                continue;
+            }
+            if (!surgery.keepOnly() && !shrunk.equals(term)) {
+                if (removed != null) removed.add(term + "（" + category + "·只删该片段）");
+                if (kept != null) kept.add(shrunk + "（" + category + "·保留其余片段）");
+                result.add(shrunk);
+                continue;
+            }
             boolean drop;
             if (!unknown) {
                 if (surgery.keepOnly()) drop = !surgery.keep().contains(category);
@@ -8267,7 +8325,7 @@ public final class Bot implements AutoCloseable {
         PromptUsage usage = usageIndex();
         SdClient.Prompts current = userPrompts.prompts(scope);
         List<String> kept = new ArrayList<>(), removed = new ArrayList<>(), tags = new ArrayList<>();
-        String positive = applyCategorySurgery(current.positive(), surgery, usage, kept, removed, tags);
+        String positive = applyCategorySurgery(current.positive(), surgery, usage, kept, removed, tags, categoryModel(scope));
         if (positive.equals(current.positive())) {
             return "当前 prompt 没有需要变动的词条：" + (keep ? "保留 " : "删除 ")
                     + String.join("、", categories) + " 的结果与现在一致。\n" + TermCategories.describe(usage, current.positive());
@@ -8283,6 +8341,55 @@ public final class Bot implements AutoCloseable {
                 + (removed.isEmpty() ? "" : "\n删除 " + removed.size() + " 条：" + summarizeCategories(removed))
                 + (tags.isEmpty() ? "" : "\nLoRA/嵌入标签原样保留：" + String.join("、", tags))
                 + "\n反向 prompt 未改动；用 /prompt 查看完整结果，/prompt undo 可以回退这一步。";
+    }
+    /**
+     * 方案 B 的兜底模型实例（惰性创建：缓存与用量计数都挂在这一个实例上）。按会话套开关：
+     * 关闭时 {@link CategoryModel#resolve} 不发请求、不读缓存，筛选完全走本地判定。
+     */
+    private volatile CategoryModel categoryModel;
+    CategoryModel categoryModel(String scope) throws Exception {
+        CategoryModel model = categoryModel;
+        if (model == null) {
+            synchronized (this) {
+                if (categoryModel == null) categoryModel = CategoryModel.deepSeek(settings);
+                model = categoryModel;
+            }
+        }
+        model.setEnabled(settings.categoryModelEnabled(scope));
+        return model;
+    }
+    /**
+     * {@code /prompt category status} 与 {@code /prompt category model on|off}：复合短语兜底模型的开关与用量。
+     * 用量**只展示、不限制**（本地判不出来的短语有多少就处理多少，单次请求只按字符数自动分批）。
+     */
+    String categoryModelCommand(String scope, String value) throws Exception {
+        CategoryModel model = categoryModel(scope);
+        String argument = value == null ? "" : value.strip().toLowerCase(Locale.ROOT);
+        if (argument.isEmpty() || argument.equals("status") || argument.equals("状态") || argument.equals("用量")) {
+            JsonObject status = model.status();
+            boolean on = status.get("enabled").getAsBoolean();
+            return "复合短语兜底模型（DeepSeek）：" + (on ? "开启" : "关闭") + "（默认开启，按会话保存）"
+                    + "\n缓存 " + status.get("cached").getAsInt() + " 条短语：" + status.get("cacheFile").getAsString()
+                    + "\n用量（只统计、不限制）：调用 " + status.get("lastCalls").getAsInt() + " 次，发送 "
+                    + status.get("lastPhrases").getAsInt() + " 条短语，命中缓存 " + status.get("lastCachedHits").getAsInt()
+                    + " 条，兜底保留 " + status.get("lastFallbacks").getAsInt() + " 条"
+                    + "\n单次请求 " + status.get("batchChars").getAsInt() + " 字符 / " + status.get("batchPhrases").getAsInt()
+                    + " 条自动分批，短语总数不限；失败的短语按未分类处理（一个字都不删）"
+                    + "\n" + (on ? "关闭：/prompt category model off" : "开启：/prompt category model on");
+        }
+        String toggle = argument.replace("model", "").strip();
+        if (toggle.equals("on") || toggle.equals("开") || toggle.equals("开启") || toggle.equals("启用")) {
+            settings.setCategoryModelEnabled(scope, true);
+            model.setEnabled(true);
+            return "复合短语兜底模型已开启：本地判不出来的复合短语会交给 DeepSeek 切片段（结果缓存，第二次不再调用）。";
+        }
+        if (toggle.equals("off") || toggle.equals("关") || toggle.equals("关闭") || toggle.equals("禁用")) {
+            settings.setCategoryModelEnabled(scope, false);
+            model.setEnabled(false);
+            return "复合短语兜底模型已关闭：/prompt drop|keep 完全走本地判定（不发请求、不读缓存）。";
+        }
+        throw new IllegalArgumentException("用法：/prompt category status 查看开关与用量；"
+                + "/prompt category model on|off 开关本会话的复合短语兜底模型（默认开启）。");
     }
     /** 把"词条（分类）"明细汇总成"服装 21 条、环境 3 条（场地、天气…）"这样的一行。 */
     private static String summarizeCategories(List<String> items) {

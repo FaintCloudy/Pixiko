@@ -11,6 +11,9 @@
   const PAGE = window.PIXIKO_PAGE || 'gen';
   const state = { token: localStorage.getItem(TOKEN_KEY) || '', status: null, options: null, pollTimer: null, followTimer: null, busy: 0,
     seenImages: new Map(), seenGroups: new Map(), followUntil: 0, receiptKey: '', receiptTexts: 0, receiptImages: 0,
+    // 正在跟的那条回执（对话栏靠它把机器人发来的消息实时画进来）。页面切到后台/失焦后要**接着**跟，
+    // 所以 id 与 follow 标记都记下来：见 resumeCapturePoll()。
+    activeCaptureId: '', activeCaptureFollow: false, followCaptureId: '', lastCapturePollAt: 0, wasHidden: false,
     receiptCount: 0, receiptBox: null, receiptToasted: '',
     // 面板底部回执栏的图片是增量追加的：记住当前那张图集卡 / 单张卡，新图到了就地更新，不整块重建。
     receiptGallery: null, receiptSingle: null, receiptSingleFile: '',
@@ -1434,17 +1437,52 @@
 
   /**
    * 给对话里已经渲染出来的图片各挂一次性贴底校准（load/error 各一次，不是死循环）：
-   * <img> 是异步撑高的，加载完再把滚动条压回底部，视图才不会被顶走。
+   * `<img>` 是异步撑高的，加载完再把滚动条压回底部，视图才不会被顶走。
+   *
+   * <p>**只在"挂的时候本来就在底部"时贴**（`stick`）：否则用户往上翻着读历史，
+   * 一张懒加载图片加载完就把视图弹回底部 —— 这正是"往上滚会莫名其妙弹回最底部"的一个来源。
+   * 用户自己滚回底部后，后续新增的图片会重新按新状态挂校准（见 {@link chatGrabAnchor}）。
    */
   function chatStickImages(log) {
     if (!log || !log.querySelectorAll) return;
+    const stick = nodeAtBottom(log, STICK_BOTTOM_PX);
     log.querySelectorAll('img').forEach((img) => {
       if (!img || img.__chatStick) return;
       img.__chatStick = true;
-      const stick = () => { img.__chatStick = false; log.scrollTop = Number(log.scrollHeight) || 0; };
-      img.addEventListener('load', stick, { once: true });
-      img.addEventListener('error', stick, { once: true });
+      const settle = () => {
+        img.__chatStick = false;
+        if (stick) log.scrollTop = Number(log.scrollHeight) || 0;
+      };
+      img.addEventListener('load', settle, { once: true });
+      img.addEventListener('error', settle, { once: true });
     });
+  }
+
+  /**
+   * 新增条目/图片后的"贴底"：**只有当下确实在底部时才贴**。
+   *
+   * <p>以前的调用点是无条件 `log.scrollTop = log.scrollHeight`，于是每次轮询/追加条目都把用户
+   * 正在读的历史弹回最底部（用户报的"往上拉会弹回最底部"）。现在统一走这对函数：
+   * 追加**之前**用 {@link chatGrabAnchor} 记下"当时在不在底部"，追加**之后**用 {@link chatSettle} 决定动作。
+   *
+   * <p>为什么必须在追加前记：追加一条就会让 `scrollHeight` 变大，追加**之后**再判"在不在底部"，
+   * 差出来的那几十像素（一条气泡 55~63px）已经超过 40px 阈值 —— 明明用户刚才就贴在底部，
+   * 也会被判成"不在底部"，于是新消息来了不跟手（实测：gap 从 0 直接变成 63）。
+   */
+  function chatGrabAnchor(log) {
+    if (!log) return null;
+    return { top: Number(log.scrollTop) || 0, atBottom: nodeAtBottom(log, STICK_BOTTOM_PX) };
+  }
+
+  function chatSettle(log, anchor) {
+    if (!log) return false;
+    if (!anchor || anchor.atBottom) {                 // 追加前在底部：贴到新的底部
+      log.scrollTop = Number(log.scrollHeight) || 0;
+      chatStickImages(log);
+      return true;
+    }
+    log.scrollTop = Math.max(0, Number(anchor.top) || 0);   // 追加前不在底部：把位置放回原处，不动
+    return false;
   }
 
   /**
@@ -1750,6 +1788,9 @@
       box.appendChild(row);
     });
     renderQuestTabBadge();
+    // 列表铺完再收敛一次两栏高度（见 fitQuestPanes）：列表行数会影响左栏高度，
+    // 早量拿到的是还没铺行的布局，两栏会比对话栏短一截（实测 11.83px）。
+    fitQuestPanes(0);
   }
 
   /** 点列表里的一行：换地址（可分享/可刷新）→ 打开那条 → 标为已读（点立刻消失）。 */
@@ -2069,6 +2110,18 @@
 
   async function pollCapture(id, attempt = 0, follow = false) {
     clearTimeout(state.pollTimer);
+    // 记下"当前在跟哪条回执"：页面隐藏 / 窗口失焦后定时器会被浏览器节流甚至停摆，
+    // 回前台时必须能立刻接着跟（见 resumeCapturePoll 与 visibilitychange/focus 那两处）。
+    //
+    // 注意 `follow` 的记法：续轮（`attempt>0`）是由 `setTimeout(() => pollCapture(id, attempt+1, follow))`
+    // 重入的，但**首次调用**（`sendChat` / `runCommands`）才是 follow=true 的那一次；
+    // 只要不是换了另一条回执，就**不要**把它降级成 false —— 否则回前台补拉的门控
+    // (`state.activeCaptureFollow`) 永远不成立（实测：focus/visibilitychange 派发后 resumeAt 一直是 0）。
+    const key = String(id || '');
+    if (state.followCaptureId !== key) { state.followCaptureId = key; state.activeCaptureFollow = false; }
+    if (follow) state.activeCaptureFollow = true;
+    state.activeCaptureId = key;
+    state.lastCapturePollAt = Date.now();
     try {
       const capture = await api('/api/capture', { body: { id } });
       // 机器人发的每条消息都直接回到对话里：一条消息 = 一条聊天记录（文字配着自己的图）。
@@ -2136,6 +2189,36 @@
     }
   }
 
+  /**
+   * 页面回到前台 / 窗口重新获得焦点时，**立刻**把对话栏在跟的那条回执再拉一次。
+   *
+   * <p>为什么必须有这一步：`pollCapture` 的定时器（忙碌 900ms / 空闲 2500ms）是 `setTimeout` 链，
+   * 浏览器在标签页不可见时会把定时器节流到分钟级、甚至长时间不触发（后台/最小化都属于这种）。
+   * 于是"服务端已经有新消息、页面上却没有"——直到下一次定时器醒来。用户在别处待一会儿再切回来，
+   * 看到的就是"焦点不在对话上就不返回消息"。
+   *
+   * <p>这里只**补拉一轮**（attempt=0）：已有的 `state.seenGroups` / `state.seenImages` 去重照旧生效，
+   * 所以补拉不会重复画条目；`follow` 标记沿用调用方（网页对话/指令通道跟到底的那条）。
+   */
+  function resumeCapturePoll(source) {
+    const id = state.activeCaptureId;
+    if (!id || !state.token) return null;
+    if (document.visibilityState === 'hidden') return null;            // 还在后台就别发请求
+    if (!(state.activeCaptureFollow || state.busy > 0)) return null;   // 已经跟完的（不 follow、也不忙）不必再拉
+    // 节流：刚拉过就别重复拉（同一轮里 visibilitychange/focus/pageshow 可能一起来）。
+    // **但从后台回来时不受节流限制**：那正是"定时器被节流、消息停在服务端"的场景，必须立刻补拉。
+    // 用显式的 hidden 标记判断（`hiddenSince` 在 visibilitychange→hidden 时打点），
+    // **不要**只看"距上次轮询多久"——实测从隐藏切回时那个差可能只有几百毫秒（轮询正好刚跑过一轮），
+    // 光看时间差会把补拉挡掉，用户就要再等一整轮（实测 1.8~2.1s）才看到消息。
+    if (!state.wasHidden && Date.now() - (state.lastCapturePollAt || 0) < 2000) return null;
+    state.wasHidden = false;
+    state.followUntil = Date.now() + 20 * 60 * 1000;
+    window.__captureResumeAt = Date.now();      // 探针用：确认"回前台确实补拉过"
+    window.__captureResumeSource = String(source || '');
+    pollCapture(id, 0, state.activeCaptureFollow).catch(() => {});
+    return { id, source };
+  }
+
   async function runCommands(commands, after, follow = false) {
     const list = Array.isArray(commands) ? commands : [commands];
     try {
@@ -2187,12 +2270,24 @@
   function chatScopeName() { return chatSnapshot.scope || scope() || 'default'; }
 
   /** 把一条任意来源的条目洗成能存能渲染的形状；坏数据返回 null（不抛、也不渲染半条）。 */
+  /**
+   * 对话条目里的图片路径：存档里实测见过**两种**写法 —— `"data/generated/…"` 字符串
+   * （`/api/chat/log` 的 `images` 现在是这个），以及对象 `{file:"…"}` / `{path:"…"}`
+   * （`/api/images` 与 `/api/capture` 的图片段用的是对象）。以前只认**字符串数组**，
+   * 于是对象形态会被整条过滤掉 —— 对话里就"有图但画不出来"。这里统一收敛成字符串。
+   */
+  function chatImageFile(item) {
+    if (typeof item === 'string') return item.trim();
+    if (!item || typeof item !== 'object') return '';
+    return String(item.file || item.path || '').trim();
+  }
+
   function chatEntryClean(raw) {
     if (!raw || typeof raw !== 'object') return null;
     const role = raw.role === 'user' || raw.role === 'sys' ? raw.role : 'bot';
     const text = typeof raw.text === 'string' ? raw.text : '';
     const images = Array.isArray(raw.images)
-      ? raw.images.filter((file) => typeof file === 'string' && file).map(String).slice(0, 60) : [];
+      ? raw.images.map(chatImageFile).filter(Boolean).slice(0, 60) : [];
     if (!text && !images.length) return null;
     return images.length ? { role, text, images } : { role, text };
   }
@@ -2286,6 +2381,23 @@
   const CHAT_LOG_PUSH_DELAY = 800;
   /** 存档状态：`timer` 防抖表、`dirty` 有内容待推、`disabled` 本次会话不再尝试（接口不可用）。 */
   const chatArchive = { timer: null, dirty: false, disabled: false };
+  /**
+   * 上次同步时服务端存档里"纯文字条目"的快照（{@link syncChatArchive} 用）：
+   * 只拿来算"尾部多了哪几条"，不参与渲染去重之外的任何判断。初始 null = 还没同步过。
+   */
+  let chatArchiveSyncSeen = null;
+  /** 周期同步的定时器（{@link syncChatArchive}）：对话栏读服务端存档靠它。 */
+  let chatSyncTimer = null;
+  /**
+   * 条目指纹（{@link syncChatArchive} 的窗口差集用）：角色 + 正文 + 图片列表。
+   * 图片也进指纹 —— 带图条目由 {@link pollCapture} 画并**由它写进存档**，靠指纹认出来就不会双份；
+   * 反过来若某条带图条目谁都没画过，同步也会把它补上（这正是"对话里没有图"的一半）。
+   */
+  function chatArchiveKey(entry) {
+    if (!entry) return '';
+    const images = entry.images && entry.images.length ? entry.images.join('\u0002') : '';
+    return String(entry.role || '') + '\u0001' + String(entry.text || '') + '\u0001' + images;
+  }
 
   /** 本地有变化 → 800ms 后推一份（防抖窗口里再变化只刷新时间，不叠加请求）。 */
   function chatArchiveSchedule() {
@@ -2370,6 +2482,84 @@
   }
 
   /**
+   * 对话存档的**周期同步**：定期重读 `/api/chat/log`，把服务端**新增**的条目补进 `#chat-log`。
+   *
+   * <p>为什么必须有这一步（用户报的"焦点不在对话里就一直不出现、只能去回执那里看"）：
+   * 面板以前**只在进页面时读一次**存档（{@link chatArchiveMerge} 由 loadChatHistory 调一次），
+   * 之后再没有任何人重读它 —— 服务端存档里后来多出来的条目，页面上**永远不会**出现，
+   * 直到刷新页面。而"另一端说话/出图完成"这些消息是先落到服务端、再指望页面去拿的，
+   * 于是表现成"对话栏里一直不出现，回执里能看到"。
+   *
+   * <p>去重口径（三处都要照顾到，避免重复条目）：
+   * <ol>
+   *   <li>`syncSeen`：上次同步时服务端存档里"纯文字条目"的完整快照（不含带图条目 ——
+   *       图片类消息由 {@link pollCapture} 负责画、并**由它写进存档**，如果这里也画就会双份）；</li>
+   *   <li>`chatSnapshot.entries` 里已有的 role+text：本地刚发出去的那条也在存档里，靠它认出来；</li>
+   *   <li>只追加**存档尾部多出来的那一段**（`list.length > syncSeen.length` 才动），不做整块重建 ——
+   *       重建会把已经加载好的 `<img>` 摘下来重挂，肉眼就是闪烁；追加还能保住用户的滚动位置
+   *       （走 {@link chatGrabAnchor} / {@link chatSettle} 那对，往上滚过的不被弹回底部）。</li>
+   * </ol>
+   */
+  async function syncChatArchive() {
+    const log = $('chat-log');
+    if (!log || chatArchive.disabled || !state.token) return 0;
+    if (document.visibilityState === 'hidden') return 0;
+    let list;
+    try {
+      const payload = await api('/api/chat/log', { body: { scope: scope() } });
+      list = (Array.isArray(payload.entries) ? payload.entries : []).map(chatEntryClean).filter(Boolean);
+    } catch { return 0; }                       // 读不到就等下一轮（不在这里关掉存档，避免一次抖动就永久停摆）
+    const keys = list.map(chatArchiveKey);
+    // 首次同步：只记下当前这份窗口，不补画（首屏已经由 loadChatHistory/chatArchiveMerge 铺好了）
+    if (!Array.isArray(chatArchiveSyncSeen)) { chatArchiveSyncSeen = keys; return 0; }
+    // **按"窗口差集"算新条目，不能按长度**：服务端存档是**滚动窗口**（上限 200 条，满了从最旧的开始丢），
+    // 所以"条数变多"永远不成立 —— 实测就是这里：存档恒为 200，长度判据一次都不触发，新消息一条都补不上。
+    // 差集口径：当前窗口里"上一轮窗口没出现过"的条目（同一条重复出现时按出现次数配对，不误判）。
+    const prev = new Map();
+    chatArchiveSyncSeen.forEach((key) => prev.set(key, (prev.get(key) || 0) + 1));
+    const candidate = [];
+    list.forEach((entry, index) => {
+      const left = prev.get(keys[index]) || 0;
+      if (left > 0) { prev.set(keys[index], left - 1); return; }   // 上一轮就有 → 不是新的
+      candidate.push(entry);
+    });
+    chatArchiveSyncSeen = keys;
+    if (!candidate.length) return 0;
+    // 再和本地已画的对一遍：前端自己发的那条会被它自己推上存档（chatArchiveSend），
+    // 那条已经在 DOM 里了，这里必须认出来，否则每发一条都会多画一份。
+    const known = new Map();
+    chatSnapshot.entries.forEach((entry) => {
+      const key = chatArchiveKey(entry);
+      known.set(key, (known.get(key) || 0) + 1);
+    });
+    const fresh = [];
+    candidate.forEach((entry) => {
+      const key = chatArchiveKey(entry);
+      const left = known.get(key) || 0;
+      if (left > 0) { known.set(key, left - 1); return; }
+      fresh.push(entry);
+    });
+    if (!fresh.length) return 0;
+    const anchor = chatGrabAnchor(log);
+    fresh.forEach((entry) => {
+      const clean = chatSnapshotRemember(entry);       // 先记进快照（切栏目回来还在）
+      if (clean) chatEntryAppend(clean, true);
+    });
+    chatSettle(log, anchor);                           // 在底部才贴底；否则位置放回原处
+    return fresh.length;
+  }
+
+  /**
+   * 对话存档的周期同步表：2.5 秒一轮，页面不可见时不发请求（syncChatArchive 自己会判）。
+   * 2.5 秒就是"另一端说话后最晚多久出现在对话栏"的上限，与 pollCapture 空闲轮询同量级。
+   */
+  const CHAT_SYNC_INTERVAL = 2500;
+  function startChatArchiveWatch() {
+    if (chatSyncTimer) return;
+    chatSyncTimer = setInterval(() => { syncChatArchive().catch(() => {}); }, CHAT_SYNC_INTERVAL);
+  }
+
+  /**
    * 一条对话条目 → 一条消息卡。文字在上、图片在下同属一条；带图的机器人消息多挂一个
    * `chat-receipt-images` 类（对话页底部的回执栏已经取消，`#chat-log` 就是图片的落点）。
    *
@@ -2405,10 +2595,10 @@
   function chatEntryAppend(entry, eager) {
     const log = $('chat-log');
     if (!log) return null;
+    const anchor = chatGrabAnchor(log);          // 追加前先记"在不在底部"（见 chatGrabAnchor 注释）
     const node = chatEntryNode(entry, eager);
     log.appendChild(node);
-    log.scrollTop = log.scrollHeight;
-    chatStickImages(log);                 // 图片是异步加载的：加载完再贴一次底，别让图把视图顶上去
+    chatSettle(log, anchor);                     // 在底部才贴底；用户翻历史时把位置放回原处
     return node;
   }
 
@@ -2455,10 +2645,10 @@
       list.forEach((file) => { if (images.indexOf(file) < 0) images.push(file); });
       chatSnapshotSchedule();                     // 节流窗口可能已经写过一次：这里显式再标脏，切栏目/隐藏前一定落盘
       const fresh = chatEntryNode(run.entry, true);   // 张数变了：重建这一条（图集网格按新张数画）；最新那条 eager
+      const anchor = chatGrabAnchor(log);             // 重建前记"在不在底部"
       log.replaceChild(fresh, run.node);
       run.node = fresh;
-      log.scrollTop = log.scrollHeight;           // 与单条消息一样贴底（图片异步撑高由 chatStickImages 再校准）
-      chatStickImages(log);
+      chatSettle(log, anchor);                        // 在底部才贴底；否则位置放回原处
       return run.entry;
     }
     // 新建一条：先记进快照、再渲染，游标记住**快照里那个条目对象**（后面的图要追加进它的 images）。
@@ -2540,11 +2730,13 @@
     input.value = '';
     growChatInput();                       // 清空后回到 150px 的默认高度（不是 1 行）
     appendMessage('user', message);
+    const log = $('chat-log');
+    const anchor = chatGrabAnchor(log);            // 追加前记"在不在底部"
     const pending = el('div', 'msg bot');
     pending.appendChild(el('span', 'spin'));
     pending.appendChild(document.createTextNode(' 正在思考…'));
-    $('chat-log').appendChild(pending);
-    $('chat-log').scrollTop = $('chat-log').scrollHeight;
+    log.appendChild(pending);
+    chatSettle(log, anchor);                       // 发消息时通常就在底部 → 贴底；（用户翻历史发消息也不被顶走）
     $('chat-send').disabled = true;
     try {
       const result = await api('/api/chat', { body: { message, execute: $('chat-execute').checked, scope: scope() } });
@@ -5554,7 +5746,7 @@
     // 内容变多就长高（Shift+回车换行、粘贴整段要求都算），到 40vh 停下自己在框内滚。
     on('chat-input', 'input', () => growChatInput());
     window.addEventListener('resize', () => growChatInput());
-    window.addEventListener('resize', () => syncRailSpacing());
+    watchRailSpacing();                        // 右栏上边界的对齐基准：resize / 导航-内容区尺寸变化都重量一次
     on('chat-reset', 'click', async () => {
       // 顺序很重要：**先** reset（服务端那份正文存档一起清掉），**再**丢本地这份；
       // chatSnapshotClear() 会把待推的存档一起作废，清空后的空内容绝不回推（服务端不会「复活」）。
@@ -5807,12 +5999,18 @@
     // 列表里的「进行中」条目不靠高频轮询：页面重新可见时刷一次就够了。
     document.addEventListener('visibilitychange', () => {
       // 页面隐藏：5 秒那套「有没有新回执」的表停掉（隐藏期间一个请求都不发），重新可见时再起。
-      if (document.hidden) { stopQuestUnreadWatch(); return; }
+      if (document.hidden) { state.wasHidden = true; stopQuestUnreadWatch(); return; }
       refreshQuestListQuietly();
       pollQuestStatusQuietly();            // 切回来顺手问一次未读数（新回执 → 徽标涨）
       pollQuestUnreadQuietly();            // 回执页：切回来立刻查一次有没有新回执（不等那 5 秒）
       startQuestUnreadWatch();
+      // **对话栏**：后台期间 follow 定时器被浏览器节流，切回来立刻补拉一次，别让"新消息"要等到下次定时器才出现。
+      resumeCapturePoll('visibilitychange');
+      syncChatArchive().catch(() => {});      // 对话栏读的是服务端存档：切回来立刻补一次（不等 2.5 秒那轮）
     });
+    // 窗口重新获得焦点也补一次（同窗口多标签、或者其他窗口盖住时，visibility 未必变化）
+    window.addEventListener('focus', () => { resumeCapturePoll('focus'); });
+    window.addEventListener('pageshow', () => { resumeCapturePoll('pageshow'); });
 
     on('terminal-form', 'submit', async (event) => { event.preventDefault(); await submitTerminal(); });
     // 点终端任意位置都聚焦到提示符（真终端就是这样）
@@ -5911,6 +6109,36 @@
    *    CSS 里那组默认值继续生效 —— 这个函数在 `boot()` 里要**在 `loadPage()` 之后**再调一次
    *    （那时 `#app` 已经可见、布局也落定了）。
    */
+  /**
+   * 对话栏（右栏）**上边界**的对齐基准：**布局无关**地取"导航栏上边界"与"主内容列上边界"里
+   * 更靠上、且有效的那个。
+   *
+   * <p>为什么不能只认 `nav.tabs` 的 `top`：
+   * <ul>
+   *   <li>现在的导航是**顶部横版**（`.bar` 之下的 `nav.tabs`），它自己就是那一行的上边界；</li>
+   *   <li>导航可能被改成**贴左竖版**（另一个代理在做，类名 `nav.tabs` 保留、只改外观）：
+   *       那时导航占一列、从内容区顶部开始，`.workspace` 的最上沿才是两条栏该对齐的线；</li>
+   *   <li>竖版下 `nav.tabs` 的 `top` 与 `.workspace` 的 `top` 一般相等，取较小值就落在同一条线上。</li>
+   * </ul>
+   * 取"两者中更靠上且 > 0 的那个"：横版下 `.workspace` 的 top 其实就是 `.tabs` 的 top（同一行），
+   * 竖版下导航从内容顶开始，两种布局都能落到正确的线上；两者都量不到就退回 CSS 的兜底值。
+   */
+  function railAlignTop() {
+    const tabs = document.querySelector('.tabs');
+    const workspace = document.querySelector('.workspace');
+    const candidates = [];
+    if (tabs) {
+      const top = tabs.getBoundingClientRect().top;
+      if (top > 0) candidates.push(top);
+    }
+    if (workspace) {
+      const top = workspace.getBoundingClientRect().top;
+      if (top > 0) candidates.push(top);
+    }
+    if (!candidates.length) return 0;
+    return Math.min.apply(null, candidates);
+  }
+
   function syncRailSpacing() {
     const root = document.body;
     if (!root) return null;
@@ -5922,8 +6150,8 @@
     const height = (node) => (node ? node.getBoundingClientRect().height : 0);
     const barH = height(bar);
     const tabsH = height(tabs);
-    // 导航栏（nav.tabs）**上边界**：右栏顶边就对齐这一条线
-    const tabsTop = tabs ? tabs.getBoundingClientRect().top : 0;
+    // 对齐基准（布局无关，见 railAlignTop）：右栏顶边就压在这一条线上
+    const alignTop = railAlignTop();
     // 右栏**下边界**：回执页两栏要延长到这一条线（读的是真实 rect，不是第二份算式）
     const railBottom = rail ? rail.getBoundingClientRect().bottom : 0;
     // 回执页两栏的起点（面板顶部）：两栏的高度 = 右栏底边 - 这个起点 - 20（上下各 10 呼吸）
@@ -5931,21 +6159,80 @@
     const splitTop = split && rail ? split.getBoundingClientRect().top : 0;
     if (scrolled > 0) window.scrollTo(0, scrolled);
     if (barH > 0) root.style.setProperty('--rail-bar', Math.round(barH * 100) / 100 + 'px');
+    // `--rail-tabs` 现在写的是 `nav.tabs` 的**高度**：横版导航时它是页签条的高（约 55px），
+    // 变成**贴左竖栏**之后就是那一列的高（实测 744.25px）。它只喂 CSS 里 `--rail-stick-top` 这个**兜底**
+    // （`--rail-top` 量到就不生效），不参与其它几何 —— 名字沿用旧称，语义以"导航容器的高度"为准。
     if (tabsH > 0) root.style.setProperty('--rail-tabs', Math.round(tabsH * 100) / 100 + 'px');
-    if (barH > 0 && tabsH > 0) {
+    if (alignTop > 0) {
       // 控制台全屏（body.console-full）没有页头也没有导航栏：右栏从视口顶开始，
       // 与那条 `body.console-full { --rail-stick-top: 0px }` 同一个口径。
       const fullscreen = document.body.classList.contains('console-full');
-      const top = fullscreen ? 0 : tabsTop;
+      const top = fullscreen ? 0 : alignTop;
       root.style.setProperty('--rail-top', Math.round(top * 100) / 100 + 'px');
     }
-    // 回执页两栏延到「对话」底边。窄屏（<=860px）是竖排，"底边齐平"不适用：
-    // 那边 CSS 用 `--quest-pane-h: 0px` + `height: auto` 关掉它，这里不写（否则会盖掉那条规则）。
-    if (rail && split && railBottom > 0 && splitTop > 0 && !window.matchMedia('(max-width: 860px)').matches) {
-      const paneH = Math.round((railBottom - splitTop - 20) * 100) / 100;
-      if (paneH > 0) root.style.setProperty('--quest-pane-h', paneH + 'px');
-    }
+    // 回执页两栏的高度由 {@link fitQuestPanes} 收敛（不是在这里量一次就写）：
+    // 那一刻右栏/左栏的几何还没落定，量出来会差 ~11.8px 且之后没人再量。
+    if (split && rail) fitQuestPanes(0);
     return rail ? Math.round(rail.getBoundingClientRect().top) : null;
+  }
+
+  /** 布局变化的兜底：窗口 resize、字体加载完、以及导航/内容区尺寸变化时都重新量一次。 */
+  function watchRailSpacing() {
+    let raf = 0;
+    const schedule = () => {
+      if (raf) return;
+      raf = requestAnimationFrame(() => { raf = 0; syncRailSpacing(); });
+    };
+    window.addEventListener('resize', schedule);
+    const tabs = document.querySelector('.tabs');
+    const workspace = document.querySelector('.workspace');
+    if (typeof ResizeObserver === 'function') {
+      try {
+        const observer = new ResizeObserver(schedule);
+        if (tabs) observer.observe(tabs);
+        if (workspace) observer.observe(workspace);
+      } catch { /* 老浏览器：上面的 resize 兜着 */ }
+    }
+    if (document.fonts && document.fonts.ready) document.fonts.ready.then(schedule).catch(() => {});
+    return schedule;
+  }
+
+  /**
+   * 把回执页两栏的底边**收到**「对话」栏底边上（差值 ≈ 0），而不是"量一次就完事"。
+   *
+   * <p>为什么不能只量一次（实测到的 11.83px 就是这么来的）：这个高度必须在**右栏几何落定之后**量，
+   * 而右栏的底边（`--rail-top` + `--rail-bottom` 算出来的高度）与左栏内容高度是相互依赖的 ——
+   * 进入页面那一秒里，右栏还在按旧的 `--rail-top` 排、左栏的列表行/结果正文也还在陆续铺出来。
+   * 在那之前量一次，写下去的就是旧几何的差值（实测 708.68 vs 需要的 720.5，正好差 11.83px），
+   * 而且之后没人再量 → 一直差着，直到某次 resize 才自己纠正。
+   *
+   * <p>所以这里做成**按实测差迭代纠正**：每次都量"两栏底边 vs 右栏底边"的真实差，把差补进 `--quest-fit-h`，
+   * 下一帧再量，直到 |差| ≤ 1px 或连续两次不再改善（最多 4 轮、约 65ms）。基准值从**当前 rect** 重算
+   * （不累加历史状态），所以不会像"读回上次写过的值"那样越补越偏。
+   *
+   * <p>为什么一轮不够：`height: calc(var(--quest-fit-h) + 20px)` 请求的高度与实际渲染出来的高度
+   * 会差 2~3px（grid 行 + 卡片 flex 链 + 亚像素取整，实测稳定偏短），一轮写完就差那几像素，
+   * 所以必须**以实测差为准**再补。
+   */
+  function fitQuestPanes(attempt) {
+    const tick = Number(attempt) || 0;
+    const split = document.querySelector('.quest-split');
+    const rail = $('agent-rail');
+    if (!split || !rail) return null;
+    if (window.matchMedia('(max-width: 860px)').matches) return null;      // 竖排：底边齐平不适用
+    if (document.body.classList.contains('console-full')) return null;     // 全屏没有导航栏，规则同 CSS
+    const railRect = rail.getBoundingClientRect();
+    const splitRect = split.getBoundingClientRect();
+    // 基准：右栏底边 − 本容器顶边 − 20（20 = CSS 里那对上下各 10px 呼吸）
+    const fit = Math.round((railRect.bottom - splitRect.top - 20) * 100) / 100;
+    if (fit > 0) document.body.style.setProperty('--quest-fit-h', fit + 'px');
+    if (tick < 4) {
+      requestAnimationFrame(() => {
+        const diff = rail.getBoundingClientRect().bottom - split.getBoundingClientRect().bottom;
+        if (Math.abs(diff) > 1) fitQuestPanes(tick + 1);                  // 还差：按新的 rect 再补一轮
+      });
+    }
+    return fit;
   }
 
   async function boot() {
@@ -5963,6 +6250,7 @@
     // 回执页：约 5 秒查一次「有没有新回执」（latest/unread 一涨就立刻刷左栏列表，右栏不动）。
     // 先起表再 loadPage：列表万一没读出来也不会把这条轮询一起丢掉（poll 里自己会判空跳过）。
     startQuestUnreadWatch();
+    startChatArchiveWatch();
     await loadPage();
     // 页面铺完再校正一次上下间距：字体/布局落定后的真实高度才是准的（见 syncRailSpacing）。
     // 连调两次是有意的：第一次把 `--rail-top` 写下去（右栏高度跟着它算），第二次才读到**已经落定**的

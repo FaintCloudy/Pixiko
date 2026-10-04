@@ -644,7 +644,7 @@
      换条目（openDetail）或整屏重挂（mountDetail）时必须清掉 —— 那时 DOM 已经不在，留着会串页。 */
   var detail = { root: null, body: null, head: null, headNodes: null, number: 0, payload: null, error: '',
     loading: false, files: [], extras: [], timer: null, progress: null, stepNodes: [], stepCount: 0,
-    owned: [], ownedDirs: Object.create(null), pullSince: 0 };
+    owned: [], ownedDirs: Object.create(null), pullSince: 0, window: null };
 
   /**
    * 这条回执**自己**的图片（只认 `/api/quest` 的 `messages`/`images` —— 服务端权威，不含"提前拉进来的" extras）。
@@ -698,13 +698,34 @@
     return detail.pullSince || now;
   }
 
+  /* 生成目录 → 回执号。会话内每读到一条回执就把它的图目录登记下来：
+     别的回执（尤其**并发/交错**的那条）在挑"提前到达的图"时，先看这个目录是不是已经名花有主。 */
+  var dirOwner = Object.create(null);
+  var RUN_SLACK = 5000;        // 目录时间戳只精确到秒 + 回执开始时刻是反推的，给 5 秒余量
+
+  /** 生成目录名里的时间戳（`…/20261005-034042-hash/image-01.png`，本地时间）→ 毫秒；没有给 0。 */
+  function dirStampMillis(path) {
+    var dir = imageDirOf(path);
+    var match = /(\d{8})-(\d{6})/.exec(dir);
+    if (!match) return 0;
+    return new Date(+match[1].slice(0, 4), +match[1].slice(4, 6) - 1, +match[1].slice(6, 8),
+      +match[2].slice(0, 2), +match[2].slice(2, 4), +match[2].slice(4, 6)).getTime();
+  }
+
   /**
-   * 这张图**是不是这条回执"这一次生成"的产物**（用户报的「回执界面生成图片时会加入不属于该任务的先前图片」）。
+   * 这张图**是不是这条回执"这一次生成"的产物**（用户报的「多个生成任务时要区分图片归属，不能一股脑
+   * 放进正在生成的那条回执」）。
    *
-   * <p>判据只有两条，都不成立就**不并进来**（宁可少并：下一轮 `renderDetail()` 会从回执正文里把它补回来）：
-   *   ① 它所在的生成目录 == 这条回执**自己**已经有的图片的目录（同一轮 task 目录，最硬）；
-   *   ② 它的时间（`modified`，缺失才回退路径时间戳）≥ {@link runStartMillis}（本次生成开始时刻）。
-   * ② 覆盖"换一次生成会开一个新的 task 目录"这种情况 —— 新目录里的图只要晚于本次开始就照样进得来。
+   * <p><b>服务端没有任务身份字段</b>（实测：`/api/quests` 行只有 number/startedAt/command/…；`/api/quest`
+   * 只有 id/quest/command/texts/images/messages/busy/done/closed/ageMillis；`/api/tasks` 只有
+   * slot/number/done/total/images/failed/running/…；`/api/progress` 只有 percent/step/text/queue —— 四处
+   * 都**没有** task id / 目录 / 回执号的对应关系）。所以只能靠**图片路径自带的运行目录** + **回执自己的
+   * 开始-结束区间**这两条硬证据：
+   *   ① 目录 == 这条回执正文里已有图片的目录（`ownedDirs`）→ 就是它的；
+   *   ② 这个目录已经登记在**别的**回执名下 → 一律不要（并发/交错时最关键的一条）；
+   *   ③ 目录时间戳（拿不到才用 `modified`）落在本回执的窗口 `[本次开始 - 5s, 下一条回执开始 + 5s)` 内 →
+   *      是它这一次新开目录里的图（`.gen 5` 分多批就是这种）。
+   * 三条都不成立就不并进来 —— 宁可少并：下一轮 `renderDetail()` 会从回执正文（服务端权威）里补回来。
    */
   function belongsToRun(item) {
     var path = typeof item === 'string' ? item : (item && item.path);
@@ -712,9 +733,45 @@
     if (!path) return false;
     var dir = imageDirOf(path);
     if (dir && detail.ownedDirs[dir]) return true;
-    var when = imageTime(item);
+    var owner = dir ? dirOwner[dir] : 0;
+    if (owner && owner !== detail.number) return false;
+    var when = dirStampMillis(path) || imageTime(item);
     if (!when) return false;
-    return when >= detail.pullSince;
+    var window_ = detail.window;
+    if (!window_) return when >= detail.pullSince;
+    return when >= window_.from && when < window_.until;
+  }
+
+  /**
+   * 算出这条回执的"生成时间窗"，顺便把它的图目录登记进 {@link dirOwner}。
+   * 上界 = **下一条回执的开始时刻**（从 `/api/quests` 里取比它大的最小 startedAt）：这条之后开始的
+   * 任务，图一定不属于它 —— 这就是"两个任务交错"时把两边分开的那把尺子。
+   */
+  function loadRunWindow(payload) {
+    var number = detail.number;
+    detail.window = { from: runStartMillis(payload) - RUN_SLACK, until: Infinity };
+    detail.owned.forEach(function (file) {
+      var dir = imageDirOf(file);
+      if (dir) dirOwner[dir] = number;
+    });
+    if (!(payload && (payload.busy || payload.done === false))) return Promise.resolve(detail.window);
+    return Promise.resolve(P.api('/api/quests', { body: { limit: 8 } })).then(function (data) {
+      var rows = (data && data.quests) || [];
+      var next = 0;
+      rows.forEach(function (row) {
+        var rowNumber = num(row.number, 0);
+        if (!(rowNumber > number)) return;
+        var age = num(row.ageMillis, 0);
+        var start = age > 0 ? Date.now() - age : Date.parse(row.startedAt);
+        /* 只认"确实晚于本次开始"的那些（号更大却更早开始的数据不一致 / 时钟偏移就跳过），
+           在它们里取最早的 → 那就是把两个交错任务分开的那把尺子。 */
+        if (isFinite(start) && start > detail.window.from && (!next || start < next)) next = start;
+      });
+      /* 上界**不能往后放宽**：目录名的时间戳只精确到秒，下一条回执开始前的最后一秒可能落在它的号上，
+         所以往**前**留 1 秒容差；再往后就会把"下一条任务刚出的图"吃进来（用户报的正是这个）。 */
+      if (next) detail.window.until = Math.max(detail.window.from + 1, next - 1000);
+      return detail.window;
+    }).catch(function () { return detail.window; });
   }
 
   function piecesOf(payload) {
@@ -1266,15 +1323,18 @@
       });
       renderDetail();
       var running = !detail.payload.error && !(detail.payload.done && !detail.payload.busy);
-      return Promise.resolve(P.api('/api/progress', { body: {} })).then(function (live) {
-        setProgress(live);
-        renderProgress();
-        if (running && live && (live.running || num(live.queue, 0) > 0)) {
-          detail.pullSince = runStartMillis(detail.payload);     // 本次生成开始时刻（服务端 ageMillis 反推）
-          pullLiveImages();
-        }
-        return detail.payload;
-      }).catch(function () { setProgress(null); renderProgress(); return detail.payload; });
+      /* 先把"生成时间窗 + 目录归属"算好，再决定要不要并提前到达的图 —— 并发/交错的任务就靠它分开。 */
+      return Promise.resolve(loadRunWindow(detail.payload)).then(function () {
+        return Promise.resolve(P.api('/api/progress', { body: {} })).then(function (live) {
+          setProgress(live);
+          renderProgress();
+          if (running && live && (live.running || num(live.queue, 0) > 0)) {
+            detail.pullSince = runStartMillis(detail.payload);     // 本次生成开始时刻（服务端 ageMillis 反推）
+            pullLiveImages();
+          }
+          return detail.payload;
+        }).catch(function () { setProgress(null); renderProgress(); return detail.payload; });
+      });
     }).catch(function (error) {
       detail.loading = false;
       detail.error = text(error && error.message) || String(error);

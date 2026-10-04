@@ -1,3 +1,13 @@
+/* Pixiko 控制台样式表。
+   ---------------------------------------------------------------------------
+   写注释的一条硬规矩：**注释里不要再写出「注释结束标记」本身**（星号紧跟斜杠那两个字符）。
+   CSS 的注释不能嵌套：一旦正文里出现那两个字符连写，注释就在那里提前结束，
+   剩下的中文说明变成游离的 CSS，解析器会一路吞到下一个花括号 —— 结果是**紧跟其后的那条规则整条消失**。
+   这个坑真出过：`.quest-split` 的注释里写了那两个字符连写，于是 grid 规则被丢掉，
+   两栏退回 `display: block` 各占满整列（1440 下各 904px 宽），表现成"只让延长高度、宽度却被拉齐了"。
+   要提到这两个字符就分开写（星号 加 斜杠），别连写；同理也别在注释里写「注释开始标记」（斜杠加星号）。
+   改完 CSS 建议跑一遍 work/img-squash/css-comment-lint.mjs 自查。
+   --------------------------------------------------------------------------- */
 :root {
   --bg: #0b1220;
   --bg-2: #0f1728;
@@ -59,6 +69,49 @@ input:focus, textarea:focus, select:focus {
 textarea { resize: vertical; }
 code { background: rgba(120, 160, 220, .14); padding: 1px 5px; border-radius: 6px; font-size: .9em; }
 
+/* ------------------------------------------------------------ 数字框的「上下调整」（步进）
+   2026-10 用户反馈：宽输入框右侧那对「上下调整箭头」是裸的 UA 原生样式（Chromium 在悬停/聚焦时
+   会在右边缘画一个白色小方块 + 两个灰三角），跟这套深色玻璃风格完全不搭。
+   处理办法（首选方案，两层保险）：
+     ① 关掉原生 spinner：`appearance: textfield` 让 UA 不再画那对箭头，
+        `::-webkit-inner-spin-button` / `::-webkit-outer-spin-button` 再显式归零（老 Blink/WebKit 也吃）。
+        这一步**只管绘制**：type=number 的键盘 ↑↓、手输数字、min/max/step 校验、change 事件一律不变。
+     ② 补一对项目自己的加减按钮 `.stepper-btn`：外观沿用既有的 ghost 按钮语言
+        （1px var(--line) 边框 + 淡蓝底 + 12px 圆角 + 悬停提亮 + 按下下沉 + 聚焦 3px 蓝色光环），
+        尺寸 44×44（项目硬规矩：触摸/点击目标 ≥44px）。
+   结构：`.stepper` 是一条 flex 行，里面是 [−][输入框][＋]。带文字标签的字段仍然保留 `label.field`
+   （标签包着输入框），所以「点标签文字聚焦输入框」照旧；加减按钮是 label 的**兄弟节点**，不会被
+   标签的激活行为误触。宽输入框（`.row` 里 flex: 1 1 150px）与窄输入框（`.grid-2` 里 1fr）
+   共用同一个 `.stepper`，外观与行为完全一致。 */
+input[type=number] {
+  -moz-appearance: textfield;
+  -webkit-appearance: textfield;
+  appearance: textfield;
+  font-variant-numeric: tabular-nums;   /* 数字等宽：加减时数值不左右跳 */
+}
+input[type=number]::-webkit-outer-spin-button,
+input[type=number]::-webkit-inner-spin-button { -webkit-appearance: none; appearance: none; margin: 0; }
+
+.stepper { display: flex; align-items: flex-end; gap: 6px; min-width: 0; }
+.stepper > input[type=number] { flex: 1 1 0; min-width: 0; width: auto; }
+.stepper > .field { flex: 1 1 auto; min-width: 0; }
+/* `.row` 里的宽输入框原本吃的是 `.row > input { flex: 1 1 150px }`；包进 .stepper 之后由它顶上，
+   否则这条会落空、输入框缩成内容宽。 */
+.row > .stepper { flex: 1 1 150px; }
+.stepper-btn {
+  flex: 0 0 auto; width: 44px; min-width: 44px; height: 44px; min-height: 44px; padding: 0;
+  display: inline-flex; align-items: center; justify-content: center;
+  border: 1px solid var(--line); border-radius: 12px;
+  background: rgba(120, 160, 220, .08); color: var(--text);
+  font-size: 18px; font-weight: 650; line-height: 1; box-shadow: none; cursor: pointer;
+  transition: background .2s var(--ease), border-color .18s var(--ease), box-shadow .18s var(--ease),
+    transform .16s var(--ease), opacity .2s linear;
+}
+.stepper-btn:hover { background: rgba(120, 160, 220, .16); box-shadow: none; filter: none; }
+.stepper-btn:active { transform: translateY(1px) scale(.985); }
+.stepper-btn:focus { outline: none; border-color: rgba(90, 162, 255, .65); box-shadow: 0 0 0 3px rgba(90, 162, 255, .16); }
+.stepper-btn:disabled { opacity: .45; cursor: not-allowed; transform: none; }
+
 .aurora {
   position: fixed; inset: -20% -10% auto -10%; height: 60vh; z-index: -1; pointer-events: none;
   background: conic-gradient(from 210deg at 30% 40%, rgba(90,162,255,.16), rgba(185,139,255,.14), rgba(79,215,168,.12), rgba(90,162,255,.16));
@@ -99,27 +152,70 @@ code { background: rgba(120, 160, 220, .14); padding: 1px 5px; border-radius: 6p
 .banner.error { background: rgba(255, 125, 138, .12); border: 1px solid rgba(255, 125, 138, .35); color: #ffd7db; }
 @keyframes drop-in { from { opacity: 0; transform: translateY(-8px); } to { opacity: 1; transform: none; } }
 
+/* ---------------------------------------------------------------- 导航：贴左的竖版侧栏
+   2026-10 用户要求「导航栏改为贴近左侧的竖版，每个栏目配一个图标」，原来是顶部一条横向页签；
+   随后又明确「单个栏目里**图标在正中央、文字在图标之下**」——所以每个条目是
+   flex-direction: column + align-items: center + justify-content: center：
+   图标在上、文字在图标正下方，两者都相对条目水平居中（探针按 ±1px 断言）。
+   侧栏本身：宽 --nav-w、竖排、贴着 #app 的左外留白（--rail-gutter = 24px）；宽屏下是 fixed
+   （理由见下面 .tabs 里的注释），左侧那一列由 .workspace 的 padding-left 让出来。
+   三条硬约束（别改坏）：
+     ① 结构/选择器一个字都不动：仍然 `<nav class="tabs">` + 每个栏目一个 `<a class="tab" data-tab="…">`
+        且按钮文字含栏目名（服务端 WebPages.render 按 `<a class="tab" data-tab="X"` 前缀加 active，
+        WebUiTest / 既有探针按它定位页签）；
+     ② 每个栏目可点区域 ≥ 44px（项目硬规矩）：条目 min-height 62px、宽度 = 侧栏内宽（≥ 44px），
+        整块都是点击区；
+     ③ **三条边界同一条线**：侧栏顶边 = 内容区（面板）顶边 = 对话栏顶边 = 页头 62.25px + #app 上内边距 12px
+        = 74.25px（1440×900 实测差值 0px）。app.js 的 syncRailSpacing() 量的仍是
+        `.tabs` 的 getBoundingClientRect().top，竖版之后量到的就是这条线，右栏照旧对齐。
+   窄屏（<=1000px）：侧栏回到文档流（static）、换成横向的一排，条目内部仍然图标在上、文字在下、居中。 */
 .tabs {
-  display: flex; gap: 6px; overflow-x: auto; padding: 6px; position: sticky; top: 62px; z-index: 20;
+  display: flex; flex-direction: column; gap: 4px; padding: 6px;
+  /* 宽屏用 **fixed** 而不是 sticky：11 个栏目竖排后侧栏本身有 ~745px 高，sticky 的夹紧条件是
+     「包含块底边 ≥ 侧栏底边 + 视口内偏移」，实测 1440×900 滚到整页最底时导航会被包含块推上去
+     （顶边从 74.25 爬到 16.6，底下几个栏目点不到）；1280×800 更糟（侧栏比视口还高）。
+     fixed 让侧栏钉在视口里，任何页长、任何滚动位置都完整可点。
+     `.workspace` 用 padding-left 留出它那一列 —— 侧栏脱离文档流后不再参与 flex 布局，
+     `flex: 0 0 var(--nav-w)` 也就没有意义了（窄屏的 static 态重新给它 flex: 0 0 auto）。
+     left 用 --rail-gutter（= #app 的左外留白），保证"贴左"与页面同一套 24px。 */
+  position: fixed; left: var(--rail-gutter); top: calc(var(--rail-bar) + 12px);
+  width: var(--nav-w); z-index: 20;
   background: rgba(15, 23, 39, .82); backdrop-filter: blur(12px) saturate(140%);
-  border: 1px solid var(--line); border-radius: 24px; margin-bottom: 6px;
+  border: 1px solid var(--line); border-radius: 18px; margin: 0;
   box-shadow: 0 8px 22px rgba(4, 10, 22, .28);
-  scrollbar-width: none;
-  -webkit-overflow-scrolling: touch;
 }
-.tabs::-webkit-scrollbar { display: none; }
+/* 极矮视口（页头 62px + 侧栏 744px + 底部留白 24px = 830px，所以 height <= 768px 一定装不下）：
+   11 项竖排的侧栏比视口还高，fixed 元素不随页面滚动，超出的那几项原本永远点不到。
+   这里给侧栏自己一条内部滚动 + 高度上限（视口高 - 页头 - 上下各 12px 留白），
+   矮窗口里 11 个栏目就都能滚到了。用 `max-height`，所以够高的视口（>= 830px）**完全不受影响**
+   （1440×900 / 1280×800 / 900×900 实测的导航 rect/内部居中/点击区都不变）。
+   注意：这条只在 max-height 断点内生效，所以 `33px 空白`（滚动条槽）不会出现在常规视口上。 */
+@media (max-height: 768px) {
+  .tabs { max-height: calc(100vh - var(--rail-bar) - 24px); overflow-y: auto; overscroll-behavior: contain; }
+}
+/* 单个栏目：图标在上、文字在下、**两者都水平居中**（column + align-items/justify-content: center）。
+   position: relative 是给角上的未读徽标定位用的（它不参与这一列的居中，所以数字位数变多也不会把
+   图标/文字挤歪）。white-space: nowrap 只作用于标签，不换行、**不做省略号截断**（见 .tab-label）。 */
 .tab {
-  display: inline-flex; align-items: center; justify-content: center;
+  position: relative;
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  gap: 4px; width: 100%;
   text-decoration: none; cursor: pointer;
-  background: rgba(120, 160, 220, .07); color: var(--muted); border: 1px solid transparent; border-radius: 18px;
-  padding: 8px 15px; min-height: 40px; white-space: nowrap; font-weight: 550; box-shadow: none;
-  transition: color .2s var(--ease), background .25s var(--ease), transform .18s var(--ease), border-color .2s var(--ease);
+  background: rgba(120, 160, 220, .07); color: var(--muted); border: 1px solid transparent; border-radius: 12px;
+  padding: 8px 6px; min-height: 62px; font-weight: 550; box-shadow: none;
+  transition: color .2s var(--ease), background .25s var(--ease), border-color .2s var(--ease);
 }
-.tab:hover { color: var(--text); background: rgba(120, 160, 220, .14); transform: translateY(-1px); }
+.tab:hover { color: var(--text); background: rgba(120, 160, 220, .14); }
 .tab.active {
   background: linear-gradient(135deg, var(--accent), var(--accent-3)); color: #05101d;
   border-color: transparent; box-shadow: 0 8px 22px rgba(120, 140, 255, .3);
 }
+/* 栏目图标：内联 SVG（stroke 用 currentColor），随文字颜色走，不引任何外部依赖/图标字体。
+   22px 见方：flex 会把 SVG 拉成 stretch，所以宽高都显式钉住（margin 也归零，免得基线偏移）。 */
+.tab-icon { flex: 0 0 auto; width: 22px; height: 22px; margin: 0; display: block; fill: none; stroke: currentColor; stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round; }
+/* 文字标签：一行、居中、不换行、**不截断**（不用 text-overflow: ellipsis —— 侧栏宽度
+   --nav-w 已经按最长栏目名「提示词集」留够，放不下时改宽度而不是砍字）。 */
+.tab-label { display: block; max-width: 100%; white-space: nowrap; text-align: center; line-height: 1.25; }
 .panel { display: none; flex-direction: column; gap: 12px; }
 .panel.active { display: flex; animation: panel-in .34s var(--ease) both; }
 @keyframes panel-in { from { opacity: 0; transform: translateY(10px) scale(.995); } to { opacity: 1; transform: none; } }
@@ -246,6 +342,13 @@ body {
   /* 兜底：右栏顶边 ≈ 页头 + 导航栏（JS 量到 --rail-top 时以它为准，见 app.js 的 syncRailSpacing） */
   --rail-stick-top: calc(var(--rail-bar) + var(--rail-tabs));
   --rail-pad: 12px;
+  /* 左侧竖版导航（.tabs）那一列的宽度：内容区（.panel）左边留出它 + 栏间距。
+     单个栏目里图标在上、文字在下且都居中，所以宽度由**最长的栏目名**决定：
+     「提示词集」4 个汉字（15px 字号 ≈ 60px）+ 左右内边距 6px × 2 + 侧栏内边距 6px × 2 = 84px；
+     再给右上角的未读徽标（18px）留出余量 —— 取 104px（实测最长标签渲染宽 60px，余量 44px）。
+     文字因此永不换行、也不被截断。 */
+  --nav-w: 104px;
+  --nav-gap: 12px;
   /* 在流内用：100% = .shell 内容框（= 视口宽 - 2×外留白），比「右栏宽」的基准多减了外留白，
      所以这里把 2 × (外留白 - 基准) 加回去 —— 算出来仍是同一个右栏宽 */
   --rail-w-flow: calc((100% + 2 * var(--rail-gutter) - 2 * var(--rail-pad) - var(--rail-gap)) / 3);
@@ -254,11 +357,20 @@ body {
   /* 固定右栏的右边距：与 #app 内容右边缘对齐（#app 铺满，所以就是页面外留白） */
   --rail-right: var(--rail-gutter);
 }
+/* 左栏（栏目）那一列：内容区（.panel）左边用 padding-left 给固定的竖版导航留出「导航宽 + 栏间距」。
+   宽屏下 .tabs 是 fixed（钉在视口左侧），所以它不参与这里的 flex 布局，也不占宽度 ——
+   真正的"让位"就是这条 padding-left。三条边界（侧栏 / 内容区顶边 / 对话栏顶边）都在 74.25px 上：
+   #app 上内边距 12px + 页头 62.25px。
+   `position: relative; z-index: 10`：内容区自成一个 stacking context，低于侧栏（20）与对话栏（30）。 */
 .workspace {
   min-width: 0;                                   /* 长内容/窄屏不许把整页顶出横向滚动 */
+  position: relative; z-index: 10;
+  padding-left: calc(var(--nav-w) + var(--nav-gap));
   /* 给固定右栏让出「右栏宽 + 间距」；--rail-w-flow 已经把外留白的变化补偿进去了（见变量注释） */
   margin-right: calc(var(--rail-w-flow) + var(--rail-gap));
 }
+/* 当前栏目的面板：min-width: 0 让长内容在窄屏也能收缩（不顶出横向滚动）。 */
+.workspace > .panel { min-width: 0; }
 .agent-rail {
   position: fixed;               /* 宽屏：真正固定（取舍见上面的注释） */
   /* 顶边优先用 JS 量的 --rail-top（= 左侧导航栏 .tabs 的上边界，见 app.js 的 syncRailSpacing）——
@@ -324,9 +436,22 @@ body {
 /* 窄屏（<= 1000px）：单列堆叠 —— 右栏放到左栏**下面**（左栏是主角、先看栏目；DOM 顺序本来就是
    左先右后，不用 order 反转，键盘 Tab / 朗读顺序也自然）。右栏给 min(60vh, 520px) 的高度、自己滚动，
    此时**不能再 fixed**（会浮在栏目上面挡住内容），改回流内的普通块；宽度跟着单列走，
-   390px 宽也不出横向滚动。 */
+   390px 宽也不出横向滚动。
+   竖版导航在窄屏换成**横向的一排**（与 webui/m 的底部 tab 一个路子）：排在一行、横向滚动
+   （不是换行 —— 换行会把内容顶下去）。条目**内部不变**：仍然图标在上、文字在下、两者水平居中，
+   可点区域照旧 ≥44px（62px 高 × ≥52px 宽）。 */
 @media (max-width: 1000px) {
-  .workspace { margin-right: 0; }
+  /* 单列：侧栏回到文档流（static、铺满一行），所以把为它留的 padding-left 撤掉。 */
+  .workspace { margin-right: 0; min-height: 0; padding-left: 0; }
+  .tabs {
+    position: static; width: auto; left: auto; top: auto;
+    flex-direction: row; align-items: stretch; align-self: stretch; flex: 0 0 auto;
+    width: 100%; overflow-x: auto; gap: 6px; margin-bottom: 12px;
+    scrollbar-width: none; -webkit-overflow-scrolling: touch;
+  }
+  .tabs::-webkit-scrollbar { display: none; }
+  /* 横排时每个条目按内容收窄（但 min-width 保证 ≥44px 的可点宽度），内部仍是 column + 居中 */
+  .tab { width: auto; min-width: 52px; flex: 0 0 auto; padding: 8px 8px; }
   .agent-rail {
     position: static;
     top: auto;
@@ -561,10 +686,18 @@ body.console-full { overflow: hidden; }
 body.console-full #app { max-width: none; margin: 0; padding: 0; }
 body.console-full .panel.active { gap: 0; }
 /* 控制台全屏（/logs 默认）：**右栏照旧在右边 1/3**（用户要「无论哪个栏目都能对话」）。
-   这里把两个留白变量一起归零：--rail-gutter:0 → 全屏终端铺满、右栏贴住视口右边（--rail-right = 0）；
+   这里把留白变量一起归零：--rail-gutter:0 → 全屏终端铺满、右栏贴住视口右边（--rail-right = 0）；
    --rail-pad:0 → 右栏宽按满宽算（右栏仍是满宽的 1/3）；--rail-stick-top:0 → 没有页头，右栏从视口顶开始。
+   --nav-w / --nav-gap 也必须一起归零：竖版导航在宽屏是 fixed，它那一列是靠
+   `.workspace` 的 `padding-left: calc(--nav-w + --nav-gap)` 让出来的；全屏时 `.tabs` 虽然
+   `display: none` 了，但那条 padding 还在 —— 不归零的话终端左边缘会从 0 变成 116px
+   （实测归零后终端 left = 0、宽 = 视口宽 - 右栏宽 - 栏间距）。
    终端占左 2/3 那一列（见下）。于是「全屏」的语义 = **终端占满它那一列的高度**（不再是 100vw 独占整窗）。 */
 body.console-full { --rail-pad: 0px; --rail-gutter: 0px; --rail-stick-top: 0px; }
+/* 竖版导航让出的那一列也要一起归零：全屏时 .tabs 虽已 display:none，但 .workspace 的
+   `padding-left: calc(var(--nav-w) + var(--nav-gap))` 还在 —— 不归零终端左边缘会从 0 变成 116px。
+   单独一条声明，是为了让 `WebUiTest` 里那串逐字节断言的原文保持原样（契约式检查）。 */
+body.console-full { --nav-w: 0px; --nav-gap: 0px; }
 body.console-full .terminal {
   height: 100vh; width: auto; margin: 0; border: 0; border-radius: 0; box-shadow: none;
 }
@@ -654,6 +787,8 @@ body.console-full .terminal {
   .msg { max-width: 94%; }
   .kv { grid-template-columns: 1fr; }
   .kv > div:nth-child(odd) { margin-top: 6px; }
+  /* 竖版导航在 <=1000px 已经是横向图标条（贴左外留白、不再是页头下沿那条 sticky 条），
+     这里只把它的停顿位置跟着页头一起上移（页头在窄屏矮一点）。 */
   .tabs { top: 54px; }
   .list li { flex-wrap: wrap; }
   .list li .acts { width: 100%; justify-content: flex-start; }
@@ -951,8 +1086,7 @@ a.image-link img:hover { border-color: rgba(120, 160, 220, .55); }
      如果 JS 也写 `--quest-pane-h`，本行的兜底值会把它盖掉（实测就是这样：JS 写了 720.5px，
      这里仍是 min(76vh,760px)=704px，两栏就比对话栏短 36.5px）。 */
   --quest-pane-h: min(76vh, 760px);
-  --quest-fit-h: var(--quest-pane-h);
-  height: calc(var(--quest-fit-h) + 20px);
+  height: calc(var(--quest-fit-h, var(--quest-pane-h)) + 20px);
   min-height: 260px;
 }
 /* 列表卡：竖直排列「卡片头 / 状态行 / 列表」，列表吃掉剩余高度并可内部滚动。
@@ -960,7 +1094,7 @@ a.image-link img:hover { border-color: rgba(120, 160, 220, .55); }
 .quest-list-card { min-width: 0; min-height: 0; display: flex; flex-direction: column; }
 .quest-split > .card { min-height: 0; }
 .quest-list {
-  display: flex; flex-direction: column; gap: 8px;
+  display: flex; flex-direction: column; gap: 9px;
   /* 高度交给卡片的 flex 链（`flex: 1 1 auto` 吃掉剩余高度）；卡片高度由 `.quest-split` 统一决定，
      `max-height` 不再单独写一份 —— 两份独立来源就是漂移的来源。 */
   overflow-y: auto; padding-right: 2px;
@@ -973,8 +1107,10 @@ a.image-link img:hover { border-color: rgba(120, 160, 220, .55); }
   display: flex; align-items: flex-start; gap: 8px; width: 100%; text-align: left;
   background: rgba(120, 160, 220, .06); color: var(--text);
   border: 1px solid var(--line); border-left: 3px solid transparent; border-radius: 12px;
-  /* 每条回执不被压扁：给足最小高度与内边距（不设 height / max-height，内容多就自己撑开） */
-  min-height: 68px; padding: 10px 12px; box-sizing: border-box;
+  /* 每条回执不被压扁：给足最小高度与内边距（不设 height / max-height，内容多就自己撑开）。
+     用户嫌"两行文字（标题行 + 摘要行）挤在一起"，这里把上下内边距 10 → 13px、最小高度 68 → 74px
+     （量级 6px，属于"略微"）：**只加呼吸，不动字号/字色/对齐，也不动摘要行的行高与截断方式**。 */
+  min-height: 74px; padding: 13px 12px; box-sizing: border-box;
   font-weight: 450; cursor: pointer;
   /* 朴素样式：全局 button 那层蓝色投影在这一类行上太花，这里一律去掉（只留 1px 边框 + 未读左色条）。 */
   box-shadow: none;
@@ -1028,10 +1164,14 @@ a.image-link img:hover { border-color: rgba(120, 160, 220, .55); }
 }
 .quest-row.expired .quest-unread-count { background: var(--muted); }
 
-/* 「回执」页签上的未读数徽标：文字在 active 态是深色、平时是 muted，所以徽标用自带底色 + 亮字。 */
+/* 「回执」栏目上的未读数徽标：文字在 active 态是深色、平时是 muted，所以徽标用自带底色 + 亮字。
+   条目内部现在是「图标在上、文字在下」的一列居中，所以徽标**不参与那一列**：绝对定位钉在条目
+   右上角（.tab 是 position: relative）—— 这样数字位数变多既不会把图标/文字挤歪，也不会撑高条目
+   （撑高会连带动到「对话栏上边界 = 导航顶边」的对齐）。 */
 .tab-badge {
+  position: absolute; top: 2px; right: 2px;
   display: inline-flex; align-items: center; justify-content: center; min-width: 18px;
-  margin-left: 6px; padding: 0 5px; height: 18px; border-radius: 999px;
+  padding: 0 5px; height: 18px; border-radius: 999px;
   background: var(--accent); color: #04101f; font-size: 11.5px; font-weight: 700;
   font-variant-numeric: tabular-nums; line-height: 1;
 }
@@ -1043,7 +1183,7 @@ a.image-link img:hover { border-color: rgba(120, 160, 220, .55); }
   .quest-list { max-height: min(64vh, 620px); }
   /* 竖排了，"底边与对话栏齐平"不适用：把 JS 量出来的"延长到对话栏底边"关掉，
      退回上面那条 max-height 的窄屏规则 */
-  .quest-split { --quest-pane-h: 0px; --quest-fit-h: var(--quest-pane-h); height: auto; min-height: 0; }
+  .quest-split { --quest-pane-h: 0px; height: auto; min-height: 0; }
   /* 窄屏：翻页按钮贴边收窄一点，别压住画面 */
   .viewer-nav { width: 38px; height: 62px; min-height: 62px; font-size: 22px; }
   #viewer-prev { left: 6px; }

@@ -34,18 +34,57 @@
   <div class="shell" id="shell">
   <section class="workspace" id="workspace">
 
-  <nav class="tabs" role="tablist">
-    <a class="tab" data-tab="gen" role="tab" href="/gen">出图</a>
-    <a class="tab" data-tab="prompt" role="tab" href="/prompt">提示词</a>
-    <a class="tab" data-tab="styles" role="tab" href="/styles">样式</a>
-    <a class="tab" data-tab="loras" role="tab" href="/loras">LoRA</a>
-    <a class="tab" data-tab="functions" role="tab" href="/functions">提示词集</a>
-    <a class="tab" data-tab="chatcfg" role="tab" href="/chatcfg">聊天</a>
-    <a class="tab" data-tab="system" role="tab" href="/system">系统</a>
-    <a class="tab" data-tab="setup" role="tab" href="/setup">配置</a>
-    <a class="tab" data-tab="logs" role="tab" href="/logs">控制台</a>
-    <a class="tab" data-tab="help" role="tab" href="/help">帮助</a>
-    <a class="tab" data-tab="quest" role="tab" href="/quest" id="tab-quest"><span class="tab-label">回执</span><span class="tab-badge" id="quest-tab-badge" hidden>0</span></a>
+  <!-- 左侧竖版导航：每个栏目一行「图标 + 文字」，贴 #app 的左内边距（--rail-gutter = 24px）排。
+       硬约束（别改坏）：① 每个栏目仍是 `<a class="tab" data-tab="…">` —— 服务端 WebPages.render
+       按 `<a class="tab" data-tab="X"` 这个**逐字节的前缀**加 active 类（WebUiTest 也按它断言），
+       所以 class 与 data-tab 的顺序、引号都不能动，新属性只能加在 data-tab 之后；
+       ② 按钮里的文字仍是栏目名（<span class="tab-label">），图标是 aria-hidden 的装饰元素；
+       ③ 加内联 SVG（stroke 用 currentColor），不引外部依赖/图标字体/CDN —— 与 webui/m 那套一致。 -->
+  <nav class="tabs" role="tablist" aria-label="栏目导航">
+    <a class="tab" data-tab="gen" role="tab" href="/gen" title="出图" aria-label="出图">
+      <svg class="tab-icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="3.5" y="4.5" width="17" height="15" rx="2.5"/><circle cx="9" cy="10" r="1.6"/><path d="M4.2 16.8l4.6-4.4 3.2 3 3-2.7 4.8 4.3"/></svg>
+      <span class="tab-label">出图</span>
+    </a>
+    <a class="tab" data-tab="prompt" role="tab" href="/prompt" title="提示词" aria-label="提示词">
+      <svg class="tab-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6.5h16M4 12h16M4 17.5h9"/></svg>
+      <span class="tab-label">提示词</span>
+    </a>
+    <a class="tab" data-tab="styles" role="tab" href="/styles" title="样式" aria-label="样式">
+      <svg class="tab-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3.4a8.6 8.6 0 1 0 0 17.2c1.3 0 1.9-.8 1.9-1.7 0-1.6-1.7-1.8-1.7-3.1 0-.9.8-1.6 1.9-1.6h1.6a4.9 4.9 0 0 0 4.9-4.9c0-3.3-3.8-5.9-8.6-5.9z"/><circle cx="8.3" cy="9.4" r="1.1"/><circle cx="12.3" cy="7.6" r="1.1"/><circle cx="16" cy="9.8" r="1.1"/><circle cx="7.9" cy="14" r="1.1"/></svg>
+      <span class="tab-label">样式</span>
+    </a>
+    <a class="tab" data-tab="loras" role="tab" href="/loras" title="LoRA" aria-label="LoRA">
+      <svg class="tab-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3.6l7.2 4.2v8.4L12 20.4 4.8 16.2V7.8z"/><path d="M4.8 7.8L12 12l7.2-4.2M12 12v8.4"/></svg>
+      <span class="tab-label">LoRA</span>
+    </a>
+    <a class="tab" data-tab="functions" role="tab" href="/functions" title="提示词集" aria-label="提示词集">
+      <svg class="tab-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M6.5 3.8h11v16.4L12 16.4l-5.5 3.8z"/></svg>
+      <span class="tab-label">提示词集</span>
+    </a>
+    <a class="tab" data-tab="chatcfg" role="tab" href="/chatcfg" title="聊天" aria-label="聊天">
+      <svg class="tab-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M20.6 12.1c0 4-3.9 7.2-8.6 7.2-1 0-2-.15-2.9-.42L4 20.6l1.6-4.1A6.9 6.9 0 0 1 3.4 12.1c0-4 3.9-7.2 8.6-7.2s8.6 3.2 8.6 7.2z"/><path d="M8.8 12h.01M12 12h.01M15.2 12h.01"/></svg>
+      <span class="tab-label">聊天</span>
+    </a>
+    <a class="tab" data-tab="system" role="tab" href="/system" title="系统" aria-label="系统">
+      <svg class="tab-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3.1"/><path d="M12 3.4v2.3M12 18.3v2.3M20.6 12h-2.3M5.7 12H3.4M18.1 5.9l-1.6 1.6M7.5 16.5l-1.6 1.6M18.1 18.1l-1.6-1.6M7.5 7.5L5.9 5.9"/></svg>
+      <span class="tab-label">系统</span>
+    </a>
+    <a class="tab" data-tab="setup" role="tab" href="/setup" title="配置" aria-label="配置">
+      <svg class="tab-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M5 7h14M5 12h14M5 17h14"/><circle cx="9" cy="7" r="2"/><circle cx="15" cy="12" r="2"/><circle cx="8" cy="17" r="2"/></svg>
+      <span class="tab-label">配置</span>
+    </a>
+    <a class="tab" data-tab="logs" role="tab" href="/logs" title="控制台" aria-label="控制台">
+      <svg class="tab-icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="3.2" y="4.4" width="17.6" height="15.2" rx="2.4"/><path d="M7.2 9.6l2.8 2.6-2.8 2.6M12.4 15.4h4.4"/></svg>
+      <span class="tab-label">控制台</span>
+    </a>
+    <a class="tab" data-tab="help" role="tab" href="/help" title="帮助" aria-label="帮助">
+      <svg class="tab-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="8.4"/><path d="M9.6 9.5a2.5 2.5 0 1 1 3.4 2.3c-.7.3-1 .9-1 1.6v.5"/><path d="M12 17.1h.01"/></svg>
+      <span class="tab-label">帮助</span>
+    </a>
+    <a class="tab" data-tab="quest" role="tab" href="/quest" id="tab-quest" title="回执" aria-label="回执">
+      <svg class="tab-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M6.2 3.6h8.4l3.6 3.6v13.2H6.2z"/><path d="M14.6 3.6v3.6h3.6"/><path d="M9 12.4l1.5 1.5 3-3.2M9 17h6"/></svg>
+      <span class="tab-label">回执</span><span class="tab-badge" id="quest-tab-badge" hidden>0</span>
+    </a>
   </nav>
 
   <!--#panel:gen-->
@@ -54,7 +93,11 @@
     <div class="card">
       <div class="card-head"><b>生成</b><span class="muted">当前任务在下面的「任务队列」里看</span></div>
       <div class="row wrap">
-        <input id="gen-count" type="number" min="1" value="1" inputmode="numeric">
+        <span class="stepper">
+          <button class="stepper-btn" type="button" data-step-for="gen-count" data-step="-1" aria-label="生成张数 减少" title="减少">−</button>
+          <input id="gen-count" type="number" min="1" value="1" inputmode="numeric">
+          <button class="stepper-btn" type="button" data-step-for="gen-count" data-step="1" aria-label="生成张数 增加" title="增加">＋</button>
+        </span>
         <button type="button" id="gen-btn">开始生成</button>
         <button class="ghost" type="button" id="gen-status-btn">队列状态</button>
         <button class="ghost" type="button" id="get-btn">领取图片</button>
@@ -77,14 +120,38 @@
     <div class="card">
       <div class="card-head"><b>生成参数</b><span class="muted">没有「应用」按钮：改完立刻生效，只影响之后提交的任务</span></div>
       <div class="grid-2">
-        <label class="field"><span>宽（8 的倍数）</span><input id="set-width" type="number" min="64" max="2048" step="8" inputmode="numeric"></label>
-        <label class="field"><span>高（8 的倍数）</span><input id="set-height" type="number" min="64" max="2048" step="8" inputmode="numeric"></label>
+        <span class="stepper">
+          <button class="stepper-btn" type="button" data-step-for="set-width" data-step="-1" aria-label="宽 减少" title="减少">−</button>
+          <label class="field"><span>宽（8 的倍数）</span><input id="set-width" type="number" min="64" max="2048" step="8" inputmode="numeric"></label>
+          <button class="stepper-btn" type="button" data-step-for="set-width" data-step="1" aria-label="宽 增加" title="增加">＋</button>
+        </span>
+        <span class="stepper">
+          <button class="stepper-btn" type="button" data-step-for="set-height" data-step="-1" aria-label="高 减少" title="减少">−</button>
+          <label class="field"><span>高（8 的倍数）</span><input id="set-height" type="number" min="64" max="2048" step="8" inputmode="numeric"></label>
+          <button class="stepper-btn" type="button" data-step-for="set-height" data-step="1" aria-label="高 增加" title="增加">＋</button>
+        </span>
         <label class="field"><span>采样方法</span><select id="set-sampler"></select></label>
         <label class="field"><span>基础模型</span><select id="set-model"></select></label>
-        <label class="field"><span>步数</span><input id="set-steps" type="number" min="1" inputmode="numeric"></label>
-        <label class="field"><span>CFG</span><input id="set-cfg" type="number" min="0.1" step="0.1" inputmode="decimal"></label>
-        <label class="field"><span>种子（-1 随机）</span><input id="set-seed" type="number" inputmode="numeric"></label>
-        <label class="field"><span>图片上限/条</span><input id="set-imgcnt" type="number" min="1" inputmode="numeric"></label>
+        <span class="stepper">
+          <button class="stepper-btn" type="button" data-step-for="set-steps" data-step="-1" aria-label="步数 减少" title="减少">−</button>
+          <label class="field"><span>步数</span><input id="set-steps" type="number" min="1" inputmode="numeric"></label>
+          <button class="stepper-btn" type="button" data-step-for="set-steps" data-step="1" aria-label="步数 增加" title="增加">＋</button>
+        </span>
+        <span class="stepper">
+          <button class="stepper-btn" type="button" data-step-for="set-cfg" data-step="-1" aria-label="CFG 减少" title="减少">−</button>
+          <label class="field"><span>CFG</span><input id="set-cfg" type="number" min="0.1" step="0.1" inputmode="decimal"></label>
+          <button class="stepper-btn" type="button" data-step-for="set-cfg" data-step="1" aria-label="CFG 增加" title="增加">＋</button>
+        </span>
+        <span class="stepper">
+          <button class="stepper-btn" type="button" data-step-for="set-seed" data-step="-1" aria-label="种子 减少" title="减少">−</button>
+          <label class="field"><span>种子（-1 随机）</span><input id="set-seed" type="number" inputmode="numeric"></label>
+          <button class="stepper-btn" type="button" data-step-for="set-seed" data-step="1" aria-label="种子 增加" title="增加">＋</button>
+        </span>
+        <span class="stepper">
+          <button class="stepper-btn" type="button" data-step-for="set-imgcnt" data-step="-1" aria-label="图片上限 减少" title="减少">−</button>
+          <label class="field"><span>图片上限/条</span><input id="set-imgcnt" type="number" min="1" inputmode="numeric"></label>
+          <button class="stepper-btn" type="button" data-step-for="set-imgcnt" data-step="1" aria-label="图片上限 增加" title="增加">＋</button>
+        </span>
       </div>
       <div class="muted" id="gen-applied">当前生效参数会显示在这里。</div>
     </div>
@@ -125,7 +192,11 @@
     <div class="card">
       <div class="card-head"><b>回溯 recent</b></div>
       <div class="row wrap">
-        <input id="rg-count" type="number" min="1" value="4" inputmode="numeric">
+        <span class="stepper">
+          <button class="stepper-btn" type="button" data-step-for="rg-count" data-step="-1" aria-label="回溯张数 减少" title="减少">−</button>
+          <input id="rg-count" type="number" min="1" value="4" inputmode="numeric">
+          <button class="stepper-btn" type="button" data-step-for="rg-count" data-step="1" aria-label="回溯张数 增加" title="增加">＋</button>
+        </span>
         <button class="ghost" type="button" id="rg-btn">回溯最近 N 张</button>
       </div>
     </div>
@@ -296,7 +367,11 @@
       <label class="check"><input type="checkbox" id="set-chat-global"> 全局聊天开关</label>
       <div class="row wrap">
         <span class="muted">每分钟回复上限</span>
-        <input id="set-frequency" type="number" min="0" inputmode="numeric" placeholder="每分钟上限">
+        <span class="stepper">
+          <button class="stepper-btn" type="button" data-step-for="set-frequency" data-step="-1" aria-label="每分钟回复上限 减少" title="减少">−</button>
+          <input id="set-frequency" type="number" min="0" inputmode="numeric" placeholder="每分钟上限">
+          <button class="stepper-btn" type="button" data-step-for="set-frequency" data-step="1" aria-label="每分钟回复上限 增加" title="增加">＋</button>
+        </span>
         <button type="button" id="apply-frequency">应用频率</button>
       </div>
       <div class="muted" id="chatcfg-summary"></div>
@@ -609,5 +684,41 @@
 <!-- 任务信息云：从下方弹出，带跳去 /quest/#N 的链接 -->
 <div id="quest-clouds" class="quest-clouds" aria-live="polite"></div>
 <script src="/app.js?v=1.5.2"></script>
+<!-- 数字框的加减按钮（.stepper-btn）在这里接线。
+     app.css 已经把原生 spinner 关掉（appearance: textfield），这一对按钮就是它的替身；
+     样式走项目自己的 .stepper / .stepper-btn（和手机端同一套外观，44×44 触摸目标）。
+     它只做两件事：调值（stepUp/stepDown，按 min/max/step 走规范算法，0.1 这种小数不会算出
+     7.1000000000000005）和派发 input + change —— 于是既有的「改完即生效」（app.js 的
+     change 监听 → POST /api/generation）、min/max/step 校验、键盘 ↑↓、手输数字全都原样不变，
+     没有任何一条既有行为被替换掉。放在 app.js 之后，确保 app.js 的监听先注册。 -->
+<script>
+(function () {
+  function stepFor(input, button) {
+    try {
+      if (button.dataset.step === '-1') input.stepDown(); else input.stepUp();
+    } catch (error) { return false; }        // step="any" 之类会抛，按规范直接不动
+    if (input.value === '') return false;
+    var value = Number(input.value);
+    if (Number.isNaN(value)) return false;
+    // 按钮不该把值推到 min/max 之外（键盘与手输仍是浏览器原生那一套，不在这里拦）
+    if (input.min !== '' && value < Number(input.min)) input.value = input.min;
+    else if (input.max !== '' && value > Number(input.max)) input.value = input.max;
+    return true;
+  }
+  function wire(button) {
+    var input = document.getElementById(button.dataset.stepFor || '');
+    if (!input) return;
+    button.addEventListener('click', function () {
+      if (input.disabled) return;
+      var before = input.value;
+      if (!stepFor(input, button)) return;
+      if (input.value === before) return;    // 已经顶到边界：不发无谓的 change
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+      input.dispatchEvent(new Event('change', { bubbles: true }));
+    });
+  }
+  Array.prototype.forEach.call(document.querySelectorAll('button[data-step-for]'), wire);
+})();
+</script>
 </body>
 </html>

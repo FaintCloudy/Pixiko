@@ -679,8 +679,18 @@
         var found = ensure(path);
         if (found.url && url && found.url !== url) { found.nodes.length = 0; found.loaded = false; found.failed = false; found.width = found.height = 0; }
         if (url) found.url = url;
-        for (var i = 0; i < found.nodes.length; i++) if (!found.nodes[i].isConnected) return found.nodes[i];
+        /* 挑一个"空闲"的旧节点：既没挂在文档里（`isConnected`），也没被这一拍的构造过程占用。
+           为什么要有第二个条件：气泡/格子是**先离线拼好再挂上去**的，第一个格子拿到旧节点时它还没
+           `isConnected`，第二个格子（同一路径出现两次时）就会拿到同一个节点 —— 再 appendChild 只是
+           把它**搬走**，前一格就空了。挂上去之后占用标记自动释放，节点被摘掉后又能被复用。 */
+        for (var i = 0; i < found.nodes.length; i++) {
+          var candidate = found.nodes[i];
+          if (candidate.isConnected) { candidate.__pooled = false; continue; }
+          if (!candidate.__pooled) { candidate.__pooled = true; return candidate; }
+        }
+        if (found.nodes.length > 6) found.nodes.splice(0, found.nodes.length - 6);
         var fresh = document.createElement('img');
+        fresh.__pooled = true;
         found.nodes.push(fresh);
         return fresh;
       },
@@ -835,6 +845,29 @@
     nextBtn.style.zIndex = '2';
     var scale = 1, tx = 0, ty = 0;
 
+    /* 翻页箭头贴在**图片本体**左右两侧（用户报的"箭头放到最两边、离图太远"）。
+       `.viewer-stage img` 的 max-width 已经给箭头留出 2×(44+12) 的位置，所以这里按图片的实际
+       矩形算 left/right 就一定能落在图片外面：距离 12px、整体夹在 stage 内（不出屏、不盖图）。
+       换图 / 图片解码完 / 窗口尺寸变化 / 旋转都会重算。 */
+    var NAV_GAP = 12;
+    function placeNav() {
+      if (!panel.parentNode || !img) return;
+      var stageRect = stage.getBoundingClientRect();
+      if (!stageRect.width) return;
+      var imgRect = img.getBoundingClientRect();
+      var size = Math.round(prevBtn.getBoundingClientRect().width) || 44;
+      var cap = Math.max(4, Math.round(stageRect.width - size - 4));
+      var left = Math.round(imgRect.left - stageRect.left - NAV_GAP - size);
+      var right = Math.round(stageRect.right - imgRect.right - NAV_GAP - size);
+      prevBtn.style.left = Math.max(4, Math.min(left, cap)) + 'px';
+      prevBtn.style.right = 'auto';
+      nextBtn.style.right = Math.max(4, Math.min(right, cap)) + 'px';
+      nextBtn.style.left = 'auto';
+    }
+    img.addEventListener('load', function () { placeNav(); });
+    window.addEventListener('resize', placeNav);
+    window.addEventListener('orientationchange', placeNav);
+
     function apply() {
       img.style.transform = 'translate(' + tx + 'px,' + ty + 'px) scale(' + scale + ')';
     }
@@ -849,6 +882,7 @@
       prevBtn.disabled = at <= 0;
       nextBtn.disabled = at >= items.length - 1;
       reset();
+      nextFrame(placeNav);                  // 换图之后（比例/尺寸都变了）重新贴一次图片两侧
     }
     function step(delta) {
       var next = at + delta;
@@ -862,6 +896,8 @@
       panel.classList.remove('in');
       setTimeout(function () { if (panel.parentNode) panel.parentNode.removeChild(panel); }, 180);
       document.removeEventListener('keydown', onKey);
+      window.removeEventListener('resize', placeNav);
+      window.removeEventListener('orientationchange', placeNav);
       if (stopPoll) stopPoll();
     }
     function onKey(event) {
@@ -974,36 +1010,92 @@
   };
 
   /** 只在"这一屏还可见"时轮询：切屏、页面隐藏、元素被移除都会自动停。 */
+  /* ── 「页面又活了」的唤醒通道 ─────────────────────────────────────────────
+   * 为什么需要：安卓 WebView（以及某些壳）里 `visibilitychange` 可能**根本不派发**，`document.hidden`
+   * 甚至可能一直停在 `true` —— 于是"页面隐藏时不排下一拍"的轮询再也醒不过来，用户看到的就是
+   * 「对话不在焦点就不返回消息」。所以：把"重新可见"的所有可能信号（事件 + 看门狗 + 用户碰一下）
+   * 汇到一个注册表里，谁在轮询谁登记，任意一个信号到了就**立刻补一拍**。
+   */
+  var wakeHandlers = [];
+  var wakeBound = false;
+  function fireWake(why) {
+    wakeHandlers.slice().forEach(function (fn) { try { fn(why); } catch (error) { /* 一个唤醒失败不影响别的 */ } });
+  }
+  /** 登记一个"该补一拍了"的回调；返回注销函数。 */
+  PixikoM.onWake = function (fn) {
+    if (typeof fn !== 'function') return function () {};
+    wakeHandlers.push(fn);
+    if (!wakeBound) {
+      wakeBound = true;
+      var onEvent = function (why) { return function () { fireWake(why); }; };
+      document.addEventListener('visibilitychange', onEvent('visibilitychange'));
+      window.addEventListener('focus', onEvent('focus'));
+      window.addEventListener('pageshow', onEvent('pageshow'));
+      document.addEventListener('resume', onEvent('resume'));           // 某些安卓壳会派这个
+      window.addEventListener('online', onEvent('online'));
+      /* 用户碰一下 = 页面一定在前台 —— **不信 `document.hidden`**，有的壳里它一直是 true。 */
+      ['pointerdown', 'touchstart', 'keydown'].forEach(function (name) {
+        window.addEventListener(name, onEvent('user:' + name), { passive: true, capture: true });
+      });
+    }
+    return function () { var at = wakeHandlers.indexOf(fn); if (at >= 0) wakeHandlers.splice(at, 1); };
+  };
+
+  /**
+   * 可见时按 `ms` 轮询；页面隐藏时**不排下一拍**（省电 + 安卓后台节流），但回来必须**立刻**补。
+   *
+   * <p>三重保底（任何一条生效就够）：
+   *   ① `visibilitychange` / `focus` / `pageshow` / `resume` / `online` 事件（见 {@link PixikoM.onWake}）；
+   *   ② **看门狗**：每 1.5 秒自查一次，只要 `document.hidden` 已经是 false 而定时器还没排上，就补排
+   *      —— 专治"事件没派发但状态已经变回来"；
+   *   ③ **用户交互**（touch/pointer/keydown）：即使 `document.hidden` 卡在 true，也给它 20 秒"当可见处理"
+   *      的宽限并立刻补一拍 —— 用户的手指就是最可靠的"我在前台"证据。
+   */
   PixikoM.pollWhileVisible = function (fn, ms) {
     var interval = Math.max(200, Number(ms) || 1000);
-    var stopped = false, timer = null, running = false;
-    function visible() {
-      return !stopped && !document.hidden && !!currentId;
-    }
+    var stopped = false, timer = null, running = false, forcedUntil = 0;
+    function canRun() { return !stopped && !!currentId && (!document.hidden || Date.now() < forcedUntil); }
     async function tick() {
       timer = null;
-      if (!visible() || running) { schedule(); return; }
+      if (!canRun() || running) { schedule(); return; }
       running = true;
       try { await fn(); } catch (error) { /* 轮询失败不打断（错误由各屏自己呈现） */ }
       running = false;
       schedule();
     }
-    function schedule() {
-      if (stopped || timer) return;
-      if (document.hidden) return;                  // 页面隐藏时完全不排下一次，回来时 onVisible 会重新排
-      timer = setTimeout(tick, interval);
+    function schedule(soon) {
+      if (stopped || timer || !canRun()) return;
+      timer = setTimeout(tick, soon ? 120 : interval);
     }
-    function onVisible() {
+    /* 唤醒：用户交互 → 给一段"当可见"的宽限（不怕 document.hidden 卡住）；其它事件按状态走。 */
+    function wake(why) {
       if (stopped) return;
-      if (document.hidden) { if (timer) { clearTimeout(timer); timer = null; } return; }
-      schedule();
+      if (String(why).indexOf('user:') === 0) forcedUntil = Date.now() + 20000;
+      if (timer) { clearTimeout(timer); timer = null; }
+      schedule(true);
+      if (document.hidden && timer) { clearTimeout(timer); timer = null; }   // 真在后台：别空转
     }
-    document.addEventListener('visibilitychange', onVisible);
+    function onVisibility() {
+      if (!document.hidden) forcedUntil = 0;
+      if (document.hidden) { if (timer) { clearTimeout(timer); timer = null; } return; }
+      if (timer) { clearTimeout(timer); timer = null; }
+      schedule(true);
+    }
+    var stopWake = PixikoM.onWake(wake);
+    document.addEventListener('visibilitychange', onVisibility);
+    /* 看门狗：事件没派发也不怕（安卓壳兜底）。 */
+    var watchdog = setInterval(function () {
+      if (stopped) return;
+      if (!document.hidden) forcedUntil = 0;
+      if (!timer) schedule(true);
+    }, 1500);
     timer = setTimeout(tick, Math.min(interval, 400));
     return function stop() {
       stopped = true;
+      stopWake();
+      clearInterval(watchdog);
       if (timer) { clearTimeout(timer); timer = null; }
-      document.removeEventListener('visibilitychange', onVisible);
+      document.removeEventListener('visibilitychange', onVisibility);
     };
   };
 
@@ -1588,6 +1680,35 @@
     return out.slice(-CHAT_ENTRIES_CAP);
   }
 
+  /**
+   * 对话里**所有**图片（按时间顺序）。气泡点图进查看器时用它当列表 —— 于是"最近生成"的那几张
+   * 在对话里也能左右翻（用户报的"最近生成的图片查看器也应该带有浏览箭头"：老写法只把**这一条气泡**里
+   * 的图当列表，一条消息一张图时列表长度就是 1，两个箭头全是灰的，看着就像没有箭头）。
+   */
+  function chatImageList() {
+    var out = [];
+    (chat.entries || []).forEach(function (entry) {
+      (entry.images || []).forEach(function (raw) {
+        var path = normalizeImagePath(raw);
+        if (path) out.push({ src: raw, caption: String(path).replace(/^.*[\\/]/, '') || '图片' });
+      });
+    });
+    return out;
+  }
+
+  /** 这张图在 {@link chatImageList} 里的下标（同一张出现多次时取最靠前的那次）。 */
+  function chatImageIndex(raw) {
+    var target = normalizeImagePath(raw);
+    var at = -1, seen = 0;
+    (chat.entries || []).forEach(function (entry) {
+      (entry.images || []).forEach(function (item) {
+        if (at < 0 && normalizeImagePath(item) === target) at = seen;
+        seen++;
+      });
+    });
+    return at < 0 ? 0 : at;
+  }
+
   /** 一条条目 → DOM。图片缩略图点击进查看器。 */
   function chatBubble(entry) {
     var node = el('div', 'bubble ' + (entry.role === 'user' ? 'user' : entry.role === 'sys' ? 'sys' : 'bot'));
@@ -1595,7 +1716,6 @@
     if (entry.text) node.appendChild(el('div', 'bubble-text', entry.text));
     if (entry.images && entry.images.length) {
       var box = el('div', 'bubble-imgs' + (entry.images.length === 1 ? ' one' : ''));
-      var list = entry.images.map(function (src, index) { return { src: src, caption: '第 ' + (index + 1) + ' 张' }; });
       entry.images.forEach(function (raw, index) {
         var src = normalizeImagePath(raw);
         // 每张图外面套一层宽高比宿主：CSS 先给中性 4:3 占位，图 load 后由 applyNaturalRatio
@@ -1614,7 +1734,9 @@
         img.setAttribute('data-img-index', String(index));
         img.addEventListener('click', function () {
           if (img.parentNode && img.parentNode.getAttribute('data-img-failed') === '1') return;   // 失败态点击 = 复制路径
-          PixikoM.openViewer(list, index);
+          /* 列表用**整段对话的图片**（不是这一条气泡自己的）：一条消息只有一张图时也能左右翻，
+             箭头才不会两边全灰（用户报的"最近生成的图片查看器没有箭头"）。 */
+          PixikoM.openViewer(chatImageList(), chatImageIndex(raw));
         });
         cell.appendChild(img);
         box.appendChild(cell);
@@ -1746,6 +1868,46 @@
   function chatRenderAll() {
     if (!chat.host) return;
     chatSyncEntries();
+  }
+
+  /** 一条条目的签名（角色+正文+图片），用来对齐"服务端有哪些、本地已经有哪条"。 */
+  function chatEntrySig(entry) {
+    return entry.role + '\u0001' + entry.text + '\u0001' + (entry.images || []).join('\u0002');
+  }
+
+  /**
+   * 轻轮询服务端存档，**只追加**本地还没有的尾巴。
+   *
+   * <p>为什么需要：出图完成时那条带图的条目不一定是"这台手机自己发的"——控制台 / QQ / 别台设备出的图
+   * 也会写进同一条正文存档里；而对话屏以前只在**进屏那一次**（和手动刷新）读存档，用户已经停在对话屏时
+   * 那张图永远不出现，只能去回执看（用户报的正是这个）。
+   *
+   * <p>为什么是"合并"而不是整屏重读：重读会把用户正在输入/刚发出去、还没防抖存回去的那条冲掉。
+   * 这里按 {@link chatEntrySig} 对齐 —— 本地已有的（含还没存上去的）一条都不动，只补服务端多出来的。
+   * 新增的条目走正常的 `chatRenderAll()` 增量路径，图仍是缩略图 `&w=320` 且命中 {@link imageCache}。
+   */
+  function chatPollMerge() {
+    if (chat.loading || chat.sending) return Promise.resolve(null);
+    return PixikoM.api('/api/chat/log', { body: { scope: PixikoM.scope() } }).then(function (data) {
+      var fresh = chatNormalize(data && data.entries);
+      if (!fresh.length) return 0;
+      var have = Object.create(null);
+      chat.entries.forEach(function (entry) { var key = chatEntrySig(entry); have[key] = (have[key] || 0) + 1; });
+      var added = 0;
+      fresh.forEach(function (entry) {
+        var key = chatEntrySig(entry);
+        if (have[key]) { have[key]--; return; }
+        chat.entries.push(entry);
+        added++;
+      });
+      if (!added) return 0;
+      if (chat.entries.length > CHAT_ENTRIES_CAP) chat.entries = chat.entries.slice(-CHAT_ENTRIES_CAP);
+      var placeholder = chat.host && chat.host.querySelector('[data-state="empty"]');
+      if (placeholder) clear(chat.host);
+      chatRenderAll();
+      chatFollow();                 // 只有用户本来就在底部附近才跟着走（不抢正在上翻的视口）
+      return added;
+    }).catch(function () { return null; });
   }
 
   function chatAppend(entry, scroll) {
@@ -2056,6 +2218,15 @@
       }
     });
     send.addEventListener('click', function () { chatSend(); });
+
+    /* 对话屏的轻轮询：只补服务端多出来的尾巴（别的入口出的图也能自己冒出来），
+       页面隐藏 / 不在这一屏 / 有浮层 都自动跳过；用户在输入或正在发消息时不读，避免打架。 */
+    chat.poll = PixikoM.pollWhileVisible(function () {
+      if (currentId !== 'chat') return;
+      if (!chat.loaded) return chatLoad();
+      if (PixikoM.overlayBusy && PixikoM.overlayBusy()) return;
+      return chatPollMerge();
+    }, 4000);
   }
 
   PixikoM.register('chat', {
@@ -2079,6 +2250,8 @@
     count: 1,
     images: [],             // /api/images → [{path,name,size,modified,pending}]
     ratios: Object.create(null),   // 路径 → 已知的真实比例 '234 / 320'（新格子先用它/生成参数垫盒子）
+    liveActive: false,             // 队列为空但 SD 正在生成（单图 `.gen 1` 实测就是这样）
+    liveImage: '',                 // 那次"没进队列的生成"最后产出的图（收尾时接进「这一轮的图」）
     busyRendering: false,
     stops: [],
     lastGridKey: ''
@@ -2341,19 +2514,40 @@
   }
 
   /** 进度卡的数：总进度 = total>0 ? (done + percent/100)/total*100 : percent（任务书给的公式）。 */
-  function genOverall(tasks, imagePercent) {
+  /**
+   * 总进度 = total>0 ? (done + percent/100)/total*100 : percent（任务书给的公式）。
+   *
+   * <p>**队列为空但 SD 正在生成**这一支是单图任务的关键：实测 `.gen 1`（单张）全程 `/api/tasks` 都是
+   * `[]`（83/83 采样），SD 的 `/api/progress` 却从 0% 走到 91%；老代码在这里一律返回
+   * `percent: 0, running: false`，于是单图生成**既没有进度条也没有 placeholder**（用户报的就是这个）。
+   * 现在把"SD 在跑但没进队列"当成一次真实的生成（`live: true`），百分比用 SD 的实时进度。
+   */
+  function genOverall(tasks, imagePercent, progress) {
     var list = tasks || [];
-    if (!list.length) return { percent: 0, text: '队列是空的', running: false, current: null };
+    var percent = Math.max(0, Math.min(100, fmtNum(imagePercent, 0)));
+    if (!list.length) {
+      var live = !!(progress && progress.running);
+      if (!live) return { percent: 0, text: '队列是空的', running: false, current: null, live: false };
+      return {
+        percent: percent,
+        text: progress.text ? String(progress.text) : ('正在生成这一张：' + Math.round(percent) + '%'),
+        running: true,
+        current: null,
+        tasks: list,
+        live: true
+      };
+    }
     var task = list[0];
     var total = fmtNum(task.total, 0);
     var done = fmtNum(task.done, 0);
-    var percent = total > 0 ? ((done + fmtNum(imagePercent, 0) / 100) / total) * 100 : fmtNum(imagePercent, 0);
+    var overall = total > 0 ? ((done + percent / 100) / total) * 100 : percent;
     return {
-      percent: Math.max(0, Math.min(100, percent)),
-      text: '第 ' + done + ' / ' + total + ' 张（当前这张 ' + Math.round(fmtNum(imagePercent, 0)) + '%）',
+      percent: Math.max(0, Math.min(100, overall)),
+      text: '第 ' + done + ' / ' + total + ' 张（当前这张 ' + Math.round(percent) + '%）',
       running: !!task.running,
       current: task,
-      tasks: list
+      tasks: list,
+      live: false
     };
   }
 
@@ -2591,7 +2785,7 @@
     var tasks = PixikoM.state.tasks || [];
     var progress = PixikoM.state.progress || {};
     var imagePercent = fmtNum(progress.percent, 0);
-    var overall = genOverall(tasks, imagePercent);
+    var overall = genOverall(tasks, imagePercent, progress);
     var dom = genProgressDom(host);
     clear(dom.cardHost);                     // 只有进度卡（纯文字，没有图片）每拍重建
 
@@ -2607,7 +2801,9 @@
     var track = el('div', 'bar-track');
     var fill = el('div', 'bar-fill');
     fill.style.width = overall.percent + '%';
-    if (overall.running && !tasks.length) fill.classList.add('indet');
+    /* 只有在"跑了但拿不到百分比"时才用不确定动画（`.indet` 是 `width:40%!important`，会把真实进度盖掉）。
+       现在"SD 在跑但没进队列"这一支有真实百分比（overall.live），所以只在 0% 那一下才用动画。 */
+    if (overall.running && !tasks.length && !(imagePercent > 0)) fill.classList.add('indet');
     track.appendChild(fill);
     card.appendChild(track);
 
@@ -2638,12 +2834,25 @@
       });
       actions.appendChild(allBtn);
       card.appendChild(actions);
+    } else if (overall.live) {
+      /* 没进队列的那一张（单图 `.gen 1`）：也要有一行"任务进度"，否则用户只看到一条空队列。 */
+      var liveRow = el('div', 'row-sub');
+      liveRow.setAttribute('data-gen-task-status', '生成中');
+      liveRow.setAttribute('data-gen-live', '1');
+      liveRow.textContent = '正在生成这一张：' + Math.round(overall.percent) + '%'
+        + (fmtNum(progress.etaSeconds, 0) > 0 ? '（预计还需 ' + Math.round(fmtNum(progress.etaSeconds, 0)) + ' 秒）' : '');
+      card.appendChild(liveRow);
     }
     var queueNote = el('div', 'hint');
     if (tasks.length > 1) {
       queueNote.textContent = '队列里还有 ' + (tasks.length - 1) + ' 条任务在后面。';
     } else if (!tasks.length) {
-      queueNote.textContent = progress.reachable === false ? 'SD 没在跑（/api/progress 说 reachable=false）。' : '现在没有排队或生成中的任务。';
+      if (overall.live) {
+        queueNote.setAttribute('data-gen-live-note', '1');
+        queueNote.textContent = overall.text || '正在生成这一张…';       // SD 的实时文字（步骤 x/y、预计还需…）
+      } else {
+        queueNote.textContent = progress.reachable === false ? 'SD 没在跑（/api/progress 说 reachable=false）。' : '现在没有排队或生成中的任务。';
+      }
     } else {
       queueNote.textContent = progress.text ? String(progress.text) : '';
     }
@@ -2664,6 +2873,16 @@
       entries.push({ key: 'img:' + gen.images[i].path, kind: 'img', item: gen.images[i], index: i, cap: 'name' });
     }
     if (runningSlots) entries.push({ key: 'ring', kind: 'ring', percent: imagePercent, suspended: !!(task && task.suspended) });
+    /* 队列为空但 SD 正在生成（单图 `.gen 1` 实测就是这样）：也要给一个**看得见的 placeholder**。
+       用和任务生成中同一个环形进度格，百分比同样取 SD 的实时进度。 */
+    if (!task && overall.live) entries.push({ key: 'ring', kind: 'ring', percent: imagePercent, suspended: false });
+    /* 这一次"没进队列的生成"刚出完图：把那一张接进「这一轮的图」，于是环形占位**在同一个网格里**
+       被真图替换（不是凭空消失，也不是幽灵）。下次开始新一轮时会被覆盖。 */
+    if (!task && !overall.live && gen.liveImage) {
+      for (var j = 0; j < gen.images.length; j++) {
+        if (gen.images[j].path === gen.liveImage) { entries.push({ key: 'img:' + gen.images[j].path, kind: 'img', item: gen.images[j], index: j, cap: 'name' }); break; }
+      }
+    }
     for (var k = 0; k < pending; k++) entries.push({ key: 'pending:' + k, kind: 'pending' });
     syncCells(dom.grid, entries, function (entry) {
       if (entry.kind === 'ring') return genRingCell(entry);
@@ -2679,8 +2898,14 @@
     dom.grid.style.display = shown ? '' : 'none';
     dom.empty.style.display = shown ? 'none' : '';
     // 任务说"出过图"但列表里还没有 → 给一句明确的说明（不是画一个空盒子）
-    var emptyText = task && images > 0 && !done ? '图还在路上，稍等一下…' : '还没有图。点下面的「开始生成」。';
+    var emptyText = task && images > 0 && !done ? '图还在路上，稍等一下…'
+      : overall.live ? '正在生成这一张，图出来就显示在这里。' : '还没有图。点下面的「开始生成」。';
     if (dom.empty.textContent !== emptyText) dom.empty.textContent = emptyText;
+    /* 记住"没进队列的那次生成"最后产出的那张图：live 结束的那一拍记下来，下一拍它就被接进
+       「这一轮的图」（于是环形占位在同一个网格里被真图替换）。有任务或开始新一轮时清掉。 */
+    if (overall.live) { gen.liveActive = true; gen.liveImage = ''; }
+    else if (gen.liveActive) { gen.liveActive = false; gen.liveImage = gen.images.length && gen.images[0] ? gen.images[0].path : ''; }
+    if (task) gen.liveImage = '';
 
     // ── 最近的作品（/api/images）：同一个增量同步，同一个 <img> 跨轮询一直活着
     var galleryHost = gen.root.querySelector('[data-gen-gallery]');
