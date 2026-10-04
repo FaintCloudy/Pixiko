@@ -369,6 +369,37 @@ input[type="range"]::-webkit-slider-thumb {
   background: #1d2a42; display: grid; place-items: center; font-size: 22px; font-weight: 600;
 }
 .stepper-btn:active { background: #24334f; }
+/* ── 数字框：关掉原生 spinner，并与控制台「模型预设」下拉箭头**同款**（同一张 data URI） ──
+   安卓 WebView 里原生 spinner 是另一套皮肤（还有近白三角），和控制台的视觉不一路；
+   这套规则与控制台 webui/app.css:875-895 一字不差地复用：同色 %238ea2bf、同 15×15、
+   同 right 11px center、聚焦换 %235aa2ff。加减仍然走手机端自己的 .stepper-btn（触摸目标见下）。 */
+input[type=number] {
+  -moz-appearance: textfield;
+  -webkit-appearance: textfield;
+  appearance: textfield;
+  font-variant-numeric: tabular-nums;
+  padding-right: 36px;
+  background-image: url("data:image/svg+xml;charset=utf-8,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='%238ea2bf' stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M4.5 6.2 8 2.9l3.5 3.3'/%3E%3Cpath d='M11.5 9.8 8 13.1 4.5 9.8'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 11px center;
+  background-size: 15px 15px;
+}
+input[type=number]::-webkit-outer-spin-button,
+input[type=number]::-webkit-inner-spin-button { -webkit-appearance: none; appearance: none; margin: 0; }
+input[type=number]:hover { border-color: rgba(120, 160, 220, .45); }
+input[type=number]:focus {
+  background-image: url("data:image/svg+xml;charset=utf-8,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='%235aa2ff' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M4.5 6.2 8 2.9l3.5 3.3'/%3E%3Cpath d='M11.5 9.8 8 13.1 4.5 9.8'/%3E%3C/svg%3E");
+  background-repeat: no-repeat; background-position: right 11px center; background-size: 15px 15px;
+}
+/* 屏幕自己的样式是**运行时注入**的（`screen-system.js` 里的 `.sy-input{padding:10px 12px}` 等），
+   注入的样式排在 app.css 之后 → 会把我上面那条 padding-right 盖掉（实测：一部分框只有 6–12px，
+   箭头被数字压住）。所以这几条必须带 !important：位置/内边距/背景三件事要么全对、要么全不对。 */
+input[type=number] {
+  padding-right: 36px !important;
+  background-position: right 11px center !important;
+  background-size: 15px 15px !important;
+  background-repeat: no-repeat !important;
+}
 .switch {
   position: relative; flex: 0 0 auto;
   width: 48px; height: var(--m-tap);       /* 可点区域 ≥44×44；轨道靠 ::before 画 */

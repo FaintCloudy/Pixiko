@@ -23,6 +23,7 @@ import cn.szu.bot.civitai.CivitaiClient;
 import cn.szu.bot.civitai.CivitaiLinkLogin;
 import cn.szu.bot.civitai.CivitaiStyleSync;
 import cn.szu.bot.civitai.DownloadControl;
+import cn.szu.bot.civitai.LoraTriggers;
 import cn.szu.bot.prompt.CategoryModel;
 import cn.szu.bot.prompt.PromptEditor;
 import cn.szu.bot.prompt.PromptFunctions;
@@ -98,6 +99,11 @@ public final class Bot implements AutoCloseable {
     /** 机器人自己的样式库：与 WebUI 的预设样式完全分开，同名也不会冲突。 */
     private final cn.szu.bot.sd.LocalStyles localStyles;
     private final LoraDownloader loraDownloader;
+    /**
+     * 本机 LoRA 触发词的耐久存储（data/lora-triggers.json）：下载成功那一刻写入，之后随时可查。
+     * 触发词与"是否加载模型""是否写进提示词"无关——用户要的只是留着做参考。
+     */
+    private final LoraTriggers loraTriggers;
     /** SD WebUI 自启动：生成前发现 SD 没在跑就把它拉起来。 */
     private final cn.szu.bot.sd.SdLauncher sdLauncher;
     /** 群禁言识别：被禁言时不再尝试发送（见 {@link MuteGuard}）。 */
@@ -1210,6 +1216,7 @@ public final class Bot implements AutoCloseable {
         /lora search <关键词> [页码] — 翻页搜索 Civitai（关键词以数字结尾时用双引号，如 /lora search "milf 2"）
         /lora status — 查看最近下载状态
         /lora list — 列出 WebUI 本地 LoRA
+        /lora triggers <名称|#编号> — 查看已记下的触发词（原样列出、带 Civitai 页面与底模）；/lora triggers set <名称> <词1, 词2> 手动补录（仅管理员）
         /lora load <完整本地名称> [权重] — 重新加载或启用已有 LoRA
         /lora rename <旧本地名称> <新本地名称> — 重命名本地 LoRA 文件并同步你个人 prompt 的标签
         /gen [次数] — 按当前完整参数排队生成，默认 1 次；生成过程中不逐张通知，任务结束汇总
@@ -1255,6 +1262,8 @@ public final class Bot implements AutoCloseable {
         });
     }
     public Bot(Settings settings, SdClient sd, Sender sender, LoraDownloader loraDownloader) {        this.settings = settings; this.sd = sd; this.sender = muteAware(webAware(sender)); this.loraDownloader = Objects.requireNonNull(loraDownloader);
+        // 触发词存储：构造只算路径，不读盘、不建文件（第一次写记录时才落盘）。
+        this.loraTriggers = new LoraTriggers(settings.root);
         // VAE 的读写统一走这一层：生产环境就是 SdClient 本身，测试可以换成假 SD 桩（SdClient 是 final，没法用子类打桩）。
         this.vae = sdVaeSupport(sd);
         // 传输层是否真的实现了合并转发（要在包装之前问原始传输层：包装器自己会转发 sendRecord）。
@@ -3165,6 +3174,22 @@ public final class Bot implements AutoCloseable {
             reply(event, "LoRA 下载：" + Json.str(outcome, "message", "") + "\n" + loraProgressLine());
             return;
         }
+        Matcher triggerQuery = Pattern.compile("(?i)^triggers(?:\\s+([\\s\\S]*))?$").matcher(arguments);
+        if (triggerQuery.matches()) {
+            String rest = Objects.requireNonNullElse(triggerQuery.group(1), "").strip();
+            Matcher setting = Pattern.compile("(?i)^set(?:\\s+([\\s\\S]*))?$").matcher(rest);
+            if (setting.matches()) {
+                loraTriggerSet(event, Objects.requireNonNullElse(setting.group(1), "").strip());
+                return;
+            }
+            if (rest.isEmpty())
+                throw new IllegalArgumentException("用法：/lora triggers <名称|#编号>——查看这个 LoRA 已记下的触发词"
+                        + "（原样列出、不截断，并附 Civitai 页面地址与底模）。"
+                        + "手动补录：/lora triggers set <名称|#编号> <词1, 词2>（仅管理员）。");
+            String value = rest.startsWith("#") ? select(event, "lora", rest) : stripQuotes(rest);
+            reply(event, loraTriggerText(value));
+            return;
+        }
         if (arguments.equalsIgnoreCase("list")) {
             startLora(event, "正在读取 WebUI 本地 LoRA 列表。", false, () -> {
                 List<SdClient.Lora> values = sd.loras();
@@ -3179,7 +3204,8 @@ public final class Bot implements AutoCloseable {
                     SdClient.BaseModel base = loraBaseModel(item.name(), item.path(), presetBase);
                     names.add(item.name());
                     labels.add(item.name() + "（" + alias
-                            + (base.known() ? "底模：" + base.name() + base.note() : "底模未识别") + "）");
+                            + (base.known() ? "底模：" + base.name() + base.note() : "底模未识别")
+                            + "；" + loraTriggerSummary(item.name(), item.path(), index + 1) + "）");
                     groups.computeIfAbsent(base.known() ? base.name() + base.note() : "未识别底模", ignored -> new ArrayList<>())
                             .add("#" + (index + 1));
                 }
@@ -3189,7 +3215,8 @@ public final class Bot implements AutoCloseable {
                 for (Map.Entry<String, List<String>> group : groups.entrySet())
                     text.append("\n【").append(group.getKey()).append("】").append(String.join("、", group.getValue()));
                 return new LoraResult(safeLoraText(text
-                        + numbered(event, "lora", values.stream().map(SdClient.Lora::name).toList(), labels)), true);
+                        + numbered(event, "lora", values.stream().map(SdClient.Lora::name).toList(), labels)
+                        + "\n触发词明细：.lora triggers <名字|#编号>（原样列出，不截断；下载成功时会自动记下）"), true);
             });
             return;
         }
@@ -3280,6 +3307,7 @@ public final class Bot implements AutoCloseable {
         Matcher command = Pattern.compile("^(download|load)(?:\\s+([\\s\\S]*))?$", Pattern.CASE_INSENSITIVE).matcher(arguments);
         if (!command.matches() || command.group(2) == null || command.group(2).isBlank())
             throw new IllegalArgumentException("用法：/lora download <Civitai链接> [权重]、/lora status、/lora list、/lora detail <名称|#编号>、"
+                    + "/lora triggers <名称|#编号>（查看触发词）、"
                     + "/lora cancel（取消当前下载）、/lora pause（暂停）、/lora resume（继续）、"
                     + "/lora load <完整本地名称> [权重] 或 /lora delete <名称|#编号>。权重默认 1，范围 0–2。");
         JsonObject civitai = Json.obj(settings.snapshot(), "civitai");
@@ -3345,10 +3373,13 @@ public final class Bot implements AutoCloseable {
             if (control != null) control.markFinished();
         }
         String filename = downloaded.path().getFileName().toString();
+        // 触发词在"下载成功这一刻"就落盘：与是否加载模型、是否把标签写进提示词完全无关；
+        // 即使后面刷新/抓展示图失败，甚至这次下载被取消（文件已完整），触发词也已经留下了。
+        String triggerLine = recordLoraTriggers(downloaded);
         if (control != null && control.isCancelled()) {
             // 取消来晚了：文件已经完整下载并通过校验（不是半截），但后面的刷新/展示图/加载一律不做。
             loraStatus = safeLoraText("LoRA 文件已完整下载：" + filename + "；取消请求到得太晚——下载已经完成（文件保留在 LoRA 目录），"
-                    + "之后的刷新/展示图/加载阶段已跳过。要用请点本机列表的「加载」。");
+                    + "之后的刷新/展示图/加载阶段已跳过。\n" + triggerLine + "\n要用请点本机列表的「加载」。");
             Log.info("LoRA 下载已完成但收到取消请求（文件保留）：" + filename);
             return new LoraResult(loraStatus, false);
         }
@@ -3369,27 +3400,24 @@ public final class Bot implements AutoCloseable {
             StringBuilder message = new StringBuilder("LoRA ")
                     .append(downloaded.reused() ? "本地文件已复用" : "下载成功").append("：").append(name)
                     .append("\n本机标签：").append(tag).append("（没有改动提示词；要用就点本机列表的「加载」）");
-            if (hasPreview || !downloaded.trainedWords().isEmpty()) {
-                message.append("\n");
-                if (hasPreview) message.append("展示图：").append(previewFile.getFileName());
-                if (!downloaded.trainedWords().isEmpty()) {
-                    if (hasPreview) message.append("｜");
-                    message.append("触发词 ").append(downloaded.trainedWords().size()).append(" 条");
-                }
-                message.append("（详情已存进本机记录，需要时再查）");
-            }
+            // 触发词永远报一句：下载时记下来了（哪怕是 0 条），用户可以随时回头查。
+            message.append("\n");
+            if (hasPreview) message.append("展示图：").append(previewFile.getFileName()).append("｜");
+            message.append(triggerLine);
             message.append("\n").append(showcaseSummary(showcaseReport));
             SdClient.BaseModel downloadBase = loraBaseModel(filename, downloaded.path().toString(), null);
             Log.info("LoRA 详情（" + name + "）：基础模型=" + display(downloadBase.known()
                             ? downloadBase.name() + "（" + downloadBase.sourceLabel() + "）"
                             : "未识别（Civitai 记录里没有，Forge 元数据里也没有）")
                     + "；展示图=" + (hasPreview ? previewFile.getFileName().toString() : "无")
-                    + "；触发词=" + downloaded.trainedWords().size() + " 条\n" + showcaseReport);
+                    + "；触发词=" + downloaded.trainedWords().size() + " 条"
+                    + (triggerLine.startsWith("触发词已记下") ? "" : "（存储写入失败）") + "\n" + showcaseReport);
             loraStatus = safeLoraText(message.toString());
             return new LoraResult(loraStatus, true);
         } catch (Exception e) {
             String retry = new JsonPrimitive(filename).toString();
             loraStatus = safeLoraText("LoRA 文件已保存：" + filename + "。\n刷新/确认本机标签失败：" + error(e)
+                    + "\n" + triggerLine
                     + "\n发送 /lora load " + retry + " " + weight + " 可重试。\n" + showcaseSummary(showcaseReport));
             return new LoraResult(loraStatus, false);
         }
@@ -3920,6 +3948,271 @@ public final class Bot implements AutoCloseable {
         JsonObject record = file == null ? null : readManifest(settings.root.resolve("data/civitai").resolve(file.getFileName() + ".json"));
         return record == null ? "" : Json.str(record, "model_name", "");
     }
+
+    // ---- LoRA 触发词（data/lora-triggers.json）----
+
+    /**
+     * 下载成功那一刻把触发词写进 {@code data/lora-triggers.json}，并返回回执里那一行。
+     *
+     * <p>写的是 Civitai 给的 trained words 原文与 Civitai 页面上的 Base Model；加载失败、用户不加进提示词、
+     * 甚至这次下载被取消（文件已经完整）都不影响写入。这个方法**永远不抛错**：存储写不进去也只是如实回一句，
+     * 绝不把一次成功的下载变成失败。
+     */
+    private String recordLoraTriggers(CivitaiClient.DownloadedLora downloaded) {
+        String filename = downloaded.path().getFileName().toString();
+        String stem = LoraTriggers.key(filename);
+        String look = ".lora triggers " + quotedLoraName(stem);
+        LoraTriggers.Trigger record = null;
+        String failure = "";
+        try {
+            record = loraTriggers.put(new LoraTriggers.Trigger(stem, filename,
+                    downloaded.trainedWords() == null ? List.of() : downloaded.trainedWords(),
+                    LoraTriggers.sourceUrl(civitaiBaseUrl(), downloaded.modelId(), downloaded.versionId()),
+                    downloaded.modelId(), downloaded.versionId(),
+                    LoraTriggers.baseModel(downloaded.baseModel()), loraStackOf(filename, downloaded.path()),
+                    java.time.Instant.now().toString(), LoraTriggers.SOURCE_DOWNLOAD));
+            Log.info("LoRA 触发词已记下（" + stem + "）：" + record.count() + " 条 → " + loraTriggers.path());
+        } catch (Exception error) {
+            failure = error(error);
+            Log.warn("LoRA 触发词写入失败（" + stem + "）：" + failure);
+        }
+        if (record == null) return "触发词记录失败：" + failure + "（LoRA 文件本身已经保存好了）";
+        if (record.count() == 0) return "触发词已记下：0 条（Civitai 这个版本没给；" + look + " 可查看）";
+        return "触发词已记下：" + record.count() + " 条（" + look + " 可随时查看）";
+    }
+
+    /** 本机家族/栈判断（只作参考，另一路存进触发词记录的 stack 字段）；判不出来就空着，不去猜。 */
+    private String loraStackOf(String name, Path file) {
+        try {
+            SdClient.BaseModel base = loraBaseModel(name, file == null ? "" : file.toString(), null);
+            return base.stackKnown() ? base.stack() : "";
+        } catch (Exception error) { return ""; }
+    }
+
+    /** 配置里的 Civitai 站点地址（页面链接用）；没配就用默认镜像。 */
+    private String civitaiBaseUrl() {
+        String configured = Json.str(Json.obj(settings.snapshot(), "civitai"), "base_url", CivitaiClient.DEFAULT_BASE_URL).strip();
+        return configured.isBlank() ? CivitaiClient.DEFAULT_BASE_URL : configured;
+    }
+
+    /** 名字里有空格或以 # 开头时加双引号，用户可以直接把回执里的写法复制回来。 */
+    private static String quotedLoraName(String name) {
+        String value = Objects.requireNonNullElse(name, "");
+        if (value.isEmpty()) return value;
+        boolean needsQuotes = value.startsWith("#");
+        for (int index = 0; index < value.length() && !needsQuotes; index++)
+            if (Character.isWhitespace(value.charAt(index))) needsQuotes = true;
+        return needsQuotes ? new JsonPrimitive(value).toString() : value;
+    }
+
+    /**
+     * 本机 LoRA 的触发词记录：先查 {@code data/lora-triggers.json}，再**只读**回落到
+     * {@code data/civitai/<文件名>.json} 里的下载记录；两边都没有返回 {@code null}（= 没有记录）。
+     */
+    private LoraTriggers.Trigger loraTriggersOf(String name, String path) {
+        LoraTriggers.Trigger stored = loraTriggers.get(name);
+        if (stored != null) return stored;
+        String filename = loraFileName(name, path);
+        if (filename.isBlank()) return null;
+        stored = loraTriggers.get(filename);
+        return stored != null ? stored : LoraTriggers.fromCivitaiRecord(settings.root, filename, civitaiBaseUrl());
+    }
+
+    /** 本机 LoRA 的文件名（含 .safetensors）：优先用真实文件，其次按 WebUI 给的名字补后缀。 */
+    private String loraFileName(String name, String path) {
+        try {
+            if (path != null && !path.isBlank()) {
+                Path candidate = Path.of(path);
+                if (Files.isRegularFile(candidate)) return candidate.getFileName().toString();
+            }
+        } catch (Exception ignored) { /* 路径不可用就退回按名字找文件 */ }
+        Path file = localLoraFile(name);
+        if (file != null) return file.getFileName().toString();
+        String value = Objects.requireNonNullElse(name, "").strip().replace('\\', '/');
+        value = value.substring(value.lastIndexOf('/') + 1);
+        if (value.isBlank()) return "";
+        return value.toLowerCase(Locale.ROOT).endsWith(".safetensors") ? value : value + ".safetensors";
+    }
+
+    /** `.lora list` 每条里那半句触发词摘要（没有记录就如实说"未记录"，不假装有）。 */
+    private String loraTriggerSummary(String name, String path, int number) {
+        LoraTriggers.Trigger record = loraTriggersOf(name, path);
+        if (record == null) return "触发词未记录";
+        if (record.count() == 0) return "触发词 0 条（下载时 Civitai 没给）";
+        return "触发词 " + record.count() + " 条（.lora triggers #" + number + " 看全部）";
+    }
+
+    /** 触发词查询/补录定位到的本机 LoRA：名字 + 真实文件（拿不到文件时为 null）。 */
+    private record LoraTarget(String name, Path file) {
+        String fileName() { return file == null ? "" : file.getFileName().toString(); }
+    }
+
+    /** 本机 LoRA 列表（WebUI 拿不到时扫配置目录；扫描只读，不改任何文件）。 */
+    private List<LoraEntry> loraEntries() {
+        List<LoraEntry> entries = new ArrayList<>();
+        try {
+            for (SdClient.Lora item : sd.loras()) {
+                Path file = null;
+                try {
+                    Path candidate = Path.of(item.path());
+                    if (Files.isRegularFile(candidate)) file = candidate;
+                } catch (Exception ignored) { /* 列表里的路径不可用就按名字找 */ }
+                if (file == null) file = localLoraFile(item.name());
+                entries.add(new LoraEntry(item.name(), Objects.requireNonNullElse(item.alias(), ""),
+                        LoraTriggers.key(item.name()), file));
+            }
+        } catch (Exception error) { Log.warn("读取 WebUI LoRA 列表失败，改扫本机 LoRA 目录：" + error(error)); }
+        if (entries.isEmpty()) {
+            String directory = Json.str(Json.obj(settings.snapshot(), "civitai"), "lora_dir", "");
+            try (var files = Files.list(Path.of(directory))) {
+                for (Path file : files.filter(Files::isRegularFile)
+                        .filter(path -> path.getFileName().toString().toLowerCase(Locale.ROOT).endsWith(".safetensors"))
+                        .sorted(Comparator.comparing(path -> path.getFileName().toString().toLowerCase(Locale.ROOT))).toList())
+                    entries.add(new LoraEntry(file.getFileName().toString(), "",
+                            LoraTriggers.key(file.getFileName().toString()), file));
+            } catch (Exception error) { /* 目录没配/读不到：候选项就是空的，回执里会如实说 */ }
+        }
+        return entries;
+    }
+
+    /** LoRA 目录里的一个条目：显示名、别名、文件名去掉扩展名、真实文件。 */
+    private record LoraEntry(String name, String alias, String stem, Path file) { }
+
+    /**
+     * 把用户写的名字/#编号解析成本机 LoRA：先精确（显示名/别名/文件名），再"唯一命中才算"的宽松匹配；
+     * 命中多个或一个都没有就**列出候选项**——绝不挑一个"最像的"去查错模型。
+     */
+    private LoraTarget resolveLoraTarget(String requested) throws Exception { return resolveLoraTarget(requested, false); }
+
+    /**
+     * @param exactOnly 写数据（手动补录）时必须写完整名字或 #编号：宽松匹配只留给"查询"用，
+     *                  免得"只写了名字的一部分"就把词写到了别的 LoRA 上
+     */
+    private LoraTarget resolveLoraTarget(String requested, boolean exactOnly) throws Exception {
+        String wanted = Objects.requireNonNullElse(requested, "").strip();
+        if (wanted.isBlank()) throw new IllegalArgumentException("请给出 LoRA 名称或 #编号（用 /lora list 查看本机列表）。");
+        String key = LoraTriggers.key(wanted);
+        List<LoraEntry> entries = loraEntries();
+        for (LoraEntry entry : entries) {
+            if (entry.name().equalsIgnoreCase(wanted) || entry.stem().equalsIgnoreCase(key)
+                    || (!entry.alias().isBlank() && entry.alias().equalsIgnoreCase(wanted)))
+                return new LoraTarget(entry.name(), entry.file());
+        }
+        if (exactOnly)
+            throw new IllegalArgumentException("要补录的 LoRA 必须写完整名字（或 #编号）：「" + wanted + "」不是本机某个 LoRA 的完整名字；"
+                    + "名字含空格时用双引号，例如 /lora triggers set \"测试 LoRA 2\" 词1, 词2。候选项："
+                    + loraCandidates(entries.stream().map(LoraEntry::name).toList()));
+        String wantedLoose = LoraTriggers.looseKey(key);
+        List<LoraEntry> matched = new ArrayList<>();
+        for (LoraEntry entry : entries)
+            if (!wantedLoose.isEmpty() && LoraTriggers.looseKey(entry.stem()).equals(wantedLoose)) matched.add(entry);
+        // 再退一步：用户只写了文件名的一部分（"未记录" → "未记录LoRA"）。同样只有唯一命中才敢用。
+        if (matched.isEmpty() && wantedLoose.length() >= 2) {
+            for (LoraEntry entry : entries)
+                if (LoraTriggers.looseKey(entry.stem()).contains(wantedLoose)) matched.add(entry);
+        }
+        if (matched.size() == 1) return new LoraTarget(matched.get(0).name(), matched.get(0).file());
+        if (matched.size() > 1)
+            throw new IllegalArgumentException("「" + wanted + "」匹配到多个 LoRA，请写完整名字或 #编号："
+                    + loraCandidates(matched.stream().map(LoraEntry::name).toList()));
+        throw new IllegalArgumentException("本机 LoRA 里找不到「" + wanted + "」；候选项：" + loraCandidates(entries.stream().map(LoraEntry::name).toList()));
+    }
+
+    /** 候选项列表（最多 12 个，多了只报个数——回执不是文件列表）。 */
+    private static String loraCandidates(List<String> names) {
+        if (names == null || names.isEmpty()) return "（本机一个 LoRA 都没有：先用 /lora download 下一个）";
+        if (names.size() <= 12) return String.join("、", names);
+        return String.join("、", names.subList(0, 12)) + " 等 " + names.size() + " 个";
+    }
+
+    /**
+     * {@code .lora triggers <名称|#编号>} 的回执：触发词**原样**逐条列出（有序、不截断、不省略号），
+     * 并附来源（Civitai 页面地址 / 底模 / 记录时间）。没有记录时如实说明，绝不编。
+     */
+    private String loraTriggerText(String requested) throws Exception {
+        LoraTarget target = resolveLoraTarget(requested);
+        LoraTriggers.Trigger record = loraTriggersOf(target.name(), target.file() == null ? "" : target.file().toString());
+        StringBuilder text = new StringBuilder("LoRA：" + target.name());
+        if (target.file() != null) text.append("（本机文件 ").append(target.file().getFileName()).append("）");
+        if (record == null) {
+            text.append("\n这个 LoRA 没有记下触发词（可能是本地导入、或下载时 Civitai 没给）。");
+            text.append("\n可以自己补录：/lora triggers set ").append(quotedLoraName(target.name())).append(" 词1, 词2（仅管理员）");
+            return text.toString();
+        }
+        if (loraTriggers.corrupt())
+            text.append("\n注意：触发词存储文件（").append(loraTriggers.path()).append("）读起来有问题，下面只显示能读到的部分。");
+        if (record.count() == 0) {
+            text.append("\n触发词：0 条——").append(record.sourceLabel()).append("里这个版本没有触发词。");
+        } else {
+            text.append("\n触发词 ").append(record.count()).append(" 条（原样列出，未截断）：");
+            for (int index = 0; index < record.trainedWords().size(); index++)
+                text.append("\n").append(index + 1).append(". ").append(record.trainedWords().get(index));
+            boolean multiline = false;
+            for (String word : record.trainedWords())
+                if (word.indexOf('\n') >= 0 || word.indexOf('\r') >= 0) multiline = true;
+            if (multiline) text.append("\n（有触发词本身含换行，就照上面逐条原样看；这里不再给合并写法，免得改写了原文）");
+            else text.append("\n合并写法（可直接粘贴）：").append(String.join(", ", record.trainedWords()));
+        }
+        text.append("\n来源：").append(record.sourceLabel())
+                .append("｜").append(record.hasPage() ? record.pageAddress() : "没有 Civitai 页面地址")
+                .append("｜").append(record.baseModel().isBlank() ? "底模未记录" : "Civitai 底模 " + record.baseModel());
+        if (!record.stack().isBlank()) text.append("（本机栈 ").append(record.stack()).append("）");
+        if (!record.recordedAt().isBlank()) text.append("｜记录时间 ").append(record.recordedAt());
+        return text.toString();
+    }
+
+    /**
+     * {@code .lora triggers set <名称|#编号> <词1, 词2>}：管理员手动补录（写进同一份存储）。
+     * 只改触发词，原来记着的页面地址/底模/栈尽力保留；不碰 LoRA 文件，也不碰任何提示词。
+     */
+    private void loraTriggerSet(JsonObject event, String arguments) throws Exception {
+        if (!settings.isAdmin(Json.str(event, "user_id", "")))
+            throw new IllegalArgumentException("手动补录触发词仅管理员可用（在本机 config.json 的 admin_user_ids 里配置管理员）。");
+        String[] parts = triggerSetArguments(arguments);
+        String requested = parts[0].startsWith("#") && event != null ? select(event, "lora", parts[0]) : parts[0];
+        List<String> words = new ArrayList<>();
+        for (String word : parts[1].split("[,，、\\r\\n]")) {
+            String trimmed = word.strip();
+            if (!trimmed.isEmpty()) words.add(trimmed);
+        }
+        if (words.isEmpty()) throw new IllegalArgumentException("请至少给出一个触发词，例如：/lora triggers set \"模型名\" 词1, 词2（仅管理员）。");
+        LoraTarget target = resolveLoraTarget(requested, true);
+        LoraTriggers.Trigger record = loraTriggers.setWords(target.name(), target.fileName(), words);
+        Log.info("LoRA 触发词手动补录（" + record.loraName() + "）：" + record.count() + " 条（" + describeConversation(event) + "）");
+        reply(event, "已写入触发词记录：" + record.loraName() + "（" + record.count() + " 条）"
+                + "\n存储：" + loraTriggers.path()
+                + "\n查看：/lora triggers " + quotedLoraName(record.loraName())
+                + "\n（来源记为「" + record.sourceLabel() + "」；不改 LoRA 文件，也不动提示词）");
+    }
+
+    /** 把 {@code <名称|#编号> <词1, 词2>} 拆成名字与词表；名字含空格时用双引号。 */
+    static String[] triggerSetArguments(String arguments) {
+        String text = Objects.requireNonNullElse(arguments, "").strip();
+        if (text.isEmpty())
+            throw new IllegalArgumentException("用法：/lora triggers set <名称|#编号> <词1, 词2>；名称含空格时用双引号，例如 "
+                    + "/lora triggers set \"我的 LoRA\" 词1, 词2。");
+        if (text.startsWith("\"")) {
+            // 名字在双引号里（可含空格），后面整段都是词表——QUOTED_LORA 只认一个尾随 token（权重），这里不能复用。
+            Matcher quoted = Pattern.compile("^(\"(?:[^\"\\\\]|\\\\.)*\")(?:\\s+([\\s\\S]+))?$").matcher(text);
+            if (!quoted.matches())
+                throw new IllegalArgumentException("名称引号格式不正确，例如 /lora triggers set \"我的 LoRA\" 词1, 词2。");
+            String name;
+            try {
+                name = STRICT_JSON.fromJson(quoted.group(1), String.class);
+            } catch (JsonParseException error) {
+                throw new IllegalArgumentException("名称须使用有效的双引号字符串。");
+            }
+            String words = Objects.requireNonNullElse(quoted.group(2), "").strip();
+            if (name == null || name.isBlank()) throw new IllegalArgumentException("请提供 LoRA 名称（或 #编号）。");
+            if (words.isEmpty()) throw new IllegalArgumentException("请至少给出一个触发词，例如：/lora triggers set \"我的 LoRA\" 词1, 词2。");
+            return new String[]{name, words};
+        }
+        Matcher separated = Pattern.compile("^(\\S+)\\s+([\\s\\S]+)$").matcher(text);
+        if (!separated.matches())
+            throw new IllegalArgumentException("用法：/lora triggers set <名称|#编号> <词1, 词2>；名称含空格时用双引号，例如 "
+                    + "/lora triggers set \"我的 LoRA\" 词1, 词2。");
+        return new String[]{separated.group(1), separated.group(2).strip()};
+    }
     /**
      * 展示图样式要记下的模型参数：底模按优先级识别（Civitai → Forge 元数据 → 预设推断），
      * 采样方法/调度器/步数/CFG/Shift/尺寸用当前 Forge 预设栈（没有预设就用机器人当前设置）。
@@ -4049,9 +4342,16 @@ public final class Bot implements AutoCloseable {
             text.append("\nCivitai 记录：").append(Json.str(record, "model_name", "未命名"))
                     .append(" / ").append(Objects.requireNonNullElse(Json.str(record, "version_name", ""), "").isBlank() ? "未知版本" : Json.str(record, "version_name", ""))
                     .append("；记录里的底模=").append(recorded.isBlank() ? "未记录" : recorded);
-            int words = record.has("trained_words") && record.get("trained_words").isJsonArray()
-                    ? record.getAsJsonArray("trained_words").size() : 0;
-            text.append("\n触发词：").append(words).append(" 条");
+        }
+        // 触发词：先看本机触发词存储，再只读回落到下载记录——查询入口统一是 .lora triggers。
+        LoraTriggers.Trigger trigger = loraTriggersOf(found.name(), file == null ? "" : file.toString());
+        if (trigger == null) {
+            text.append("\n触发词：没有记下（本地导入、或下载时 Civitai 没给；/lora triggers set 可手动补录）");
+        } else if (trigger.count() == 0) {
+            text.append("\n触发词：0 条（下载时 Civitai 没给；可 /lora triggers set 手动补录）");
+        } else {
+            text.append("\n触发词：").append(trigger.count()).append(" 条（.lora triggers ")
+                    .append(quotedLoraName(trigger.loraName())).append(" 看全部）");
         }
         text.append("\n展示图：").append(hasLoraPreview(directory, found.name())
                 ? found.name() + ".preview.png" : "无（/lora cover " + found.name() + " 可补抓）");
@@ -7928,6 +8228,18 @@ public final class Bot implements AutoCloseable {
             item.addProperty("stackSourceLabel", base.stackSourceLabel());
             item.addProperty("preset", cn.szu.bot.sd.StackClassifier.presetFor(base.stack(), presets));
             item.addProperty("groupKey", base.stack());
+            // 触发词（Civitai 的 trained words）：固定字段名 trainedWords，形如 ["词1","词2"]，原样有序；
+            // 没有记录或 Civitai 没给时是空数组 []（不是 null），来源信息拿不到就给 null。界面由前端消费。
+            LoraTriggers.Trigger trigger = loraTriggersOf(loras.get(index).name(), loras.get(index).path());
+            item.add("trainedWords", Json.GSON.toJsonTree(trigger == null ? List.of() : trigger.trainedWords()));
+            item.addProperty("triggerCount", trigger == null ? 0 : trigger.count());
+            item.add("sourceUrl", trigger == null || trigger.sourceUrl().isBlank()
+                    ? JsonNull.INSTANCE : new JsonPrimitive(trigger.sourceUrl()));
+            item.add("triggerRecordedAt", trigger == null || trigger.recordedAt().isBlank()
+                    ? JsonNull.INSTANCE : new JsonPrimitive(trigger.recordedAt()));
+            item.addProperty("triggerSource", trigger == null ? "" : trigger.source());
+            item.addProperty("triggerSourceLabel", trigger == null ? "" : trigger.sourceLabel());
+            item.addProperty("triggerStack", trigger == null ? "" : trigger.stack());
             items.add(item);
         }
         JsonObject result = new JsonObject();

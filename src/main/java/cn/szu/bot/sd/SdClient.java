@@ -1560,15 +1560,25 @@ public final class SdClient {
      * {@code ss_base_model_version="anima"}；另一个没有这个键，只有 sd-scripts 的占位
      * {@code ss_sd_model_name="model.safetensors"}——后者是"训练时没记底模"，必须当成没有，
      * 拿它当底模就是编造。{@code modelspec.architecture} 是最后一条线索（如 stable-diffusion-v1/lora）。
+     *
+     * <p>**具体**值优先：{@code ss_sd_model_name="model.ckpt"} 这类**通用底模名**只说明哪个时代，
+     * 不许挡住后面的 {@code ss_base_model_version} / {@code modelspec.architecture}；真的只有通用名时
+     * 才返回它（调用方用 {@link StackClassifier#genericBaseModel(String)} 认出来并降级处理）。
      */
     static String metadataBaseModel(JsonElement metadata) {
         if (metadata == null || !metadata.isJsonObject()) return "";
         JsonObject value = metadata.getAsJsonObject();
+        String generic = "";
         for (String key : List.of("ss_base_model_version", "ss_sd_model_name", "modelspec.architecture")) {
             String candidate = usableBaseModel(Json.str(value, key, ""));
-            if (!candidate.isEmpty()) return candidate;
+            if (candidate.isEmpty()) continue;
+            if (StackClassifier.genericBaseModel(candidate)) {
+                if (generic.isEmpty()) generic = candidate;
+                continue;
+            }
+            return candidate;
         }
-        return "";
+        return generic;
     }
 
     /** 明显的占位值当成"没有底模"：识别不出来时宁可回退到预设栈，也不要编一个名字。 */
@@ -1617,30 +1627,109 @@ public final class SdClient {
     /**
      * 解析一个 LoRA 的底模与归属栈。
      *
-     * <p>底模优先级：{@code safetensors} 头部元数据 → Civitai 记录 → Forge 元数据 → 头部张量名结构
-     * → 当前 Forge 预设栈（标注为推断）。栈由底模名（兜底再用 LoRA 名/文件名）判出，并带上判据原文。
+     * <p>**底模优先级**（越靠前越硬；每一步都要求"能判出已知族"，判不出来的名字留到最后兜底）：
+     * <ol>
+     *   <li><b>Civitai 记录</b>：{@code data/civitai/<文件名>.json} 的 {@code base_model}（下载时由
+     *       Civitai 的 {@code /api/v1/model-versions/<id>} 的 {@code baseModel} 落盘，见
+     *       {@code CivitaiClient}）。那是**发布者自己填的**架构声明（{@code SD 1.5} / {@code Illustrious} /
+     *       {@code NoobAI} / {@code Flux.1 D} …），比训练脚本名可靠，所以排在第一位；</li>
+     *   <li><b>safetensors 头部自己声明的架构/底模</b>（{@code ss_base_model_version} /
+     *       {@code modelspec.architecture} / {@code modelspec.importer}）→ {@code safetensors-header}；</li>
+     *   <li><b>Forge 的 LoRA 元数据</b>（与头部同源，但它可能把某些键过滤掉了）→ {@code forge-metadata}；</li>
+     *   <li><b>头部张量名结构与张量形状</b>→ {@code safetensors-keys}（{@code lora_te1_*}/{@code lora_te2_*}、
+     *       {@code attn2} 的上下文维度 768/1024/2048、{@code conditioner.embedders.*}、{@code net.*}、
+     *       {@code double_blocks.*} …）；</li>
+     *   <li><b>训练时的通用底模名</b>（{@code ss_sd_model_name="model.ckpt"} / {@code "Anything-v5.0-…"}）：
+     *       {@link StackClassifier#genericBaseModel(String)} 认得的，映射到它指的家族（SD1.5 → {@code sd} 栈），
+     *       来源如实标 {@link StackClassifier#INFERRED_SOURCE}；</li>
+     *   <li>具体但认不出族的名字（Civitai 的 {@code Other}、用户自训底模）：照旧用它自己的 slug 当栈；</li>
+     *   <li>都没有：按当前 Forge 预设栈**推断**（{@code preset-inferred}）。</li>
+     * </ol>
      *
-     * @param civitaiBaseModel Civitai 下载记录里的 base_model（没有就空串）
+     * <p>通用底模名**绝不再当栈名**：{@code model.ckpt} 以前会变成 {@code model-ckpt} 这种伪栈，
+     * 现在它归 {@code sd} 栈，底模名显示成「SD 1.5（原底模名 model.ckpt）」（见 {@link #attribute}）。
+     * 判据原文里照旧写出"哪个键、什么值"，用户问得出来源。
+     *
+     * @param civitaiBaseModel Civitai 记录里的 base_model（没有就空串）
      * @param presetFallback   预设栈兜底（一次列表里只读一遍，别每个 LoRA 都问一次 Forge）；null 表示现读
      */
     public synchronized BaseModel resolveBaseModel(String civitaiBaseModel, String loraName, String loraPath, BaseModel presetFallback) {
         Path file = readableFile(loraPath);
-        // 1) 文件头部自己声明的底模：最可靠，也最经得起追问（哪个键、什么值都记下来）。
+        // 文件头部先读一遍（有缓存）：Civitai 优先，但头部声明要写进判据，用户才看得出两边一致还是冲突。
         StackClassifier.Header declared = StackClassifier.declared(file);
-        if (declared.known()) return attribute(declared.baseModel(), StackClassifier.HEADER_SOURCE, declared.evidence(), loraName, loraPath);
-        // 2) Civitai 下载记录。
+        boolean declaredGeneric = StackClassifier.genericBaseModel(declared.baseModel());
+        // 1) Civitai 记录：发布者自己填的 Base Model，比训练脚本名可靠，所以排在第一位。
         String recorded = usableBaseModel(civitaiBaseModel);
-        if (!recorded.isEmpty())
-            return attribute(canonicalBaseModel(recorded), CIVITAI_SOURCE, "Civitai 记录的 base_model=" + recorded.strip(), loraName, loraPath);
+        if (familyKnown(recorded))
+            return attribute(canonicalBaseModel(recorded), CIVITAI_SOURCE,
+                    "Civitai 记录的 base_model=" + recorded.strip() + declaredNote(recorded, declared, declaredGeneric),
+                    loraName, loraPath);
+        // 2) 文件头部自己声明的架构/底模：具体值最经得起追问（哪个键、什么值都记下来）。
+        if (declared.known() && !declaredGeneric)
+            return attribute(declared.baseModel(), StackClassifier.HEADER_SOURCE, declared.evidence(), loraName, loraPath);
         // 3) Forge 的 LoRA 元数据（与头部同源，但它可能把某些键过滤掉了）。
         String metadata = usableBaseModel(forgeLoraBaseModel(loraName, loraPath));
-        if (!metadata.isEmpty())
+        boolean metadataGeneric = StackClassifier.genericBaseModel(metadata);
+        if (familyKnown(metadata) && !metadataGeneric)
             return attribute(canonicalBaseModel(metadata), FORGE_SOURCE, "Forge LoRA 元数据的底模=" + metadata.strip(), loraName, loraPath);
-        // 4) 头部张量名结构：没有声明式元数据时，键名结构就是最硬的实据（不加载权重也知道是什么架构）。
+        // 4) 头部张量名结构与形状：通用底模名不可信时，这是最硬的实据（键名 + 维度说了架构）。
+        String generic = firstGeneric(declared, recorded, metadata);
         StackClassifier.Header structure = StackClassifier.structural(file);
-        if (structure.known()) return attribute(structure.baseModel(), StackClassifier.KEYS_SOURCE, structure.evidence(), loraName, loraPath);
-        // 5) 三层都读不到：按当前 Forge 预设栈推断（显式标成推断）。
+        if (structure.known())
+            return attribute(structure.baseModel(), StackClassifier.KEYS_SOURCE,
+                    withGenericNote(structure.evidence(), generic), loraName, loraPath, generic);
+        // 5) 只剩通用底模名（model.ckpt / Anything-v5 …）：按 SD1.5 时代的命名归家族，来源如实标成推断。
+        if (!generic.isEmpty())
+            return attribute(StackClassifier.canonicalBaseModel(generic), StackClassifier.INFERRED_SOURCE,
+                    genericEvidence(generic), loraName, loraPath, generic);
+        // 6) 具体但认不出族的名字：照旧自成一族（栈名是它的 slug），来源照实写。
+        if (!recorded.isEmpty())
+            return attribute(canonicalBaseModel(recorded), CIVITAI_SOURCE,
+                    "Civitai 记录的 base_model=" + recorded.strip(), loraName, loraPath);
+        if (!metadata.isEmpty())
+            return attribute(canonicalBaseModel(metadata), FORGE_SOURCE,
+                    "Forge LoRA 元数据的底模=" + metadata.strip(), loraName, loraPath);
+        // 7) 都读不到：按当前 Forge 预设栈推断（显式标成推断）。
         return presetFallback == null ? presetBaseModel() : presetFallback;
+    }
+
+    /** 这个名字能不能判出**已知族**（能，才算"具体底模"；判不出来只能当名字兜底）。 */
+    private static boolean familyKnown(String baseModel) {
+        String canonical = canonicalBaseModel(usableBaseModel(baseModel));
+        return !canonical.isEmpty() && StackClassifier.knownStack(StackClassifier.stackOfBaseModel(canonical));
+    }
+
+    /** 三层来源里读到的第一个**通用底模名**（{@code model.ckpt} / {@code Anything-v5} …）；都没有就是空串。 */
+    private static String firstGeneric(StackClassifier.Header declared, String recorded, String metadata) {
+        if (StackClassifier.genericBaseModel(declared.baseModel())) return declared.baseModel();
+        if (StackClassifier.genericBaseModel(recorded)) return recorded;
+        return StackClassifier.genericBaseModel(metadata) ? metadata : "";
+    }
+
+    /**
+     * Civitai 值当选时，把文件头部**另外**说的那些也写进判据：用户看的是一条结论，但依据必须能追问。
+     * 头部说的是通用名（{@code model.ckpt}）时点明"不作为底模"；头部说的是别的栈时点明"以 Civitai 为准"。
+     */
+    private static String declaredNote(String recorded, StackClassifier.Header declared, boolean generic) {
+        if (!declared.known()) return "";
+        if (generic) return "；文件头部另有训练底模名 " + declared.baseModel() + "（通用名，不作为具体底模）";
+        String mine = StackClassifier.stackOfBaseModel(canonicalBaseModel(recorded));
+        String theirs = StackClassifier.stackOfBaseModel(declared.baseModel());
+        if (!mine.isEmpty() && mine.equals(theirs))
+            return "；文件头部声明的是 " + declared.baseModel() + "（同一栈：" + declared.evidence() + "）";
+        return "；文件头部声明的是 " + declared.baseModel() + "（" + declared.evidence() + "，不同栈时以 Civitai 为准）";
+    }
+
+    /** 通用底模名不参与"具体底模"判定，但用户问起来要答得上：把为什么不算写进判据。 */
+    private static String withGenericNote(String evidence, String generic) {
+        return generic.isEmpty() ? evidence
+                : evidence + "；另有通用底模名 " + generic + "（SD1.5 时代的常见命名，不作为具体底模，已按张量键判定）";
+    }
+
+    /** 只剩通用底模名时的判据原文：说清"这不是文件声明的架构，是按时代命名归的家族"。 */
+    private static String genericEvidence(String generic) {
+        return "头部/元数据里的训练底模名 " + generic + " 是通用名（SD1.5 时代的常见命名），"
+                + "没有更硬的实据，按它归入 " + StackClassifier.canonicalBaseModel(generic);
     }
 
     /**
@@ -1652,8 +1741,17 @@ public final class SdClient {
      *
      * <p>最后一步：底模名确实为空（占位值），但栈能从名字/文件名判出来时，补该栈的规范底模名
      * （来源 {@code inferred}），别让这条记录底模一栏永远空着。
+     *
+     * <p>{@code generic} 是这条记录里读到的**通用底模名**（{@code model.ckpt} /
+     * {@code Anything-v5.0-PRT-RE.safetensors}）：它跟最终判出来的栈同族时，底模名显示成
+     * 「{@code SD 1.5（原底模名 model.ckpt）}」——人看得懂，而且不会再有 {@code model-ckpt} 这种伪栈名。
+     * 两边不同族（例如张量键判出 SDXL）时以硬证据为准，通用名只留在判据里。
      */
     private static BaseModel attribute(String baseModel, String source, String evidence, String name, String path) {
+        return attribute(baseModel, source, evidence, name, path, "");
+    }
+
+    private static BaseModel attribute(String baseModel, String source, String evidence, String name, String path, String generic) {
         String canonical = canonicalBaseModel(baseModel);
         if (canonical.isEmpty()) {
             String stack = StackClassifier.stackOf("", name);
@@ -1671,7 +1769,12 @@ public final class SdClient {
             if (!byName.isEmpty()) stack = byName;
             stackSource = stack.isEmpty() ? "" : StackClassifier.INFERRED_SOURCE;
         }
-        return new BaseModel(canonical, source, stack, stackSource, evidence);
+        // 通用底模名与硬证据同族时，把"原底模名"并排显示出来（面板上是「底模 SD 1.5（原底模名 model.ckpt）」）。
+        String shown = canonical;
+        String label = StackClassifier.genericBaseModelLabel(generic);
+        if (!label.isEmpty() && !stack.isEmpty()
+                && stack.equals(StackClassifier.stackOfBaseModel(StackClassifier.canonicalBaseModel(generic)))) shown = label;
+        return new BaseModel(shown, source, stack, stackSource, evidence);
     }
 
     /** 本机存在、可读的模型文件（这里只认绝对/相对路径直接指到的文件）。 */

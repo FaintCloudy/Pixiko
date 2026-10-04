@@ -16,17 +16,24 @@ import cn.szu.bot.Json;
  * {@code sd} / {@code flux} / {@code qwen} / {@code krea} / {@code sd3} …）。只换底模不换栈会出全灰废图，
  * 所以「这个底模属于哪一栈」必须能自动判出来，而不是靠人去记。
  *
- * <p>判据按可靠性排序，全部来自**真实数据**：
+ * <p>判据按可靠性排序，全部来自**真实数据**（完整的多来源优先级见
+ * {@code SdClient#resolveBaseModel}，那边还多一层"下载记录里的 Civitai {@code baseModel}"）：
  * <ol>
- *   <li>{@code safetensors} 头部 {@code __metadata__} 里声明的架构/底模：{@code ss_base_model_version}
+ *   <li>{@code safetensors} 头部 {@code __metadata__} 里**声明的架构/底模**：{@code ss_base_model_version}
  *       （如 {@code anima}、{@code krea}）、{@code modelspec.architecture}（如
- *       {@code stable-diffusion-xl-v1-base}、{@code stable-diffusion-v1/lora}）、{@code ss_sd_model_name}
- *       （sd-scripts 的 {@code model.safetensors} 是占位，不算）；</li>
- *   <li>头部里的**张量名结构**（同一份头部，只读前若干 KB）：SDXL 有第二个文本编码器
+ *       {@code stable-diffusion-xl-v1-base}、{@code stable-diffusion-v1/lora}），以及
+ *       {@code ss_sd_model_name}（sd-scripts 记的**训练底模名**，见第 3 条）；</li>
+ *   <li>头部里的**张量名结构与张量形状**（同一份头部，只读前若干 KB）：SDXL 有第二个文本编码器
  *       {@code conditioner.embedders.1.*}，SD1.5 只有 {@code conditioner.embedders.0.transformer.*}，
  *       SD2 是 {@code conditioner.embedders.0.model.*}（OpenCLIP），Anima 是 {@code net.llm_adapter.*} /
- *       {@code net.blocks.*}，Flux 是 {@code double_blocks.* + single_blocks.*}，LoRA 侧则看
- *       {@code lora_te_*}（单文本编码器＝SD1.5）与 {@code lora_te1_*}/{@code lora_te2_*}（＝SDXL）；</li>
+ *       {@code net.blocks.*}，Flux 是 {@code double_blocks.* + single_blocks.*}；LoRA 侧看
+ *       {@code lora_te_*}（单文本编码器＝SD1.5）与 {@code lora_te1_*}/{@code lora_te2_*}（＝SDXL），
+ *       另外直接看**交叉注意力的上下文维度** {@code attn2_to_k/to_v} 的 shape：768＝SD1.x、1024＝SD2.x、
+ *       2048＝SDXL——只训了 UNet 的 LoRA 没有文本编码器键，只有这一条判得出来；</li>
+ *   <li>**通用/占位底模名**（{@code model.ckpt}、{@code Anything-v5.0-PRT-RE.safetensors}、
+ *       {@code v1-5-pruned-emaonly.ckpt} …，见 {@link #SD15_GENERIC}）：它们只说明"哪个时代的底模"，
+ *       那就归到那个家族（stack {@code sd}）；**绝不再拿它当栈名**（以前会变成 {@code model-ckpt}、
+ *       {@code anything-v5-0-prt-re-safetensors} 这种伪栈）；</li>
  *   <li>Forge 预设配置（{@code forge_checkpoint_<preset>}）：哪个预设置的就是这个文件，它就属于那一栈；</li>
  *   <li>底模名/文件名关键词兜底（{@link #FAMILIES}），结果必须标成推断。</li>
  * </ol>
@@ -34,7 +41,8 @@ import cn.szu.bot.Json;
  * <p>栈的判定**不再是"五种里猜一个，其余返回空"**：底模名只要非空，认不出已知族也会用它自己的
  * slug 当栈名（见 {@link #stackOfBaseModel(String)}），调用方用 {@link #knownStack(String)} 区分
  * 「已知族」与「自成一族」，后者标成 {@link #INFERRED_SOURCE}。只有真的没有底模信息（空串、占位值）
- * 才返回空串——绝不无中生有。
+ * 才返回空串——绝不无中生有。通用名是**例外**：它有家族信息（SD1.5 时代），所以映射到 {@code sd} 栈，
+ * 不参与"自成一族"。
  */
 public final class StackClassifier {
     /**
@@ -61,9 +69,42 @@ public final class StackClassifier {
     public static final String INFERRED_SOURCE = "inferred";
     /** 头部 JSON 最多读这么多：真机最大的头部不到 400 KB，超出的当读坏了。 */
     private static final long MAX_HEADER_BYTES = 8L * 1024 * 1024;
-    /** {@code __metadata__} 里按这个顺序找声明式底模。 */
+    /**
+     * {@code __metadata__} 里**声明架构/底模族**的键，按这个顺序找：这几个说的是"这是什么架构"，
+     * 比"训练时用的底模文件名"硬。
+     */
     private static final List<String> METADATA_KEYS =
             List.of("ss_base_model_version", "modelspec.architecture", "ss_sd_model_name", "modelspec.importer");
+
+    /**
+     * **通用底模名**（SD1.5 时代最常见的那些"俗名"）：它们指向**家族**，不是某一个具体检查点。
+     *
+     * <p>实测（本机 {@code F:\sd\sd-webui-forge-neo\models\Lora} 的 12 个 LoRA）：老 LoRA 的
+     * {@code __metadata__.ss_sd_model_name} 大量是 {@code model.ckpt}（2023 年那批 sd-scripts 训练时
+     * 底模就叫这个名字），社区底模则是 {@code Anything-v5.0-PRT-RE.safetensors} 这类写法。它们既不是
+     * 已知族关键词、又不是 {@link SdClient#usableBaseModel(String)} 认的占位值，于是被
+     * {@link #slug(String)} 做成了 {@code model-ckpt} / {@code anything-v5-0-prt-re-safetensors}
+     * 这种**伪栈**——面板上"所有 model.ckpt 的 LoRA 各自成一栈"就是这么来的。
+     *
+     * <p>匹配规则：**词首**匹配（{@code anything v5.0 prt re.safetensors} 命中 {@code anything}，
+     * {@code my anything model} 不命中），并且**名字里带 {@code xl} 的一律不认**
+     * （{@code AnythingXL} / {@code CounterfeitXL} / {@code ponyXL} 都是 SDXL，绝不能落进 SD1.5）。
+     * 已知族关键词（{@link #FAMILIES}）永远先判：这里只是"比 slug 强一点"的最后一级。
+     *
+     * <p>注意 {@code model} / {@code model.safetensors}（**裸名**，没有 {@code .ckpt}）不在这里：
+     * 它们是 {@link SdClient#usableBaseModel(String)} 认的**占位值**（"底模没记下来"），
+     * 归到"没有底模信息"；{@code model.ckpt} 才是 SD1.5 时代那个真实的检查点文件名。
+     */
+    private static final List<String> SD15_GENERIC = List.of(
+            "model.ckpt", "v1 5", "v1.5", "sd v1 5", "sd v1.5",
+            "anything", "counterfeit", "naifu", "abyssorangemix", "aom2", "aom3", "orangemix",
+            "meinamix", "chilloutmix", "majicmix", "pastel mix", "perfectworld", "hassaku",
+            "7th anime", "7th love", "waifu diffusion", "dreamlike", "deliberate", "berrymix",
+            "dark sushi mix", "cetusmix", "kohaku", "mistoon", "anylora", "blue pencil",
+            "cyberrealistic", "realistic vision", "dalcefo", "expmix", "kotosmix", "yabal",
+            "elldreth", "holyxyz", "hoshimix", "bluemix", "brav6", "cutemix", "aingdiffusion");
+    /** SD1.4 时代的通用名（同样是 sd 栈，只是规范名写 SD 1.4）。 */
+    private static final List<String> SD14_GENERIC = List.of("v1 4", "v1.4");
 
     /** 一个底模族的定义：栈 key、中文标签、给外人看的规范名、判定关键词（子串）与整词。 */
     private record Family(String stack, String label, String canonical, List<String> keywords, List<String> tokens) {
@@ -178,19 +219,32 @@ public final class StackClassifier {
     // ---------------------------------------------------------------- 对外判定
 
     /**
-     * 读一个 {@code .safetensors} 文件的地模归属：头部 {@code __metadata__} 声明优先，其次张量名结构。
-     * 只读文件开头的头部（8 字节长度 + N 字节 JSON），不加载权重；读不到返回空串。
+     * 读一个 {@code .safetensors} 文件的地模归属：头部 {@code __metadata__} 声明优先，其次张量名结构，
+     * 最后才是**通用底模名**（{@code model.ckpt} 这种，映射到 SD1.5 家族）；读不到返回空串。
+     * 只读文件开头的头部（8 字节长度 + N 字节 JSON），不加载权重。
      */
     public static String baseModelOf(Path safetensors) {
         Header declared = declared(safetensors);
-        if (declared.known()) return declared.baseModel();
-        return structural(safetensors).baseModel();
+        boolean generic = genericBaseModel(declared.baseModel());
+        if (declared.known() && !generic) return canonicalBaseModel(declared.baseModel());
+        // 通用底模名（model.ckpt）不可信：先看张量键与形状，再退回"按通用名归家族"。
+        String structural = structural(safetensors).baseModel();
+        if (!structural.isEmpty()) return structural;
+        return declared.known() ? canonicalBaseModel(declared.baseModel()) : "";
     }
 
-    /** 头部 {@code __metadata__} 里**声明**的底模（最可靠的一条）。 */
+    /**
+     * 头部 {@code __metadata__} 里**声明**的底模（最可靠的一条）。
+     *
+     * <p>只读到**通用底模名**（{@code model.ckpt} / {@code Anything-v5}）时**原样**返回那个名字
+     * （不归一成家族），调用方用 {@link #genericBaseModel(String)} 认出来并降级处理；
+     * 读到具体架构就返回规范名（{@code SDXL} / {@code Anima} …）。
+     */
     public static Header declared(Path safetensors) { return parse(safetensors).declared(); }
 
-    /** 头部**张量名结构**推断出的底模（同一份头部；声明式元数据缺失时的第二条判据）。 */
+    /**
+     * 头部**张量名结构与张量形状**推断出的底模（同一份头部；声明式元数据缺失或只是通用名时的第二条判据）。
+     */
     public static Header structural(Path safetensors) { return parse(safetensors).structural(); }
 
     /**
@@ -208,11 +262,14 @@ public final class StackClassifier {
      * <ol>
      *   <li>已知族按 {@link #FAMILIES} 判：{@code krea} 排在 {@code flux} 前面，{@code Flux.1 Krea} 不会被
      *       判成 flux 栈；{@code SD 1.5} / {@code SDXL} / {@code SD 2.1} / {@code SD 3.5} 各归各的；</li>
+     *   <li>**通用底模名**（{@code model.ckpt} / {@code Anything-v5} / {@code v1-5-pruned-emaonly} …）：
+     *       归它指的那个家族——{@code sd} 栈（见 {@link #SD15_GENERIC}）——**不许**变成
+     *       {@code model-ckpt} 这种伪栈；</li>
      *   <li>认不出族但名字非空：用**规范化 slug** 当栈名（{@code Foo BarXL v2} → {@code foo-barxl-v2}）——
      *       分不到已知族，也要有一个明确、可复现的栈名；{@link #knownStack(String)} 能认出这种"自成一族"，
      *       调用方据此把来源标成 {@link #INFERRED_SOURCE}；</li>
-     *   <li>空串，以及 {@code model.safetensors} / {@code unknown} / {@code none} 这类占位值：空串——
-     *       那是"没有底模信息"，不是"认不出族"，绝不无中生有。</li>
+     *   <li>空串，以及 {@code model} / {@code model.safetensors} / {@code unknown} / {@code none}
+     *       这类占位值：空串——那是"没有底模信息"，不是"认不出族"，绝不无中生有。</li>
      * </ol>
      */
     public static String stackOfBaseModel(String baseModel) {
@@ -220,6 +277,8 @@ public final class StackClassifier {
         if (value.isEmpty() || SdClient.usableBaseModel(value).isEmpty()) return "";
         String known = stackOfFamily(value);
         if (!known.isEmpty()) return known;
+        String generic = genericFamily(value);
+        if (!generic.isEmpty()) return stackOfFamily(generic);
         String slug = slug(value);
         return slug.isEmpty() ? OTHER : slug;
     }
@@ -246,6 +305,62 @@ public final class StackClassifier {
             for (String token : family.tokens()) if (wholeWord(key, token)) return family.stack();
         }
         return "";
+    }
+
+    // ---------------------------------------------------------------- 通用/占位底模名
+
+    /**
+     * 这个底模名是不是**通用名**（{@code model.ckpt} / {@code Anything-v5.0-PRT-RE.safetensors} /
+     * {@code v1-5-pruned-emaonly.ckpt} …，见 {@link #SD15_GENERIC}）：它只说明"哪个时代的底模"。
+     *
+     * <p>调用方据此把通用名**降级**：先去看张量键/形状，只有实在没有别的实据时才用它兜底
+     * （那时它指向的家族就是答案）。见 {@code SdClient#resolveBaseModel}。
+     */
+    public static boolean genericBaseModel(String value) {
+        return !genericFamily(value).isEmpty();
+    }
+
+    /**
+     * 通用底模名 → 它指向的**规范底模名**（就是家族名，如 {@code SD 1.5}）；不是通用名返回空串。
+     */
+    public static String genericBaseModelFamily(String value) {
+        return genericFamily(value);
+    }
+
+    /**
+     * 通用底模名给人看的写法：{@code SD 1.5（原底模名 model.ckpt）}——面板/回执上要让人看得懂，
+     * 而不是甩一个 {@code model-ckpt} 伪栈名；不是通用名返回空串。
+     */
+    public static String genericBaseModelLabel(String value) {
+        String family = genericFamily(value);
+        String raw = value == null ? "" : value.strip();
+        return family.isEmpty() || raw.isEmpty() ? "" : family + "（原底模名 " + raw + "）";
+    }
+
+    /**
+     * 通用名的匹配：**词首**匹配（{@code anything v5.0 prt re.safetensors} 命中 {@code anything}），
+     * 且名字里带 {@code xl} 的一律不认（{@code AnythingXL} 是 SDXL）。
+     */
+    private static String genericFamily(String value) {
+        String key = normalize(value);
+        if (key.isEmpty() || key.contains("xl")) return "";
+        for (String stem : SD14_GENERIC) if (startsWithName(key, stem)) return "SD 1.4";
+        for (String stem : SD15_GENERIC) if (startsWithName(key, stem)) return "SD 1.5";
+        return "";
+    }
+
+    /**
+     * 名字以这个词开头才算命中通用名：后面必须是名字结尾、非字母（{@code anything v5.0} /
+     * {@code abyssorangemix3aom3} / {@code model.ckpt}），或者是版本号写法
+     * （{@code AnythingV5} / {@code CounterfeitV3}）。{@code anythingelse} / {@code my anything model}
+     * 都不算——宁可少认，也不要把别人的底模塞进 SD1.5。
+     */
+    private static boolean startsWithName(String key, String stem) {
+        if (!key.startsWith(stem) || key.length() == stem.length()) return key.equals(stem);
+        char next = key.charAt(stem.length());
+        if (Character.isDigit(next)) return true;
+        if (next == 'v' && stem.length() + 1 < key.length() && Character.isDigit(key.charAt(stem.length() + 1))) return true;
+        return !Character.isLetter(next);
     }
 
     /**
@@ -387,7 +502,9 @@ public final class StackClassifier {
 
     /**
      * 各来源对同一个底模的写法不一样（Civitai 写 Anima，Forge 写 anima，架构串写 stable-diffusion-xl-v1-base）。
-     * 先按**整词**归一（Civitai/Forge 的常见写法，见 {@link #CANONICAL}），再按关键词族兜底（架构串）。
+     * 先按**整词**归一（Civitai/Forge 的常见写法，见 {@link #CANONICAL}），再按关键词族兜底（架构串），
+     * 最后把**通用底模名**（{@code model.ckpt} / {@code Anything-v5} …）归到它指的家族
+     * （{@link #genericBaseModelFamily(String)}）——那是"哪个时代的底模"，不是"哪个具体检查点"。
      */
     public static String canonicalBaseModel(String raw) {
         String value = SdClient.usableBaseModel(raw);
@@ -427,6 +544,9 @@ public final class StackClassifier {
         if (key.contains("z image") || key.contains("zimage")) return "Z-Image";
         if (key.contains("nitro")) return "Nitro-E";
         if (key.contains("odor")) return "ODOR";
+        // 通用底模名（model.ckpt / Anything-v5 …）：说不出具体是哪个检查点，但说得出是哪个家族。
+        String generic = genericFamily(value);
+        if (!generic.isEmpty()) return generic;
         return value;
     }
 
@@ -534,23 +654,41 @@ public final class StackClassifier {
         }
     }
 
-    /** {@code __metadata__} 里声明的底模。 */
+    /**
+     * {@code __metadata__} 里声明的底模/架构。
+     *
+     * <p>按 {@link #METADATA_KEYS} 顺序找第一个**具体**的值（能归到已知族或至少是个确定名字的），
+     * 顺手记下第一个**通用名**（{@code model.ckpt}）当兜底：通用名不是"具体底模"，不能挡住后面的
+     * {@code ss_base_model_version} / {@code modelspec.architecture}。只读到通用名时**原样返回**
+     * （不归一），让调用方先去看张量键、再拿它兜底——{@link #genericBaseModel(String)} 认得出来。
+     */
     private static Header declaredIn(JsonObject header) {
         if (!header.has("__metadata__") || !header.get("__metadata__").isJsonObject()) return Header.NONE;
         JsonObject metadata = header.getAsJsonObject("__metadata__");
+        Header generic = Header.NONE;
         for (String key : METADATA_KEYS) {
             String raw = Json.str(metadata, key, "");
             if (SdClient.usableBaseModel(raw).isEmpty()) continue;   // 占位值（model.safetensors）不算
+            String evidence = "__metadata__ " + key + "=" + raw.strip();
+            if (genericBaseModel(raw)) {
+                if (!generic.known()) generic = new Header(raw.strip(), HEADER_SOURCE, evidence);
+                continue;
+            }
             String canonical = canonicalBaseModel(raw);
             if (canonical.isEmpty()) continue;
-            return new Header(canonical, HEADER_SOURCE, "__metadata__ " + key + "=" + raw.strip());
+            return new Header(canonical, HEADER_SOURCE, evidence);
         }
-        return Header.NONE;
+        return generic;
     }
 
     /**
-     * 张量名结构：同一份头部里的键名就够判架构（等于「不加载权重也知道这是什么模型」）。
-     * 只看前缀，2 千多个键扫一遍是微秒级。
+     * 张量名结构 + 张量形状：同一份头部里的键名与 shape 就够判架构（等于「不加载权重也知道这是什么模型」）。
+     * 只看前缀与 shape，2 千多个键扫一遍是微秒级。
+     *
+     * <p>LoRA 侧新增一条最硬的判据：**交叉注意力的上下文维度**（{@code attn2_to_k/to_v} 的
+     * {@code lora_down.weight} 是 {@code [rank, 上下文维度]}）——768＝SD1.x 的 CLIP-L、1024＝SD2.x 的
+     * OpenCLIP-H、2048＝SDXL 的 OpenCLIP-bigG。只训了 UNet 的 LoRA（没有 {@code lora_te*} 键，
+     * 例如本机的 {@code 莉贝尔noobXL-000042}）只有这一条判得出来。
      */
     private static Header structuralIn(JsonObject header) {
         boolean embedder1 = false, embedder0Model = false, embedder0Transformer = false;
@@ -558,6 +696,7 @@ public final class StackClassifier {
         boolean llmAdapter = false, netBlocks = false, animaLoraBlocks = false;
         boolean doubleBlocks = false, singleBlocks = false, ldmUnet = false;
         boolean loraTe = false, loraTe1 = false, loraTe2 = false;
+        int attn2Context = 0, textHidden = 0;
         for (String key : header.keySet()) {
             if (key.equals("__metadata__")) continue;
             if (key.startsWith("conditioner.embedders.1.")) embedder1 = true;
@@ -574,6 +713,10 @@ public final class StackClassifier {
             else if (key.startsWith("lora_te2")) loraTe2 = true;
             else if (key.startsWith("lora_te1")) loraTe1 = true;
             else if (key.startsWith("lora_te_")) loraTe = true;
+            if (key.startsWith("lora_te_") && key.contains("mlp_fc1") && key.endsWith("lora_down.weight"))
+                textHidden = Math.max(textHidden, lastDim(header, key));
+            if ((key.contains("attn2_to_k") || key.contains("attn2_to_v")) && key.endsWith("lora_down.weight"))
+                attn2Context = Math.max(attn2Context, lastDim(header, key));
         }
         boolean sd2 = isV2(header);
         // 顺序＝专指度：Anima 与 Flux 的键名很独特，先判；再判文本编码器个数区分 SDXL / SD1.5 / SD2。
@@ -586,6 +729,10 @@ public final class StackClassifier {
         }
         if (doubleBlocks && singleBlocks)
             return new Header("Flux", KEYS_SOURCE, "张量键 double_blocks.* + single_blocks.*（Flux 结构）");
+        // 2048 只可能是 SDXL（OpenCLIP-bigG 的上下文维度）：unet-only 的 LoRA 也判得出来，排在文本编码器之前。
+        if (attn2Context == 2048)
+            return new Header("SDXL", KEYS_SOURCE,
+                    "张量键 attn2_to_k/to_v 的上下文维度 2048（SDXL 的 OpenCLIP-bigG）→ SDXL 家族");
         if (embedder1 || loraTe2 || loraTe1) {
             String signals = embedder1 ? "conditioner.embedders.1.*（双文本编码器）"
                     : "lora_te1_*/lora_te2_*（LoRA 带两个文本编码器）";
@@ -594,15 +741,39 @@ public final class StackClassifier {
         if (embedder0Model || condModel)
             return new Header("SD 2.1", KEYS_SOURCE, "张量键 " + (embedder0Model ? "conditioner.embedders.0.model.*" : "cond_stage_model.model.*")
                     + "（OpenCLIP 文本编码器）→ SD 2.x");
+        if (attn2Context == 1024)
+            return new Header("SD 2.1", KEYS_SOURCE,
+                    "张量键 attn2_to_k/to_v 的上下文维度 1024（OpenCLIP-H）→ SD 2.x");
         if (embedder0Transformer || condTransformer)
             return new Header("SD 1.5", KEYS_SOURCE, "张量键 " + (embedder0Transformer ? "conditioner.embedders.0.transformer.*" : "cond_stage_model.transformer.*")
                     + "（单 CLIP 文本编码器）→ SD 1.x");
-        if (loraTe)
-            return sd2 ? new Header("SD 2.1", KEYS_SOURCE, "张量键 lora_te_* + __metadata__ ss_v2=True")
-                    : new Header("SD 1.5", KEYS_SOURCE, "张量键 lora_te_*（单文本编码器）+ ss_v2=False");
+        if (loraTe) {
+            String hidden = textHidden > 0 ? "，隐藏维度 " + textHidden : "";
+            boolean v2 = sd2 || textHidden == 1024;
+            return v2
+                    ? new Header("SD 2.1", KEYS_SOURCE, "张量键 lora_te_*（单文本编码器" + hidden + "）"
+                            + (sd2 ? " + __metadata__ ss_v2=True" : "（OpenCLIP-H 隐藏维度）") + " → SD 2.x")
+                    : new Header("SD 1.5", KEYS_SOURCE, "张量键 lora_te_*（单文本编码器" + hidden + "）"
+                            + (sd2 ? "" : " + ss_v2=False") + " → SD 1.x");
+        }
+        if (attn2Context == 768)
+            return new Header("SD 1.5", KEYS_SOURCE,
+                    "张量键 attn2_to_k/to_v 的上下文维度 768（CLIP-L）→ SD 1.x");
         if (ldmUnet)
             return new Header("SD 1.5", KEYS_SOURCE, "张量键 model.diffusion_model.input_blocks.*（LDM UNet，无第二个文本编码器）");
         return Header.NONE;
+    }
+
+    /** 头部里某个张量的最后一维（LoRA 的 {@code lora_down.weight} 就是 {@code [rank, 输入维度]}）；读不到返回 0。 */
+    private static int lastDim(JsonObject header, String key) {
+        JsonElement value = header.get(key);
+        if (value == null || !value.isJsonObject()) return 0;
+        JsonElement shape = value.getAsJsonObject().get("shape");
+        if (shape == null || !shape.isJsonArray()) return 0;
+        JsonArray array = shape.getAsJsonArray();
+        if (array.size() == 0) return 0;
+        JsonElement last = array.get(array.size() - 1);
+        return last.isJsonPrimitive() && last.getAsJsonPrimitive().isNumber() ? last.getAsInt() : 0;
     }
 
     /** sd-scripts 的 {@code ss_v2}（True 表示 SD2.x 底模）。 */
