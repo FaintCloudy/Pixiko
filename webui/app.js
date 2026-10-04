@@ -9,7 +9,7 @@
     // 面板底部回执栏的图片是增量追加的：记住当前那张图集卡 / 单张卡，新图到了就地更新，不整块重建。
     receiptGallery: null, receiptSingle: null, receiptSingleFile: '',
     // 「回执」栏：全部回执列表 + 未查看（unread）标记。字段与 /api/quests 契约一致。
-    quests: { unread: 0, latest: 0, retainedMinutes: 0 }, questPollTimer: null,
+    quests: { unread: 0, latest: 0, retainedMinutes: 0 }, questPollTimer: null, questUnreadTimer: null,
     questList: null, questListError: '', questListLoading: false, questListWarned: false,
     loras: null, loraGroups: null, terminalHistory: [], terminalCursor: 0,
     // Civitai 搜索的翻页状态：搜索词与当前页留在前端，翻页时不用重敲。
@@ -386,7 +386,8 @@
     setTimeout(() => { cloud.classList.remove('show'); setTimeout(() => cloud.remove(), 300); }, ttl);
   }
 
-  const questWatch = { timer: null, number: 0 };
+  // `signature` 是上一次真正重画 #quest-body 时的渲染签名：一样就只更新头部文字，绝不整块重建（见 renderQuest）。
+  const questWatch = { timer: null, number: 0, signature: '' };
 
   /** 会话里记住「当前打开的回执号」与各处的滚动位置：切页面/切会话回来时接着看。 */
   const QUEST_CURRENT_KEY = 'pixiko-quest-current';
@@ -395,6 +396,18 @@
   const PAGE_SCROLL_PREFIX = 'pixiko-scroll:';
   /** 生成期间实时视图（进度卡 + 图集预览）的轮询间隔；与 questWatch.timer（900ms 回执轮询）各走各的表。 */
   const QUEST_LIVE_INTERVAL = 1500;
+  /**
+   * 回执页「有没有新回执」的检测间隔：`/api/status` 很轻（只看 quests.unread / quests.latest），
+   * 5 秒问一次；latest 或 unread 一涨就立刻刷新左栏列表。跨页面的 30 秒徽标轮询（questPollTimer）照旧保留。
+   */
+  const QUEST_UNREAD_INTERVAL = 5000;
+  /**
+   * 占位格的宽限期：两张图之间的下发间隙里 `/api/tasks` 会一瞬间返回空数组、或那条任务 `running:false`
+   * （done<total），这不是「收掉占位格」的理由。只有**连续** QUEST_PLAN_GRACE_POLLS 轮都拿不到
+   * `total>0` 的 running 任务（一轮 1.5 秒，2 轮 ≈ 3 秒），或者任务确实结束（done>=total）/ 被取消，
+   * 才真的把占位格收掉；宽限期内保持上一次的格子规划（含圆环与等待格），只更新环的百分比。
+   */
+  const QUEST_PLAN_GRACE_POLLS = 2;
   /** 距底小于这么多像素就算「在底部」（切换回来仍然贴底跟随）。 */
   const STICK_BOTTOM_PX = 40;
 
@@ -459,6 +472,7 @@
     questLiveReset(0);
     const body = $('quest-body');
     if (!body) return;
+    questWatch.signature = '';      // 提示是空手画的：作废渲染签名，免得下一次签名一样而跳过重画、把提示留在正文里
     body.innerHTML = '';
     body.appendChild(el('div', 'quest-empty', '从左边选一条回执看执行结果。'));
   }
@@ -493,6 +507,31 @@
     questWatch.timer = setInterval(tick, 900);
   }
 
+  /**
+   * 渲染签名：`renderQuest` 只按它判断「正文内容变没变」。
+   *
+   * 900ms 一轮的整块重画会把图集卡与占位格从文档里摘下来再挂回去（<img> 还会重新加载），肉眼就是闪烁；
+   * 只有真来了新消息 / 新图 / 状态变了才值得重画。这里只收**决定 body 长什么样**的字段：
+   * 回执号、指令、错误与摘要、done/busy、文本、messages/images 里的文本与图片路径。
+   * 生成期间提前到达的实时图（questLive.extras）**不进签名**：它们本来就靠 questAddImage 就地追加，不该触发重画。
+   */
+  function questRenderSignature(data, number) {
+    const parts = ['#' + (Number(number) || 0), 'cmd:' + questLive.command, 'err:' + String(data.error || ''),
+      'sum:' + String(data.summary || ''), 'flag:' + (data.done ? 'd' : '-') + (data.busy ? 'b' : '-')];
+    const messages = Array.isArray(data.messages) ? data.messages : null;
+    if (messages) {
+      // 每一步里的「文字 + 图片路径」按顺序拼进去：加一条消息、换一张图、改一个字都会让签名变。
+      parts.push('m:' + messages.map((pieces) => (pieces || []).map((piece) => {
+        if (!piece) return '';
+        return piece.type === 'image' ? 'i' + String(piece.file || '') : 't' + String(piece.text || '');
+      }).join('\u0002')).join('\u0003'));
+    } else {
+      parts.push('t:' + (Array.isArray(data.texts) ? data.texts.map((text) => String(text == null ? '' : text)).join('\u0002') : ''));
+    }
+    parts.push('i:' + (Array.isArray(data.images) ? data.images.map((image) => String((image && image.file) || '')).join('\u0002') : ''));
+    return parts.join('|');
+  }
+
   function renderQuest(data) {
     const body = $('quest-body');
     if (!body) return;
@@ -508,6 +547,15 @@
     setText('quest-state', data.error ? data.error : '#' + number + (running ? '（进行中…）' : '（已完成）'));
     setText('quest-command', data.command ? '指令：' + data.command : '');
     setText('quest-progress', data.latest ? '最新一条是 #' + data.latest : '');
+    // 内容没变（900ms 一轮里绝大多数情况）：只更新上面那三行头部文字就收工，**绝不触碰 #quest-body**。
+    // 整块重画会把图集卡与占位格摘出文档再挂回，这就是占位格与圆环「若隐若现」的根源；
+    // 而进度卡与占位格本来就是 questLiveTick（1.5 秒一轮、就地改）在推进，跳过重画不会让它们停住。
+    const signature = questRenderSignature(data, number);
+    if (signature === questWatch.signature) {          // QUEST_SKIP_GUARD（自检的负向对照在这里打桩）
+      questLiveSync(number, running);                 // 只做起表/停表这种轻活（表在跑就什么都不做）
+      return;
+    }
+    questWatch.signature = signature;
     // 重画前后把滚动位置接回来：本次就是按现在 DOM 里的位置，换页回来按会话里记的那份（之前在底部就保持贴底）。
     const here = { top: Number(body.scrollTop) || 0, atBottom: nodeAtBottom(body, STICK_BOTTOM_PX) };
     const restore = Number(body.scrollHeight) > 0 ? here : (questScrollRead(number) || here);
@@ -590,6 +638,10 @@
     // 任务级格子规划：这条正在跑的任务总共要铺 total 个格子（真实缩略图 + 失败格 + 生成中格 + 等待格）。
     // `plan` 非空 = 此刻页面上铺着占位格；`planTotal` 跑完/取消后仍然留着，表头用它补「任务共 N 张，实际 M 张」。
     plan: null, planTotal: 0, tiles: [],
+    // 占位格宽限期（见 QUEST_PLAN_GRACE_POLLS）：`planMisses` 数连续多少轮没拿到 running 任务，
+    // `planHeld` = 这一轮是在「保持上一次的 plan」（接口暂时没给 running，但任务还会继续），
+    // `sample` = 环的百分比（拿不到新采样时沿用上一次的值，不归零），`lastTask` = 上一次拿到的那条任务。
+    planMisses: 0, planHeld: false, sample: 0, lastTask: null,
   };
 
   /**
@@ -599,6 +651,15 @@
    */
   function questGenerating() {
     return !!(questLive.tasksRunning || questLive.progressRunning);
+  }
+
+  /**
+   * 实时视图此刻算不算「在推进」：接口说在跑，或者正处在占位格的宽限期里（`planHeld`）。
+   * 宽限期里也要照原样画（进度卡不跳「已完成」、不把条推满、格子不收），并且**不能停表** ——
+   * 表一停，宽限期就再也不会被判定到期，占位格会永远留在页面上。
+   */
+  function questLiveActive() {
+    return questGenerating() || questLive.planHeld;
   }
 
   /**
@@ -708,6 +769,26 @@
   }
 
   /**
+   * 这一轮的采样：接口真在采样就给出新值，拿不到（没在跑 / SD 读不到）返回 null。
+   * 两张图之间的间隙会出现「接口没有采样」的一两轮，这时调用方应当保留上一次的值（见 {@link questLiveSample}）。
+   */
+  function questSampleFresh(progress) {
+    if (!progress || progress.reachable === false || !progress.running) return null;
+    const percent = Number(progress.percent);
+    return Number.isFinite(percent) ? questSamplePercent(progress) : null;
+  }
+
+  /**
+   * 圆环用的采样百分比：有新的就用新的，拿不到就沿用上一次的值 —— **绝不归零**
+   * （归零会让环在两张图之间从 96% 掉回 0% 再涨回来，看着就是闪）。
+   */
+  function questLiveSample(progress) {
+    const fresh = questSampleFresh(progress);
+    if (fresh !== null) questLive.sample = fresh;
+    return questLive.sample;
+  }
+
+  /**
    * 总进度百分比：`(已生成图片数 + 当前这张的采样百分比/100) / 总图片数 × 100`。
    * 例：done=9、total=20、当前那张 41% → (9 + 0.41)/20 = 47.05%。单张任务（total=1、done=0）算出来
    * 就是这一张的采样百分比。`total<=0`（或 /api/tasks 里没有这一条）时退回只用采样百分比。
@@ -725,12 +806,12 @@
     const card = questLive.card, head = questLive.head, fill = questLive.fill, note = questLive.note;
     if (!card || !head || !fill || !note) return;
     const number = questLive.number;
-    const running = questGenerating();
+    const running = questLiveActive();                 // 含占位格宽限期：那一两轮不显示「已完成」、不把条推满
     const done = task ? questCount(task.done) : 0;
     const total = task ? questCount(task.total) : 0;
     // 取消过（/api/tasks 那条带 cancelled，或本地点过取消）就不再把条推满。
     const cancelled = !!(task && task.cancelled) || questLive.cancelled;
-    const sample = questSamplePercent(progress);
+    const sample = questLiveSample(progress);          // 拿不到采样就沿用上一次的值（不归零）
     let percent = Math.round(questTotalPercent(done, total, sample));
     // 真跑满了才把条推满（被取消的不假装 100%）。
     if (!running && !cancelled && (!task || (total > 0 && done >= total))) percent = 100;
@@ -1071,8 +1152,13 @@
 
   /**
    * 生成期间的一轮：进度（/api/progress + /api/tasks）与提前预览（/api/images）。
-   * 严格门槛：只有「最新一条 + 生成类指令 + 队列里真有 running 的任务」才建卡、才铺格子、才追加实时图；
+   * 严格门槛：只有「最新一条 + 生成类指令 + 队列里有任务」才建卡、才铺格子、才追加实时图；
    * 缺一条就把之前建过的卡撤掉（实时图不再追加），队列空了/被取消就收掉占位格、把卡就地标「已完成」并停表。
+   *
+   * **占位格不因为「这一轮没拿到 running 任务」就立刻收掉**：两张图之间的下发间隙里 `/api/tasks`
+   * 会一瞬间返回空数组、或那条任务 `running:false`（done<total），照旧收掉就会「掉一格又铺回来」地闪。
+   * 这里按 {@link QUEST_PLAN_GRACE_POLLS} 给宽限期：间隙里保持上一次的 plan（含圆环与等待格），
+   * 环的百分比按当前采样更新（拿不到就沿用上一次的，不归零），而且用的还是同一批 tile 节点。
    */
   async function questLiveTick() {
     const number = questLive.number;
@@ -1092,40 +1178,74 @@
     const task = questTaskOf(list, number);
     // 被取消（接口说的或本地点过取消的）与跑完一样是收尾：不再铺格子，表头回到「共 M 张」。
     const cancelled = !!(task && task.cancelled) || questLive.cancelled;
-    const live = running && !cancelled;
-    // 格子规划：只认 /api/tasks 的 images/failed（done 含失败），`shown` 是网格里已经画出来的缩略图数。
-    const plan = live ? questTilePlan(task, questLive.gallery ? questLive.gallery.items.length : 0) : null;
+    // ---- 格子规划与宽限期（阈值见 QUEST_PLAN_GRACE_POLLS）------------------------------------
+    // 格子规划只认 /api/tasks 的 images/failed（done 含失败），`shown` 是网格里已经画出来的缩略图数。
+    const total = task ? questCount(task.total) : 0;
+    const done = task ? questCount(task.done) : 0;
+    const finished = !!task && total > 0 && done >= total;   // 确实跑完：立刻收，不给宽限
+    // 「还会继续」：没取消、没跑完，而且接口说在跑，或队列里还有这条但 done<total
+    // （两张图之间正是 running:false + done<total，也算还会继续）。
+    const continues = !cancelled && !finished && !!task && total > 0 && (!!task.running || done < total);
+    const live = !cancelled && !finished && (running || continues);
+    const shown = questLive.gallery ? questLive.gallery.items.length : 0;
+    let plan = live ? questTilePlan(task, shown) : null;
+    if (plan) {
+      // 下发间隙（running:false 但还会继续）：格子数按最新的 images/failed 对齐，但**保留那一格圆环**，
+      // 看起来始终是「正在生成下一张」，不会掉一格再铺回来。
+      if (!plan.running && continues && plan.total > plan.images + plan.failed) {
+        plan.running = true;
+        plan.pending = Math.max(0, plan.total - plan.images - plan.failed - 1);
+      }
+      questLive.planMisses = 0;
+    } else if (!live && !finished && !cancelled && questLive.plan) {          // QUEST_PLAN_GRACE_GUARD（自检的负向对照在这里打桩）
+      // 这一轮 /api/tasks 什么都没给（瞬时空响应）：先按宽限期留着上一次的 plan，
+      // 连续 QUEST_PLAN_GRACE_POLLS 轮都拿不到才真的收掉；这段时间用的还是同一批 tile 节点
+      // （questSyncTiles 只在尾部增删，不重建、不换节点）。
+      questLive.planMisses += 1;
+      if (questLive.planMisses <= QUEST_PLAN_GRACE_POLLS) plan = questLive.plan;
+    } else {
+      questLive.planMisses = 0;                                              // 真结束 / 被取消 / 本来就没铺：立刻收
+    }
     questLive.plan = plan;
+    // `planHeld` = 铺着格子但接口这一轮没在跑（宽限期）：这段时间进度卡不许跳「已完成」，表也不许停
+    // （表一停，宽限期就再也不会被判定到期）。
+    questLive.planHeld = !!plan && !running && !cancelled;
+    // 宽限期里 /api/tasks 空了一轮：卡片文案与张数沿用上一次那条任务，别跟着空响应跳一下。
+    if (task) questLive.lastTask = task;
+    const shownTask = task || (questLive.planHeld ? questLive.lastTask : null);
+    const sample = questLiveSample(progress);
     // 总张数留着：收尾那一轮表头要靠它补「（任务共 N 张，实际 M 张）」。
-    const planned = plan ? plan.total : (task ? questCount(task.total) : 0);
+    const planned = plan ? plan.total : (shownTask ? questCount(shownTask.total) : 0);
     if (planned > 0) questLive.planTotal = planned;
-    if (running && questLiveCandidate(number)) {
+    if (questLiveActive() && questLiveCandidate(number)) {
       if (!questLive.card) { questBuildCard(); questMountCard(); }
       if (plan) questEnsureGallery();                                       // 一张真图都还没有时也要先有图集卡，占位格才有地方待
-      questPaintCard(task, progress);
+      questPaintCard(shownTask, progress);
       questAppendImages(images);
-      questSyncTiles(plan, questSamplePercent(progress));
+      questSyncTiles(plan, sample);
       questGalleryHead();
-    } else if (questLive.card && running) {
+    } else if (questLive.card && questLiveActive()) {
       questDropCard();                                                        // 跑到一半不再是「最新 + 生成类」：撤卡
       questLive.plan = null;                                                  // 表头也不再算「生成中…」
-      questSyncTiles(null, 0);
+      questLive.planHeld = false; questLive.planMisses = 0;
+      questSyncTiles(null, sample);
       questGalleryHead();
     } else if (questLive.card) {
-      questPaintCard(task, progress);                                         // 收尾：卡片留在原地标「已完成 / 已取消」
+      questPaintCard(shownTask, progress);                                    // 收尾：卡片留在原地标「已完成 / 已取消」
       // 最后一张图恰好和「跑完」同一轮到达也别漏：生成期间认下的目录优先，一次都没认下才退回「最新那张任务图」的目录。
       questAppendImages(images, questLive.dir || null);
-      questSyncTiles(null, 0);                                                // 跑完 / 被取消：占位格收掉，只留真实缩略图
+      questSyncTiles(plan, sample);                                           // 跑完 / 被取消：占位格收掉，只留真实缩略图
       questGalleryHead();
     } else {
       questDropCard();                                                       // 没建过卡也没在跑：确保页面上没有残留的卡
-      questSyncTiles(null, 0);
+      questSyncTiles(plan, sample);
+      questGalleryHead();
     }
     // 900ms 的回执重画会把图集卡从 body 上撸下来：卡里已经有图就按**同一个节点**挂回去（图不重新加载、不闪）。
     if (questLive.gallery && questLive.gallery.items.length > 0 && !questLive.gallery.card.parentNode) {
       questMountGallery(questLive.gallery.card);
     }
-    if (!running) questLiveStop();                                            // 空闲：卡片留在原地标「已完成」，表停掉
+    if (!questLiveActive()) questLiveStop();                                  // 空闲：卡片留在原地标「已完成」，表停掉
   }
 
   function questLiveStart() {
@@ -1151,6 +1271,7 @@
   function questLiveDrop() {
     questDropCard();
     questLive.plan = null;
+    questLive.planHeld = false; questLive.planMisses = 0;       // 不合格就没有宽限期可言
     questSyncTiles(null, 0);
     questGalleryHead();
     questLive.tasksRunning = false;
@@ -1173,6 +1294,7 @@
     questLive.card = null; questLive.head = null; questLive.fill = null; questLive.note = null;
     questLive.cancelBtn = null; questLive.taskNumber = ''; questLive.percent = 0; questLive.cancelled = false;
     questLive.plan = null; questLive.planTotal = 0;                    // 上一条任务的格子规划与总张数作废
+    questLive.planMisses = 0; questLive.planHeld = false; questLive.sample = 0; questLive.lastTask = null;
     questClearTiles();                                                 // 上一张回执铺过的占位格收掉（图集随 body 重画，这里只管 DOM 干净）
     questLive.gallery = null; questLive.single = null; questLive.singleFile = '';
     questLive.files = new Set();
@@ -1421,16 +1543,23 @@
   }
 
   /** 末位刷新：列表里有"进行中"的条目就顺带更新一下状态（不重复标已读）。 */
-  async function refreshQuestListQuietly() {
+  /**
+   * 末位刷新：列表里有"进行中"的条目就顺带更新一下状态（不重复标已读）。
+   * `force` 给「发现新回执」用：那一刻列表里可能一条"进行中"都没有
+   * （新回执刚下达、还没跑起来），但**也必须**把左栏列表刷出来，否则用户要等 30 秒才看到。
+   */
+  async function refreshQuestListQuietly(force) {
     if (!Array.isArray(state.questList)) return;
     if (!(PAGE === 'quest' && document.visibilityState !== 'hidden')) return;
-    if (!state.questList.some((item) => item && (item.busy || (item.done === false && !item.expired)))) return;
+    if (!force && !state.questList.some((item) => item && (item.busy || (item.done === false && !item.expired)))) return;
     try { await loadQuestList(); } catch { /* 旧后端/断网：下一次动作再刷新 */ }
   }
 
   /**
    * 回执未读数的轻量轮询：每 30 秒问一次 /api/status（**不拉列表**），
    * 有新回执时页签徽标就涨。标签页切回来立刻问一次；页面隐藏时完全不动。
+   * 跨页面保留：服务的是「在别的页面也能看到未读涨」。回执页上另有 5 秒一次的
+   * {@link pollQuestUnreadQuietly}（见 QUEST_UNREAD_INTERVAL），两者互不依赖。
    */
   async function pollQuestStatusQuietly() {
     if (!state.token || document.visibilityState === 'hidden') return;
@@ -1443,6 +1572,44 @@
       renderQuestTabBadge();
       if (PAGE === 'quest') await refreshQuestListQuietly();
     } catch { /* 旧后端/断网/未登录：静默，等下一次 */ }
+  }
+
+  /**
+   * 回执页专用：约 5 秒问一次 /api/status（很轻），只看 `quests.unread` / `quests.latest`。
+   * 一发现「有新回执」（latest 变大，或 unread 变大）就**立刻**刷新左栏列表并更新页签徽标。
+   *
+   * **不**把右栏详情切到最新那条：用户正在看哪条就继续看哪条（`renderQuest`/`loadQuest` 一概不碰）；
+   * 右栏跟的那条本身就是最新那条时，900ms 的回执轮询会继续把它更新。
+   * 页面隐藏时不发请求；离开回执页/页面隐藏时由 {@link stopQuestUnreadWatch} 清掉这个表。
+   */
+  async function pollQuestUnreadQuietly() {
+    if (PAGE !== 'quest' || !state.token || document.visibilityState === 'hidden') return;
+    try {
+      const status = await api('/api/status');
+      const quests = status.quests || {};
+      const beforeLatest = Math.max(0, Number(state.quests.latest) || 0);
+      const beforeUnread = questUnreadCount();
+      const latest = Number(quests.latest);
+      const unread = Number(quests.unread);
+      if (Number.isFinite(unread)) state.quests.unread = unread;
+      if (Number.isFinite(latest)) state.quests.latest = latest;
+      renderQuestTabBadge();
+      const grew = (Number.isFinite(latest) && latest > beforeLatest)
+        || (Number.isFinite(unread) && unread > beforeUnread);
+      if (grew) await refreshQuestListQuietly(true);      // 有新回执：左栏列表立刻跟上（右栏一个字都不动）
+    } catch { /* 旧后端/断网/未登录：静默，等下一次 */ }
+  }
+
+  /** 起 5 秒那套「有没有新回执」的表：只有回执页才起；已经起着就复用，绝不叠加。 */
+  function startQuestUnreadWatch() {
+    if (PAGE !== 'quest' || !state.token || document.visibilityState === 'hidden') return;
+    if (state.questUnreadTimer !== null) return;
+    state.questUnreadTimer = setInterval(() => { pollQuestUnreadQuietly(); }, QUEST_UNREAD_INTERVAL);
+  }
+
+  /** 停 5 秒那套表（离开回执页 / 页面隐藏时调；清干净不留悬挂的定时器）。 */
+  function stopQuestUnreadWatch() {
+    if (state.questUnreadTimer !== null) { clearInterval(state.questUnreadTimer); state.questUnreadTimer = null; }
   }
 
   /** 「回执」页签上的未读数徽标（所有栏目都会跟着 /api/status 更新）。 */
@@ -4503,9 +4670,12 @@
     bindQuestListActions();
     // 列表里的「进行中」条目不靠高频轮询：页面重新可见时刷一次就够了。
     document.addEventListener('visibilitychange', () => {
-      if (document.hidden) return;
+      // 页面隐藏：5 秒那套「有没有新回执」的表停掉（隐藏期间一个请求都不发），重新可见时再起。
+      if (document.hidden) { stopQuestUnreadWatch(); return; }
       refreshQuestListQuietly();
       pollQuestStatusQuietly();            // 切回来顺手问一次未读数（新回执 → 徽标涨）
+      pollQuestUnreadQuietly();            // 回执页：切回来立刻查一次有没有新回执（不等那 5 秒）
+      startQuestUnreadWatch();
     });
 
     on('terminal-form', 'submit', async (event) => { event.preventDefault(); await submitTerminal(); });
@@ -4576,11 +4746,16 @@
     syncConsoleFullscreen(PAGE);               // 控制台栏目默认全屏（跟着页面走）
     clearInterval(state.followTimer);
     clearInterval(state.questPollTimer);
+    stopQuestUnreadWatch();                    // 重新 boot（点刷新/重新登录）时把 5 秒那套也收干净，不叠加
     // 回执未读徽标：只问 /api/status（很轻），不用整页刷新；页面隐藏时不发请求。
+    // **跨页面保留**：它服务的是「在别的页面也能看到未读涨」，别改成只在回执页跑。
     state.questPollTimer = setInterval(() => { pollQuestStatusQuietly(); }, 30000);
     state.followTimer = setInterval(() => {
       if ($('logs-follow') && $('logs-follow').checked && PAGE === 'logs') loadLogs().catch(() => {});
     }, 4000);
+    // 回执页：约 5 秒查一次「有没有新回执」（latest/unread 一涨就立刻刷左栏列表，右栏不动）。
+    // 先起表再 loadPage：列表万一没读出来也不会把这条轮询一起丢掉（poll 里自己会判空跳过）。
+    startQuestUnreadWatch();
     await loadPage();
   }
 
