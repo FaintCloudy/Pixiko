@@ -1067,13 +1067,14 @@
       if (stopped || timer || !canRun()) return;
       timer = setTimeout(tick, soon ? 120 : interval);
     }
-    /* 唤醒：用户交互 → 给一段"当可见"的宽限（不怕 document.hidden 卡住）；其它事件按状态走。 */
+    /* 唤醒：只在**定时器已经没了**（之前被隐藏/暂停清掉）时才补一拍。
+       否则正常跑着的轮询会被手势插队多打一次请求 —— 那会让"下拉刷新恰好 1 次"变成 2 次。
+       用户交互额外给一段"当可见"的宽限（不怕 document.hidden 卡住）。 */
     function wake(why) {
       if (stopped) return;
       if (String(why).indexOf('user:') === 0) forcedUntil = Date.now() + 20000;
-      if (timer) { clearTimeout(timer); timer = null; }
+      if (timer) return;
       schedule(true);
-      if (document.hidden && timer) { clearTimeout(timer); timer = null; }   // 真在后台：别空转
     }
     function onVisibility() {
       if (!document.hidden) forcedUntil = 0;
