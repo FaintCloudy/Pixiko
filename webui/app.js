@@ -2365,13 +2365,56 @@
     return chatEntryAdd(entry);
   }
 
+  /**
+   * 右栏写字框（#chat-input）的高度：**默认 150px**，内容多了往上长，到 40vh 停下自己滚。
+   * 150px 这个默认值定在 CSS（app.css 的 `.agent-rail #chat-input`），这里只负责「长高」和
+   * 「发完清空后回到 150px」——绝不能把 style.height 写成 auto/0：那会让它当场塌回一行，
+   * 而这正是这次要修的毛病（发一条消息后输入框变矮）。
+   *
+   * **为什么不读 `input.scrollHeight`**（实测，本机 Chrome）：把 textarea 的 height 设成 auto 之后，
+   * 它的 scrollHeight 被**它自己 rows/默认高度**顶住了 —— 空内容（占位符两行）量到 160px、
+   * 内容再少也是 160px，与「文本真正需要多高」无关；而 height:150px 时同一条又量到 148px。
+   * 拿它当高度会得到一个比 150px 还高的空框，长文也会永远矮一截、白留一条滚动条。
+   * 所以内容高度用一个**同字体的隐藏镜像 div**量（宽度按 textarea 的内容盒算，长行照样折行），
+   * 再把上下内边距与边框加回去。镜像宽度取「有竖向滚动条」这个更窄的口径算一次：
+   * 若按窄口径都放得下，就不用滚动条，实际只会更宽、更放得下；若放不下，高度已经到顶、滚动条本来就有。
+   * 长高上限与 CSS 的 max-height 同源（40vh），到顶就交给 CSS 的 overflow-y:auto 滚。
+   */
+  const CHAT_INPUT_MIN = 150;
+  /** 量文本框内容高度的隐藏镜像（同一份字体，宽度 = 去掉内边距与边框后的内容盒宽）。 */
+  function chatInputMirror(input, width) {
+    const probe = el('div');
+    probe.style.cssText = 'position:absolute;left:-9999px;top:0;visibility:hidden;pointer-events:none;'
+      + 'margin:0;padding:0;border:0;white-space:pre-wrap;overflow-wrap:break-word;word-break:break-word;'
+      + 'width:' + Math.max(20, width) + 'px;font:' + getComputedStyle(input).font;
+    probe.textContent = input.value || '';
+    document.body.appendChild(probe);
+    const height = probe.getBoundingClientRect().height;
+    probe.remove();
+    return height;
+  }
+
+  function growChatInput() {
+    const input = $('chat-input');
+    if (!input) return;
+    const style = getComputedStyle(input);
+    const padT = parseFloat(style.paddingTop) || 0, padB = parseFloat(style.paddingBottom) || 0;
+    const bordT = parseFloat(style.borderTopWidth) || 0, bordB = parseFloat(style.borderBottomWidth) || 0;
+    const chrome = padT + padB + bordT + bordB;
+    // 镜像宽度：[内容盒宽] − [竖向滚动条宽]（口径更窄的那一种，见上面的注释）
+    const scrollbar = Math.max(0, input.offsetWidth - input.clientWidth - chrome);
+    const need = chatInputMirror(input, input.clientWidth - scrollbar) + chrome;
+    const cap = Math.max(CHAT_INPUT_MIN, Math.round(window.innerHeight * 0.4));   // 与 CSS max-height:40vh 同源
+    input.style.height = Math.max(CHAT_INPUT_MIN, Math.min(need, cap)) + 'px';
+  }
+
   async function sendChat(event) {
     if (event) event.preventDefault();
     const input = $('chat-input');
     const message = input.value.trim();
     if (!message) return;
     input.value = '';
-    input.style.height = 'auto';
+    growChatInput();                       // 清空后回到 150px 的默认高度（不是 1 行）
     appendMessage('user', message);
     const pending = el('div', 'msg bot');
     pending.appendChild(el('span', 'spin'));
@@ -2980,7 +3023,8 @@
     if (!data) return;
     ensureCoverPicker();          // 保存样式的封面选择器（动态建，index.html 不动）
     lastStyles = data;
-    $('style-loaded').textContent = '载入即替换，之后 prompt 由你自己改';
+    // 面板最上面那张标题卡片整块删掉了（连它那个写「载入即替换…」的小字元素一起）：
+    // 那句说明只解释旧说法，现在样式面板 = 摘要行 + 保存卡片 + 列表。摘要行移到面板最上面。
     $('style-pageselected').textContent = '样式库 ' + (data.library ?? (data.styles || []).length) + ' 个（只属于机器人，与 WebUI 的样式互不影响）';
     // 底模分类：列表按分类分组，这里只在上面汇总一行。
     const groups = (data.baseModelGroups || []).map((group) => group.baseModel + ' ' + group.count);
@@ -3290,7 +3334,8 @@
     li.appendChild(previewThumb(item.preview ? stylePreviewUrl(item.name) : '', item.name));
     const name = el('span', 'name');
     name.appendChild(el('span', 'tag on', '样式'));
-    // 名字只读：行内不再改名（要改名去上面的「批量操作」卡片），换分类靠把整行拖到别的组头上。
+    // 名字只读：行内不改名（批量那栏已删，面板上**没有**改名入口）——改名走 QQ 侧的
+    // `.style rename <旧> <新>`；换分类靠把整行拖到别的组头上。
     const label = el('span', 'style-name', ' ' + item.name);
     name.appendChild(label);
     name.appendChild(el('div', 'sub', '载入时替换你的个人提示词，之后 prompt 就是你自己的文本'));
@@ -3322,7 +3367,8 @@
       const noLora = $('style-load-nolora') && $('style-load-nolora').checked;
       editStyles('load', current, { noLora: !!noLora });
     }));
-    // 「改名」「改分类」两个按钮已删：改名走上面的「批量操作」，换分类靠把整行拖到别的分类组头上。
+    // 「改名」「改分类」两个按钮在行内没有，批量那栏也已删：改名走 QQ 侧的
+    // `.style rename <旧> <新>`，换分类靠把整行拖到别的分类组头上，删样式用这一行的「删除」。
     acts.appendChild(actionButton('查看原文', () => {
       const current = li.dataset.name || item.name;
       const data = styleItems.get(current) || item;
@@ -4879,6 +4925,9 @@
     on('refresh', 'click', () => boot().catch((error) => banner('刷新失败：' + error.message)));
     on('chat-form', 'submit', sendChat);
     on('chat-input', 'keydown', (event) => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); sendChat(event); } });
+    // 内容变多就长高（Shift+回车换行、粘贴整段要求都算），到 40vh 停下自己在框内滚。
+    on('chat-input', 'input', () => growChatInput());
+    window.addEventListener('resize', () => growChatInput());
     on('chat-reset', 'click', async () => {
       // 顺序很重要：**先** reset（服务端那份正文存档一起清掉），**再**丢本地这份；
       // chatSnapshotClear() 会把待推的存档一起作废，清空后的空内容绝不回推（服务端不会「复活」）。
@@ -4962,22 +5011,6 @@
           { title: '导入 WebUI 样式', confirmText: '导入' })) {
         runCommands(['.style import webui']).then(loadStyles);
       }
-    });
-    on('style-batch-rename', 'click', () => {
-      const range = $('style-range').value.trim(), name = $('style-range-name').value.trim();
-      if (range && name) editStyles('rename', range, { newName: name });
-    });
-    on('style-batch-category', 'click', () => {
-      const range = $('style-range').value.trim(), category = $('style-range-category').value.trim();
-      if (!range) { toast('请先填要改分类的编号区间，例如 #12-#16。'); return; }
-      // 分类留空＝清空手动分类、回到默认规则（与 `.style category <目标> -` 同一个意思）。
-      editStyles('category', range, { category });
-    });
-    on('style-batch-delete', 'click', async () => {
-      const range = $('style-range').value.trim();
-      if (!range) return;
-      if (!await askConfirm('删除 ' + range + '？', { title: '批量删除样式', confirmText: '删除', danger: true })) return;
-      editStyles('delete', range);
     });
     on('style-filter', 'input', () => { if (lastStyles) renderStyles(lastStyles); });
     on('style-category-filter', 'change', () => { if (lastStyles) renderStyles(lastStyles); });

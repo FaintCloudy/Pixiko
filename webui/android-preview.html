@@ -29,6 +29,14 @@
   · 自己的设置写在 pixiko-preview-settings / pixiko-preview-view 两个键下；
   · 「清除登录状态」会真的删掉令牌（＝退出控制台），菜单里写明了。
 
+  ── 里面装的是哪个 UI ──────────────────────────────────────────────────────
+  默认装**手机端 UI**（{@code /m}，另一套从零写的 App 风格界面，文件在 webui/m/），
+  ⋮ →「切换到完整控制台（/）」可以切回原来的桌面控制台，再点一次切回来。当前选择存在
+  pixiko-preview-view 的 path 字段里（默认 "/m"）。
+  设置屏 / 错误页里的「地址」始终是**服务器根地址**（如 192.168.1.5:8787），
+  路径后缀（/m 或 /）由本页内部拼上；切换服务器时保持当前后缀不变。
+  /m 与 / 同源，用的是同一个 kotori-webui-token，所以令牌注入与长按脚本对两者都成立。
+
   ── 令牌自动注入的状态字段（都挂在 window.__preview.state 上，探针可直接断言）────
   这里**没有次数上限**，只有「环路守卫」：
   · injectWrites / injectSuspicious —— **连续可疑次数**（0..injectGuardLimit）。
@@ -244,12 +252,12 @@ button{cursor:pointer}
 
 <!-- ───────────────────────── 设备工具条 ───────────────────────── -->
 <div id="controls">
-  <label>视口
+  <label title="默认「手机 390×844」：iframe 就是 390×844，机身在窗口里居中显示（不会全屏）；只有「自适应」那一档才会铺满窗口。">视口
     <select id="preset">
       <option value="phone" selected>手机 390×844</option>
       <option value="phablet">大屏手机 430×932</option>
       <option value="tablet">平板 768×1024</option>
-      <option value="fluid">自适应（占满容器）</option>
+      <option value="fluid">自适应（铺满窗口，仅用于宽屏试排）</option>
     </select>
   </label>
   <label>缩放
@@ -267,7 +275,7 @@ button{cursor:pointer}
   <div id="stage-inner">
     <div id="device">
       <div id="device-inner">
-        <iframe id="view" src="/" title="Pixiko 网页控制台"></iframe>
+        <iframe id="view" src="/m" title="Pixiko 手机界面"></iframe>
 
         <!-- 原生错误页 -->
         <div id="errorpage" hidden>
@@ -292,6 +300,7 @@ button{cursor:pointer}
 
           <div class="panel">
             <p class="lead">地址支持 192.168.1.5:8787、http://192.168.1.5:8787、http://host:端口/ 等写法，会自动补 http:// 和默认端口 8787。</p>
+            <p class="lead" id="settings-path-note"></p>
             <label class="field"><span>名称（可留空，默认显示主机名）</span>
               <input id="set-name" type="text" autocomplete="off" placeholder="例如：家里的机器人"></label>
             <label class="field"><span>地址，例如 192.168.1.5:8787</span>
@@ -335,7 +344,8 @@ button{cursor:pointer}
   </div>
 </div>
 
-<p id="hint">这是 <b>Android 外壳（cn.szu.bot.app）的网页预览</b>：中间是同源 iframe 里的真控制台。
+<p id="hint">这是 <b>Android 外壳（cn.szu.bot.app）的网页预览</b>：中间是同源 iframe。默认装的是<b>手机界面 <code>/m</code></b>，
+点 ⋮ →「<b>切换到完整控制台（/）</b>」可以切回桌面控制台，再点一次切回手机界面。
 <b>长按 / 右键图片</b>会弹出 app 的原生菜单（保存到相册 / 分享…），点右上角 <b>⋮</b> 是 app 的菜单。
 真机少的只有后台通知与相册写入。</p>
 
@@ -515,7 +525,7 @@ button{cursor:pointer}
     sameOrigin: true,
     wake: false,
     wakeLock: null,
-    view: { preset: 'phone', scale: 1, rotate: false, fit: 1, effectiveScale: 1, w: 390, h: 844 },
+    view: { preset: 'phone', scale: 1, rotate: false, fit: 1, effectiveScale: 1, w: 390, h: 844, path: '/m' },
   };
 
   function loadSettings() {
@@ -535,13 +545,14 @@ button{cursor:pointer}
       if (['phone', 'phablet', 'tablet', 'fluid'].indexOf(savedView.preset) >= 0) state.view.preset = savedView.preset;
       if ([0.5, 0.75, 1].indexOf(Number(savedView.scale)) >= 0) state.view.scale = Number(savedView.scale);
       state.view.rotate = !!savedView.rotate;
+      if (savedView.path === '/' || savedView.path === '/m') state.view.path = savedView.path;
     }
   }
   function persistSettings() {
     writeJson(SETTINGS_KEY, { servers: state.servers, lastId: state.lastId });
   }
   function persistView() {
-    writeJson(VIEW_KEY, { preset: state.view.preset, scale: state.view.scale, rotate: state.view.rotate });
+    writeJson(VIEW_KEY, { preset: state.view.preset, scale: state.view.scale, rotate: state.view.rotate, path: uiPath() });
   }
   function current() {
     var found = null;
@@ -550,6 +561,18 @@ button{cursor:pointer}
   }
   function currentBase() { return current().base; }
   function currentToken() { return String(current().token || '').trim(); }
+
+  /* ── 装哪个 UI：手机界面 /m（默认）还是完整控制台 / ─────────────────────── */
+  var UI_NAMES = { '/m': '手机界面', '/': '完整控制台' };
+  function uiPath() { return state.view.path === '/' ? '/' : '/m'; }
+  function uiName() { return UI_NAMES[uiPath()]; }
+  function uiLabel() { return uiName() + '（' + uiPath() + '）'; }
+  /** iframe 的真正地址 = 服务器根地址 + 当前路径后缀。设置屏里的「地址」永远只填根地址。 */
+  function targetUrl() { return joinPath(currentBase(), uiPath()); }
+  function updateChrome() {
+    $('subtitle').textContent = 'Android 外壳 · 网页预览 · ' + uiLabel();
+    view.setAttribute('title', 'Pixiko ' + uiName());
+  }
 
   /* ══════════════════════════════════════════════════════════════════════
      4) 顶部进度条
@@ -868,6 +891,10 @@ button{cursor:pointer}
       var app = win.document.getElementById('app');
       if (login && !login.hidden) return true;
       if (app && app.hasAttribute('hidden')) return true;
+      // 手机端 UI（/m）没有独立锁屏：没令牌时它自己屏内显示「令牌不对」错误态 —— 按令牌为空判。
+      if (win.document.getElementById('m-app') && win.PixikoM && typeof win.PixikoM.token === 'function') {
+        return !win.PixikoM.token();
+      }
     } catch (error) { return false; }
     return false;
   }
@@ -1040,6 +1067,8 @@ button{cursor:pointer}
     $('set-address').value = server.base || '';
     $('set-token').value = server.token || '';
     setTokenMasked(true);   // 每次打开都恢复打码：截图/旁人看到的是 ••••
+    $('settings-path-note').textContent = '当前界面：' + uiLabel()
+      + ' —— 地址只填服务器根地址，路径后缀由预览页自动拼上（切服务器会保持当前后缀）。';
     renderServers();
     status('', '');
   }
@@ -1156,7 +1185,8 @@ button{cursor:pointer}
     state.suppressInject = false;
     state.reloadedForToken = false;
     resetInjectGuard('设置已应用');   // 用户显式动作：不受环路守卫限制
-    var target = joinPath(currentBase(), '/');
+    updateChrome();
+    var target = targetUrl();
     if (target !== state.loadedTarget) navigate(target);
     else syncIframe();
   }
@@ -1165,28 +1195,52 @@ button{cursor:pointer}
      10) app 菜单（⋮）—— 项与 res/menu/menu_main.xml 一致
      ══════════════════════════════════════════════════════════════════════ */
 
+  /* title / sub 可以是字符串，也可以是函数（每次渲染菜单时求值）——「切换界面」那项的文案随当前界面变。 */
   var MENU_ITEMS = [
     { id: 'mi-refresh', title: '刷新', run: function () { hideErrorPage(); resetInjectGuard('菜单刷新'); state.suppressInject = false; state.reloadedForToken = false; reloadView(); log('菜单：刷新'); } },
-    { id: 'mi-home', title: '回到首页', run: function () { log('菜单：回到首页'); hideErrorPage(); navigate(joinPath(currentBase(), '/')); } },
-    { id: 'mi-switch', title: '切换服务器', sub: '多台服务器之间切换', run: function () { switchServer(); } },
+    { id: 'mi-home', title: '回到首页', run: function () { log('菜单：回到首页'); hideErrorPage(); navigate(targetUrl()); } },
+    {
+      id: 'mi-ui',
+      title: function () { return uiPath() === '/m' ? '切换到完整控制台（/）' : '切换到手机界面（/m）'; },
+      sub: function () { return '当前是 ' + uiLabel(); },
+      run: function () { toggleUi(); },
+    },
+    { id: 'mi-switch', sep: true, title: '切换服务器', sub: '多台服务器之间切换（保持当前界面）', run: function () { switchServer(); } },
     { id: 'mi-settings', title: '服务器设置', sub: '地址 / 令牌 / 多服务器', run: function () { openSettings(); } },
     { id: 'mi-browser', title: '在浏览器打开', sub: '新标签打开 iframe 当前地址', run: function () { openInBrowser(); } },
     { id: 'mi-keep', title: '屏幕常亮', sub: '网页预览用 Screen Wake Lock', check: true, run: function () { toggleWake(); } },
-    { id: 'mi-cache', title: '清空网页缓存', sub: '清 iframe 的 sessionStorage，不动 localStorage 令牌', run: function () { clearWebCache(); } },
+    { id: 'mi-cache', sep: true, title: '清空网页缓存', sub: '清 iframe 的 sessionStorage，不动 localStorage 令牌', run: function () { clearWebCache(); } },
     { id: 'mi-login', title: '清除登录状态', sub: '会退出控制台登录（删 iframe 同源令牌）', run: function () { clearLoginState(); } },
-    { id: 'mi-about', title: '关于', run: function () { $('about-overlay').hidden = false; } },
+    { id: 'mi-about', sep: true, title: '关于', run: function () { $('about-overlay').hidden = false; } },
   ];
+
+  /** 切换 iframe 装哪个 UI（/m ⇄ /），保持服务器与令牌不变。 */
+  function toggleUi() {
+    setUiPath(uiPath() === '/m' ? '/' : '/m', '菜单切换');
+  }
+  function setUiPath(path, reason) {
+    var next = path === '/' ? '/' : '/m';
+    if (next === uiPath() && state.loadedTarget) { log('界面已经是 ' + uiLabel() + '，不用再切'); return next; }
+    state.view.path = next;
+    persistView();
+    updateChrome();
+    log('界面切换 → ' + uiLabel() + '（' + (reason || '') + '），服务器仍是 ' + hostOf(currentBase()) + '，令牌不变');
+    applySettings();   // 内部会 resetInjectGuard + 重新导航（地址变了就走 navigate）
+    return next;
+  }
 
   function renderMenu() {
     var menu = $('app-menu');
     menu.innerHTML = '';
-    MENU_ITEMS.forEach(function (item, index) {
-      if (index === 6 || index === 8) { var hr = document.createElement('hr'); menu.appendChild(hr); }
+    MENU_ITEMS.forEach(function (item) {
+      if (item.sep) { var hr = document.createElement('hr'); menu.appendChild(hr); }
+      var title = typeof item.title === 'function' ? item.title() : item.title;
+      var sub = typeof item.sub === 'function' ? item.sub() : item.sub;
       var button = document.createElement('button');
       button.type = 'button';
       button.id = item.id;
       button.className = item.check ? ('check' + (state.wake ? '' : ' off')) : '';
-      button.innerHTML = '<span>' + esc(item.title) + '</span>' + (item.sub ? '<span class="sub">' + esc(item.sub) + '</span>' : '');
+      button.innerHTML = '<span>' + esc(title) + '</span>' + (sub ? '<span class="sub">' + esc(sub) + '</span>' : '');
       button.addEventListener('click', function () { closeMenu(); item.run(); });
       menu.appendChild(button);
     });
@@ -1231,7 +1285,7 @@ button{cursor:pointer}
   }
 
   function openInBrowser() {
-    var target = joinPath(currentBase(), '/');
+    var target = targetUrl();
     log('菜单：在浏览器打开 ' + target);
     window.open(target, '_blank', 'noopener');
   }
@@ -1322,7 +1376,7 @@ button{cursor:pointer}
     state.suppressInject = false;
     state.reloadedForToken = false;
     resetInjectGuard('错误页重试');
-    navigate(joinPath(currentBase(), '/'));
+    navigate(targetUrl());
   });
   $('err-settings').addEventListener('click', function () { openSettings(); });
   $('err-browser').addEventListener('click', function () { openInBrowser(); });
@@ -1335,7 +1389,10 @@ button{cursor:pointer}
     state.view.preset = $('preset').value;
     persistView();
     applyViewport();
-    log('视口：' + $('preset').selectedOptions[0].textContent + '（iframe 内宽高 ' + state.view.w + '×' + state.view.h + '）');
+    log('视口：' + $('preset').selectedOptions[0].textContent + '（iframe 内宽高 ' + state.view.w + '×' + state.view.h + '）'
+      + (state.view.preset === 'fluid'
+        ? ' —— 注意：这一档是铺满窗口的试排模式，**不是**安卓机身尺寸；要看真机比例请选「手机 390×844」'
+        : '（安卓机身尺寸，机身居中显示，不会铺满窗口）'));
   });
   $('scale').addEventListener('change', function () {
     state.view.scale = Number($('scale').value);
@@ -1359,10 +1416,12 @@ button{cursor:pointer}
   renderMenu();
   closeMenu();
 
-  log('Android 外壳网页预览已启动：版本 ' + APP_VERSION + '，当前服务器 ' + hostOf(currentBase()));
+  updateChrome();
+  log('Android 外壳网页预览已启动：版本 ' + APP_VERSION + '，当前服务器 ' + hostOf(currentBase())
+    + '，界面 ' + uiLabel() + '（⋮ →「切换到' + (uiPath() === '/m' ? '完整控制台（/）' : '手机界面（/m）') + '」可切换）');
   if (sameOriginAs(currentBase())) log('同源：令牌注入与长按菜单可用');
   else log('跨源无法注入，令牌与长按菜单仅同源可用');
-  navigate(joinPath(currentBase(), '/'));
+  navigate(targetUrl());
 
   /* 供人（和自测探针）查的内部句柄。 */
   window.__preview = {
@@ -1382,6 +1441,11 @@ button{cursor:pointer}
     hideErrorPage: hideErrorPage,
     errorHints: errorHints,
     setTokenMasked: setTokenMasked,
+    uiPath: uiPath,
+    uiLabel: uiLabel,
+    targetUrl: targetUrl,
+    setUiPath: setUiPath,
+    toggleUi: toggleUi,
     syncIframe: function (reason) {
       resetInjectGuard(reason || '手动 syncIframe()');
       state.suppressInject = false;

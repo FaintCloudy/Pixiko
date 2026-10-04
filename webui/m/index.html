@@ -1,0 +1,84 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+<meta name="theme-color" content="#0b1220">
+<meta name="color-scheme" content="dark">
+<meta name="format-detection" content="telephone=no">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<title>Pixiko</title>
+<link rel="stylesheet" href="/m/app.css">
+</head>
+<body>
+<!--
+  #m-viewport 只在"宽视口"（电脑浏览器）下起作用：它把整个 app 装进一个
+  390×844 的手机模拟框里居中显示（见 app.css 第 13 段）。窄视口（真机 / 平板竖屏）
+  下这个容器不参与布局，app 照旧铺满整屏。
+-->
+<div id="m-viewport" class="viewport">
+  <div id="m-stage" class="stage">
+    <div id="m-device" class="device" data-device="1">
+      <div id="m-app" class="app">
+
+        <header id="m-bar" class="bar">
+          <button id="m-bar-back" class="bar-btn bar-back" type="button" aria-label="返回" hidden>
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M15 5l-7 7 7 7"/></svg>
+          </button>
+          <h1 id="m-bar-title" class="bar-title">对话</h1>
+          <div class="bar-actions">
+            <button id="m-bar-refresh" class="bar-btn" type="button" aria-label="刷新">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 12a8 8 0 1 1-2.3-5.6M20 4v4h-4"/></svg>
+            </button>
+            <button id="m-bar-menu" class="bar-btn" type="button" aria-label="更多操作">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="5" r="1.7"/><circle cx="12" cy="12" r="1.7"/><circle cx="12" cy="19" r="1.7"/></svg>
+            </button>
+          </div>
+        </header>
+
+        <main id="m-main" class="main" role="main"></main>
+
+        <nav id="m-tabs" class="tabs" role="tablist" aria-label="主导航">
+          <a class="tab" href="#/chat" data-nav="chat" role="tab">
+            <svg class="tab-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M21 12a8 8 0 0 1-8 8H8l-5 3 1.6-4.4A8 8 0 1 1 21 12z"/></svg>
+            <span class="tab-text">对话</span>
+          </a>
+          <a class="tab" href="#/gen" data-nav="gen" role="tab">
+            <svg class="tab-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 5h16v12H4zM9 21h6M12 17v4"/><path d="M8 11l2.5 2.5L16 8"/></svg>
+            <span class="tab-text">出图</span>
+          </a>
+          <a class="tab" href="#/quest" data-nav="quest" role="tab">
+            <svg class="tab-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M6 3h9l4 4v14H6z"/><path d="M15 3v4h4M9 12h6M9 16h6"/></svg>
+            <span class="tab-text">回执</span>
+            <span class="tab-badge" data-badge="quest" hidden></span>
+          </a>
+          <a class="tab" href="#/styles" data-nav="styles" role="tab">
+            <svg class="tab-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3l2.4 5.6L20 11l-5.6 2.4L12 19l-2.4-5.6L4 11l5.6-2.4z"/></svg>
+            <span class="tab-text">样式</span>
+          </a>
+          <a class="tab" href="#/more" data-nav="more" role="tab">
+            <svg class="tab-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="5" cy="12" r="1.8"/><circle cx="12" cy="12" r="1.8"/><circle cx="19" cy="12" r="1.8"/></svg>
+            <span class="tab-text">更多</span>
+          </a>
+        </nav>
+
+        <div id="m-overlay" class="overlay-root" aria-live="polite"></div>
+      </div>
+    </div>
+  </div>
+  <p id="m-frame-note" class="frame-note" hidden>这是手机界面预览（390 × 844）· 点一下就是触摸点击 · 缩放 <span id="m-frame-scale">100%</span></p>
+</div>
+
+<script src="/m/app.js" defer></script>
+<script src="/m/screen-quest.js" defer></script>
+<script src="/m/screen-styles.js" defer></script>
+<script src="/m/screen-prompt.js" defer></script>
+<script src="/m/screen-loras.js" defer></script>
+<script src="/m/screen-more.js" defer></script>
+<script src="/m/screen-functions.js" defer></script>
+<script src="/m/screen-system.js" defer></script>
+<script src="/m/screen-help.js" defer></script>
+</body>
+</html>

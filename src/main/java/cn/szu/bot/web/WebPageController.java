@@ -164,6 +164,46 @@ public class WebPageController {
         }
     }
 
+    /**
+     * 手机端 App 界面（**按 app 习惯重写的一套移动 UI**，与桌面控制台各写各的，复用同一套 {@code /api}
+     * 接口）。路由 {@code /m}，静态资源在 {@code webui/m/} 下（{@code /m/app.css}、{@code /m/app.js}、
+     * {@code /m/screen-*.js}…）。Android 外壳默认就装它（{@code http://<地址>:<端口>/m}）。
+     */
+    @RequestMapping(value = {"/m", "/m/"}, method = RequestMethod.GET)
+    public ResponseEntity<byte[]> mobileApp() {
+        return mobileFile("index.html", true);
+    }
+
+    /** 手机端界面的静态资源：{@code /m/**}。目录穿越一律 404。 */
+    @RequestMapping(value = "/m/**", method = RequestMethod.GET)
+    public ResponseEntity<byte[]> mobileAsset(HttpServletRequest request) {
+        String path = request.getRequestURI();
+        String relative = path.startsWith("/m/") ? path.substring("/m/".length()) : "";
+        return mobileFile(relative, false);
+    }
+
+    /** 手机端界面的一个文件（{@code relative} 相对 {@code webui/m/}）；找不到时给一句人话说明。 */
+    private ResponseEntity<byte[]> mobileFile(String relative, boolean html) {
+        Path base = webRoot.resolve("m").normalize();
+        Path target = base.resolve(relative == null ? "" : relative).normalize();
+        if (relative == null || relative.isBlank() || relative.contains("..") || !target.startsWith(base)
+                || !Files.isRegularFile(target)) {
+            return WebJson.bytes(HttpStatus.NOT_FOUND,
+                    ("没找到手机端界面文件：webui/m/" + (relative == null ? "" : relative)
+                            + "（这是给 Android App 用的移动 UI，随 webui/m/ 目录一起分发）").getBytes(StandardCharsets.UTF_8),
+                    "text/plain; charset=utf-8", "no-store");
+        }
+        try {
+            String name = target.getFileName().toString().toLowerCase(Locale.ROOT);
+            String type = name.endsWith(".html") ? "text/html; charset=utf-8" : WebJson.contentTypeOf(name);
+            return WebJson.bytes(HttpStatus.OK, Files.readAllBytes(target), type, "no-store");
+        } catch (IOException error) {
+            Log.warn("手机端界面文件读取失败（" + relative + "）：" + Bot.error(error));
+            return WebJson.bytes(HttpStatus.INTERNAL_SERVER_ERROR, ("读取失败：" + Bot.error(error)).getBytes(StandardCharsets.UTF_8),
+                    "text/plain; charset=utf-8", "no-store");
+        }
+    }
+
     /** 静态资源：app.js / app.css / 图标。目录穿越一律 404。 */
     @RequestMapping(value = {"/app.js", "/app.css", "/favicon.ico", "/favicon-32.png",
             "/apple-touch-icon.png", "/icon-192.png", "/icon-512.png"},

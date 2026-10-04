@@ -10,7 +10,7 @@
 <link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <title>Pixiko · 控制台</title>
-<link rel="stylesheet" href="/app.css?v=1.3.1">
+<link rel="stylesheet" href="/app.css?v=1.5.0">
 </head>
 <body>
 <div class="aurora" aria-hidden="true"></div>
@@ -189,15 +189,9 @@
   <!--#panel:styles-->
   <!-- ============================ 样式 ============================ -->
   <section class="panel" id="panel-styles">
-    <div class="card">
-      <div class="card-head"><b>样式 = 固定模板</b><span class="muted" id="style-loaded"></span></div>
-      <div class="muted" id="style-pageselected"></div>
-      <div class="row wrap">
-        <input id="style-prompt-name" placeholder="样式名称或 #编号">
-        <button class="ghost" type="button" id="style-prompt-btn">查看样式原文</button>
-      </div>
-      <div class="muted">不记录「上一次载入哪个样式」：载入即把样式文本写进你的个人提示词，之后 prompt 就是你自己的内容，不会被样式自动覆盖。</div>
-    </div>
+    <!-- 样式库摘要（app.js renderStyles 往 #style-pageselected 里写「样式库 N 个 / 底模 / 分类」）：
+         它原来挂在面板最上面那张标题卡片头下面，那张卡片整块删掉了，摘要这一行独立留在面板最上面。 -->
+    <div class="muted" id="style-pageselected"></div>
     <div class="card">
       <div class="card-head"><b>保存当前提示词为样式</b><span class="muted">只属于机器人，保存在 data/local-styles.json</span></div>
       <div class="row wrap">
@@ -208,18 +202,12 @@
         <button class="ghost" type="button" id="style-import">导入 WebUI 预设样式</button>
         <label class="check"><input type="checkbox" id="style-load-nolora"> 载入时不加载 LoRA</label>
       </div>
-      <div class="muted">样式完全独立在机器人这边：载入时替换你的个人提示词，不需要 WebUI 在线，也不会改动 WebUI。「导入 WebUI 预设样式」是一次性搬家，之后机器人不再读 WebUI 的样式列表。</div>
-    </div>
-    <div class="card">
-      <div class="card-head"><b>批量操作</b><span class="muted">支持 #12-#16 这类区间；样式只属于机器人</span></div>
+      <!-- 「查看某条样式原文」的入口：原来是面板最上面那张标题卡片里的第二行，跟着一起搬到这张卡片里。 -->
       <div class="row wrap">
-        <input id="style-range" placeholder="#12-#16 或 #12,#15">
-        <input id="style-range-name" placeholder="改名时的新名称/前缀">
-        <input id="style-range-category" placeholder="改分类时的分类名（留空＝自动）">
-        <button type="button" id="style-batch-rename">批量改名</button>
-        <button type="button" id="style-batch-category">批量改分类</button>
-        <button class="danger" type="button" id="style-batch-delete">批量删除</button>
+        <input id="style-prompt-name" placeholder="样式名称或 #编号">
+        <button class="ghost" type="button" id="style-prompt-btn">查看样式原文</button>
       </div>
+      <div class="muted">样式完全独立在机器人这边：载入时替换你的个人提示词，不需要 WebUI 在线，也不会改动 WebUI。「导入 WebUI 预设样式」是一次性搬家，之后机器人不再读 WebUI 的样式列表。</div>
     </div>
     <div class="row wrap">
       <input id="style-filter" placeholder="筛选样式（名称 / 分类 / 底模）">
@@ -555,11 +543,11 @@
   <aside class="agent-rail" id="agent-rail" aria-label="对话">
     <div class="agent-rail-head">
       <b>对话</b>
-      <span class="muted">在哪个栏目都能说话；出图任务在左边「出图」里看</span>
     </div>
     <div class="messages" id="chat-log"></div>
     <form class="composer" id="chat-form">
-      <textarea id="chat-input" rows="1" placeholder="和机器人说话，或直接写要求（例如：把地点换成草地，服饰换成军装，然后生成）"></textarea>
+      <!-- 默认高度 150px 由 app.css 的 `.agent-rail #chat-input` 定（rows 只是脚本没跑时的兜底） -->
+      <textarea id="chat-input" rows="6" placeholder="和机器人说话，或直接写要求（例如：把地点换成草地，服饰换成军装，然后生成）"></textarea>
       <button type="submit" id="chat-send">发送</button>
     </form>
     <div class="row wrap">
@@ -620,6 +608,6 @@
 <div id="toast" class="toast" hidden></div>
 <!-- 任务信息云：从下方弹出，带跳去 /quest/#N 的链接 -->
 <div id="quest-clouds" class="quest-clouds" aria-live="polite"></div>
-<script src="/app.js?v=1.3.1"></script>
+<script src="/app.js?v=1.5.0"></script>
 </body>
 </html>

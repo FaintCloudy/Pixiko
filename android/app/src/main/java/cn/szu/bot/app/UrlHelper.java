@@ -22,6 +22,17 @@ public final class UrlHelper {
     /** 与 config.json → webui.port 的默认值保持一致。 */
     public static final int DEFAULT_PORT = 8787;
 
+    /**
+     * 手机端界面（{@code webui/m/}，由机器人伺服在 {@code /m}，{@code /m/} 同）。
+     * 这是 Android 外壳<b>默认</b>打开的入口，见 {@code MainActivity.uiPath()}。
+     */
+    public static final String PATH_MOBILE = "/m";
+
+    /**
+     * 完整网页控制台（{@code webui/}，伺服在 {@code /}）。保留入口，用户可随时从菜单切回。
+     */
+    public static final String PATH_CONSOLE = "/";
+
     private UrlHelper() { }
 
     /**

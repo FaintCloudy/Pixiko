@@ -17,6 +17,15 @@
         android:title="@string/menu_home"
         app:showAsAction="never" />
 
+    <!--
+      「切换界面」：手机界面（/m）↔ 完整控制台（/）。
+      文案刻意不在这里写死：当前在哪个界面，菜单就该显示「切换到另一个」，
+      由 MainActivity.onPrepareOptionsMenu 按当前选择设置标题。
+    -->
+    <item
+        android:id="@+id/action_toggle_ui"
+        app:showAsAction="never" />
+
     <item
         android:id="@+id/action_switch"
         android:title="@string/menu_switch_server"

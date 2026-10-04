@@ -12,7 +12,8 @@
 
 | 栏目 | 路由 | 在 app 里怎么用 |
 | --- | --- | --- |
-| 出图（首页，右栏常驻对话） | `/`（`/chat` 同构） | 启动就加载它，就是「全部功能」的入口 |
+| 手机端界面（**默认入口**） | `/m`（`/m/` 同） | 启动就加载它：App 风格的手机页面，复用同一套 `/api/*` |
+| 出图（右栏常驻对话） | `/`（`/chat` 同构） | 在 `/m` 里点「更多 → 完整控制台（网页版）」切过去；在 `/` 里用菜单「切换到手机界面（/m）」切回。就是「全部功能」的入口 |
 | 生成 / 提示词 / 风格 / LoRA | `/gen` `/prompt` `/styles` `/loras` | 网页顶部导航点进去，WebView 内正常跳转 |
 | 功能 / 聊天设置 / 系统 / 首次配置 | `/functions` `/chatcfg` `/system` `/setup` | 同上 |
 | 日志 / 回执 / 帮助 | `/logs` `/quest` `/help` | 同上 |
@@ -23,7 +24,8 @@
 `src/main/java/cn/szu/bot/web/WebPageController.java` 的路由表与 `WebAuthFilter` 的三种令牌给法。
 
 **响应式是这次的底气**：`webui/app.css` 在 ≤1000px 把右栏变成单列堆叠，390×844 已经被真机浏览器验收过
-（无横向滚动）。所以「把网页装进 WebView」＝拿到全部功能，不需要为手机重做一套 UI。
+（无横向滚动）。所以「把网页装进 WebView」＝拿到全部功能。**v1.5.0 起默认入口改成另写的手机端界面
+`/m`**（见上表），完整控制台 `/` 照旧保留、两边互相独立。
 
 ## 2. 原生新增什么（网页做不到 / 手机上体验必要的）
 
@@ -37,6 +39,7 @@
 | 原生错误页 | `activity_main.xml` 的 `error_page` | WebView 自带错误页只有一行英文，给不出「你该去检查什么」 |
 | 屏幕常亮 | `MainActivity.applyKeepScreenOnState()` | 出图要等，屏幕灭掉很烦 |
 | 令牌自动注入 | `NativeHook.tokenScript()` | 免得在网页锁屏里再敲一次令牌 |
+| App 级入口（服务器设置 / 清空网页缓存 / 清除登录状态 / 在浏览器打开） | `PixikoBridge` 的 4 个桥方法 + `/m` 的「更多 → App」分组 | **`/m` 下 ActionBar 是隐藏的**（`applyActionBarVisibility()`），原生菜单点不到，入口改由网页提供；这 4 行只在方法存在时才建，纯浏览器打开 `/m` 时不建；「完整控制台（网页版）」一行常显 |
 | `<input type=file>` / 下载 / 新窗口 / 控制台日志 | `PixikoChromeClient` / `PixikoDownloadListener` | WebView 默认不处理，不接管就会「点了没反应」 |
 
 ## 3. 关键实现点（按文件/方法）
@@ -55,7 +58,8 @@ http 且没写端口时补 **8787**（与 `config.json → webui.port` 默认值
 * 脚本值一样就返回 `'same'`，不一样才写并返回 `'written'`，只有 `written` 才 `reload()`；
 * `tokenInjected` 是「本轮已处理」标志，**不是**「值已正确」——网页自己也可能改 localStorage
   （用户在网页锁屏里手敲令牌），那时值不一致但我们不再 reload，避免和网页互相刷成死循环；
-* 菜单里的「清除登录状态」会置 `suppressTokenInjection`，本轮不再注入，让网页老老实实回到锁屏。
+* 菜单里的「清除登录状态」会置 `suppressTokenInjection`，本轮不再注入，让网页老老实实回到锁屏
+  （`/m` 下这个入口在网页的「更多 → App」里，完整控制台下才在菜单里）。
 
 ### 3.3 图片长按/右键 —— `NativeHook.hookScript()` + `PixikoBridge`
 
@@ -151,7 +155,8 @@ http 且没写端口时补 **8787**（与 `config.json → webui.port` 默认值
 * 日志里**从不打印令牌**：需要时用 `Log.mask()` 只打首尾字符与长度。
 * 原生桥只在配置的服务器域名下挂载（见 3.3）。
 * `FileProvider` 只暴露 `cacheDir/share/`。
-* 网页令牌默认注进去是为了省事；想换账号/令牌，菜单「清除登录状态」即可回到网页锁屏。
+* 网页令牌默认注进去是为了省事；想换账号/令牌，用「清除登录状态」即可回到网页锁屏
+  （`/m` 走网页的「更多 → App」，完整控制台下走菜单）。
 
 ## 5. 工程结构
 
@@ -160,7 +165,7 @@ android/
 ├─ build.gradle / settings.gradle / gradle.properties / gradlew(.bat) / gradle/wrapper/
 ├─ build-apk.ps1                  ← 另一个代理写的构建脚本（本代理未改动）
 └─ app/
-   ├─ build.gradle                ← compileSdk 34 / minSdk 26 / applicationId cn.szu.bot.app / 1.4.0(140)
+   ├─ build.gradle                ← compileSdk 34 / minSdk 26 / applicationId cn.szu.bot.app / 1.5.0(150)
    ├─ proguard-rules.pro          ← 保留 @JavascriptInterface 方法名（万一以后开混淆）
    └─ src/main/
       ├─ AndroidManifest.xml
@@ -172,6 +177,8 @@ android/
 ## 6. 没做 / 做不到
 
 * 没有真机与模拟器：所有交互（长按菜单、MediaStore 落盘、扫描结果）只经过**编译期**验证，没有跑过 UI。
+  **v1.5.0 的手机端界面 `/m` 与「更多 → App」这套入口同样没有在真机 / 模拟器上跑过**
+  （用户决定不跑虚拟机）。
 * 没有自动化测试（无 instrumented test 依赖，避免多拉依赖）。
 * 合入方式未做：release 变体没配签名（要发到手机用 `assembleDebug` 的 debug 包即可）。
 * `webui/app.js` 里的图片查看器在 WebView 里是网页自己在跑，原生只加长按菜单；两者手势可能互相影响，

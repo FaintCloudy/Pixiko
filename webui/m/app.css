@@ -1,0 +1,729 @@
+/* ============================================================================
+ * Pixiko 手机端 App 界面 —— 全部样式
+ *
+ * 这份 CSS 只服务 webui/m/ 下的这套移动 UI（Android 外壳的 WebView 里跑的就是它），
+ * 与桌面控制台的 webui/app.css 完全各写各的，互不影响、互不引用。
+ *
+ * 结构（与 index.html 的 DOM 一一对应）：
+ *   .app                全屏三行网格：.bar / .main / .tabs
+ *   .bar                app bar（标题 + 刷新 + 溢出菜单）
+ *   .main               屏幕容器（只有它是滚动的；键盘弹出时靠 --kb 抬高底部）
+ *   .screen             一屏；mount(root) 拿到的就是它
+ *   .card/.list/.row    卡片与列表行（44px 触摸目标、14px 圆角、行距 8–10px）
+ *   .tabs               底部 5 个 tab（内联 SVG 图标 + 文字，选中态高亮）
+ *   .overlay-root       浮层：sheet / 对话框 / 查看器 / toast
+ *   .sk-*               骨架屏；.state-*  空态与错误态
+ *
+ * 断行约定：section 注释用 ── 分隔，方便按行号定位（报告里引用的就是这些段）。
+ * ========================================================================== */
+
+/* ── 1. 变量与重置 ─────────────────────────────────────────────────────── */
+:root {
+  --bg: #0b1220;
+  --card: #131c2e;
+  --card-2: #182338;
+  --line: #22304a;
+  --primary: #5aa2ff;
+  --primary-dim: #2f5f9e;
+  --text: #e8eefc;
+  --muted: #93a4c4;
+  --danger: #ff6b6b;
+  --ok: #4fd196;
+  --warn: #ffc266;
+  --radius: 14px;
+  --gap: 10px;
+  --bar-h: 52px;
+  --tabs-h: 56px;
+  --kb: 0px;
+  --sat: env(safe-area-inset-top, 0px);
+  --sab: env(safe-area-inset-bottom, 0px);
+  --sal: env(safe-area-inset-left, 0px);
+  --sar: env(safe-area-inset-right, 0px);
+}
+
+* { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+/* hidden 属性优先于类选择器（否则 .frame-note{display:block} 这类规则会把它顶开） */
+[hidden] { display: none !important; }
+
+html, body {
+  margin: 0;
+  padding: 0;
+  height: 100%;
+  height: 100dvh;               /* 移动端地址栏/软键盘下的真实高度；不认 dvh 就退回 100% */
+  background: var(--bg);
+  color: var(--text);
+  font: 15px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans SC", "Microsoft YaHei", Roboto, sans-serif;
+  overscroll-behavior-y: none;
+}
+
+/* 除输入框外一律不可选中（长按不再弹系统的选择菜单，长按留给图片桥）。 */
+body { user-select: none; -webkit-user-select: none; }
+input, textarea, [contenteditable="true"], .selectable, .selectable * {
+  user-select: text;
+  -webkit-user-select: text;
+}
+
+button { font: inherit; color: inherit; background: none; border: 0; padding: 0; cursor: pointer; }
+a { color: var(--primary); text-decoration: none; }
+svg { width: 24px; height: 24px; fill: none; stroke: currentColor; stroke-width: 1.9; stroke-linecap: round; stroke-linejoin: round; display: block; }
+::-webkit-scrollbar { width: 4px; height: 4px; }
+::-webkit-scrollbar-thumb { background: #26344f; border-radius: 4px; }
+
+/* ── 2. 外壳三行网格 ───────────────────────────────────────────────────── */
+/*
+ * 布局分两种视口（判据与 app.js 的 isWideViewport() 一致：`innerWidth > 560`）：
+ *   窄视口（真机 / 平板竖屏）：.viewport/.stage 不参与布局，.app 直接铺满整屏。
+ *   宽视口（电脑浏览器）：      .viewport/.stage 把 .device（390×844）居中成"手机模拟框"，
+ *                              .device 上的 transform 让它成为内部 position:fixed 元素的包含块，
+ *                              于是底部 tab / sheet / 查看器都相对**框**定位而不是相对窗口。
+ * 下面这段是"窄视口"的默认形态；宽视口的覆盖在文件末尾第 13 段。
+ */
+.viewport, .stage { display: contents; }
+.frame-note { display: none; }
+
+.app {
+  position: fixed;
+  top: 0; left: 0; right: 0;
+  /* 软键盘把视口压扁时，用 --kb 再收缩一层（见 app.js 的 installKeyboardHandling）；
+     --kb 永不为负、且有 40% 上限，min-height 再兜一层，保证内容不会被压没。 */
+  height: calc(100% - var(--kb));
+  height: calc(100dvh - var(--kb));
+  min-height: 320px;
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr) auto;
+  padding-left: var(--sal);
+  padding-right: var(--sar);
+}
+
+.bar {
+  grid-row: 1;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-height: var(--bar-h);
+  padding: calc(var(--sat) + 4px) 8px 4px 8px;
+  background: rgba(11, 18, 32, .94);
+  border-bottom: 1px solid var(--line);
+  backdrop-filter: blur(10px);
+}
+.bar-title {
+  flex: 1 1 auto;
+  margin: 0;
+  font-size: 17px;
+  font-weight: 650;
+  letter-spacing: .2px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.bar-actions { display: flex; gap: 2px; flex: 0 0 auto; }
+.bar-btn {
+  width: 44px;
+  height: 44px;
+  display: grid;
+  place-items: center;
+  border-radius: 12px;
+  color: var(--text);
+  transition: background .12s;
+}
+.bar-btn:active { background: #1d2a42; }
+.bar-back[hidden] { display: none; }
+
+/* ── 3. 主区与屏幕 ─────────────────────────────────────────────────────── */
+.main {
+  grid-row: 2;
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+  -webkit-overflow-scrolling: touch;
+  overscroll-behavior-y: contain;
+  position: relative;          /* 对话屏用 position:absolute; inset:0 铺满"可见的"主区（关键：包含块） */
+}
+/* 对话屏可见时，滚动交给 .chat-log：可滚动祖先越少越不会出现双滚动条/联动 */
+.main:has(.screen.chat.active) { overflow: hidden; }
+.screen { display: none; padding: var(--gap) 12px 18px; }
+.screen.active { display: block; }
+.screen.pad-x0 { padding-left: 0; padding-right: 0; }
+
+/* 顶部下拉刷新提示（用刷新按钮为主，下拉手势是补充） */
+.ptr {
+  height: 0;
+  overflow: hidden;
+  display: grid;
+  place-items: center;
+  color: var(--muted);
+  font-size: 12px;
+  transition: height .18s ease;
+}
+.ptr.on { height: 40px; }
+.ptr-track { display: flex; align-items: center; gap: 8px; }
+.spinner {
+  width: 16px; height: 16px; border-radius: 50%;
+  border: 2px solid #2b3a56; border-top-color: var(--primary);
+  animation: spin .8s linear infinite;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+
+/* ── 4. 通用块：卡片 / 列表 / 行 / 按钮 ───────────────────────────────── */
+.card {
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 12px;
+  margin-bottom: var(--gap);
+}
+.card.flush { padding: 0; overflow: hidden; }
+.card-title { font-size: 13px; color: var(--muted); margin: 0 0 8px; font-weight: 600; letter-spacing: .3px; }
+.card-head { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+.card-head .card-title { margin: 0; flex: 1 1 auto; }
+.hint { color: var(--muted); font-size: 12.5px; margin: 6px 0 0; }
+.muted { color: var(--muted); }
+.danger-text { color: var(--danger); }
+.ok-text { color: var(--ok); }
+.warn-text { color: var(--warn); }
+.mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12.5px; }
+.row-gap { display: flex; flex-direction: column; gap: 8px; }
+.inline { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.spread { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.grow { flex: 1 1 auto; min-width: 0; }
+.nowrap { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.center { text-align: center; }
+.hidden { display: none !important; }
+
+.list { display: flex; flex-direction: column; }
+.list.gap > * + * { margin-top: 8px; }
+.row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-height: 52px;
+  padding: 8px 12px;
+  background: var(--card);
+  border-bottom: 1px solid var(--line);
+  text-align: left;
+  width: 100%;
+  transition: background .12s;
+}
+.row:last-child { border-bottom: 0; }
+.row:active { background: var(--card-2); }
+.row-main { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.row-title { font-size: 15px; line-height: 1.35; overflow-wrap: anywhere; }
+.row-sub { font-size: 12.5px; color: var(--muted); overflow-wrap: anywhere; }
+.row-chevron { flex: 0 0 auto; color: #4d6187; }
+.row-chevron svg { width: 18px; height: 18px; }
+.row-tail { flex: 0 0 auto; color: var(--muted); font-size: 12.5px; }
+.row.pressed-flash { background: #24334f; }
+
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  min-height: 44px;
+  padding: 0 16px;
+  border-radius: 12px;
+  background: #1d2a42;
+  color: var(--text);
+  font-size: 15px;
+  font-weight: 600;
+  transition: transform .08s, background .12s, opacity .12s;
+}
+.btn:active { transform: scale(.975); background: #24334f; }
+.btn.primary { background: var(--primary); color: #05101f; }
+.btn.primary:active { background: #4b90ea; }
+.btn.danger { background: rgba(255, 107, 107, .16); color: var(--danger); }
+.btn.ghost { background: transparent; border: 1px solid var(--line); }
+.btn.block { width: 100%; }
+.btn.big { min-height: 52px; font-size: 16px; }
+.btn[disabled], .btn.is-disabled { opacity: .45; pointer-events: none; }
+.btn-icon { width: 44px; height: 44px; padding: 0; }
+.chip {
+  display: inline-flex; align-items: center; gap: 6px;
+  min-height: 44px; padding: 0 14px; border-radius: 999px;
+  background: #1b2740; border: 1px solid var(--line); color: var(--text); font-size: 13px;
+}
+.chip.on { background: rgba(90, 162, 255, .18); border-color: var(--primary-dim); color: #cfe2ff; }
+.chip:active { background: #24334f; }
+.badge {
+  display: inline-grid; place-items: center;
+  min-width: 20px; height: 20px; padding: 0 6px; border-radius: 999px;
+  background: var(--danger); color: #fff; font-size: 11.5px; font-weight: 700;
+}
+.badge.soft { background: #24334f; color: var(--muted); }
+
+/* ── 5. 表单控件（输入框一律 16px，防 iOS 自动缩放） ───────────────────── */
+.field { display: flex; flex-direction: column; gap: 6px; margin-bottom: var(--gap); }
+.field-label { font-size: 13px; color: var(--muted); font-weight: 600; }
+.input, textarea.input, select.input {
+  width: 100%;
+  min-height: 44px;
+  padding: 10px 12px;
+  font-size: 16px;
+  font-family: inherit;
+  color: var(--text);
+  background: #0e1727;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  outline: none;
+}
+.input:focus { border-color: var(--primary-dim); }
+textarea.input { resize: none; line-height: 1.45; }
+select.input { appearance: none; -webkit-appearance: none; padding-right: 34px;
+  background-image: linear-gradient(45deg, transparent 50%, var(--muted) 50%), linear-gradient(135deg, var(--muted) 50%, transparent 50%);
+  background-position: calc(100% - 18px) 20px, calc(100% - 13px) 20px;
+  background-size: 5px 5px, 5px 5px;
+  background-repeat: no-repeat;
+}
+input[type="range"] {
+  -webkit-appearance: none; appearance: none;
+  width: 100%; height: 44px; background: transparent; margin: 0;
+}
+input[type="range"]::-webkit-slider-runnable-track { height: 6px; border-radius: 6px; background: #24334f; }
+input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none; appearance: none;
+  width: 26px; height: 26px; margin-top: -10px; border-radius: 50%;
+  background: var(--primary); border: 3px solid #0b1220;
+}
+.stepper { display: flex; align-items: center; gap: 8px; }
+.stepper .input { text-align: center; min-width: 0; }
+.stepper-btn {
+  flex: 0 0 auto; width: 44px; height: 44px; border-radius: 12px;
+  background: #1d2a42; display: grid; place-items: center; font-size: 22px; font-weight: 600;
+}
+.stepper-btn:active { background: #24334f; }
+.switch {
+  position: relative; flex: 0 0 auto;
+  width: 48px; height: 44px;              /* 触摸目标 ≥44px；轨道靠 ::before 画 */
+  background: none; border: 0;
+}
+.switch::before {
+  content: ""; position: absolute; left: 0; right: 0; top: 50%;
+  height: 28px; margin-top: -14px; border-radius: 999px; background: #2b3a56; transition: background .15s;
+}
+.switch::after {
+  content: ""; position: absolute; top: 50%; left: 3px;
+  width: 22px; height: 22px; margin-top: -11px; border-radius: 50%; background: #8fa2c4;
+  transition: transform .15s, background .15s;
+}
+.switch.on::before { background: var(--primary-dim); }
+.switch.on::after { transform: translateX(20px); background: var(--primary); }
+.switch-row { display: flex; align-items: center; gap: 10px; min-height: 44px; }
+.switch-row .row-main { flex: 1 1 auto; }
+/* 输入条里的开关小一号，但同样保持 44px 的可点高度 */
+.composer-meta .switch { width: 44px; height: 40px; }
+.composer-meta .switch::before { height: 24px; margin-top: -12px; }
+.composer-meta .switch::after { width: 18px; height: 18px; margin-top: -9px; }
+.composer-meta .switch.on::after { transform: translateX(20px); }
+
+/* ── 6. 底部 tab ───────────────────────────────────────────────────────── */
+.tabs {
+  grid-row: 3;
+  display: grid;
+  grid-template-columns: repeat(5, 1fr);
+  align-items: stretch;
+  background: rgba(15, 23, 38, .97);
+  border-top: 1px solid var(--line);
+  padding-bottom: var(--sab);
+  backdrop-filter: blur(10px);
+  position: relative;
+  z-index: 2;
+}
+.tab {
+  position: relative;
+  min-height: var(--tabs-h);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 3px;
+  color: var(--muted);
+  font-size: 11px;
+  transition: color .12s, background .12s;
+}
+.tab:active { background: #16203a; }
+.tab.on { color: var(--primary); }
+.tab.on .tab-icon { transform: translateY(-1px); }
+.tab-icon { width: 23px; height: 23px; }
+.tab-text { line-height: 1; }
+.tab-badge {
+  position: absolute; top: 6px; left: 50%; margin-left: 4px;
+  min-width: 16px; height: 16px; padding: 0 4px; border-radius: 999px;
+  background: var(--danger); color: #fff; font-size: 10px; font-weight: 700;
+  display: grid; place-items: center;
+}
+.tab-badge[hidden] { display: none; }
+
+/* ── 7. 三态：骨架 / 空 / 错误 ─────────────────────────────────────────── */
+.state { padding: 40px 16px; text-align: center; color: var(--muted); }
+.state-icon { width: 40px; height: 40px; margin: 0 auto 10px; color: #3d4f70; }
+.state-title { font-size: 15px; color: var(--text); margin: 0 0 4px; }
+.state-text { font-size: 13px; margin: 0 0 14px; overflow-wrap: anywhere; }
+.state-error .state-icon { color: #7a3a44; }
+.state-error .state-title { color: var(--danger); }
+.sk { background: linear-gradient(90deg, #16203a 25%, #1d2a42 37%, #16203a 63%); background-size: 400% 100%; animation: sk 1.3s ease infinite; border-radius: 8px; }
+@keyframes sk { 0% { background-position: 100% 50%; } 100% { background-position: 0 50%; } }
+.sk-row { height: 52px; margin-bottom: 8px; border-radius: var(--radius); }
+.sk-bubble { height: 46px; width: 70%; margin-bottom: 10px; border-radius: var(--radius); }
+.sk-bubble.right { margin-left: 30%; }
+
+/* ── 8. 对话屏 ─────────────────────────────────────────────────────────── */
+/*
+ * 布局要点（用户要求："输入框不能随滚动条移动，一直跟随"）：
+ *   .screen.chat  绝对定位铺满 .main 的**可见**区域（不参与 .main 的内容高度），
+ *                 所以 .main 自己永远不滚动（scrollHeight == clientHeight）；
+ *   .chat-log     唯一的滚动容器（flex:1 1 auto; min-height:0; overflow-y:auto）；
+ *   .composer     flex:0 0 auto，钉在屏幕底部，列表怎么滚它都不动。
+ * 底部安全区靠 .tabs 的 padding-bottom: env(safe-area-inset-bottom) 承担，
+ * .main 上不再留任何为旧"整页滚动"准备的 padding-bottom。
+ */
+.screen.chat.active {
+  display: flex;
+  flex-direction: column;
+  position: absolute;
+  top: 0; left: 0; right: 0; bottom: 0;
+  padding: 0;
+  overflow: hidden;
+}
+.chat-log {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding: var(--gap) 12px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: var(--gap);
+  -webkit-overflow-scrolling: touch;
+  overscroll-behavior-y: contain;
+}
+.bubble {
+  max-width: 84%;
+  padding: 9px 12px;
+  border-radius: var(--radius);
+  background: var(--card);
+  border: 1px solid var(--line);
+  font-size: 15px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  user-select: text;
+  -webkit-user-select: text;
+}
+.bubble.user { align-self: flex-end; background: #1b3358; border-color: #29456f; }
+.bubble.bot { align-self: flex-start; }
+.bubble.sys {
+  align-self: center; max-width: 92%; text-align: center;
+  background: #101a2c; border-style: dashed; color: var(--muted); font-size: 12.5px;
+}
+.bubble.imgs { padding: 6px; }
+.bubble .bubble-imgs { display: grid; grid-template-columns: repeat(2, 1fr); gap: 6px; margin-top: 6px; }
+.bubble .bubble-imgs.one { grid-template-columns: 1fr; }
+.bubble .bubble-imgs img {
+  width: 100%; height: 120px; object-fit: cover; border-radius: 10px;
+  background: #0e1727; display: block;
+}
+.bubble .bubble-imgs.one img { height: auto; max-height: 46vh; object-fit: contain; }
+.bubble .bubble-text + .bubble-imgs { margin-top: 8px; }
+
+.composer {
+  flex: 0 0 auto;
+  border-top: 1px solid var(--line);
+  background: rgba(13, 21, 36, .97);
+  backdrop-filter: blur(10px);
+  padding: 8px 10px calc(8px + 4px);
+}
+.composer-row { display: flex; align-items: flex-end; gap: 8px; }
+.composer textarea {
+  flex: 1 1 auto;
+  min-height: 44px;
+  max-height: 40vh;
+  padding: 11px 12px;
+  font-size: 16px;
+  line-height: 1.4;
+  color: var(--text);
+  background: #0e1727;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  outline: none;
+  resize: none;
+  overflow-y: auto;
+}
+.composer textarea:focus { border-color: var(--primary-dim); }
+.composer .send {
+  flex: 0 0 auto;
+  width: 44px; height: 44px; border-radius: 12px;
+  background: var(--primary); color: #05101f; display: grid; place-items: center;
+}
+.composer .send:active { background: #4b90ea; }
+.composer .send[disabled] { opacity: .4; }
+.composer-meta {
+  display: flex; align-items: center; gap: 10px;
+  padding: 6px 2px 0; font-size: 12.5px; color: var(--muted);
+}
+/* 触摸目标的尺寸统一由第 5 段的 .switch/.composer-meta .switch 规则负责（44×40） */
+.composer-spacer { height: 0; }
+
+/* 生成中：气泡下方的“正在出图”提示 */
+.typing { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); font-size: 12.5px; }
+.typing i { width: 6px; height: 6px; border-radius: 50%; background: var(--muted); animation: blink 1.2s infinite; }
+.typing i:nth-child(2) { animation-delay: .2s; }
+.typing i:nth-child(3) { animation-delay: .4s; }
+@keyframes blink { 0%, 60%, 100% { opacity: .25; } 30% { opacity: 1; } }
+
+/* ── 9. 出图屏 ─────────────────────────────────────────────────────────── */
+.progress-card { display: flex; flex-direction: column; gap: 8px; }
+.progress-top { display: flex; align-items: baseline; gap: 8px; }
+.progress-pct { font-size: 26px; font-weight: 700; font-variant-numeric: tabular-nums; }
+.bar-track { height: 8px; border-radius: 8px; background: #1d2a42; overflow: hidden; }
+.bar-fill { height: 100%; width: 0; background: linear-gradient(90deg, var(--primary-dim), var(--primary)); transition: width .35s ease; }
+.bar-fill.indet { width: 40% !important; animation: indet 1.2s ease-in-out infinite; }
+@keyframes indet { 0% { margin-left: -40%; } 100% { margin-left: 100%; } }
+.queue-row { display: flex; align-items: center; gap: 8px; min-height: 44px; }
+.queue-row .stepper-btn { width: 44px; height: 44px; font-size: 16px; }
+
+.grid-imgs {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 6px;
+}
+.grid-imgs .cell {
+  position: relative;
+  aspect-ratio: 1 / 1;
+  border-radius: 10px;
+  overflow: hidden;
+  background: #0e1727;
+  border: 1px solid var(--line);
+  display: grid;
+  place-items: center;
+}
+.grid-imgs .cell img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.grid-imgs .cell.tap:active { transform: scale(.97); }
+.grid-imgs .cell .ring { width: 34px; height: 34px; }
+.grid-imgs .cell .ring circle { fill: none; stroke-width: 3; }
+.grid-imgs .cell .ring .bg { stroke: #22304a; }
+.grid-imgs .cell .ring .fg { stroke: var(--primary); stroke-linecap: round; transition: stroke-dashoffset .3s; }
+.grid-imgs .cell .pct {
+  position: absolute; font-size: 11px; font-weight: 700; font-variant-numeric: tabular-nums; color: #cfe2ff;
+}
+.grid-imgs .cell.pending { color: var(--muted); font-size: 11px; }
+.grid-imgs .cell.pending .dot { width: 8px; height: 8px; border-radius: 50%; background: #2b3a56; }
+.grid-imgs .cell.failed { border-color: #5a2b33; background: #1b1119; }
+.grid-imgs .cell.failed .x { color: var(--danger); font-size: 18px; font-weight: 700; }
+.grid-imgs .cell.done { border-color: #2b3a56; }
+.grid-imgs .cell.held::after {
+  content: "挂起"; position: absolute; left: 4px; bottom: 4px;
+  font-size: 10px; padding: 1px 5px; border-radius: 6px; background: rgba(0,0,0,.6); color: var(--warn);
+}
+.grid-imgs .cell .cap {
+  position: absolute; left: 0; right: 0; bottom: 0;
+  font-size: 10px; padding: 3px 5px; color: #dbe6fb;
+  background: linear-gradient(transparent, rgba(0, 0, 0, .72));
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.param-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.param-grid .field { margin-bottom: 0; }
+
+/* ── 10. 浮层：sheet / 对话框 / 查看器 / toast ─────────────────────────── */
+.overlay-root { position: relative; z-index: 40; }
+.scrim {
+  position: fixed; inset: 0; z-index: 30;
+  background: rgba(3, 7, 15, .62);
+  opacity: 0; transition: opacity .18s ease;
+}
+.scrim.in { opacity: 1; }
+
+.sheet {
+  position: fixed; left: 0; right: 0; bottom: 0; z-index: 31;
+  background: #16203a;
+  border-top-left-radius: 18px; border-top-right-radius: 18px;
+  border-top: 1px solid var(--line);
+  padding-bottom: var(--sab);
+  transform: translateY(102%);
+  transition: transform .22s cubic-bezier(.22, .8, .3, 1);
+  max-height: 82vh;
+  display: flex; flex-direction: column;
+}
+.sheet.in { transform: translateY(0); }
+.sheet-grip { width: 40px; height: 4px; border-radius: 4px; background: #33456a; margin: 8px auto 4px; }
+.sheet-title { padding: 6px 16px 8px; font-size: 14px; font-weight: 650; }
+.sheet-list { overflow-y: auto; padding-bottom: 8px; }
+.sheet-item {
+  display: flex; align-items: center; gap: 10px;
+  width: 100%; min-height: 52px; padding: 10px 16px;
+  font-size: 16px; text-align: left; border-top: 1px solid var(--line);
+}
+.sheet-item:active { background: #1d2a42; }
+.sheet-item.danger { color: var(--danger); }
+.sheet-item .sheet-sub { font-size: 12.5px; color: var(--muted); }
+.sheet-cancel {
+  margin: 8px 12px 12px; min-height: 48px; border-radius: 12px;
+  background: #1d2a42; display: grid; place-items: center; font-size: 16px; font-weight: 600;
+}
+.sheet-cancel:active { background: #24334f; }
+
+.dialog {
+  position: fixed; z-index: 31; left: 50%; top: 50%;
+  width: min(92vw, 420px);
+  transform: translate(-50%, -46%) scale(.96);
+  opacity: 0;
+  background: #16203a; border: 1px solid var(--line); border-radius: 18px;
+  padding: 18px 16px 12px;
+  transition: transform .18s ease, opacity .18s ease;
+}
+.dialog.in { opacity: 1; transform: translate(-50%, -50%) scale(1); }
+.dialog-title { font-size: 16px; font-weight: 650; margin: 0 0 6px; }
+.dialog-text { font-size: 14px; color: var(--muted); margin: 0 0 12px; overflow-wrap: anywhere; }
+.dialog-input { width: 100%; min-height: 44px; padding: 10px 12px; font-size: 16px; color: var(--text);
+  background: #0e1727; border: 1px solid var(--line); border-radius: 12px; outline: none; margin-bottom: 12px; }
+.dialog-actions { display: flex; gap: 8px; }
+.dialog-actions .btn { flex: 1 1 0; }
+
+.toast-host {
+  position: fixed; left: 0; right: 0; z-index: 60;
+  bottom: calc(var(--tabs-h) + var(--sab) + 12px);
+  display: flex; flex-direction: column; align-items: center; gap: 6px;
+  pointer-events: none; padding: 0 16px;
+}
+.toast {
+  max-width: 92vw;
+  padding: 9px 14px; border-radius: 12px;
+  background: rgba(24, 35, 56, .97); border: 1px solid var(--line);
+  color: var(--text); font-size: 13.5px; text-align: center;
+  box-shadow: 0 6px 22px rgba(0, 0, 0, .4);
+  opacity: 0; transform: translateY(8px);
+  transition: opacity .18s, transform .18s;
+  white-space: pre-wrap; overflow-wrap: anywhere;
+}
+.toast.in { opacity: 1; transform: translateY(0); }
+.toast.error { border-color: #5a2b33; color: #ffd7d7; }
+
+.viewer {
+  position: fixed; inset: 0; z-index: 50;
+  background: #05080f;
+  display: flex; flex-direction: column;
+  opacity: 0; transition: opacity .16s ease;
+}
+.viewer.in { opacity: 1; }
+.viewer-top {
+  display: flex; align-items: center; gap: 8px;
+  padding: calc(var(--sat) + 6px) 8px 6px;
+  color: var(--muted); font-size: 13px;
+}
+.viewer-count { flex: 1 1 auto; padding-left: 6px; font-variant-numeric: tabular-nums; }
+.viewer-stage {
+  flex: 1 1 auto; min-height: 0; position: relative;
+  overflow: hidden; touch-action: none;
+  display: grid; place-items: center;
+}
+.viewer-stage img {
+  max-width: 100%; max-height: 100%;
+  transform-origin: center center;
+  transition: transform .16s ease;
+  will-change: transform;
+  user-select: none; -webkit-user-select: none;
+}
+.viewer-stage img.snap { transition: none; }
+.viewer-nav {
+  position: absolute; top: 50%; transform: translateY(-50%);
+  width: 44px; height: 44px; border-radius: 50%;
+  background: rgba(19, 28, 46, .8); display: grid; place-items: center; color: var(--text);
+}
+.viewer-nav.prev { left: 8px; }
+.viewer-nav.next { right: 8px; }
+.viewer-nav[disabled] { opacity: .28; }
+.viewer-bottom {
+  padding: 10px 16px calc(14px + var(--sab));
+  color: var(--muted); font-size: 13px; text-align: center;
+  white-space: pre-wrap; overflow-wrap: anywhere;
+  min-height: 44px;
+}
+
+/* ── 11. 占位屏（screen-*.js 还没加载出来时） ──────────────────────────── */
+.missing { padding: 48px 16px; text-align: center; }
+.missing h2 { font-size: 16px; margin: 0 0 6px; }
+.missing p { color: var(--muted); font-size: 13px; margin: 0; }
+
+/* ── 12. 窄屏微调（360×640 一类的机器） ────────────────────────────────── */
+@media (max-width: 380px) {
+  .grid-imgs { grid-template-columns: repeat(2, 1fr); }
+  .bubble { max-width: 92%; }
+  .bar-title { font-size: 16px; }
+}
+@media (max-height: 560px) {
+  :root { --tabs-h: 50px; }
+  .tab-icon { width: 21px; height: 21px; }
+}
+
+/* ── 13. 宽视口：把 app 装进 390×844 的「手机模拟框」 ──────────────────────
+ *
+ * 触发条件只有一个真相来源：`html[data-wide="1"]`，由 app.js 的 installDeviceFrame() 设置。
+ * 为什么不直接用 `@media (min-width: 561px)`：CSS 媒体查询无法知道自己在不在 iframe 里，
+ * 而这一页会被 Android 外壳的网页预览页（`/android`，同源 iframe）套进去 —— 那时 innerWidth
+ * 是 iframe 的宽度，媒体查询会命中，于是在预览页的机身框里再画一个机身框（框里套框）。
+ * app.js 的 isWideViewport() = `window.self === window.top && innerWidth > 560`，
+ * 被嵌进 iframe 时 data-wide 永远是 "0"，这一整段就不命中。CSS 与 JS 因此只有一个判据。
+ *
+ * 为什么用 transform 框定：`.device` 上只要有 transform，它就成为内部 position:fixed 后代的
+ * **包含块**（CSS Transforms 规范），底部 tab / 底部 sheet / 查看器 / toast 于是全部相对这个框
+ * 定位、并跟着一起缩放 —— 这正是"模拟安卓尺寸"要的效果。框的高度用 --device-scale 反算，
+ * 保证缩放后正好落在视口里（最大 100%，不会超出）。
+ */
+html[data-wide="1"] {
+  /* clip 而不是 hidden：不产生滚动条，页面宽度就是视口宽度（框才能真正居中） */
+  html, body { height: 100%; overflow: hidden; overflow: clip; }
+  body {
+    background: #070c16;
+    background-image:
+      radial-gradient(1100px 620px at 50% -8%, rgba(90, 162, 255, .10), transparent 62%),
+      radial-gradient(760px 420px at 88% 108%, rgba(90, 162, 255, .06), transparent 60%);
+  }
+  .viewport {
+    display: block;
+    height: 100%;
+    width: 100%;
+    padding: 14px;
+    overflow: hidden;
+    text-align: center;
+  }
+
+  /* --device-scale 由 app.js 按视口高度算，保证 390×844 缩完正好放得下（最大 1） */
+  .stage {
+    display: block;
+    width: 390px;
+    height: calc(844px * var(--device-scale, 1));
+    margin: 0 auto;
+  }
+
+  .device {
+    position: relative;
+    width: 390px;
+    height: 844px;
+    transform: scale(var(--device-scale, 1));
+    transform-origin: top left;
+    contain: paint;                       /* 双保险：把 fixed 后代关在框里 */
+    border-radius: 28px;
+    border: 5px solid #1b2537;
+    background: var(--bg);
+    box-shadow: 0 24px 70px rgba(0, 0, 0, .62), 0 0 0 1px rgba(120, 150, 200, .10);
+    overflow: hidden;
+  }
+
+  /* 框内的 app 就是"一块 390×844 的屏幕"：高度按框算，宽度吃满 */
+  #m-app {
+    position: absolute;
+    inset: 0;
+    height: 100%;
+    min-height: 0;
+    width: 100%;
+    padding: 0;
+  }
+
+  .frame-note {
+    display: block;
+    margin: 0;
+    color: var(--muted);
+    font-size: 12.5px;
+    text-align: center;
+    letter-spacing: .2px;
+  }
+}

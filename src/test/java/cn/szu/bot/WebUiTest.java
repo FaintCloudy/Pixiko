@@ -222,13 +222,66 @@ public final class WebUiTest {
         check(preview.statusCode() == 200 && String.valueOf(preview.headers().firstValue("Content-Type").orElse("")).startsWith("text/html"),
                 "安卓预览页 /android 可访问且是 HTML：" + preview.statusCode());
         check(preview.body().contains("id=\"device-inner\"") && preview.body().contains("id=\"view\"")
-                        && preview.body().contains("src=\"/\"") && preview.body().contains("id=\"app-menu\"")
+                        && preview.body().contains("src=\"/m\"") && preview.body().contains("id=\"app-menu\"")
                         && preview.body().contains("id=\"settings-screen\"") && preview.body().contains("id=\"image-menu\"")
                         && preview.body().contains("id=\"errorpage\""),
-                "预览页带机身/iframe/菜单/设置/图片菜单/错误页（外框复刻 app 外壳）");
+                "预览页带机身/iframe（默认装手机端界面 /m）/菜单/设置/图片菜单/错误页（外框复刻 app 外壳）");
         check(preview.body().contains("__pixikoNativeHooked") && preview.body().contains("kotori-webui-token")
                         && preview.body().contains("showImageMenu"),
                 "预览页内联了与 APK 相同的长按脚本（钩子标志 + 网页令牌键 + showImageMenu）");
+        // 手机端界面 /m：Android App 默认装的就是它（与桌面控制台并行的另一套移动 UI），静态资源在 webui/m/ 下。
+        HttpResponse<String> mobile = HTTP.send(HttpRequest.newBuilder(URI.create(base + "/m")).GET().build(),
+                HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+        check(mobile.statusCode() == 200
+                        && String.valueOf(mobile.headers().firstValue("Content-Type").orElse("")).startsWith("text/html"),
+                "手机端界面 /m 可访问且是 HTML：" + mobile.statusCode());
+        check(mobile.body().contains("id=\"m-app\"") && mobile.body().contains("id=\"m-main\"")
+                        && mobile.body().contains("id=\"m-tabs\"") && mobile.body().contains("id=\"m-bar\"")
+                        && mobile.body().contains("id=\"m-bar-back\"") && mobile.body().contains("id=\"m-overlay\""),
+                "手机端界面带 app 外壳（app bar + 返回键 + 主滚动区 + 底部 tab + 浮层根）");
+        check(countOf(mobile.body(), "class=\"tab\"") == 5 && mobile.body().contains("href=\"#/chat\"")
+                        && mobile.body().contains("href=\"#/gen\"") && mobile.body().contains("href=\"#/quest\"")
+                        && mobile.body().contains("href=\"#/styles\"") && mobile.body().contains("href=\"#/more\""),
+                "手机端界面底部是五个 tab（对话/出图/回执/样式/更多），用 hash 路由所以 Android 返回键可用");
+        check(mobile.body().contains("id=\"m-device\"") && mobile.body().contains("viewport-fit=cover"),
+                "手机端界面在宽视口下套一层手机机身框（窄视口铺满），并按 viewport-fit=cover 适配刘海");
+        check(mobile.body().contains("/m/screen-quest.js") && mobile.body().contains("/m/screen-styles.js")
+                        && mobile.body().contains("/m/screen-prompt.js") && mobile.body().contains("/m/screen-loras.js")
+                        && mobile.body().contains("/m/screen-more.js") && mobile.body().contains("/m/screen-functions.js")
+                        && mobile.body().contains("/m/screen-system.js") && mobile.body().contains("/m/screen-help.js"),
+                "手机端界面挂了八个 screen-*.js（回执/样式/提示词/LoRA/更多/提示词集/系统/帮助各一屏）");
+        // 少一个资源不会 500，只会静默降级成「还没做好」占位，所以逐个取一遍。
+        List<String> mobileAssets = new ArrayList<>();
+        java.util.regex.Matcher assetRef = java.util.regex.Pattern.compile("(?:src|href)=\"(/m/[^\"]+)\"")
+                .matcher(mobile.body());
+        while (assetRef.find()) mobileAssets.add(assetRef.group(1));
+        check(mobileAssets.size() >= 10, "/m 引用了整套静态资源（" + mobileAssets.size() + " 个）：" + mobileAssets);
+        for (String asset : mobileAssets) {
+            HttpResponse<byte[]> file = HTTP.send(HttpRequest.newBuilder(URI.create(base + asset)).GET().build(),
+                    HttpResponse.BodyHandlers.ofByteArray());
+            check(file.statusCode() == 200 && file.body().length > 200,
+                    asset + " 能取到（" + file.statusCode() + "，" + file.body().length + " 字节）");
+        }
+        HttpResponse<String> mobileCss = HTTP.send(HttpRequest.newBuilder(URI.create(base + "/m/app.css")).GET().build(),
+                HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+        check(mobileCss.statusCode() == 200 && mobileCss.body().contains(".tabs") && mobileCss.body().contains(".sheet")
+                        && mobileCss.body().contains("env(safe-area-inset-bottom)") && mobileCss.body().contains(".device"),
+                "手机端样式含底部 tab / 动作面板 / 安全区适配 / 机身框（" + mobileCss.body().length() + " 字节）");
+        HttpResponse<String> mobileJs = HTTP.send(HttpRequest.newBuilder(URI.create(base + "/m/app.js")).GET().build(),
+                HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+        check(mobileJs.statusCode() == 200 && mobileJs.body().contains("window.PixikoM")
+                        && mobileJs.body().contains("register") && mobileJs.body().contains("PixikoNative"),
+                "手机端脚本可访问，且对外暴露 PixikoM 注册表与原生桥探测（" + mobileJs.body().length() + " 字节）");
+        HttpResponse<String> mobileMissing = HTTP.send(HttpRequest.newBuilder(URI.create(base + "/m/nope.js")).GET().build(),
+                HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+        check(mobileMissing.statusCode() == 404 && mobileMissing.body().contains("没找到手机端界面文件"),
+                "手机端不存在的文件给 404 + 一句人话说明（不是空白 500）");
+        for (String evil : new String[]{"/m/../config.json", "/m/..%2fconfig.json", "/m/%2e%2e/config.json"}) {
+            HttpResponse<String> escape = HTTP.send(HttpRequest.newBuilder(URI.create(base + evil)).GET().build(),
+                    HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+            check(escape.statusCode() != 200 && !escape.body().contains("access_token"),
+                    "手机端资源不允许目录穿越：" + evil + " → " + escape.statusCode());
+        }
         HttpResponse<String> css = HTTP.send(HttpRequest.newBuilder(URI.create(base + "/app.css")).GET().build(),
                 HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
         check(css.statusCode() == 200 && css.body().contains("transition") && css.body().contains("linear-gradient"),
@@ -238,6 +291,14 @@ public final class WebUiTest {
                 "下拉框用自定义的双向箭头（不用系统默认样式）");
         check(css.body().contains("body.console-full") && css.body().contains(".prompt-line"),
                 "控制台全屏模式与提示符的样式都在 CSS 里");
+        check(css.body().contains("--rail-gutter: 24px;")
+                        && css.body().contains("#app { max-width: none; margin: 0; padding: 12px var(--rail-gutter) 48px; }"),
+                "控制台左右各留 24px 页面外白（#app 铺满 + 外白用 --rail-gutter）");
+        check(css.body().contains("--rail-w-fixed: calc((100% - 2 * var(--rail-pad) - var(--rail-gap)) / 3);"),
+                "右栏宽度只认 --rail-pad(12px)：加外白只压缩左边主栏目，右栏一个像素都不变");
+        check(countOf(css.body(), "position: fixed; right: var(--rail-gutter); bottom: var(--rail-gutter); left: auto; transform: none;") == 1
+                        && !css.body().contains("body > .quest-clouds"),
+                "任务信息云贴在整个 body 的右下角（只有一条规则写 right/bottom，没有把它推进左栏的覆盖）");
         check(css.body().contains(".terminal-tail { height: min(68vh, 620px); }"),
                 "提示符下面那片空白的高度写死在 CSS 里（把提示符托到屏幕上方三分之一处）");
         check(css.body().contains("font: 15px/1.72") && css.body().contains("font: 15px/1.6"),
@@ -306,15 +367,16 @@ public final class WebUiTest {
                         && script.body().contains("await chatArchiveMerge(log, saved)"),
                 "前端不再有 'chat' 栏目语义：loadChatHistory 在 loadPage 里每个栏目都调（含服务端存档的合并）");
         check(css.body().contains(".agent-rail #chat-log") && !css.body().contains("#panel-chat")
-                        && css.body().contains("#app { max-width: none; margin: 0; padding: 12px 12px 48px; }")
+                        && css.body().contains("#app { max-width: none; margin: 0; padding: 12px var(--rail-gutter) 48px; }")
+                        && css.body().contains("--rail-gutter: 24px;")
                         && css.body().contains("--rail-w-fixed: calc((100% - 2 * var(--rail-pad) - var(--rail-gap)) / 3);")
-                        && css.body().contains("--rail-right: var(--rail-pad);")
+                        && css.body().contains("--rail-right: var(--rail-gutter);")
                         && css.body().contains("margin-right: calc(var(--rail-w-flow) + var(--rail-gap));")
                         && css.body().contains("height: min(60vh, 520px)")
-                        && css.body().contains("body.console-full { --rail-pad: 0px; --rail-stick-top: 0px; }")
+                        && css.body().contains("body.console-full { --rail-pad: 0px; --rail-gutter: 0px; --rail-stick-top: 0px; }")
                         && css.body().contains(".shell .terminal { width: auto; margin-left: 0; }"),
-                "右栏样式挂在 .agent-rail 上（旧的 #panel-chat 死规则已迁走）：#app 取消 1120px 居中限宽、铺满可用宽度，"
-                        + "宽屏固定右栏宽 = (内容宽-间距)/3、左栏留白对称、窄屏单列 60vh/520px、console-full 仍保持两栏");
+                "右栏样式挂在 .agent-rail 上（旧的 #panel-chat 死规则已迁走）：#app 铺满 + 左右外留白 --rail-gutter(24px)，"
+                        + "右栏宽只认 --rail-pad(12px) 基准（加外留白不压缩右栏）、窄屏单列 60vh/520px、console-full 仍保持两栏");
         check(script.body().contains("openViewer(src, caption)") && script.body().contains("点击放大（Esc 关闭）"),
                 "点图直接调查看器，链接上只留提示不再跳转");
         check(script.body().contains("applyGeneration(true)"), "点「开始生成」前先把面板里没提交的改动发出去");
@@ -574,7 +636,9 @@ public final class WebUiTest {
                 "preset-save", "infix-filter", "task-list", "task-summary", "image-grid", "image-note"});
         expected.put("/prompt", new String[]{"panel-prompt", "prompt-positive", "prompt-add-btn", "usage-body", "undo-btn",
                 "data-tag-complete"});
-        expected.put("/styles", new String[]{"panel-styles", "style-batch-delete", "style-list", "style-save"});
+        // 「批量操作」那一栏已从样式面板删掉（style-batch-* / style-range* 一个都不剩），
+        // 这里换成面板上真正在的、有代表性的两个控件：样式库摘要行 + 查看样式原文的入口。
+        expected.put("/styles", new String[]{"panel-styles", "style-pageselected", "style-prompt-btn", "style-list", "style-save"});
         expected.put("/loras", new String[]{"panel-loras", "lora-count", "lora-filter", "lora-query", "civitai-grid"});
         expected.put("/functions", new String[]{"panel-functions", "function-list", "function-save"});
         expected.put("/chatcfg", new String[]{"panel-chatcfg", "apply-frequency", "set-personality", "set-chat-global"});

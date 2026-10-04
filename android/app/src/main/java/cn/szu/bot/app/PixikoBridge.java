@@ -91,6 +91,52 @@ public final class PixikoBridge {
     @JavascriptInterface
     public boolean available() { return true; }
 
+    // ---------------------------------------------------------------- app 级入口
+    //
+    // 为什么有这四个方法：手机端界面 /m 自带顶部 app bar ＋ 底部 tab，和外壳的原生 ActionBar 叠起来
+    // 是两条栏，所以 MainActivity 在 /m 下把原生 ActionBar 隐藏了（见 applyActionBarVisibility）。
+    // 栏一藏，菜单就点不到，于是「服务器设置 / 清空网页缓存 / 清除登录状态 / 在浏览器打开」
+    // 必须由网页调回原生 —— 就是下面四个。
+    //
+    // 网页侧调用名 → 原生实现（都在 MainActivity 里，和菜单用的是同一段代码）：
+    //   window.PixikoNative.openServerSettings() → MainActivity.openServerSettings()
+    //   window.PixikoNative.clearWebCache()      → MainActivity.clearWebCache()
+    //   window.PixikoNative.clearLoginState()    → MainActivity.clearLoginState()
+    //   window.PixikoNative.openInBrowser()      → MainActivity.openInBrowser()
+    //
+    // 线程：@JavascriptInterface 方法跑在 WebView 的 JavaBridge 线程上，而开 Activity /
+    // evaluateJavascript / clearCache 都必须回主线程，所以统一走 onMain(...)。
+    // 桥只在配置的那台服务器的页面上挂着（见 MainActivity 的 host 判断），第三方页面调不到。
+
+    /** 打开原生的「服务器设置」页（选/加/改服务器、测试连接、扫描局域网）。 */
+    @JavascriptInterface
+    public void openServerSettings() { onMain(MainActivity::openServerSettings); }
+
+    /** 清空 WebView 的网页缓存（不含 localStorage 里的令牌，那是 clearLoginState 的事）。 */
+    @JavascriptInterface
+    public void clearWebCache() { onMain(MainActivity::clearWebCache); }
+
+    /** 清除登录状态：删掉 localStorage 里的令牌并 reload，网页会回到自己的锁屏。 */
+    @JavascriptInterface
+    public void clearLoginState() { onMain(MainActivity::clearLoginState); }
+
+    /** 用系统浏览器打开当前页（原生的「在浏览器打开」）。 */
+    @JavascriptInterface
+    public void openInBrowser() { onMain(MainActivity::openInBrowser); }
+
+    /**
+     * 把「开界面 / 弹窗 / 动 WebView」这类必须在主线程做的事丢回主线程，
+     * 并从弱引用里<b>重新取一次</b> Activity（排队期间它可能已经销毁）。
+     */
+    private void onMain(java.util.function.Consumer<MainActivity> action) {
+        ToastBus.main().post(() -> {
+            Activity host = activity.get();
+            if (host instanceof MainActivity && !host.isFinishing()) {
+                action.accept((MainActivity) host);
+            }
+        });
+    }
+
     /** app 版本号，注入脚本里会写进 window.__pixikoNativeVersion，方便排查「网页用的是哪一版外壳」。 */
     @JavascriptInterface
     public String version() {

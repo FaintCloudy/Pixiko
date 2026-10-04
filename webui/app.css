@@ -88,9 +88,10 @@ code { background: rgba(120, 160, 220, .14); padding: 1px 5px; border-radius: 6p
 .muted { color: var(--muted); font-size: 13px; }
 
 /* 铺满可用宽度：原来这里是 max-width: 1120px + margin: 0 auto —— 宽屏两边留一大片空白（用户嫌窄）。
-   现在不再有任何居中限宽（也不引入新的上限）：内容宽 = 视口宽 - 2 × 12px 内边距，右栏几何变量
-   （见下面 --rail-* 那一节）跟着这条事实算。 */
-#app { max-width: none; margin: 0; padding: 12px 12px 48px; }
+   现在没有任何居中限宽：内容宽 = 视口宽 - 2 × --rail-gutter（页面外留白）。
+   左右外留白用 --rail-gutter（不是右栏宽度的基准 --rail-pad），所以加外留白时**只压缩左边主栏目**，
+   右栏宽度一个像素都不变（见下面 --rail-* 那一节的推导）。 */
+#app { max-width: none; margin: 0; padding: 12px var(--rail-gutter) 48px; }
 .banner {
   border-radius: 12px; padding: 10px 14px; margin-bottom: 10px; font-size: 14px;
   animation: drop-in .32s var(--ease) both;
@@ -169,6 +170,17 @@ code { background: rgba(120, 160, 220, .14); padding: 1px 5px; border-radius: 6p
 .composer { display: flex; gap: 8px; align-items: flex-end; }
 .composer textarea { flex: 1; }
 .composer button { flex: 0 0 auto; min-width: 78px; }
+/* 右栏那个写字框（#chat-input）的默认高度：**150px**（约 6 行），不再是 1 行 44px。
+   它是输入区的地基，别再让 `rows="1"` 决定高度：CSS 里 height + min-height 一起钉死 150px，
+   内容更多时由 app.js 的 growChatInput() 往上长（上限 40vh，见下），到顶就自己滚动。
+   选择器用 `.agent-rail #chat-input`（比基础那条 `input, textarea, select` 的 min-height:44px 更高，
+   不会被盖回去）；旧的「对话」栏目面板那套选择器早就没了，别照抄。 */
+.agent-rail #chat-input {
+  height: 150px;
+  min-height: 150px;
+  max-height: 40vh;      /* 手机窄屏（右栏 60vh）下也放得下：150px 起步、到 40vh 停下 */
+  overflow-y: auto;      /* 长内容在框内滚动，不把右栏/整页顶开 */
+}
 
 /* ---------------------------------------------------------------- 两栏外壳：左 workspace（栏目）+ 右 agent-rail（全局对话栏，宽屏**固定**）
    对话栏是**外壳**的一部分（不在任何面板块的标记里），所以每条路由的页面都带着 .agent-rail。
@@ -178,16 +190,27 @@ code { background: rgba(120, 160, 220, .14); padding: 1px 5px; border-radius: 6p
    右栏在宽屏用 **position: fixed** —— 真正钉在视口右侧，页面怎么滚都不动。
    （**不用 sticky**：/loras、/functions、/chatcfg、/system、/setup、/quest、/help 这些左栏比右栏矮的
    路由上，.shell 没有可吸顶的余量，sticky 的右栏只能跟着页面一起滚上去、顶栏被切掉。）
-   宽度不再靠 grid 分列，而是左右两边用同一套变量算出来（#app 已经**取消居中限宽**，铺满可用宽度）：
+   宽度不再靠 grid 分列，而是左右两边用同一套变量算出来（#app 铺满可用宽度，左右各留 --rail-gutter）：
 
-     内容宽 = 视口宽 - 2 × #app 左右内边距（不再有 max-width 上限）
-     右栏宽 = (内容宽 - 栏间距) / 3        左栏宽 = 内容宽 - 右栏宽 - 栏间距（= 右栏宽的 2 倍）
-     右栏右边距 = #app 左右内边距  →  右栏内容框与 #app 内容右边缘对齐
+     内容宽 = 视口宽 - 2 × --rail-gutter（页面外留白）
+     右栏宽 = (视口宽 - 2 × --rail-pad - 栏间距) / 3     ← 基准是 --rail-pad(12px)，**与外留白无关**
+     左栏宽 = 内容宽 - 右栏宽 - 栏间距
+     右栏右边距 = --rail-gutter  →  右栏内容框与 #app 内容右边缘对齐
+
+   为什么把外留白与基准拆成两个变量（用户要的是「左右两侧加一点间距，但只压缩左边的主栏目」）：
+   · --rail-gutter(24px) 是**页面外留白**：#app 的左右内边距，同时是右栏的右边距；
+   · --rail-pad(12px) 只是**右栏宽度的基准**（动它，右栏才会变宽变窄）。
+   右栏宽只认 --rail-pad，所以外留白从 12px 加到 24px 时右栏**一个像素都不变**：多出来的
+   2 × (24 - 12) = 24px 全部从左边主栏目里扣（右栏整体向左移 12px，右边距 12 → 24）。
+   1440×900 一档的期望值（clientW 1430，实测见 css-probe）：#app 内容 1382、左栏 904（比改前少 24）、
+   右栏 464（**不变**）、右栏右边距 24、无横向滚动。左栏 / 右栏 = 904 / 464 ≈ 1.948 —— 右栏宽度被锁死
+   之后这个比值必然略小于 2（要精确 2.0000 就得让右栏跟着变窄，那与用户的要求相反）；验收用的
+   「≈ 2:1、±5%」口径仍然通过（偏差 2.6%）。
 
    注意百分比：fixed 元素上的 `100%` = **视口内容宽**（不含滚动条），而 .workspace 上的 `100%` = 它的
-   包含块（.shell 内容框，= 视口内容宽 - 2 × 内边距）—— 两者差着 #app 的左右内边距，所以变量分成
-   --rail-w-flow（在流内，不用减内边距）与 --rail-w-fixed（固定右栏，要自己减掉内边距）两个写，别混用：
-   两条算式算出来是**同一个数**（都等于 (视口内容宽 - 2×内边距 - 栏间距) / 3），这正是 2:1 的保证。
+   包含块（.shell 内容框 = 视口内容宽 - 2 × --rail-gutter）—— 两者差着外留白，所以变量分成
+   --rail-w-fixed（固定右栏，认视口）与 --rail-w-flow（在流内，要把外留白比基准多出来的那部分补回去）
+   两个写，别混用；两条算式算出来是**同一个右栏宽**（= (视口宽 - 2 × 12px - 栏间距) / 3）。
 
    祖先链上**不能**有 transform / filter / backdrop-filter / perspective / will-change / contain：
    有的话 fixed 会以那一层为包含块、右栏直接跑偏。实测这条链（html → body → main#app → .shell）
@@ -201,26 +224,30 @@ code { background: rgba(120, 160, 220, .14); padding: 1px 5px; border-radius: 6p
      --rail-gap:       14px     两栏之间的间距（窄屏堆叠时也是上下间距）
      --rail-stick-top: 62px     页头 .bar 的实测高度（右栏顶边贴页头下沿，与 .tabs 的 top:62px 同口径）
      --rail-bottom:    14px     右栏底边与视口底边的留白
-     --rail-pad:       12px     #app 的左右内边距（宽屏 12px；≤620px 时 #app 是 8px，那时已单列堆叠、用不到）
+     --rail-gutter:    24px     页面外留白：#app 的左右内边距 + 右栏的右边距（只压缩左栏，不影响右栏宽）
+     --rail-pad:       12px     右栏宽度的基准（已经不是页面内边距了：动它右栏才会变宽变窄）
      --rail-w-flow:    在流内的右栏宽（.workspace 的右留白基准）
      --rail-w-fixed:   固定右栏的宽
-     --rail-right:     固定右栏的右边距（与 #app 内容右边缘对齐）
+     --rail-right:     固定右栏的右边距 = --rail-gutter（与 #app 内容右边缘对齐）
    窄屏断点：**1000px**（<=1000px 单列堆叠、static，见下面的 @media）。 */
 body {
   --rail-gap: 14px;
   --rail-stick-top: 62px;
   --rail-bottom: 14px;
+  --rail-gutter: 24px;
   --rail-pad: 12px;
-  /* 在流内用：百分比按使用处的包含块解析（.workspace 的包含块 = .shell 内容框 = 内容宽） */
-  --rail-w-flow: calc((100% - var(--rail-gap)) / 3);
-  /* 固定右栏用：fixed 的百分比按视口解析，比内容宽多出 #app 的左右内边距，这里自己减掉 */
+  /* 在流内用：100% = .shell 内容框（= 视口宽 - 2×外留白），比「右栏宽」的基准多减了外留白，
+     所以这里把 2 × (外留白 - 基准) 加回去 —— 算出来仍是同一个右栏宽 */
+  --rail-w-flow: calc((100% + 2 * var(--rail-gutter) - 2 * var(--rail-pad) - var(--rail-gap)) / 3);
+  /* 固定右栏用：fixed 的 100% = 视口内容宽，减掉 2×基准与栏间距就是右栏宽（与外留白无关） */
   --rail-w-fixed: calc((100% - 2 * var(--rail-pad) - var(--rail-gap)) / 3);
-  /* 固定右栏的右边距：与 #app 内容右边缘对齐（#app 铺满，所以就是它的左右内边距） */
-  --rail-right: var(--rail-pad);
+  /* 固定右栏的右边距：与 #app 内容右边缘对齐（#app 铺满，所以就是页面外留白） */
+  --rail-right: var(--rail-gutter);
 }
 .workspace {
   min-width: 0;                                   /* 长内容/窄屏不许把整页顶出横向滚动 */
-  margin-right: calc(var(--rail-w-flow) + var(--rail-gap));   /* 给固定右栏让出右 1/3 + 间距 */
+  /* 给固定右栏让出「右栏宽 + 间距」；--rail-w-flow 已经把外留白的变化补偿进去了（见变量注释） */
+  margin-right: calc(var(--rail-w-flow) + var(--rail-gap));
 }
 .agent-rail {
   position: fixed;               /* 宽屏：真正固定（取舍见上面的注释） */
@@ -266,16 +293,17 @@ body {
    100vw 会横着溢出压住右栏：让它占满**左栏**那一列即可（全屏模式见下面 body.console-full 那几条）。 */
 .shell .terminal { width: auto; margin-left: 0; }
 
-/* 宽屏：固定右栏占住了右下角，会盖住**页脚文字**与**任务信息云**（两者都在 .shell 之外）：
-   页脚右边距的推导（#app 与 .footer 现在都是铺满、margin 0，两个盒子同宽同起点）：
+/* 宽屏：固定右栏占住了右下角，会盖住**页脚文字**（页脚在 .shell 之外）：
+   页脚右边距的推导（#app 与 .footer 都是铺满、margin 0，两个盒子同宽同起点；页脚也在 body 下，
+   所以这里的 --rail-w-fixed 同样按视口内容宽解析 = 真正的右栏宽）：
      页脚内容右边缘 = 视口内容宽 - padding-right
-     目标           = #app 内容右边缘 - 右栏宽 - 栏间距 = (视口内容宽 - --rail-pad) - --rail-w-fixed - --rail-gap
-     所以 padding-right = --rail-w-fixed + --rail-gap + --rail-pad  →  两者正好相等（不是"大约"）。
-   信息云整体挪到左栏那一列的右下角（它 z-index 60，否则会浮在对话输入区上面）。
-   用 `body > …` 提高一级优先级，免得被文件后面那两条基础规则盖回去。 */
+     目标           = #app 内容右边缘 - 右栏宽 - 栏间距 = (视口内容宽 - --rail-gutter) - --rail-w-fixed - --rail-gap
+     所以 padding-right = --rail-w-fixed + --rail-gap + --rail-gutter  →  两者正好相等（不是"大约"）。
+   用 `body > …` 提高一级优先级，免得被文件后面那条基础规则盖回去。
+   （任务信息云**不在这里让位**：它就该贴在整个 body 的右下角，基础规则见下面 .quest-clouds —— 代价是
+   宽屏下它可能短暂压在对话栏的输入区上，见那条规则的注释。） */
 @media (min-width: 1001px) {
-  body > .footer { padding-right: calc(var(--rail-w-fixed) + var(--rail-gap) + var(--rail-pad)); }
-  body > .quest-clouds { right: calc(var(--rail-w-fixed) + var(--rail-gap) + var(--rail-pad) + 6px); }
+  body > .footer { padding-right: calc(var(--rail-w-fixed) + var(--rail-gap) + var(--rail-gutter)); }
 }
 
 /* 窄屏（<= 1000px）：单列堆叠 —— 右栏放到左栏**下面**（左栏是主角、先看栏目；DOM 顺序本来就是
@@ -509,11 +537,10 @@ body.console-full { overflow: hidden; }
 body.console-full #app { max-width: none; margin: 0; padding: 0; }
 body.console-full .panel.active { gap: 0; }
 /* 控制台全屏（/logs 默认）：**右栏照旧在右边 1/3**（用户要「无论哪个栏目都能对话」）。
-   这里只把右栏几何换成「无页头、无 #app 内边距」：--rail-pad:0 → 右栏仍是内容宽的 1/3、贴住视口右边
-   （--rail-right 就等于 0）；--rail-stick-top:0 → 这条模式没有页头，右栏从视口顶开始。
-   终端占左 2/3 那一列（见下）。于是「全屏」的语义 = **终端占满它那一列的高度**（不再是 100vw 独占整窗）。
-   （#app 本身已经是铺满的，所以这里不再需要 --rail-page。） */
-body.console-full { --rail-pad: 0px; --rail-stick-top: 0px; }
+   这里把两个留白变量一起归零：--rail-gutter:0 → 全屏终端铺满、右栏贴住视口右边（--rail-right = 0）；
+   --rail-pad:0 → 右栏宽按满宽算（右栏仍是满宽的 1/3）；--rail-stick-top:0 → 没有页头，右栏从视口顶开始。
+   终端占左 2/3 那一列（见下）。于是「全屏」的语义 = **终端占满它那一列的高度**（不再是 100vw 独占整窗）。 */
+body.console-full { --rail-pad: 0px; --rail-gutter: 0px; --rail-stick-top: 0px; }
 body.console-full .terminal {
   height: 100vh; width: auto; margin: 0; border: 0; border-radius: 0; box-shadow: none;
 }
@@ -794,8 +821,13 @@ a.image-link img:hover { border-color: rgba(120, 160, 220, .55); }
 /* ---------------------------------------------------------------- 任务信息云（下方弹出）
    每次下达任务都从屏幕下方冒一条，带跳去 /quest/#N 的链接；出图完成后再冒一条。 */
 .quest-clouds {
-  /* 任务回执从**右下角**弹出：固定右下、从右侧滑入、新的一条贴着角（column-reverse）。 */
-  position: fixed; right: 18px; bottom: 18px; left: auto; transform: none;
+  /* 任务回执从**整个 body（视口）的右下角**弹出：固定右下、从右侧滑入、新的一条贴着角（column-reverse）。
+     用户明确要求"跑在整个 body 的右下角，而不是左侧主栏目的右下角"，所以这里**不再**为固定右栏让位
+     （上一版那条 @media (min-width:1001px) 的覆盖已删掉）：宽屏下这条信息云会短暂**压在对话栏的
+     右下角**、可能盖住输入框/发送按钮；卡片本身 pointer-events:auto（容器是 none），约 4～15 秒后自动消失。
+     数值与页面外留白同一套：right/bottom 都用 --rail-gutter（24px；console-full 把它归零时信息云会贴到
+     视口最角上 —— 那里本来就铺满、没有别的留白，属于同一条口径）。 */
+  position: fixed; right: var(--rail-gutter); bottom: var(--rail-gutter); left: auto; transform: none;
   z-index: 60; display: flex; flex-direction: column-reverse; gap: 8px; align-items: flex-end;
   pointer-events: none; max-width: min(92vw, 420px);
 }

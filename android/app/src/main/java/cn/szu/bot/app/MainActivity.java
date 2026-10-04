@@ -34,6 +34,7 @@ import android.widget.TextView;
 import androidx.activity.OnBackPressedCallback;
 import androidx.activity.result.ActivityResultLauncher;
 import androidx.activity.result.contract.ActivityResultContracts;
+import androidx.appcompat.app.ActionBar;
 import androidx.appcompat.app.AppCompatActivity;
 import androidx.appcompat.widget.Toolbar;
 import androidx.core.content.ContextCompat;
@@ -43,13 +44,17 @@ import androidx.swiperefreshlayout.widget.SwipeRefreshLayout;
  * 主界面：把网页控制台整站装进 WebView。
  *
  * <p><b>设计立场</b>：网页端有的功能（出图、对话、提示词、风格、LoRA、功能、聊天设置、系统、
- * 首次配置、日志、回执、帮助——共 13 个栏目）一律<b>不重新实现</b>，WebView 原样加载
- * {@code /}（出图页，右栏常驻对话）即可；网页本身就是响应式的，≤1000px 会自己变成单列堆叠，
- * 390×844 的手机宽度已经被真机浏览器验收过（无横向滚动）。原生只补网页做不到的部分：
- * 服务器配置、局域网扫描、图片保存/分享、下拉刷新、原生错误页、屏幕常亮、加载进度。
+ * 首次配置、日志、回执、帮助——共 13 个栏目）一律<b>不重新实现</b>，WebView 原样加载网页即可。
+ * 默认打开的是<b>手机端界面</b> {@code /m}（另一套从零写的 App 风格页面，复用同一套 {@code /api/*}）；
+ * 完整网页控制台 {@code /}（出图页，右栏常驻对话）保留为可切换的第二入口（见 {@link #toggleUi()}）。
+ * 原生只补网页做不到的部分：服务器配置、局域网扫描、图片保存/分享、下拉刷新、原生错误页、
+ * 屏幕常亮、加载进度。
  *
  * <p>几个关键实现点（细节见各方法注释）：
  * <ul>
+ *   <li><b>默认入口 {@code /m} ＋ 菜单一键切回 {@code /}</b>（选择记在 SharedPreferences，见 {@link #uiPath()}）；</li>
+ *   <li><b>{@code /m} 下隐藏原生 ActionBar</b>（网页自带 app bar ＋ 底部 tab，叠起来是两条栏），
+ *       app 级入口改由 {@link PixikoBridge} 的四个桥方法从网页里调回来（见 {@link #applyActionBarVisibility()}）；</li>
  *   <li>令牌自动注入 + 只 reload 一次（{@link #maybeInjectToken}）；</li>
  *   <li>图片长按/右键 → 原生菜单（{@link NativeHook#hookScript()} + {@link PixikoBridge}）；</li>
  *   <li>返回键三级：WebView 回退 → 回首页 → 双击退出；</li>
@@ -91,6 +96,22 @@ public class MainActivity extends AppCompatActivity {
     private static final String PREF_UI = "pixiko_ui";
     private static final String KEY_KEEP_SCREEN_ON = "keep_screen_on";
 
+    /**
+     * 用户选的是「手机界面（/m）」还是「完整控制台（/）」。
+     * 缺省值取 {@link UrlHelper#PATH_MOBILE}：也就是<b>没存过任何值时默认打开 /m</b>。
+     */
+    private static final String KEY_UI_PATH = "ui_path";
+
+    /**
+     * 「切换界面」这一项的两种文案（随当前状态二选一，见 {@link #onPrepareOptionsMenu}）。
+     *
+     * <p>刻意写成 Java 字面量而不是 {@code strings.xml}：这样「默认走 /m」这件事连同菜单文案
+     * 都会出现在 {@code classes.dex} 的字符串常量池里，可以被静态核验（见交付说明里的做法），
+     * 不必反编译字节码。
+     */
+    private static final String TITLE_SWITCH_TO_CONSOLE = "切换到完整控制台（/）";
+    private static final String TITLE_SWITCH_TO_MOBILE = "切换到手机界面（/m）";
+
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
@@ -101,7 +122,7 @@ public class MainActivity extends AppCompatActivity {
         if (current == null) {
             // 一台都没配：直接去设置页，别给用户看一个必然失败的错误页。
             ToastBus.shortToast(this, getString(R.string.no_server));
-            startActivityForResult(new Intent(this, SettingsActivity.class), REQUEST_SETTINGS);
+            openServerSettings();
             finish();
             return;
         }
@@ -114,6 +135,9 @@ public class MainActivity extends AppCompatActivity {
             getSupportActionBar().setDisplayShowTitleEnabled(true);
             getSupportActionBar().setTitle(R.string.app_name);
         }
+        // 这里也要同步一次：走 onSaveInstanceState 恢复（进程被回收后重建）时下面走的是 loadUrl(restore)，
+        // 不会经过 loadHome()，光靠 loadHome() 里的那次同步会漏掉这条路径。
+        applyActionBarVisibility();
         progress = findViewById(R.id.progress);
         swipe = findViewById(R.id.swipe);
         webView = findViewById(R.id.webview);
@@ -202,16 +226,140 @@ public class MainActivity extends AppCompatActivity {
             hideErrorPage();
             webView.reload();
         });
-        findViewById(R.id.error_settings).setOnClickListener(view ->
-                startActivityForResult(new Intent(this, SettingsActivity.class), REQUEST_SETTINGS));
+        // 错误页这三个按钮都挂在内容区（不是 ActionBar/菜单上），所以 /m 隐藏原生栏以后照样能用。
+        findViewById(R.id.error_settings).setOnClickListener(view -> openServerSettings());
         findViewById(R.id.error_browser).setOnClickListener(view -> openInBrowser());
     }
 
     // ------------------------------------------------------------------ 加载与状态
 
-    /** 加载首页（＝出图页，右栏常驻对话；/chat 与它同构，所以首页就是「全部功能」的入口）。 */
+    /**
+     * 当前选择的界面路径：{@link UrlHelper#PATH_MOBILE}（手机界面，默认）或
+     * {@link UrlHelper#PATH_CONSOLE}（完整控制台）。用户切过就记住（SharedPreferences），
+     * 下次启动、以及「回到首页」都按这个选择走。
+     *
+     * <p>只有明确存成 {@code "/"} 才算完整控制台，其余任何情况（没存过、值坏了）一律回落 {@code /m}。
+     */
+    private String uiPath() {
+        String saved = getSharedPreferences(PREF_UI, MODE_PRIVATE).getString(KEY_UI_PATH, UrlHelper.PATH_MOBILE);
+        return UrlHelper.PATH_CONSOLE.equals(saved) ? UrlHelper.PATH_CONSOLE : UrlHelper.PATH_MOBILE;
+    }
+
+    /** 现在选的是不是手机界面（默认就是）。 */
+    private boolean mobileUiSelected() {
+        return !UrlHelper.PATH_CONSOLE.equals(uiPath());
+    }
+
+    private void setUiPath(String path) {
+        getSharedPreferences(PREF_UI, MODE_PRIVATE).edit()
+                .putString(KEY_UI_PATH, UrlHelper.PATH_CONSOLE.equals(path) ? UrlHelper.PATH_CONSOLE : UrlHelper.PATH_MOBILE)
+                .apply();
+    }
+
+    /**
+     * 首页地址：服务器根地址不变，只换路径后缀——默认 {@code http://host:8787/m}，
+     * 切到完整控制台后是 {@code http://host:8787/}。
+     */
+    private String homeUrl() {
+        return UrlHelper.join(current.base, uiPath());
+    }
+
+    /** 去掉查询串/锚点与尾斜杠，专供地址比较（{@code /m} 与 {@code /m/}、{@code /} 与无尾斜杠等价）。 */
+    private static String trimUrl(String url) {
+        if (url == null) return "";
+        String text = url;
+        int at = text.indexOf('#');
+        if (at >= 0) text = text.substring(0, at);
+        at = text.indexOf('?');
+        if (at >= 0) text = text.substring(0, at);
+        while (text.endsWith("/")) text = text.substring(0, text.length() - 1);
+        return text;
+    }
+
+    /**
+     * 这一页是不是两个入口之一？是就返回对应的路径（{@code /m} 或 {@code /}），否则返回 {@code null}。
+     *
+     * <p>用「和首页地址比字符串」而不是解析路径，这样部署在子路径下
+     * （{@code http://host:8787/sub} → 手机界面是 {@code /sub/m}）也算得对；
+     * 只有 {@code {base}/m} 与 {@code {base}/} 两种写法算数，{@code /gen} {@code /logs}
+     * 这类站内页一律返回 null（原生栏维持现状，不跟着乱跳）。
+     */
+    private String uiPathOf(String url) {
+        String here = trimUrl(url);
+        if (here.isEmpty()) return null;
+        if (here.equals(trimUrl(UrlHelper.join(current.base, UrlHelper.PATH_MOBILE)))) return UrlHelper.PATH_MOBILE;
+        if (here.equals(trimUrl(UrlHelper.join(current.base, UrlHelper.PATH_CONSOLE)))) return UrlHelper.PATH_CONSOLE;
+        return null;
+    }
+
+    /**
+     * 网页自己导航到两个入口路径之一时，把「当前界面」这个选择跟着纠正过来，并同步原生栏。
+     *
+     * <p>正常切换走 {@link #toggleUi()}，pref 与页面本来就一致；但网页里也可能直接放一条指回
+     * {@code /}（或 {@code /m}）的链接 —— 那时 pref 还停在旧值，会出现「显示完整控制台却没有原生顶栏」
+     * （完整控制台自己没有顶栏，会很难用）。这里只认这两个入口路径，其余站内页不动。
+     */
+    private void adoptUiPathFrom(String url) {
+        String path = uiPathOf(url);
+        if (path == null) return;
+        if (!path.equals(uiPath())) {
+            setUiPath(path);
+            Log.d("网页自己跳到了 " + path + "，已把「当前界面」的选择跟过来");
+        }
+        applyActionBarVisibility();
+    }
+
+    /**
+     * 原生 ActionBar 只在「完整控制台（{@code /}）」下显示，进 {@code /m} 就收起来。
+     *
+     * <p>为什么：{@code /m} 那套手机端界面自带顶部 app bar ＋ 底部 tab，再叠一条原生栏就是<b>两条栏</b>，
+     * 不符合手机 app 的习惯。收起原生栏 = 把整屏高度让给网页（{@code activity_main.xml} 里工具栏是
+     * {@code LinearLayout} 的第一个子节点，置 GONE 后那一条的高度会立刻被下面收回）。
+     *
+     * <p>收起之后 app 级入口不丢：{@link PixikoBridge} 暴露了
+     * {@code openServerSettings / clearWebCache / clearLoginState / openInBrowser} 四个桥方法给网页调用；
+     * 原生错误页上的「重试 / 去设置 / 用浏览器打开」三个按钮也不依赖这条栏，所以照样能用。
+     *
+     * <p>调用时机：{@link #onCreate}（覆盖恢复路径）、{@link #loadHome()}（覆盖启动、
+     * {@link #toggleUi()}、换服务器、从设置页回来这几条路径）、
+     * {@link #adoptUiPathFrom(String)}（网页自己跳到 /m 或 / 时）。
+     */
+    private void applyActionBarVisibility() {
+        boolean mobile = mobileUiSelected();
+        ActionBar bar = getSupportActionBar();
+        if (bar != null) {
+            if (mobile) bar.hide(); else bar.show();
+        }
+        // 双保险：AppCompat 的 hide()/show() 本来就会把这个 Toolbar 置成 GONE/VISIBLE，
+        // 这里显式再同步一次，免得个别 ROM / AppCompat 版本上出现「栏还在、只是内容空了」。
+        if (toolbar != null) toolbar.setVisibility(mobile ? View.GONE : View.VISIBLE);
+        Log.d("原生 ActionBar " + (mobile ? "已隐藏（当前是手机界面 /m，让位给网页自带的 app bar）"
+                : "已显示（当前是完整控制台 /，它没有自己的顶栏）"));
+    }
+
+    /** 加载首页（默认＝手机界面 {@code /m}；切到完整控制台后＝{@code /}）。 */
     private void loadHome() {
-        loadUrl(UrlHelper.join(current.base, "/"));
+        applyActionBarVisibility();
+        loadUrl(homeUrl());
+    }
+
+    /**
+     * 在「手机界面（/m）」与「完整控制台（/）」之间切换，并把选择记进 SharedPreferences。
+     *
+     * <p>切换时清掉 WebView 历史：否则用户按返回键会回到上一个界面，而 SharedPreferences 还停在
+     * 新选择上，「返回键三级」与菜单文案就会和眼前这一页对不上。清完历史后，返回键在首页＝双击退出。
+     *
+     * <p>刻意<b>不动</b>令牌注入状态（tokenInjected / suppressTokenInjection）：
+     * 两个路径同源，localStorage 里的令牌本来就共用，用户在网页里手动清除登录的意图也不该被这一步覆盖。
+     */
+    private void toggleUi() {
+        boolean toConsole = mobileUiSelected();
+        setUiPath(toConsole ? UrlHelper.PATH_CONSOLE : UrlHelper.PATH_MOBILE);
+        hideErrorPage();
+        webView.clearHistory();
+        loadHome();
+        ToastBus.shortToast(this, toConsole ? TITLE_SWITCH_TO_CONSOLE : TITLE_SWITCH_TO_MOBILE);
+        invalidateOptionsMenu();
     }
 
     private void loadUrl(String url) {
@@ -230,10 +378,15 @@ public class MainActivity extends AppCompatActivity {
         if (errorPage.getVisibility() != View.GONE) errorPage.setVisibility(View.GONE);
     }
 
-    private void openInBrowser() {
+    /**
+     * 「在浏览器打开」当前页（拿不到 currentUrl 就开当前界面的首页）。
+     *
+     * <p>包级可见（非 private）：{@link PixikoBridge#openInBrowser()} 从网页里调回来，见「给网页桥用的入口」。
+     */
+    void openInBrowser() {
         try {
             Intent intent = new Intent(Intent.ACTION_VIEW, Uri.parse(currentUrl != null && !currentUrl.isEmpty()
-                    ? currentUrl : UrlHelper.join(current.base, "/")));
+                    ? currentUrl : homeUrl()));
             startActivity(intent);
         } catch (ActivityNotFoundException error) {
             ToastBus.shortToast(this, getString(R.string.no_browser));
@@ -395,6 +548,8 @@ public class MainActivity extends AppCompatActivity {
             if (getSupportActionBar() != null) {
                 getSupportActionBar().setSubtitle(UrlHelper.hostOf(current.base));
             }
+            // 网页自己跳到 /m 或 / 时（例如 /m 里放了一条指回 "/" 的链接）把界面选择与原生栏一起纠正。
+            adoptUiPathFrom(url);
         }
     }
 
@@ -529,6 +684,9 @@ public class MainActivity extends AppCompatActivity {
     public boolean onPrepareOptionsMenu(Menu menu) {
         MenuItem keep = menu.findItem(R.id.action_keep_screen_on);
         if (keep != null) keep.setChecked(keepScreenOnEnabled());
+        // 「切换界面」的文案随当前状态变：现在在 /m 就显示「切换到完整控制台（/）」，反之亦然。
+        MenuItem toggle = menu.findItem(R.id.action_toggle_ui);
+        if (toggle != null) toggle.setTitle(mobileUiSelected() ? TITLE_SWITCH_TO_CONSOLE : TITLE_SWITCH_TO_MOBILE);
         return super.onPrepareOptionsMenu(menu);
     }
 
@@ -544,12 +702,16 @@ public class MainActivity extends AppCompatActivity {
             loadHome();
             return true;
         }
+        if (id == R.id.action_toggle_ui) {
+            toggleUi();
+            return true;
+        }
         if (id == R.id.action_switch) {
             showSwitchServerDialog();
             return true;
         }
         if (id == R.id.action_settings) {
-            startActivityForResult(new Intent(this, SettingsActivity.class), REQUEST_SETTINGS);
+            openServerSettings();
             return true;
         }
         if (id == R.id.action_browser) {
@@ -583,7 +745,7 @@ public class MainActivity extends AppCompatActivity {
         final java.util.List<ServerConfig> servers = repository.list();
         if (servers.size() <= 1) {
             ToastBus.shortToast(this, servers.isEmpty() ? getString(R.string.no_server) : "只配了一台服务器，去「服务器设置」里可以再加");
-            if (servers.isEmpty()) startActivityForResult(new Intent(this, SettingsActivity.class), REQUEST_SETTINGS);
+            if (servers.isEmpty()) openServerSettings();
             return;
         }
         final String[] labels = new String[servers.size()];
@@ -613,19 +775,46 @@ public class MainActivity extends AppCompatActivity {
                 .show();
     }
 
+    // ------------------------------------------------------------------ 给网页桥用的入口
+    //
+    // /m 下原生 ActionBar 是隐藏的（见 applyActionBarVisibility），菜单点不到，所以下面这几个
+    // app 级动作必须能从网页里调回来。实现就是菜单里那几段逻辑本身（包级可见，不另写一份），
+    // 由 PixikoBridge 的 @JavascriptInterface 方法在主线程调用。
+    //   网页侧调用名       ← 这里的方法
+    //   openServerSettings → openServerSettings()
+    //   clearWebCache      → clearWebCache()
+    //   clearLoginState    → clearLoginState()
+    //   openInBrowser      → openInBrowser()
+
+    /**
+     * 打开服务器设置页。用 {@code startActivityForResult}（而不是 {@code startActivity}）是为了让
+     * {@link #onActivityResult} 里「换了服务器 / 令牌 → 重新加载首页」那套既有逻辑继续生效，
+     * 和菜单里「服务器设置」走的是同一条路。
+     */
+    void openServerSettings() {
+        startActivityForResult(new Intent(this, SettingsActivity.class), REQUEST_SETTINGS);
+    }
+
     /**
      * 清空网页缓存：WebView 的 HTTP 缓存 + 各种 DOM 存储。刻意<b>不动 localStorage 里的令牌</b>
      * （那是「清除登录状态」那一项的事），两个动作分开才对用户可预期。
+     *
+     * <p>包级可见：{@link PixikoBridge#clearWebCache()} 从网页里调回来。
      */
-    private void clearWebCache() {
+    void clearWebCache() {
         webView.clearCache(true);
         webView.clearFormData();
         WebStorage.getInstance().deleteAllData();
         ToastBus.shortToast(this, getString(R.string.toast_cache_cleared));
     }
 
-    /** 清除登录状态：删掉 localStorage 的令牌，然后 reload，网页会自己回到锁屏。 */
-    private void clearLoginState() {
+    /**
+     * 清除登录状态：删掉 localStorage 的令牌，然后 reload，网页会自己回到锁屏。
+     *
+     * <p>包级可见：{@link PixikoBridge#clearLoginState()} 从网页里调回来（桥保证在主线程执行，
+     * {@code evaluateJavascript} 必须在 UI 线程）。
+     */
+    void clearLoginState() {
         webView.evaluateJavascript(NativeHook.clearTokenScript(), value -> {
             Log.d("已清除网页登录状态，锁屏本轮不再自动注入令牌");
             // 这一轮别再自动注入：用户点「清除登录状态」就是想在网页里重新登录一次。
@@ -681,7 +870,7 @@ public class MainActivity extends AppCompatActivity {
             webView.goBack();
             return;
         }
-        String home = UrlHelper.join(current.base, "/");
+        String home = homeUrl();
         String here = currentUrl == null ? "" : UrlHelper.stripQuery(currentUrl);
         if (!here.equals(UrlHelper.stripQuery(home)) && !here.isEmpty()) {
             loadHome();
@@ -738,7 +927,7 @@ public class MainActivity extends AppCompatActivity {
         if (fresh == null) return;
         current = fresh;
         repository.setLastId(fresh.id);
-        String home = UrlHelper.join(current.base, "/");
+        String home = homeUrl();
         if (!home.equals(currentUrl)) {
             tokenInjected = false;
             suppressTokenInjection = false;
