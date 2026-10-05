@@ -941,7 +941,14 @@ public final class Bot implements AutoCloseable {
 
     void executeChatCommands(JsonObject event, List<String> commands, JsonObject choices) throws Exception {        ChatActions.validate(commands);
         if (closed.get() || !settings.allowed(event)) throw new IllegalArgumentException("当前会话无操作权限或机器人正在关闭。");
-        JsonObject context=event.deepCopy();List<String> sequence=List.copyOf(commands);JsonObject frozen=choices.deepCopy();
+        // 常规档：一条自然语言请求（可能拆成好几步）也只有一个收据窗口——整条链路最后只留一句肯定、
+        // 或（有失败时）一句说明；图片照旧发。窗口挂在 context 上，异步步骤（.infix/.gen/LoRA 下载）
+        // 带着同一份事件回来时仍然记在这条指令上。
+        NormalWindow window = openNormalWindow(event);
+        JsonObject context=attachNormalWindow(event.deepCopy());List<String> sequence=List.copyOf(commands);JsonObject frozen=choices.deepCopy();
+        // 这一份 context 已经带着窗口 id：后面的步骤（包括换线程跑的异步步骤）都靠它认领同一条指令，
+        // 本线程的 ThreadLocal 立刻收掉，免得留在池化线程上串到下一个会话。
+        if (window != null && normalWindowHere.get() == window) normalWindowHere.remove();
         // 一条自然语言请求被拆成多步执行时，各步回执先收集起来，执行完合成一条聊天记录发送，
         // 不再把每一步都单独刷屏。
         ChainRecord record = sequence.size() > 1 ? new ChainRecord() : null;
@@ -955,7 +962,7 @@ public final class Bot implements AutoCloseable {
             Set<String> keepRemoved = lorasRequestedRemoved(Json.str(context, "raw_message", ""), knownLoraTags);
             try { activeChatWorkflows.incrementAndGet(); chatWorkflows.execute(() -> {
                 try { runChatCommands(context,sequence,frozen,knownLoraTags,record,keepRemoved); }
-                catch(Exception e) { reply(context,"多步骤指令已停止："+error(e)); }
+                catch(Exception e) { replyFailure(context,"多步骤指令已停止："+error(e)); }
                 finally {
                     // Even when a step stopped the chain, a loaded LoRA tag must not be left missing.
                     restoreLoraTags(context, knownLoraTags, keepRemoved);
@@ -967,15 +974,23 @@ public final class Bot implements AutoCloseable {
                     } catch (Exception checkError) { Log.warn("提示词自检失败：" + error(checkError)); }
                     finishChainRecord(context, record, recordKey, sequence.size());
                     activeChatWorkflows.decrementAndGet();
+                    releaseNormalWindow(context);          // 常规档：这条指令的收据到这里定稿
+                    closeNormalWindow(window);
                 }
             }); } catch(RejectedExecutionException e) {
                 activeChatWorkflows.decrementAndGet();
                 if (record != null) chainRecords.remove(recordKey);
+                releaseNormalWindow(context);
+                closeNormalWindow(window);
                 throw new IllegalStateException("机器人正在关闭。");
             }
         } else {
             try { runChatCommands(context,sequence,frozen,new ArrayList<>(),record); }
-            finally { finishChainRecord(context, record, recordKey, sequence.size()); }
+            finally {
+                finishChainRecord(context, record, recordKey, sequence.size());
+                releaseNormalWindow(context);
+                closeNormalWindow(window);
+            }
         }
     }
     /**
@@ -1022,13 +1037,26 @@ public final class Bot implements AutoCloseable {
     private void finishChainRecord(JsonObject event, ChainRecord record, String key, int total) {
         if (record == null) return;
         chainRecords.remove(key);
+        // 常规档：整条链路共用一个收据窗口（各步的收据已经在窗口里了），这里只补一句总结——
+        // 全成功就是一句肯定，有一步失败就是那条失败说明（失败优先级最高，会把肯定顶掉）。
+        NormalWindow window = normalWindowFor(event);
+        if (window != null) {
+            if (record.failure != null) {
+                StringBuilder failure = new StringBuilder(record.summary(total));
+                if (!record.blocks.isEmpty()) failure.append("\n").append(record.blocks.get(record.blocks.size() - 1).strip());
+                window.offer(ReceiptRank.FAILURE, publicCommands(failure.toString()));
+            } else {
+                window.offer(ReceiptRank.AFFIRM, publicCommands(record.summary(total)));
+            }
+            return;
+        }
         if (record.empty()) return;
         // 常规档只留"肯定"与图片：多步执行的"过程"（总结 + 每一步的命令与回执块，例如
         // 「多步执行完成：2/2 条（全部成功）」「【1】.prompt add …」）在全部成功时不再发。
         // 只要有任何一步失败（failure != null）或没跑完（blocks 少于 total，原因写在收尾里），
         // 就走下面原有的完整形态——错误、失败原因与"需要用户决定"的说明绝不吞。
         // 全部成功但收尾里有内容（LoRA 恢复、词条补齐、自检修正、多步骤指令已停止…）时，只发收尾那一段。
-        if (normalReceipts(event) && record.failure == null && record.complete(total)) {
+        if (quietReceipts(event) && record.failure == null && record.complete(total)) {
             String tail = record.trailing();
             if (!tail.isEmpty()) reply(event, tail);
             return;
@@ -1371,6 +1399,8 @@ public final class Bot implements AutoCloseable {
     private final AtomicBoolean logMirrorGuard = new AtomicBoolean();
     private volatile long lastLogMirrorNanos;
     public void accept(JsonObject event) {
+        // 常规档：一条消息（＝一条用户指令，含分号拆出的多条）共用一个收据窗口，收尾时只放一条文本出去。
+        NormalWindow window = null;
         try {
             String postType = Json.str(event, "post_type", "");
             if (!"message".equals(postType)) {
@@ -1410,6 +1440,8 @@ public final class Bot implements AutoCloseable {
                 chat.accept(event, speakableNumbers(quoted.isEmpty() ? text : "[引用] " + quoted + "\n" + REQUEST_MARK + text));
                 return;
             }
+            // 到这里就是一条真的指令了：开常规档的收据窗口（debug 档 / 已经在一条指令里 → null＝照旧直接发）。
+            window = openNormalWindow(event);
             if (text.matches("(?i)^[./](jrlp|强娶|离婚|结婚|同意|拒绝|wife|marry|propose|divorce|accept|reject)(?:\\s+[\\s\\S]*)?$")) { marriage(event, text); return; }
             if (text.matches("(?i)^[./]affinity(?:\\s+[\\s\\S]*)?$")) { affinityCommand(event, text.replaceFirst("(?i)^[./]affinity","")); return; }
             List<String> commands = splitCommands(text);
@@ -1419,11 +1451,12 @@ public final class Bot implements AutoCloseable {
                 for (int index = 0; index < commands.size(); index++) {
                     String command = commands.get(index);
                     Log.info("指令 " + (index + 1) + "/" + commands.size() + "（" + who + "）：" + Log.text(command));
+                    markQueryCommand(event, queryCommand(command));
                     try { dispatch(event, command); }
                     catch (Exception e) {
                         if (chatDispatchFailed.get() != null) chatDispatchFailed.set(true);
                         Log.error("第 " + (index + 1) + " 条指令失败，剩余 " + (commands.size() - index - 1) + " 条未执行（" + who + "）", e);
-                        reply(event, "第 " + (index + 1) + " 条指令失败，后续指令未执行：\n" + command + "\n" + error(e));
+                        replyFailure(event, "第 " + (index + 1) + " 条指令失败，后续指令未执行：\n" + command + "\n" + error(e));
                         return;
                     }
                     if (Boolean.TRUE.equals(chatDispatchFailed.get())) return;
@@ -1431,11 +1464,14 @@ public final class Bot implements AutoCloseable {
                 return;
             }
             Log.info("指令（" + describeConversation(event) + "，用户 " + Json.str(event, "user_id", "") + "）：" + Log.text(text));
+            markQueryCommand(event, queryCommand(commands.get(0)));
             dispatch(event, commands.get(0));
         } catch (Exception e) {
             if (chatDispatchFailed.get() != null) chatDispatchFailed.set(true);
             Log.error("指令处理失败（" + describeConversation(event) + "）", e);
-            reply(event, "操作失败：" + error(e));
+            replyFailure(event, "操作失败：" + error(e));
+        } finally {
+            closeNormalWindow(window);
         }
     }
     /**
@@ -1806,7 +1842,7 @@ public final class Bot implements AutoCloseable {
         if (instruction.isBlank() || instruction.length() > 8000) throw new IllegalArgumentException("用法：/infix <修改要求>，最多 8000 字符。");
         if (closed.get()) throw new IllegalStateException("机器人正在关闭。");
         if (!progenBusy.compareAndSet(false, true)) { reply(event, "已有 DeepSeek 请求正在处理，请稍后重试。");completeChatWorkflowStep(event,false);return; }
-        JsonObject context = event.deepCopy(); reply(context, "正在通过 DeepSeek 智能修改你个人的提示词。");
+        JsonObject context = attachNormalWindow(event.deepCopy()); replyProcess(context, "正在通过 DeepSeek 智能修改你个人的提示词。");
         String scope = promptScope(event);
         try { progenIO.execute(() -> {
             String message; boolean succeeded=false;
@@ -1843,9 +1879,11 @@ public final class Bot implements AutoCloseable {
             } catch (Exception e) { message = "智能修改未完成：" + error(e); }
             finally { progenBusy.set(false); }
             Log.info(message);
-            reply(context, message);
+            // 改了就是一句肯定，没改成就是那句失败说明——同一处只出一条（normal 下由收据窗口定稿）。
+            replyRanked(context, succeeded ? ReceiptRank.AFFIRM : ReceiptRank.FAILURE, message);
             completeChatWorkflowStep(context,succeeded);
-        }); } catch (RejectedExecutionException e) { progenBusy.set(false);completeChatWorkflowStep(event,false);throw new IllegalStateException("机器人正在关闭。"); }
+            releaseNormalWindow(context);
+        }); } catch (RejectedExecutionException e) { progenBusy.set(false);completeChatWorkflowStep(event,false);releaseNormalWindow(context);throw new IllegalStateException("机器人正在关闭。"); }
     }
     /**
      * A（{@link InfixIntent}）识别出的祈使句**能不能由程序直接落地**；能落地返回 {@code null}，
@@ -2895,8 +2933,8 @@ public final class Bot implements AutoCloseable {
         if (description.isBlank() || description.length() > 8000) throw new IllegalArgumentException("用法：/progen <文字描述>，描述须为 1–8000 个字符。");
         if (closed.get()) throw new IllegalStateException("机器人正在关闭。");
         if (!progenBusy.compareAndSet(false, true)) { reply(event, "已有提示词生成请求正在处理，请稍后重试。");completeChatWorkflowStep(event,false);return; }
-        JsonObject context = event.deepCopy();
-        reply(context, "正在通过 DeepSeek 生成提示词，完成后会回复。");
+        JsonObject context = attachNormalWindow(event.deepCopy());
+        replyProcess(context, "正在通过 DeepSeek 生成提示词，完成后会回复。");
         try {
             progenIO.execute(() -> {
                 String message;boolean succeeded=false;
@@ -2909,10 +2947,11 @@ public final class Bot implements AutoCloseable {
                 } catch (Exception e) { message = "提示词生成失败：" + error(e); }
                 finally { progenBusy.set(false); }
                 Log.info("progen 完成：" + Log.text(message));
-                reply(context, message);
+                replyRanked(context, succeeded ? ReceiptRank.AFFIRM : ReceiptRank.FAILURE, message);
                 completeChatWorkflowStep(context,succeeded);
+                releaseNormalWindow(context);
             });
-        } catch (RejectedExecutionException e) { progenBusy.set(false);completeChatWorkflowStep(event,false);throw new IllegalStateException("机器人正在关闭。"); }
+        } catch (RejectedExecutionException e) { progenBusy.set(false);completeChatWorkflowStep(event,false);releaseNormalWindow(context);throw new IllegalStateException("机器人正在关闭。"); }
     }
     /**
      * /char <关键词>: look the character up in the local LoRA files and the WebUI styles, then ask whether
@@ -2941,7 +2980,7 @@ public final class Bot implements AutoCloseable {
             if (!requirement.isBlank()) steps.add("/infix " + requirement);
             steps.add("/gen 1");
             Log.info("角色图任务链（" + kind + "：" + name + "）：" + steps.size() + " 步");
-            reply(event, "开始按顺序执行：" + String.join(" → ", steps));
+            replyProcess(event, "开始按顺序执行：" + String.join(" → ", steps));
             runChatCommands(event, steps, selectionContext(event));
             return;
         }
@@ -3058,8 +3097,11 @@ public final class Bot implements AutoCloseable {
      * 传输层不支持时保持它原来的发法（逐条，并如实说明原因），合并转发失败也回退成逐条发送——
      * 不管走哪条路，结果一条都不能丢。
      *
-     * <p>节点正文就是用户在手机上看到的那段纯文本（编号、模型名、底模、下载量、触发词、大小、页面地址），
+     * <p>节点正文就是用户在手机上看到的那段纯文本（编号、模型名、NSFW 标记、底模、下载量/点赞/大小/发布、
+     * 触发词、页面；见 {@link #loraSearchNodeText}），
      * 编号与 {@code .lora download #N} 用的是同一份"本页"列表，所以两边永远对得上。
+     * 节点数 = 结果条数（页头/页脚另有回执，不占节点）；一页最多 {@link CivitaiClient#MAX_PAGE_SIZE} 条，
+     * 所以节点数也最多这么多；节点正文不设长度上限（只有 QQ 侧的整包大小上限，超了会发送失败并走逐条兜底）。
      */
     void sendLoraSearchResults(JsonObject event, CivitaiClient.SearchPage page) {
         List<CivitaiClient.SearchResult> results = page.results();
@@ -3075,10 +3117,21 @@ public final class Bot implements AutoCloseable {
         Log.info("LoRA 搜索结果发送方式（" + describeConversation(event) + "）：合并转发 " + nodes.size() + " 条");
         // 合并转发失败（NapCat 不支持 send_group_forward_msg、节点格式被拒……）绝不能把结果丢了：
         // 回退成逐条发送（逐条那条路自己还有"封面发不出去就改用文字"的兜底），这里只回退一次、不重试。
+        //
+        // 但"结果未知"（API 响应超时、连接中断）是另一回事：那些结果可能已经发出去了，此时再逐条发一遍
+        // 就是同一批结果出现两遍（线上 /lora query gpt 就是这样：30 秒超时 → 又发了 10 条）。
+        // 所以只有**确定被拒**才逐条兜底；不确定时只说明一句，不重发（宁可少发一次，也不许出现两遍）。
         CompletableFuture<Void> sent;
         try {
             sent = sender.sendRecord(event, nodes).handle((ignored, failure) -> {
                 if (failure == null) return CompletableFuture.<Void>completedFuture(null);
+                if (deliveryUnknown(failure)) {
+                    Log.warn("LoRA 搜索结果的合并转发结果未知（可能已发出），未自动重发 " + results.size()
+                            + " 条（" + describeConversation(event) + "）：" + error(failure));
+                    reply(event, "合并转发失败，搜索结果可能已发出（超时/连接中断，发送结果未知），未自动重发。"
+                            + "如果群里确实没看到，请重新执行一次 .lora query。");
+                    return CompletableFuture.<Void>completedFuture(null);
+                }
                 Log.warn("LoRA 搜索结果的合并转发失败，已改为逐条发送 " + results.size() + " 条（" + describeConversation(event) + "）：" + error(failure));
                 reply(event, "合并转发失败，已逐条发送（搜索结果一条不少）。");
                 return sendLoraSearchResultsOneByOne(event, results);
@@ -3099,8 +3152,9 @@ public final class Bot implements AutoCloseable {
     /**
      * 逐条发送一页搜索结果（传输层不支持合并转发，或合并转发失败后的回退）。
      *
-     * <p>从发不出去的那一条起（常见：图床被墙或超时）改用一条纯文本把余下条目一次给出，编号保持不变，
-     * 所以"封面发不出去"最多丢封面，绝不丢结果。
+     * <p>从发不出去的那一条起（常见：图床被墙或超时）改用一条纯文本把余下条目一次给出，编号不变、
+     * 版式与合并转发**同一个** {@link #loraSearchNodeText}（只少了封面图），所以"封面发不出去"最多丢封面，
+     * 绝不丢结果、也绝不换一套排版。
      */
     private CompletableFuture<Void> sendLoraSearchResultsOneByOne(JsonObject event, List<CivitaiClient.SearchResult> results) {
         for (int at = 0; at < results.size(); at++) {
@@ -3108,10 +3162,10 @@ public final class Bot implements AutoCloseable {
             try { sender.send(event.deepCopy(), loraSearchNode(at + 1, result)).get(); }
             catch (Exception failure) {
                 Log.warn("LoRA 搜索结果第 " + (at + 1) + " 条发送失败，余下改用文字：" + error(failure));
-                StringBuilder fallback = new StringBuilder("封面发送失败，余下条目以文字给出：\n");
+                StringBuilder fallback = new StringBuilder("封面发送失败，余下条目以文字给出（版式与合并转发一致）：\n");
                 for (int rest = at; rest < results.size(); rest++) {
-                    CivitaiClient.SearchResult item = results.get(rest);
-                    fallback.append("#").append(rest + 1).append(' ').append(item.name()).append('\n').append(item.url()).append('\n');
+                    if (rest > at) fallback.append('\n');
+                    fallback.append(loraSearchNodeText(rest + 1, results.get(rest))).append('\n');
                 }
                 reply(event, fallback.toString());
                 break;
@@ -3134,26 +3188,124 @@ public final class Bot implements AutoCloseable {
         }
         return message;
     }
+    /** 触发词一行的软上限（码点）：超过就按词里本来就有的逗号换行，绝不切字。 */
+    static final int LORA_SEARCH_WORD_LINE_CHARS = 120;
     /**
-     * 上面那个节点的正文：编号、模型名（不截断）、底模、下载量、触发词、大小、页面地址。
-     * 纯文本逐行写，不塞 JSON/表格——QQ 的聊天记录节点在手机上就是这段文字。
+     * 上面那个节点的正文。版式（一个结果一个节点，首行是"#编号 名称"，其余按"一眼能读"分组）：
+     *
+     * <pre>
+     * #3 Chatgpt Cartoon Style - Illustrious
+     * 底模：Illustrious
+     * 下载量：146｜点赞：34｜大小：217.9 MB｜发布：2025-11-17
+     * 触发词（1 条）：
+     * Stylized cartoon, expressive outlines, cartoony proportions, High-contrast highlights
+     * 页面：https://civitai.red/models/2144329?modelVersionId=2415380
+     * </pre>
+     *
+     * <p>每一条规则都有测试盯着：
+     * <ul>
+     *   <li>名称、底模、触发词一律**原文**给出，不截断、不加省略号；名称里的换行压成空格，
+     *       否则名称能伪装出"底模："这种字段行。</li>
+     *   <li>空值不占行：没有底模/下载量/点赞/大小/发布/触发词就没有那一行——不写"未标注"，也不留空行。</li>
+     *   <li>字段名全中文，不出现 {@code modelId}/{@code versionId}/{@code nsfw}/{@code cover} 这类内部键名，
+     *       更没有裸 JSON（QQ 的聊天记录节点在手机上就是这几行字）。</li>
+     *   <li>触发词**一条一行**（Civitai 的 trainedWords 一个元素一行，条数写在组头上）：原文里的英文逗号
+     *       紧挨着顿号（{@code ,、}）既难看又会改写要复制的提示词，所以不再用顿号拼成一行。</li>
+     *   <li>过长的触发词按**它自己的逗号**换行（每行尽量不超过 {@value #LORA_SEARCH_WORD_LINE_CHARS} 个字）；
+     *       没有可断处就整行给出——一个字都不许用省略号吃掉。</li>
+     *   <li>"页面"永远单独一行、整行只有这个地址，直接长按复制。</li>
+     *   <li>NSFW 单独一行"标记"，不贴在底模后面（贴上去会被读成底模名的一部分）。</li>
+     * </ul>
      */
     static String loraSearchNodeText(int number, CivitaiClient.SearchResult result) {
-        StringBuilder text = new StringBuilder("#").append(number).append(' ').append(result.name());
-        String base = result.baseModel() == null ? "" : result.baseModel().strip();
-        text.append("\n底模：").append(base.isEmpty() ? "未标注" : base);
-        if (result.nsfw()) text.append("（NSFW 标记）");
-        if (result.downloads() > 0) text.append("\n下载量：").append(String.format(Locale.ROOT, "%,d", result.downloads()));
-        List<String> words = result.trainedWords() == null ? List.of() : result.trainedWords();
-        if (!words.isEmpty()) text.append("\n触发词（").append(words.size()).append(" 条）：").append(String.join("、", words));
-        String size = loraSearchSize(result.sizeKb());
-        if (!size.isEmpty()) text.append("\n大小：").append(size);
+        StringBuilder text = new StringBuilder("#").append(number).append(' ').append(loraSearchName(result.name()));
+        if (result.nsfw()) text.append("\n标记：NSFW（成人内容）");
+        String base = loraSearchBaseModel(result.baseModel());
+        if (!base.isEmpty()) text.append("\n底模：").append(base);
+        String metrics = loraSearchMetrics(result);
+        if (!metrics.isEmpty()) text.append('\n').append(metrics);
+        List<String> words = loraSearchWords(result.trainedWords());
+        if (!words.isEmpty()) {
+            text.append("\n触发词（").append(words.size()).append(" 条）：");
+            for (String word : words) for (String line : loraSearchTriggerLines(word)) text.append('\n').append(line);
+        }
         text.append("\n页面：").append(result.url());
         return text.toString();
     }
-    /** 文件大小：1 MB 以下写 KB，以上写 MB（一位小数）；未知（0 / 负数）就不写这一行。 */
+    /** 节点首行的名称：换行压成空格（只动换行，其余一字不改、不截断）；真的没有名字就用解析层同一个词"未命名"。 */
+    static String loraSearchName(String name) {
+        String value = name == null ? "" : name.strip();
+        if (value.isEmpty()) return "未命名";
+        return value.replace("\r\n", " ").replace('\n', ' ').replace('\r', ' ');
+    }
+    /** "底模"这一项：Civitai 没给（空串，或解析层的占位"未知"）就返回空串，调用方连这一行都不写。 */
+    static String loraSearchBaseModel(String baseModel) {
+        String base = baseModel == null ? "" : baseModel.strip();
+        return base.isEmpty() || base.equals("未知") || base.equals("未标注") ? "" : base;
+    }
+    /**
+     * 一行"数字栏"：下载量、点赞、大小、发布时间——有的才写，之间用全角竖线分开；
+     * 一个都没有就返回空串（调用方不留空行）。
+     *
+     * <p>点赞是 Civitai 的 {@code thumbsUpCount}：v1 API 里没有 0–5 分的评分字段，
+     * 所以如实写"点赞"，不把赞/踩换算成一个编出来的分数。
+     */
+    static String loraSearchMetrics(CivitaiClient.SearchResult result) {
+        List<String> parts = new ArrayList<>();
+        if (result.downloads() > 0) parts.add("下载量：" + loraSearchCount(result.downloads()));
+        if (result.likes() > 0) parts.add("点赞：" + loraSearchCount(result.likes()));
+        String size = loraSearchSize(result.sizeKb());
+        if (!size.isEmpty()) parts.add("大小：" + size);
+        String date = loraSearchDate(result.publishedAt());
+        if (!date.isEmpty()) parts.add("发布：" + date);
+        return String.join("｜", parts);
+    }
+    /** 千分位计数（下载量/点赞共用，与旧版下载量的写法一致）。 */
+    static String loraSearchCount(long value) { return String.format(Locale.ROOT, "%,d", value); }
+    /** 版本发布时间只取日期（{@code 2026-06-03T12:00:00.000Z} → {@code 2026-06-03}）；不是这个形状就整项不写，绝不编日期。 */
+    static String loraSearchDate(String publishedAt) {
+        String value = publishedAt == null ? "" : publishedAt.strip();
+        Matcher date = Pattern.compile("^([0-9]{4}-[0-9]{2}-[0-9]{2})(?:[T ].*)?$").matcher(value);
+        return date.matches() ? date.group(1) : "";
+    }
+    /** 触发词：去掉空白项（Civitai 偶尔给空串），其余原样、有序、不截断。 */
+    static List<String> loraSearchWords(List<String> trainedWords) {
+        if (trainedWords == null) return List.of();
+        List<String> words = new ArrayList<>();
+        for (String word : trainedWords) if (word != null && !word.isBlank()) words.add(word);
+        return List.copyOf(words);
+    }
+    /**
+     * 一条触发词占的正文行：短词就是它自己；超过 {@value #LORA_SEARCH_WORD_LINE_CHARS} 个字的词按**它自己的逗号**
+     * 换行（换行处吃掉紧跟逗号的那个空格）。没有逗号/空格可断就整行给出——**绝不**切字、绝不加省略号。
+     */
+    static List<String> loraSearchTriggerLines(String word) {
+        String value = word == null ? "" : word;
+        List<String> lines = new ArrayList<>();
+        for (String piece : value.split("\\R", -1)) {
+            String rest = piece.strip();
+            if (rest.isEmpty()) { lines.add(""); continue; }
+            while (rest.codePointCount(0, rest.length()) > LORA_SEARCH_WORD_LINE_CHARS) {
+                int cut = loraSearchTriggerBreak(rest, LORA_SEARCH_WORD_LINE_CHARS);
+                if (cut <= 0) break;
+                lines.add(rest.substring(0, cut).stripTrailing());
+                rest = rest.substring(cut).stripLeading();
+            }
+            lines.add(rest);
+        }
+        return List.copyOf(lines);
+    }
+    /** 在不超过 {@code limit} 个码点的前缀里找最后一个逗号（没有逗号就找最后一个空格）之后的位置；没有可断处返回 -1。 */
+    private static int loraSearchTriggerBreak(String text, int limit) {
+        int end = text.offsetByCodePoints(0, Math.min(limit, text.codePointCount(0, text.length())));
+        int at = text.lastIndexOf(',', end - 1);
+        if (at < 0) at = text.lastIndexOf(' ', end - 1);
+        return at < 0 ? -1 : at + 1;
+    }
+    /** 文件大小：1 MB 以下写 KB，以上写 MB、1 GB 以上写 GB（都是一位小数）；未知（0 / 负数）就不写这一项。 */
     static String loraSearchSize(double sizeKb) {
         if (!(sizeKb > 0)) return "";
+        if (sizeKb >= 1024 * 1024) return String.format(Locale.ROOT, "%.1f GB", sizeKb / (1024 * 1024));
         return sizeKb >= 1024 ? String.format(Locale.ROOT, "%.1f MB", sizeKb / 1024) : String.format(Locale.ROOT, "%.0f KB", sizeKb);
     }
     private void lora(JsonObject event, String arguments) throws Exception {
@@ -3709,7 +3861,7 @@ public final class Bot implements AutoCloseable {
     private boolean startLoraJob(JsonObject event, WebCapture receipt, String start, boolean downloading, boolean cancellable, LoraAction action) {
         if (loraClosed.get()) throw new IllegalStateException("机器人正在关闭，请稍后重试。");
         if (!loraBusy.compareAndSet(false, true)) return false;
-        JsonObject context = event == null ? null : event.deepCopy();
+        JsonObject context = event == null ? null : attachNormalWindow(event.deepCopy());
         CountDownLatch done = new CountDownLatch(1);
         loraJobDone = done;
         // 每次下载都是**新**的控制对象：上一次下载的取消/暂停绝不会留到这一次。
@@ -3718,7 +3870,8 @@ public final class Bot implements AutoCloseable {
         if (receipt != null) receipt.capture(Maps.text(start));
         if (downloading) { loraStatus = safeLoraText(start); loraDownloading = true; }
         Log.info("LoRA 操作开始（" + (context == null ? "控制台" : describeConversation(context)) + "）：" + Log.text(start));
-        if (context != null) reply(context, start);
+        // 常规档：这条只是"正在下载/加载"的过程说明，收进这条指令的唯一回执里。
+        if (context != null) replyProcess(context, start);
         try {
             loraIO.execute(() -> {
                 LoraResult result;
@@ -3734,7 +3887,12 @@ public final class Bot implements AutoCloseable {
                     done.countDown();       // 取消接口据此确认"半截文件已清掉、下载线程真的退出了"
                 }
                 Log.info("LoRA 操作完成（成功=" + result.success() + "）：" + Log.text(result.text()));
-                if (context != null) reply(context, result.text());
+                // 成功就是一句肯定，失败就是那条说明（含"展示图样式：新增/修正/复用…"这类汇总行，
+                // 常规档下它们全都收在这一条里，不再一步一行）。
+                if (context != null) {
+                    replyRanked(context, result.success() ? ReceiptRank.AFFIRM : ReceiptRank.FAILURE, result.text());
+                    releaseNormalWindow(context);
+                }
                 // 控制台触发的任务没有 QQ 回执通道：把最终结论写进 loraStatus，进度条收起时显示的就是它。
                 else loraStatus = result.text();
                 if (receipt != null) { receipt.capture(Maps.text(result.text())); receipt.finish(); observeQuest(receipt); }
@@ -3749,6 +3907,7 @@ public final class Bot implements AutoCloseable {
             if (downloading) loraStatus = "操作未启动；机器人正在关闭，请稍后重试。";
             if (receipt != null) { receipt.capture(Maps.text("操作失败：机器人正在关闭，请稍后重试。")); receipt.finish(); observeQuest(receipt); }
             completeChatWorkflowStep(context, false);
+            releaseNormalWindow(context);
             throw new IllegalStateException("机器人正在关闭，请稍后重试。");
         }
         return true;
@@ -5006,7 +5165,7 @@ public final class Bot implements AutoCloseable {
         String current = Json.str(snapshot, "vae", "");
         if (level.equals("WARN")) {
             Log.warn("生成任务 #" + job.number + " 出图前 VAE 提醒：" + reason);
-            reply(job.event, "⚠ VAE 提醒（不影响本次生成）：" + (reason.isBlank() ? vaeConflictText(snapshot) : reason)
+            replyProcess(job.event, "⚠ VAE 提醒（不影响本次生成）：" + (reason.isBlank() ? vaeConflictText(snapshot) : reason)
                     + "\n要确认配置：.vae check");
             return "";
         }
@@ -5014,7 +5173,7 @@ public final class Bot implements AutoCloseable {
             List<String> actions = vaeRepair();
             Log.warn("生成任务 #" + job.number + " 出图前检测到 VAE/额外模块与当前模型冲突，已自动修复："
                     + String.join("；", actions));
-            reply(job.event, "检测到 VAE/额外模块与当前模型冲突，已自动修复：\n- " + String.join("\n- ", actions)
+            replyProcess(job.event, "检测到 VAE/额外模块与当前模型冲突，已自动修复：\n- " + String.join("\n- ", actions)
                     + "\n本次生成按修复后的配置继续。");
             return "";
         }
@@ -5506,8 +5665,8 @@ public final class Bot implements AutoCloseable {
         if (original.isBlank()) throw new IllegalStateException("当前基础性格设定为空，请先用 /chat personality 设置后再修改。");
         if (closed.get()) throw new IllegalStateException("机器人正在关闭。");
         if (!progenBusy.compareAndSet(false, true)) { reply(event, "已有 DeepSeek 请求正在处理，请稍后重试。"); completeChatWorkflowStep(event,false); return; }
-        JsonObject context = event.deepCopy();
-        reply(context, "正在通过 DeepSeek 修改基础性格设定（初始设定）。");
+        JsonObject context = attachNormalWindow(event.deepCopy());
+        replyProcess(context, "正在通过 DeepSeek 修改基础性格设定（初始设定）。");
         try { progenIO.execute(() -> {
             String message; boolean succeeded=false;
             try {
@@ -5524,9 +5683,10 @@ public final class Bot implements AutoCloseable {
             } catch (Exception e) { message = "性格设定修改未完成：" + error(e); }
             finally { progenBusy.set(false); }
             Log.info(message);
-            reply(context, message);
+            replyRanked(context, succeeded ? ReceiptRank.AFFIRM : ReceiptRank.FAILURE, message);
             completeChatWorkflowStep(context,succeeded);
-        }); } catch (RejectedExecutionException e) { progenBusy.set(false); completeChatWorkflowStep(event,false); throw new IllegalStateException("机器人正在关闭。"); }
+            releaseNormalWindow(context);
+        }); } catch (RejectedExecutionException e) { progenBusy.set(false); completeChatWorkflowStep(event,false); releaseNormalWindow(context); throw new IllegalStateException("机器人正在关闭。"); }
     }
     /** Compare-and-set style apply: never clobber a personality that changed while DeepSeek was working. */
     static String applyChatPersonality(Settings settings, String expected, String updated) throws IOException {
@@ -5575,6 +5735,14 @@ public final class Bot implements AutoCloseable {
         } finally { batchReceipts.remove(); }
         String summary = "批量执行完成：" + succeeded + "/" + steps.size() + " 条"
                 + (failure == null ? "（全部成功）" : "（已在失败处停止：" + failure + "）");
+        // 常规档：整批只留一条——全成功是一句肯定，中途失败是那条失败说明（含原因）。
+        NormalWindow window = normalWindowFor(event);
+        if (window != null) {
+            window.offer(failure == null ? ReceiptRank.AFFIRM : ReceiptRank.FAILURE,
+                    publicCommands(failure == null ? summary
+                            : summary + (blocks.isEmpty() ? "" : "\n" + blocks.get(blocks.size() - 1).strip())));
+            return;
+        }
         // Each receipt stays its own message; they travel together inside one chat record.
         ChainRecord chain = chainRecords.get(ChatService.conversationKey(event));
         if (chain != null) {
@@ -5603,7 +5771,7 @@ public final class Bot implements AutoCloseable {
         }
         if (arguments.equalsIgnoreCase("start") || arguments.equals("启动")) {
             requireStaff(event, "/sd start");
-            reply(event, "正在尝试启动 SD WebUI，请稍候…");
+            replyProcess(event, "正在尝试启动 SD WebUI，请稍候…");
             String notice = sdLauncher.startNow();
             reply(event, (notice.isEmpty() ? "SD 已就绪。" : notice) + "\n" + sdLauncher.describe());
             return;
@@ -6018,11 +6186,13 @@ public final class Bot implements AutoCloseable {
             SdClient.GenerationRequest snapshot = new SdClient.GenerationRequest(personal, sd.settings(), sd.parameters());
             synchronized (generationLock) {
                 if (closed.get()) throw new IllegalStateException("机器人正在关闭，请稍后重试。");
-                GenerationJob submitted = new GenerationJob(event.deepCopy(), snapshot, count);
+                // 常规档：这条任务接管本指令的收据窗口——"入队"这句肯定先记账、不发，
+                // 等这一批图真的发完（或失败）再定稿：图出去了就不再出声，出不去就是那一条说明。
+                GenerationJob submitted = new GenerationJob(attachNormalWindow(event.deepCopy()), snapshot, count);
                 submitted.number = nextGenerationId = nextGenerationId.add(BigInteger.ONE);
                 // 常规档：只回一句"肯定"，不把参数清单（采样方法/尺寸/步数/CFG/种子/底模/提示词来源/参数来源）
                 // 与任务号一起刷出来。debug 档（默认）就是原来那条完整回执。
-                reply(event, normalReceipts(event)
+                reply(event, quietReceipts(event)
                         ? "好的，开始生成 " + count + " 次～"
                         : "已加入生成队列，任务 #" + submitted.number + "，共 " + count + " 次生成，将依次开始生成图片。\n"
                                 + formatSettings(snapshot.settings(), promptScope(event))
@@ -6039,6 +6209,7 @@ public final class Bot implements AutoCloseable {
                     try { generation.execute(this::runGenerationQueue); }
                     catch (RejectedExecutionException e) {
                         generationWorkerActive = false; generationJobs.clear(); waitingGenerations = BigInteger.ZERO; suspendedGenerations = BigInteger.ZERO;
+                        releaseNormalWindow(submitted.event);   // 任务没起来：窗口只被任务占着，这里还回去
                         throw new IllegalStateException("机器人正在关闭，本次任务未启动。");
                     }
                 }
@@ -6076,7 +6247,8 @@ public final class Bot implements AutoCloseable {
                 String autoStart = sdLauncher.ensureRunning();
                 if (!autoStart.isEmpty()) {
                     Log.info("生成任务 #" + job.number + "：" + autoStart);
-                    reply(job.event, autoStart);
+                    // 常规档：SD 自启动只是一句过程说明，收进这条指令的唯一回执里，不再单独刷屏。
+                    replyProcess(job.event, autoStart);
                 }
                 // 出图前的防呆（只查一次）：残留的额外模块会被自动修掉，用户显式选错的 VAE 会被拒绝。
                 if (!job.vaeChecked) {
@@ -6094,7 +6266,7 @@ public final class Bot implements AutoCloseable {
                     List<Path> result = sd.generate(job.snapshot, job.taskId);
                     // 出图后的最后一道防线：灰图自检 + 自动修复 + 只重试一次（独立于上面的冲突检测）。
                     GrayCheck gray = grayCheck(job, result);
-                    if (!gray.notice().isEmpty()) reply(job.event, gray.notice());
+                    if (!gray.notice().isEmpty()) replyProcess(job.event, gray.notice());
                     if (gray.failed()) synchronized (generationLock) {
                         job.failed = job.failed.add(BigInteger.ONE);
                         job.lastError = "出图全是灰图（纯色废图）：VAE/额外模块与当前模型冲突，自动修复后重试仍失败；用 .vae check 查看";
@@ -6126,6 +6298,7 @@ public final class Bot implements AutoCloseable {
                 Log.info(notice);
                 replySettleNotice(job, settledReason, notice);
                 if (!closed.get() && settings.autoGet() && !job.completedImages.isEmpty()) getImages(job.event, List.copyOf(job.completedImages));
+                releaseNormalWindow(job.event);   // 任务这一份占用收尾；图片那一路自己另占一份，发完才定稿
             }
         }
     }
@@ -6164,16 +6337,15 @@ public final class Bot implements AutoCloseable {
     /**
      * 结算回执在常规档（{@code .mode normal}）下的发送决策——这是结算回执唯一的落点。
      *
-     * <p>只有"这一批全部成功、没有失败/拒绝/取消、图片马上会自动发出"这一种情况才不发：
-     * 图片本身就是回执。其余一律照旧发出，绝不吞掉任何异常信息——
-     * 失败（{@code job.failed>0} 或 {@code lastError} 非空）、被拒绝（{@code refused}）、
-     * 取消/停止（reason 不是"已完成"）、一张图都没出来（{@code completedImages} 为空）都算"有事"。
-     * 常规档且关闭了自动领取时，图片不会自己出现，于是只留一句"发送 .get 领取"（要用户动手的提示不能吞）。
+     * <p>常规档下它只是这条指令收据里的一个**候选**：失败/被拒绝/取消/停止/没有成品都按最高优先级记进去
+     * （会把"入队"那条肯定顶掉，绝不会出现"入队一条 + 结算一条"），全部成功且图片马上会自动发出时
+     * 连候选都不记——图片本身就是回执。关闭自动领取时图片不会自己出现，于是留一句"发送 .get 领取"。
      */
     private void replySettleNotice(GenerationJob job, String reason, String notice) {
         boolean trouble = job.refused != null || job.failed.signum() > 0 || !job.lastError.isEmpty()
                 || !"已完成".equals(reason) || job.completedImages.isEmpty();
-        if (trouble || !normalReceipts(job.event)) { reply(job.event, notice); return; }
+        if (trouble) { replyFailure(job.event, notice); return; }
+        if (!quietReceipts(job.event)) { reply(job.event, notice); return; }
         if (settings.autoGet()) return;
         reply(job.event, "生成完成，发送 /get 领取图片。");
     }
@@ -6185,17 +6357,21 @@ public final class Bot implements AutoCloseable {
             replySettleNotice(job, reason, notice);
         }
         if (!closed.get() && settings.autoGet() && !job.completedImages.isEmpty()) getImages(job.event, List.copyOf(job.completedImages));
+        releaseNormalWindow(job.event);      // 任务这一份占用收尾；图片那一路自己另占一份，发完才定稿
     }
     private void getImages(JsonObject event) { getImages(event, null); }
     private void getImages(JsonObject event, List<Path> automaticImages) { getImages(event, automaticImages, 0); }
     private void getImages(JsonObject event, List<Path> automaticImages, int recentCount) {
         if (closed.get()) throw new IllegalStateException("机器人正在关闭，请稍后重试。");
         if (automaticImages == null && !drainingImages.compareAndSet(false, true)) { reply(event, "正在领取图片，请等待本次领取完成后再试。"); return; }
-        JsonObject context = event.deepCopy();
+        // 常规档：领取/回溯也是这条指令的一部分——窗口押到"图真的发完"再定稿，
+        // 所以"本次领取完成，共 N 张"不会和前面的肯定凑成两条。
+        JsonObject context = attachNormalWindow(event.deepCopy());
         try {
             outboxDelivery.execute(() -> {
-                String notice;
+                String notice = null;
                 int delivered = 0;
+                boolean failed = false;
                 // 常规档：图片已经发出去了，"本次领取完成，共 N 张"这种计数回执就不必再发一条。
                 // 领取本身（acknowledgeImages）在本方法里先于回执完成，少发消息不会漏领。
                 // 只对这一条成功计数回执生效：暂无图片、发送失败、预览保留这些说明照旧发出。
@@ -6233,17 +6409,28 @@ public final class Bot implements AutoCloseable {
                                 + batch.size() + " 张，耗时 " + millis(started) + " ms");
                         }
                         notice = (recentCount > 0 ? "历史图片回溯完成，共 " : "本次领取完成，共 ") + delivered + " 张。" + (previewTasks.isEmpty() ? "" : "\n未完成任务的图片仅预览，仍保留在待领取列表。");
-                        quietSuccess = normalReceipts(context);
+                        quietSuccess = quietReceipts(context);
+                        markImagesDelivered(context);
                     }
                 } catch (Exception e) {
                     if (e instanceof InterruptedException) Thread.currentThread().interrupt();
+                    failed = true;
                     notice = recentCount > 0 ? "历史图片发送失败：本次已确认发送 " + delivered + " 张，历史文件及待领取列表未修改。\n" + error(e)
                             : "领取图片失败：本次已确认领取 " + delivered + " 张，未完成的图片已保留。\n" + error(e);
                     Log.error("领取图片失败（" + describeConversation(context) + "，已确认 " + delivered + " 张）", e);
-                } finally { if (automaticImages == null) drainingImages.set(false); }
-                if (!quietSuccess) reply(context, notice);
+                } finally {
+                    if (automaticImages == null) drainingImages.set(false);
+                    // 先记候选（发送失败是"有事"：最高优先级，照旧发出来），再放掉这一次占用：
+                    // 放完就定稿，所以顺序不能颠倒。
+                    if (notice != null && !quietSuccess) replyRanked(context, failed ? ReceiptRank.FAILURE : ReceiptRank.AFFIRM, notice);
+                    releaseNormalWindow(context);
+                }
             });
-        } catch (RejectedExecutionException e) { if (automaticImages == null) drainingImages.set(false); throw new IllegalStateException("机器人正在关闭，请稍后重试。"); }
+        } catch (RejectedExecutionException e) {
+            if (automaticImages == null) drainingImages.set(false);
+            releaseNormalWindow(context);
+            throw new IllegalStateException("机器人正在关闭，请稍后重试。");
+        }
     }
     /**
      * 一批图片的发送方式：多于一张时合成一条「合并转发」（每张图一个节点），单张图保持普通发送。
@@ -6274,12 +6461,7 @@ public final class Bot implements AutoCloseable {
         // 合并转发失败（比如 NapCat 不支持 send_group_forward_msg、节点格式被拒）绝不能把图丢了：
         // 回退到普通发送，且返回的 future 就是回退那次发送的结果——回退成功调用方照常 acknowledge，
         // 回退也失败才把失败抛给调用方（不 acknowledge）。这里只回退一次，不会重试。
-        return sender.sendRecord(event, nodes).handle((ignored, failure) -> {
-            if (failure == null) return CompletableFuture.<Void>completedFuture(null);
-            Log.warn("合并转发失败，已改为普通发送 " + batch.size() + " 张（" + describeConversation(event) + "）：" + error(failure));
-            try { return sender.send(event, Maps.localImages(batch)); }
-            catch (Exception fallbackFailure) { return CompletableFuture.<Void>failedFuture(fallbackFailure); }
-        }).thenCompose(future -> future);
+        return sendImagesAsRecord(event, batch, nodes);
     }
     /**
      * {@code .imgmode record}：一张也合成一条「合并转发」。
@@ -6297,12 +6479,50 @@ public final class Bot implements AutoCloseable {
         // 每个节点只含一张图；仍用本地文件引用（不把图片字节塞进 JSON），顺序与 batch 一致。
         List<JsonArray> nodes = new ArrayList<>(batch.size());
         for (Path path : batch) nodes.add(Maps.localImages(List.of(path)));
+        return sendImagesAsRecord(event, batch, nodes);
+    }
+    /**
+     * 一批图片的合并转发，以及失败之后的处理——auto 与 {@code .imgmode record} 共用这一段，避免两处走样。
+     *
+     * <p>两种失败必须分开（线上事故的核心）：
+     * <ul>
+     *   <li><b>确定被拒</b>（NapCat 回了 retcode，比如不支持 {@code send_group_forward_msg}、节点格式被拒）：
+     *       这批图确实没发出去，照旧逐张普通发送兜底，返回回退那次的结果（回退成功调用方照常 acknowledge）。</li>
+     *   <li><b>结果未知</b>（API 响应超时、连接中断）：合并转发**可能已经成功**。此时再逐张发一遍，
+     *       用户就会看到同一批图出现两遍（线上 {@code 07:44:36 → 07:45:06} 的 10 张图就是这样）。
+     *       所以这里只发一条纯文字说明「可能已发出，未自动重发」，**绝不重发**，
+     *       并把这个不确定当成"这次发送已经结束"返回给调用方——图可能真的在群里，不能让调用方再补一份。</li>
+     * </ul>
+     * 宁可少发一次，也不许同一批出现两遍。
+     */
+    private CompletableFuture<Void> sendImagesAsRecord(JsonObject event, List<Path> batch, List<JsonArray> nodes) {
         return sender.sendRecord(event, nodes).handle((ignored, failure) -> {
             if (failure == null) return CompletableFuture.<Void>completedFuture(null);
+            if (deliveryUnknown(failure)) {
+                Log.warn("合并转发结果未知（可能已发出），未自动重发 " + batch.size() + " 张（"
+                        + describeConversation(event) + "）：" + error(failure));
+                reply(event, "合并转发失败，" + batch.size() + " 张图可能已发出（超时/连接中断，发送结果未知），未自动重发。"
+                        + "如果确实没看到，请重新执行一次领取指令。");
+                return CompletableFuture.<Void>completedFuture(null);
+            }
             Log.warn("合并转发失败，已改为普通发送 " + batch.size() + " 张（" + describeConversation(event) + "）：" + error(failure));
             try { return sender.send(event, Maps.localImages(batch)); }
             catch (Exception fallbackFailure) { return CompletableFuture.<Void>failedFuture(fallbackFailure); }
         }).thenCompose(future -> future);
+    }
+    /**
+     * 这个失败是不是"结果未知"（超时、连接中断、QQ 转异步）——也就是"可能已经发出去了"。
+     *
+     * <p>只有这一种失败不许重发：把"可能已发出"当成"没发出去"再发一遍，就是同一批内容出现两遍。
+     * 传输层用 {@link cn.szu.bot.qq.DeliveryUnknownException} 标记它，这里把包装（CompletionException /
+     * ExecutionException）拆开递归找；其它异常一律照旧走"确定失败"的兜底/上报路径。
+     */
+    static boolean deliveryUnknown(Throwable failure) {
+        for (Throwable cause = failure; cause != null; cause = cause.getCause()) {
+            if (cause instanceof cn.szu.bot.qq.DeliveryUnknownException) return true;
+            if (cause.getCause() == cause) break;
+        }
+        return false;
     }
     /** {@code .imgmode single}：多张也逐张普通发送（一张一条消息），读下一张要等前一张确认。 */
     private CompletableFuture<Void> sendGeneratedIndividually(JsonObject event, List<Path> paths) {
@@ -6382,6 +6602,17 @@ public final class Bot implements AutoCloseable {
      */
     private boolean normalReceipts(JsonObject event) {
         return settings.qqMode(ChatService.conversationKey(event)) == Settings.QqMode.NORMAL;
+    }
+    /**
+     * 这条消息是不是"要经 QQ 发出去"的指令回执。网页控制台的回执走自己的收集器（存档 + /quest/#N），
+     * 不经过 QQ：常规档在那里一律不合并——控制台看到的永远完整。存档与 QQ 回执是两条路，互不影响。
+     */
+    private boolean qqReceipts(JsonObject event) {
+        return webCaptureFor(event) == null;
+    }
+    /** 常规档 + 走 QQ：可以收成一条的指令回执。 */
+    private boolean quietReceipts(JsonObject event) {
+        return normalReceipts(event) && qqReceipts(event);
     }
     static List<List<Path>> imageBatches(List<Path> paths, int limit) {
         if (limit < 1) throw new IllegalArgumentException("图片上限须为正整数。");
@@ -8851,10 +9082,232 @@ public final class Bot implements AutoCloseable {
         if (instruction == null || instruction.isBlank()) return false;
         return !instruction.matches("(?s).*(改成|改为|换成|换为|替换|移除|去掉|删除|删除|清空|设置|设为|调整|调成|变成|变成).*");
     }
-    private void reply(JsonObject event, String text) {
+    // ---------------------------------------------------------------- 常规档的"唯一回执"
+    //
+    // 不变量（.mode normal）：**一条用户指令最多产生 1 条文本消息**。这条文本要么是一句肯定，
+    // 要么什么都不发（图片/图集已经承载了结果）；失败、被拒绝、权限不足、用法错误、参数校验
+    // 一律用这一条说出来，绝不吞。debug 档（默认）一行都不变：下面这套只在常规档开窗，别处照旧。
+    //
+    // 做法是"**候选先记账、收尾才发**"，全部落在组装/发送决策这一层：没有任何一处对已生成的长文本
+    // 做正则删减，只是从这条指令产生的那几条候选里挑一条发。优先级：
+    //   失败说明（FAILURE） > 用户显式查询的答案（ANSWER） > 肯定（AFFIRM） > 过程行（PROCESS，不出声）
+    // 于是"入队一条 + 结算一条"不可能同时出现：入队的肯定先记账、不发；结算若是失败说明，它直接把
+    // 肯定顶掉；结算若是成功且图片已发出，肯定自动让位（图片本身就是回执）。
+
+    /** 把"这条指令的收据"挂在事件上：异步步骤（出图结算、领取、下载收尾）拿着同一份事件回来时仍记在同一条指令上。 */
+    static final String NORMAL_WINDOW_KEY = "_qq_normal_window";
+
+    /** 一条候选文本在常规档里的分量：越靠后越优先，收尾时只放分量最高的那一条出去。 */
+    enum ReceiptRank {
+        /** 过程行（"正在…"、SD 自启动说明、灰图自检说明、VAE 自动修复说明…）：常规档一律不出声。 */
+        PROCESS,
+        /** 肯定：常规档一条指令只留一句；图片已经承载结果时连这一句也不发。 */
+        AFFIRM,
+        /** 用户显式查询的答案：用户问的必须答全，不因"只留一条"或"图片已发出"被削掉。 */
+        ANSWER,
+        /** 失败/被拒绝/权限不足/用法错误/参数校验：最高优先，任何情况下都要发出来。 */
+        FAILURE
+    }
+
+    /**
+     * 一条指令在常规档下的唯一回执窗口。
+     *
+     * <p>候选先记账、收尾才发（{@link #commit()} 里只挑选，不改写任何一条文本）。窗口可以被异步步骤
+     * "占用"（出图任务、领取流程、LoRA/DeepSeek 后台任务）：每占用一次 {@code holders} 加一，
+     * 收尾时减一，减到 0 才定稿——所以"入队"的那条肯定要等这一批图发完，才知道该不该出声。
+     */
+    static final class NormalWindow {
+        final String id = UUID.randomUUID().toString();
+        final String conversation;
+        private final JsonObject event;
+        private final Map<ReceiptRank, String> candidates = new EnumMap<>(ReceiptRank.class);
+        private final long startedMillis = System.currentTimeMillis();
+        private boolean answerMode;
+        private boolean imageDelivered;
+        private int holders = 1;
+        private boolean closed;
+
+        NormalWindow(JsonObject event) {
+            this.event = event.deepCopy();
+            this.conversation = ChatService.conversationKey(event);
+        }
+        synchronized void answerMode(boolean on) { answerMode = on; }
+        synchronized void offer(ReceiptRank rank, String text) {
+            if (text == null || text.isBlank()) return;
+            // 用户显式查询那条指令里的肯定，本身就是"用户在问的答案"：不许被后续的图片静音掉。
+            candidates.put(rank == ReceiptRank.AFFIRM && answerMode ? ReceiptRank.ANSWER : rank, text);
+        }
+        synchronized boolean has(ReceiptRank rank) { return candidates.containsKey(rank); }
+        synchronized String peek(ReceiptRank rank) { return candidates.get(rank); }
+        synchronized void imageDelivered() { imageDelivered = true; }
+        synchronized boolean imageDeliveredAlready() { return imageDelivered; }
+        synchronized void hold() { holders++; }
+        synchronized boolean isClosed() { return closed; }
+        synchronized int holders() { return holders; }
+        synchronized long ageMillis() { return System.currentTimeMillis() - startedMillis; }
+        /** 收尾一次占用；返回 true 表示持有者都放完了，可以定稿。 */
+        synchronized boolean release() {
+            if (holders > 0) holders--;
+            return holders == 0 && !closed;
+        }
+        /** 定稿：挑一条发出去；没有可发的返回 null（＝这条指令在常规档下不出声）。 */
+        synchronized String commit() {
+            closed = true;
+            String failure = candidates.get(ReceiptRank.FAILURE);
+            if (failure != null) return failure;             // 失败说明永远优先，也永远不吞
+            String answer = candidates.get(ReceiptRank.ANSWER);
+            // 用户明确问的照旧回答：图也发了、答案也要给（这是"答案"，不是"过程回执"）。
+            if (answer != null) return answer;
+            if (imageDelivered) return null;                 // 图片已经是回执了
+            return candidates.get(ReceiptRank.AFFIRM);
+        }
+    }
+
+    private final Map<String, NormalWindow> normalWindows = new ConcurrentHashMap<>();
+    /** 正在跑这条指令的线程自己的收据窗口（异步步骤靠事件上的 {@link #NORMAL_WINDOW_KEY} 找回同一个）。 */
+    private final ThreadLocal<NormalWindow> normalWindowHere = new ThreadLocal<>();
+
+    /**
+     * 开一条指令的收据窗口。不满足条件就返回 null＝这条指令照旧直接发：
+     * <ul>
+     *   <li>会话是 debug（默认，含老配置）——一行都不变；</li>
+     *   <li>已经在一条指令里（{@code .batch}、多步链路里再走 {@code accept}）——沿用外层那一条；</li>
+     *   <li>这条消息走的是网页回执收集器——控制台的存档必须完整，不在这里合并。</li>
+     * </ul>
+     */
+    private NormalWindow openNormalWindow(JsonObject event) {
+        if (normalWindowHere.get() != null) return null;
+        // 已经归属某条指令的事件（多步链路/异步步骤带回来的那份）不再另开一个窗口。
+        if (!Json.str(event, NORMAL_WINDOW_KEY, "").isEmpty()) return null;
+        if (!quietReceipts(event)) return null;
+        NormalWindow window = new NormalWindow(event);
+        normalWindows.put(window.id, window);
+        normalWindowHere.set(window);
+        pruneNormalWindows();
+        return window;
+    }
+    /** 指令本身的那一份占用收尾（清掉本线程的窗口，再放掉一次占用）。 */
+    private void closeNormalWindow(NormalWindow window) {
+        if (window == null) return;
+        if (normalWindowHere.get() == window) normalWindowHere.remove();
+        releaseNormalWindow(window);
+    }
+    /**
+     * 让这次调用占住这条指令的收据窗口（异步步骤带着事件回来时算同一条指令）。每调用一次就多占一份，
+     * 调用方用完必须 {@link #releaseNormalWindow(JsonObject)} 一次。事件上没有窗口时原样返回。
+     */
+    private JsonObject attachNormalWindow(JsonObject event) {
+        NormalWindow window = normalWindowHere.get();
+        if (window == null || window.isClosed()) window = windowById(Json.str(event, NORMAL_WINDOW_KEY, ""));
+        if (window == null || window.isClosed()) return event;
+        if (Json.str(event, NORMAL_WINDOW_KEY, "").isEmpty()) event.addProperty(NORMAL_WINDOW_KEY, window.id);
+        window.hold();
+        return event;
+    }
+    /** 按 id 找收据窗口（已定稿/已淘汰返回 null）。 */
+    private NormalWindow windowById(String id) {
+        if (id == null || id.isEmpty()) return null;
+        NormalWindow window = normalWindows.get(id);
+        return window == null || window.isClosed() ? null : window;
+    }
+    /** 这个事件属于哪个收据窗口；没有（debug 档、或窗口已定稿）就是 null＝照旧直接发。 */
+    private NormalWindow normalWindowFor(JsonObject event) {
+        NormalWindow mine = normalWindowHere.get();
+        if (mine != null && !mine.isClosed()) return mine;
+        return windowById(Json.str(event, NORMAL_WINDOW_KEY, ""));
+    }
+    /** 异步步骤收尾：放掉它那一次占用（放完就定稿）。 */
+    private void releaseNormalWindow(JsonObject event) {
+        NormalWindow window = windowById(Json.str(event, NORMAL_WINDOW_KEY, ""));
+        if (window != null) releaseNormalWindow(window);
+    }
+    private void releaseNormalWindow(NormalWindow window) {
+        if (window == null || !window.release()) return;
+        normalWindows.remove(window.id);
+        String text = window.commit();
+        if (text == null) {
+            Log.info("常规档：本指令不出声（" + window.conversation + "）——图片已经承载了结果，或没有要报的东西");
+            return;
+        }
+        // 定稿这一条就是真正发出去的那条：走原来的发送链路（网页捕获、禁言、日志都照旧）。
+        sendReply(window.event, text);
+    }
+    /**
+     * 窗口是内存对象，极端情况下（后台任务永久卡住）不能无限留着：超过 10 分钟一律定稿发出去。
+     * 这样"肯定"最多晚到，不会丢。
+     */
+    private void pruneNormalWindows() {
+        if (normalWindows.size() <= 64) return;
+        long now = System.currentTimeMillis();
+        for (NormalWindow window : List.copyOf(normalWindows.values()))
+            if (now - window.startedMillis > TimeUnit.MINUTES.toMillis(10)) {
+                Log.warn("常规档收据超过 10 分钟仍未收尾，先定稿发出（" + window.conversation + "）");
+                normalWindows.remove(window.id);
+                String text = window.commit();
+                if (text != null) sendReply(window.event, text);
+            }
+    }
+    /** 记下"这条指令已经有图片发出去了"：图片本身就是回执，收尾时那条肯定就不必再出声。 */
+    private void markImagesDelivered(JsonObject event) {
+        NormalWindow window = normalWindowFor(event);
+        if (window != null) window.imageDelivered();
+    }
+    /** 记住这条指令是不是"用户显式查询"：是的话它的答案不许被"只留一条"削掉。 */
+    private void markQueryCommand(JsonObject event, boolean query) {
+        NormalWindow window = normalWindowFor(event);
+        if (window != null) window.answerMode(query);
+    }
+    /**
+     * 用户显式查询：这条指令的答案本身就是用户要的东西。只管"问"，不管"改"——
+     * 带取值参数的 {@code .size/.sampler/.mode/...} 是动作，不算查询。
+     */
+    static boolean queryCommand(String command) {
+        Matcher matcher = Pattern.compile("(?i)^/(help|settings|progress|usage|imgcnt|size|sampler|model|imgmode|mode"
+                + "|preset|function|vae|sd|lora|style|prompt|promptr|gen)(?:\\s+([\\s\\S]*))?$").matcher(command == null ? "" : command.strip());
+        if (!matcher.matches()) return false;
+        String verb = matcher.group(1).toLowerCase(Locale.ROOT);
+        String argument = Objects.requireNonNullElse(matcher.group(2), "").strip().toLowerCase(Locale.ROOT);
+        return switch (verb) {
+            case "help", "settings", "progress", "usage" -> true;
+            // 不带参数的这些是"查当前值"；带上取值/动作词就是改东西（改东西只算一句肯定）。
+            case "imgcnt", "prompt", "promptr" -> argument.isEmpty();
+            case "preset" -> argument.isEmpty() || argument.matches("(list|show)(\\s.*)?");
+            case "function" -> argument.isEmpty() || argument.matches("(list|active|prompt|show)(\\s.*)?");
+            case "size", "sampler", "model", "imgmode", "mode", "sd", "vae" ->
+                    argument.isEmpty() || argument.equals("status") || argument.equals("状态")
+                            || argument.equals("list") || argument.equals("列表");
+            case "lora" -> argument.isEmpty() || argument.matches("(list|status|triggers|search)(\\s.*)?");
+            case "style" -> argument.isEmpty() || argument.matches("(list|show|prompt)(\\s.*)?");
+            case "gen" -> argument.matches("(status|状态|列表|list)(\\s.*)?");
+            default -> false;
+        };
+    }
+
+    /** 一句肯定（默认档位）：常规档下会先记进这条指令的收据，收尾时可能被失败说明顶掉或被图片让位。 */
+    private void reply(JsonObject event, String text) { replyRanked(event, ReceiptRank.AFFIRM, text); }
+    /** 过程行：常规档一律不出声（debug 照旧）。 */
+    private void replyProcess(JsonObject event, String text) { replyRanked(event, ReceiptRank.PROCESS, text); }
+    /**
+     * 失败说明：常规档也一定要发出来。它在这条指令里优先级最高，会把更早记下的"肯定"顶掉——
+     * 所以一条指令仍然是 1 条文本，而失败原因一个字都不会少。
+     */
+    private void replyFailure(JsonObject event, String text) { replyRanked(event, ReceiptRank.FAILURE, text); }
+
+    private void replyRanked(JsonObject event, ReceiptRank rank, String text) {
         // `text` is reassigned, so the immutable copy is what the failure handler captures.
         String output = publicCommands(text);
         if (chatDispatchFailed.get() != null && (output.contains("仅 owner") || output.contains("需要管理员权限") || output.contains("请稍后重试") || output.contains("仅管理员"))) chatDispatchFailed.set(true);
+        NormalWindow window = normalWindowFor(event);
+        if (window != null) {
+            Log.info("常规档收据（" + describeConversation(event) + "，" + rank + "）：" + Log.text(output));
+            window.offer(rank, output);
+            return;
+        }
+        sendReply(event, output);
+    }
+
+    /** 真的把一条文本交给传输层（原 {@code reply} 的行为：先记回执，再发）。 */
+    private void sendReply(JsonObject event, String output) {
         Log.info("回复（" + describeConversation(event) + "）：" + Log.text(output));
         ChainRecord chain = chainRecords.get(ChatService.conversationKey(event));
         if (chain != null) { chain.add(output); return; }

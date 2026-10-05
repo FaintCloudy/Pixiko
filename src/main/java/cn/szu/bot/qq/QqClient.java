@@ -114,7 +114,51 @@ public final class QqClient implements AutoCloseable {
             }
             params.add("messages", nodes);
         } catch (RuntimeException error) { return failed("聊天记录缺少有效的会话 ID 或消息内容"); }
-        return submit(ws, action, params, timeoutSeconds, action.replace("_forward_msg", "_msg"), List.of());
+        // 带图的合并转发（搜索结果封面、图片批次）走图片上传预算：NapCat 要逐张下载/上传节点里的图，
+        // 30 秒的普通 API 超时根本不够（线上 10 张图就是这样超时的）。纯文本节点仍然用普通超时。
+        int images = imageCount(combined);
+        final int recordTimeout = deliveryTimeoutSeconds(images, timeoutSeconds, imageTimeoutSeconds);
+        return submit(ws, action, params, recordTimeout, recordTimeout,
+                action.replace("_forward_msg", "_msg"), List.of());
+    }
+
+    /**
+     * 一次出站发送允许等多久（秒）——**图片上传预算**与**普通请求预算**分开算。
+     *
+     * <p>带图（{@code images > 0}）时用 {@code imageApiTimeout}（配置 {@code qq.image_api_timeout_seconds}，
+     * 默认 600，单张图片发送一直用的就是它）：QQ 侧的合并转发要先把节点里的图下载/上传完才回 ACK，
+     * 10 张远程封面远超普通超时；没有图片时**原样**用 {@code ordinaryTimeout}（{@code qq.timeout_seconds}，
+     * 默认 30），所以普通短请求的等待时间与重连行为一字未变——不把全局超时无脑调大。
+     *
+     * <p>取两者较大值：万一配置把普通超时调得比图片预算还大，也只会等得更久，不会反而变短。
+     */
+    public static int deliveryTimeoutSeconds(int images, int ordinaryTimeout, int imageApiTimeout) {
+        return images > 0 ? Math.max(ordinaryTimeout, imageApiTimeout) : ordinaryTimeout;
+    }
+
+    /** 这条出站消息里有没有图片段（含合并转发节点里的图）；坏形状一律当成没有，绝不抛异常。 */
+    public static boolean eventHasImage(JsonElement payload) {
+        return imageCount(payload) > 0;
+    }
+
+    private static int imageCount(JsonElement payload) {
+        if (payload == null || !payload.isJsonArray()) return 0;
+        int total = 0;
+        for (JsonElement element : payload.getAsJsonArray()) {
+            if (!element.isJsonObject()) continue;
+            JsonObject object = element.getAsJsonObject();
+            if ("image".equals(string(object, "type", ""))) { total++; continue; }
+            // 合并转发的节点：图片在 data.content 里，和普通消息段不是同一个位置；节点自己也可能整段塞在消息里。
+            if (object.has("data") && object.get("data").isJsonObject()) {
+                JsonObject data = object.getAsJsonObject("data");
+                if (data.has("content")) total += imageCount(data.get("content"));
+            }
+            if ("node".equals(string(object, "type", ""))) {
+                for (String key : new String[]{"content", "message"})
+                    if (object.has(key)) total += imageCount(object.get(key));
+            }
+        }
+        return total;
     }
 
     public CompletableFuture<Void> sendMap(JsonObject event, JsonArray segments) {
@@ -161,7 +205,11 @@ public final class QqClient implements AutoCloseable {
         for (JsonElement segment : segments) if (segment.isJsonObject()
                 && "image".equals(string(segment.getAsJsonObject(), "type", ""))) images = true;
         final int responseTimeout = images ? Math.max(timeoutSeconds, imageTimeoutSeconds) : timeoutSeconds;
-        return submit(ws, action, params, responseTimeout, folded ? action.replace("_forward_msg", "_msg") : null,
+        // 图片段/图片节点意味着 QQ 侧要上传图片（甚至下载远程封面）：发送本身也给它一段更宽的预算。
+        final int sendTimeout = deliveryTimeoutSeconds(imageCount(folded ? params.get("messages") : segments),
+                timeoutSeconds, imageTimeoutSeconds);
+        return submit(ws, action, params, sendTimeout, responseTimeout,
+                folded ? action.replace("_forward_msg", "_msg") : null,
                 folded ? plainFallbacks(event, segments) : List.of());
     }
 
@@ -169,9 +217,12 @@ public final class QqClient implements AutoCloseable {
      * Queues one API call. A folded chat record that the QQ implementation explicitly rejects is retried
      * as ordinary messages when it is text-only, so a long command reply is never silently lost. Results that
      * are merely unknown (timeout, disconnect) are never retried.
+     *
+     * @param sendTimeout     seconds allowed for pushing the request over the socket (images need the wider budget)
+     * @param responseTimeout seconds allowed for the QQ acknowledgement (the real wait: uploads happen here)
      */
-    private CompletableFuture<Void> submit(WebSocket ws, String action, JsonObject params, int responseTimeout,
-                                          String fallbackAction, List<JsonObject> fallbackParams) {
+    private CompletableFuture<Void> submit(WebSocket ws, String action, JsonObject params, int sendTimeout,
+                                          int responseTimeout, String fallbackAction, List<JsonObject> fallbackParams) {
         String echo = UUID.randomUUID().toString();
         JsonObject request = new JsonObject();
         request.addProperty("action", action);
@@ -199,10 +250,10 @@ public final class QqClient implements AutoCloseable {
                     if (call.result.isDone()) return;
                     if (closed.get() || ws != socket) throw new IOException("QQ 连接已断开，消息未重试");
                     // JDK WebSocket permits only one pending text send at a time.
-                    ws.sendText(payload, true).get(timeoutSeconds, TimeUnit.SECONDS);
+                    ws.sendText(payload, true).get(sendTimeout, TimeUnit.SECONDS);
                     // Upload/ACK time starts after dispatch, not while waiting behind other sends.
                     call.timer = scheduler.schedule(() -> call.completeFailure(
-                            new TimeoutException("QQ API 响应超时；发送结果未知，未自动重试")), responseTimeout, TimeUnit.SECONDS);
+                            DeliveryUnknownException.timeout()), responseTimeout, TimeUnit.SECONDS);
                     if (call.result.isDone()) call.timer.cancel(false);
                 } catch (Exception ex) {
                     call.completeFailure(new IOException("QQ 发送失败；结果可能未知，未自动重试", ex));
@@ -283,7 +334,7 @@ public final class QqClient implements AutoCloseable {
             chain = chain.thenComposeAsync(ignored -> {
                 WebSocket ws = socket;
                 if (!isConnected() || ws == null) return failed("QQ 尚未连接，消息未发送");
-                return submit(ws, action, params, timeoutSeconds, null, List.of());
+                return submit(ws, action, params, timeoutSeconds, timeoutSeconds, null, List.of());
             });
         }
         return chain;
@@ -393,8 +444,7 @@ public final class QqClient implements AutoCloseable {
         }
         if (current && !closed.get()) Log.warn("QQ 连接已断开，将自动重连；发送中的消息结果未知，不自动重试。");
         pending.values().forEach(call -> {
-            if (call.socket == ws) call.completeFailure(
-                    new IOException("QQ 连接断开；发送结果可能未知，未自动重试"));
+            if (call.socket == ws) call.completeFailure(DeliveryUnknownException.disconnected());
         });
     }
 
@@ -412,7 +462,8 @@ public final class QqClient implements AutoCloseable {
                 if ("ok".equals(status) && retcode == 0) {
                     call.completeSuccess(packet.get("data"));
                 } else if ("async".equals(status)) {
-                    call.completeFailure(new IOException("QQ 已转为异步处理，无法确认消息发送结果；未自动重试"));
+                    // 异步处理 = 没有最终 ACK，能不能算发出去只能靠结果本身判断：同样不许当成"确定失败"重发。
+                    call.completeFailure(DeliveryUnknownException.async());
                 } else {
                     // NapCat puts the real reason (for example why an image upload failed) in message/wording.
                     String detail = failureDetail(packet);

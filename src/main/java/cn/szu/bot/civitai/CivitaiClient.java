@@ -160,13 +160,27 @@ public final class CivitaiClient {
     }
 
     /**
-     * 一条搜索结果。除了模型名/基础模型/封面，还带上网页卡片要显示的信息：
-     * 下载数、训练词、文件大小、是否 NSFW（旧写法只给前 5 个字段，多出来的有默认值）。
+     * 一条搜索结果。除了模型名/基础模型/封面，还带上网页卡片与 QQ 搜索回执要显示的信息：
+     * 下载数、点赞数（{@code stats.thumbsUpCount}）、训练词、文件大小、是否 NSFW、版本发布时间
+     * （旧写法只给前 5 个字段，再往后的写法只给到 {@code nsfw}，多出来的都有默认值）。
+     *
+     * <p>{@code publishedAt} 原样保留 Civitai 给的 ISO 串（拿不到就是空串）：显示层只取日期、
+     * 拿不到就整项不写，不编日期也不猜时区。
      */
     public record SearchResult(long modelId, long versionId, String name, String baseModel, String cover,
-                               long downloads, List<String> trainedWords, double sizeKb, boolean nsfw) {
+                               long downloads, List<String> trainedWords, double sizeKb, boolean nsfw,
+                               long likes, String publishedAt) {
+        public SearchResult {
+            publishedAt = publishedAt == null ? "" : publishedAt;
+        }
+        /** 老写法（前 5 个字段）：点赞数与发布时间按"没有"处理。 */
         public SearchResult(long modelId, long versionId, String name, String baseModel, String cover) {
-            this(modelId, versionId, name, baseModel, cover, 0, List.of(), 0, false);
+            this(modelId, versionId, name, baseModel, cover, 0, List.of(), 0, false, 0, "");
+        }
+        /** 上一版写法（到 {@code nsfw} 为止）：点赞数与发布时间按"没有"处理。 */
+        public SearchResult(long modelId, long versionId, String name, String baseModel, String cover,
+                            long downloads, List<String> trainedWords, double sizeKb, boolean nsfw) {
+            this(modelId, versionId, name, baseModel, cover, downloads, trainedWords, sizeKb, nsfw, 0, "");
         }
         public String url() { return displayBaseUrl + "/models/" + modelId + "?modelVersionId=" + versionId; }
     }
@@ -306,25 +320,34 @@ public final class CivitaiClient {
                             && uri.getUserInfo() == null && uri.getPort() == -1) { cover = uri.toString(); break; }
                 } catch (IllegalArgumentException ignored) { }
             }
+            JsonObject stats = Json.obj(model, "stats");
             results.add(new SearchResult(positiveLong(model, "id"), positiveLong(version, "id"),
                     Json.str(model, "name", "未命名"), Json.str(version, "baseModel", "未知"), cover,
-                    Math.max(0, Json.num(Json.obj(model, "stats"), "downloadCount", 0L)),
-                    trainedWords(version), fileSizeKb(version), Json.bool(model, "nsfw", false)));
+                    Math.max(0, Json.num(stats, "downloadCount", 0L)),
+                    trainedWords(version), fileSizeKb(version), Json.bool(model, "nsfw", false),
+                    Math.max(0, Json.num(stats, "thumbsUpCount", 0L)), Json.str(version, "publishedAt", "")));
             if (results.size() == pageSize) break;
         }
         return new SearchPage(results, query, page, pageSize, false, -1, false);
     }
 
-    /** 版本自带的训练词（卡片上给一行提示，下载后也知道该用什么触发词）。 */
+    /**
+     * 版本自带的训练词（搜索卡片的触发词、下载记录都从这里来）。
+     *
+     * <p><b>这一层绝不做省略号截断</b>：以前把超过 120 字的词裁成 120 字 + {@code "…"}、并且最多留 8 条，
+     * 结果用户在搜索回执里复制到的触发词是**缺字的**——真例（{@code .lora query chatgpt龙娘} 第 6 条）：
+     * Civitai 原文 {@code "purple_hair, …, purple shorts, purple shoes,"}（126 字）被裁成
+     * {@code "purple_hair, …, purple shorts, purple …"}，末尾的 {@code shoes,} 被省略号吃掉，
+     * 用户拿去出图就少两个标签。触发词是"原样复制进提示词"的东西，少一个字就是错的；
+     * 长度与条数交给展示层处理（QQ 搜索回执按词里本来就有的逗号换行，一个字都不删）。
+     */
     private static List<String> trainedWords(JsonObject version) {
         List<String> words = new ArrayList<>();
         JsonArray values = version.getAsJsonArray("trainedWords");
         if (values != null) for (JsonElement value : values) {
             if (!value.isJsonPrimitive()) continue;
             String word = value.getAsString().strip();
-            // 有些模型把整段示例 prompt 塞进训练词：卡片上只留一段，别把面板撑爆。
-            if (word.length() > 120) word = word.substring(0, 120) + "…";
-            if (!word.isEmpty() && words.size() < 8) words.add(word);
+            if (!word.isEmpty()) words.add(word);
         }
         return List.copyOf(words);
     }

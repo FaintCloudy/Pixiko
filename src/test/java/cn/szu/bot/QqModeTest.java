@@ -32,18 +32,23 @@ import java.util.concurrent.atomic.AtomicInteger;
 /**
  * {@code .mode}：QQ 侧回执档位（{@code normal} 只发肯定与图片 / {@code debug} 完整回执＝现状），按会话持久保存。
  *
+ * <p><b>normal 的不变量</b>：一条用户指令最多产生 <b>1 条文本消息</b>——要么是一句肯定，要么什么都不发
+ * （图片/图集已经承载了结果）；失败、被拒绝、权限不足、用法错误、参数校验一律用这一条说出来，绝不吞。
+ * 图片与合并转发（按 {@code .imgmode}）照旧发，不计入这条文本。{@code debug}（默认）一行都不变。
+ *
  * <p>两条腿都是桩，绝不碰真 QQ、真 Stable Diffusion 与真 data：
  * <ul>
  *   <li>出图/提示词/设置走**回环 HTTP 假 SD**（真 {@link SdClient}），图片是自己造的 128×128 PNG；</li>
  *   <li>VAE 冲突用**假 VAE 桩**注入 BLOCK 快照，出图前防呆的拒绝路径是真的；</li>
  *   <li>出站用一个记录型 {@link Bot.Sender}：文本立即"成功"，图片挂起等测试确认，每一次出站都留底
- *       （{@code seen}），既能断言"发了什么"，也能断言"这段时间什么都没发"。</li>
+ *       （{@code seen}）——既能断言"发了什么"，也能断言"这段时间什么都没发"、一条指令一共发了几条。</li>
  * </ul>
  *
- * <p>覆盖：① 默认（没设置）＝现状，且与显式 {@code .mode debug} 逐字相同；② normal 下 {@code .gen}
- * 入队回执不含全部生成参数字段，也不含多步过程文案；③ normal 下仍然有肯定 + 图片，且领取（ACK）不受影响；
- * ④ normal 下失败/被拒/权限不足/用法错误/需要用户决定的提示照旧发出；⑤ 按会话隔离；⑥ 无参数看当前值、
- * 非法值给用法且不改设置；⑦ 切回 debug 后与现状一致；⑧ 存储位置与坏配置容错；⑨ .help 只加一行。
+ * <p>覆盖：① 默认（没设置）＝现状，且与显式 {@code .mode debug} 逐字相同；② normal 下二十来条指令
+ * **逐条统计出站文本条数 ≤1**（并打印全量出站做证据）；③ {@code .gen} 绝不会"入队一条 + 结算一条"；
+ * ④ 失败/VAE 拒绝/权限/用法/参数校验在 normal 下**恰好 1 条且含原因**；⑤ 图片在三种 {@code .imgmode} 下
+ * 照常发出、不计入文本；⑥ 用户显式查询的答案完整；⑦ 按会话隔离；⑧ 无参数看当前值、非法值给用法；
+ * ⑨ 切回 debug 与现状一致；⑩ 存储位置与坏配置容错；⑪ .help 只加一行。
  */
 public final class QqModeTest {
     private static int assertions;
@@ -60,19 +65,22 @@ public final class QqModeTest {
         aliasesAndStoredValues();
         storageShapeAndBrokenConfig();
         defaultIsCurrentBehaviourWordForWord();
-        normalHidesTheWholeParameterBlock();
-        normalStillAffirmsAndDeliversImages();
-        normalKeepsFailuresVisible();
+        normalKeepsAtMostOneTextPerInstruction();
+        normalNeverSendsEnqueuePlusSettlement();
+        normalKeepsFailuresToOneVisibleLine();
+        normalDeliversImagesUnderEveryImageMode();
+        normalAnswersQueriesInFull();
+        normalLeavesTheConsoleArchiveWhole();
         modesArePerConversation();
         currentValueAndInvalidArgument();
         switchingBackToDebugRestoresEverything();
         helpHasExactlyOneNewLine();
-        check(assertions >= 60, "断言条数应 ≥ 60，实际 " + assertions);
+        check(assertions >= 120, "断言条数应 ≥ 120，实际 " + assertions);
         System.out.println("QqModeTest: " + assertions + " assertions passed：.mode 查看/常规/debug、中文别名、"
-                + "默认＝现状（未设置与显式 debug 逐字相同）、normal 隐藏全部生成参数字段与多步过程文案、"
-                + "normal 仍有肯定+图片且领取流程不受影响、失败/VAE 拒绝/权限/用法错误照旧可见、"
-                + "按会话（含私聊）隔离、非法值给用法且不改设置、切回 debug 与现状一致、存储 qq_mode.modes.<会话键>、"
-                + ".help 只加一行。");
+                + "默认＝现状（未设置与显式 debug 逐字相同）、normal 下每条指令出站文本 ≤1（二十来条指令逐条统计）、"
+                + ".gen 绝不出现入队+结算两条、失败/VAE 拒绝/权限/用法错误恰好一条且含原因、"
+                + "三种 .imgmode 下图片照常发出、显式查询答案完整、按会话（含私聊）隔离、"
+                + "非法值给用法且不改设置、切回 debug 与现状一致、存储 qq_mode.modes.<会话键>、.help 只加一行。");
     }
 
     // ------------------------------------------------------------------ ① 解析表
@@ -94,6 +102,16 @@ public final class QqModeTest {
         equal("debug", Settings.QqMode.DEBUG.key(), "debug 存进 config.json 的取值");
         equal("常规", Settings.QqMode.NORMAL.label(), "normal 的中文说法");
         equal("调试", Settings.QqMode.DEBUG.label(), "debug 的中文说法");
+        // "哪条指令算用户显式查询"的判定表：问的照旧答全，改的不算查询。
+        for (String query : new String[]{"/settings", "/help", "/progress", "/size", "/size status", "/sampler",
+                "/imgmode", "/mode", "/gen status", "/gen list", "/lora list", "/lora status", "/lora triggers #1",
+                "/style list", "/prompt", "/promptR", "/usage", "/vae status", "/sd status", "/preset", "/imgcnt",
+                "/function", "/model"})
+            check(Bot.queryCommand(query), "「" + query + "」是用户显式查询（答案不许被削）");
+        for (String action : new String[]{"/size set 640 640", "/sampler set Euler a", "/mode normal", "/imgmode record",
+                "/gen", "/gen 3", "/get", "/rg 3", "/prompt add x", "/lora download #1", "/style load #1", "/batch x",
+                "/vae fix", "/preset save p", "/infix 加个词"})
+            check(!Bot.queryCommand(action), "「" + action + "」是动作，不算查询");
     }
 
     /** 存储位置、按会话独立、debug 等于删掉这条设置、坏配置一律读成 debug 且不报错。 */
@@ -172,157 +190,260 @@ public final class QqModeTest {
         check(compared >= 12, "对比到的出站条数应该够多（实际 " + compared + "）");
     }
 
-    // ------------------------------------------------------------------ ③ normal 少发什么
+    // ------------------------------------------------------------------ ③ 每条指令 ≤1 条文本
 
-    /** normal 下 .gen 入队回执：不含整块生成参数，也不含「已加入生成队列」「任务 #N」这类过程文案。 */
-    private static void normalHidesTheWholeParameterBlock() throws Exception {
+    /**
+     * 核心不变量：normal 下**一条用户指令最多 1 条文本消息**。二十来条指令逐一跑端到端
+     * （假 Sender + 假 SD），逐条打印全量出站做证据，并断言文本条数 ≤1。
+     */
+    private static void normalKeepsAtMostOneTextPerInstruction() throws Exception {
+        List<String> commands = List.of(
+                ".gen", ".gen 3", ".get", ".rg 2", ".settings", ".size", ".sampler", ".imgmode", ".imgcnt",
+                ".mode", ".help", ".gen status", ".progress", ".vae status", ".style list", ".lora list",
+                ".lora status", ".prompt", ".preset", ".sd status", ".infix 加入 fishnet pantyhose",
+                ".prompt add normal_probe_a", ".prompt undo");
         try (Fixture f = new Fixture()) {
-            String set = f.command(".mode normal");
-            check(set.contains("已设为") && set.contains("常规"), "可以切到常规：" + set);
-            equal(Settings.QqMode.NORMAL, new Settings(f.root).qqMode(KEY_999), "normal 按会话保存下来了");
-
-            f.bot.accept(f.groupEvent(GROUP, ".gen"));
-            String ack = f.awaitText(20000);
-            check(ack.contains("开始生成"), "常规档仍有一句肯定：" + ack);
-            for (String name : PARAM_NAMES)
-                check(!ack.contains(name), "常规档的入队回执不含「" + name + "」：" + ack);
-            check(!ack.contains("已加入生成队列"), "常规档不再报「已加入生成队列」：" + ack);
-            check(!ack.contains("任务 #"), "常规档不再报任务号：" + ack);
-            check(!ack.contains("共 1 次生成"), "常规档不再报「共 N 次生成」：" + ack);
-            check(!ack.contains("多步执行完成") && !ack.contains("第 1 步"), "常规档不含多步过程文案：" + ack);
-            check(ack.lines().count() <= 2, "常规档的肯定是一两句短话：" + ack);
-
-            Delivery generated = f.awaitImage(30000);
-            check(generated.image() && "send".equals(generated.kind()), "图片照常发出：" + generated.kind());
-            generated.ack().complete(null);
-            check(f.quiet(800), "常规档下「任务 #1 已完成…」与「本次领取完成」都不再发；实际还发了：" + f.seen());
-            f.awaitPending(0);
-
-            // 多步链路（自然语言被拆成多步时走的那条路）：总结与每一步的回执块整条都不再发
-            int mark = f.mark();
-            f.bot.executeChatCommands(f.groupEvent(GROUP, "多步"),
-                    List.of(".prompt add mode_chain_a", ".prompt add mode_chain_b"), new JsonObject());
-            check(f.quiet(700), "常规档下多步执行的总结与每一步回执块都不再发；实际还发了：" + f.since(mark));
-            check(f.since(mark).stream().noneMatch(line -> line.contains("多步执行") || line.contains("【1】")),
-                    "常规档下没有多步过程文案：" + f.since(mark));
+            f.command(".mode normal");
+            equal(Settings.QqMode.NORMAL, new Settings(f.root).qqMode(KEY_999), "群 999 已切到常规");
+            int index = 0;
+            for (String command : commands) {
+                index++;
+                f.resolveArtifacts();
+                List<String> out = f.run(f.groupEvent(GROUP, command), 6000);
+                note("指令 " + index + " " + command, out);
+                checkAtMostOne(out, "第 " + index + " 条指令「" + command + "」");
+                check(!out.isEmpty() || imageOnly(command),
+                        "第 " + index + " 条指令「" + command + "」不该什么都不发（既没有文本也没有图片）：" + out);
+            }
+            check(index >= 12, "逐条统计的指令数应 ≥ 12，实际 " + index);
         }
     }
 
-    // ------------------------------------------------------------------ ④ normal 仍然有什么
+    /** 一条指令在 normal 下的全量出站里，文本最多一条；图片/合并转发不计入。 */
+    private static void checkAtMostOne(List<String> out, String what) {
+        long texts = textCount(out);
+        check(texts <= 1, what + " 在 normal 下最多 1 条文本，实际 " + texts + " 条：\n" + joined(out));
+    }
 
-    /** normal 下：一句肯定 + 图片（按 .imgmode 规则），而且领取（ACK 落盘）照常完成。 */
-    private static void normalStillAffirmsAndDeliversImages() throws Exception {
-        // .get：3 张仍按 auto 规则合成一条合并转发，计数回执不发，但图片真的被领取了
+    /** 只有出图/领取这类指令允许"零文本"（图片本身就是回执）。 */
+    private static boolean imageOnly(String command) {
+        return command.startsWith(".gen") || command.equals(".get") || command.startsWith(".rg");
+    }
+
+    // ------------------------------------------------------------------ ④ .gen 不会两条
+
+    /**
+     * {@code .gen} 的成功路径：**不可能**出现"入队一条 + 结算一条"。把出站全量打印出来逐条断言，
+     * 而不是"不含某个字段"——成功时只有图片（文本 0 条），失败时恰好那条失败说明。
+     */
+    private static void normalNeverSendsEnqueuePlusSettlement() throws Exception {
         try (Fixture f = new Fixture()) {
             f.command(".mode normal");
-            List<Path> three = f.seed(3, "three");
-            f.bot.accept(f.groupEvent(GROUP, ".get"));
-            Delivery merged = f.awaitImage(15000);
-            equal("sendRecord", merged.kind(), "normal 下 3 张仍按 auto 规则合成一条合并转发");
-            equal(3, merged.nodes().size(), "3 个节点");
-            check(merged.singleImageNodes(), "每个节点只含一张图");
-            equal(files(three), merged.names(), "节点顺序与文件顺序一致");
-            merged.ack().complete(null);
-            check(f.quiet(700), "normal 下不再发「本次领取完成，共 3 张」；实际还发了：" + f.seen());
+            List<String> out = f.run(f.groupEvent(GROUP, ".gen"), 12000);
+            note(".gen 成功（自动领取）", out);
+            equal(0L, textCount(out), ".gen 成功后只留图片：文本 0 条，实际\n" + joined(out));
+            equal(1L, imageCount(out), "图片照常发出：" + joined(out));
+            check(out.stream().noneMatch(line -> line.contains("已加入生成队列")), "没有入队回执：" + joined(out));
+            check(out.stream().noneMatch(line -> line.contains("任务 #")), "没有结算回执（任务号）：" + joined(out));
+            check(out.stream().noneMatch(line -> line.contains("本次领取完成")), "没有领取计数回执：" + joined(out));
+            check(out.stream().noneMatch(line -> line.contains("采样方法")), "没有生成参数块：" + joined(out));
+            check(out.get(0).startsWith("image:send"), "唯一那条出站是图片：" + joined(out));
             f.awaitPending(0);
-            equal(0, f.pending(), "图片照常从待领取列表被领取（少发一条回执不影响领取流程）");
+            equal(0, f.pending(), "自动领取照常生效（少发回执不影响领取）");
+            equal(1, f.generationCalls(), "确实出了一次图");
         }
-        // .gen：图真的出出来 → 自动领取 → 图片自己发到会话里，且 .imgmode single 规则照旧
+        // 多批（.gen 3 + .imgcnt 1 也不必一条一条报数）：文本仍然 0 条，图片一张不少
         try (Fixture f = new Fixture()) {
             f.command(".mode normal");
-            f.command(".imgmode single");
-            f.bot.accept(f.groupEvent(GROUP, ".gen"));
-            String ack = f.awaitText(30000);
-            check(ack.contains("好的") && ack.contains("开始生成"), "一句肯定照发：" + ack);
-            Delivery generated = f.awaitImage(30000);
-            check(generated.image(), "图片照发");
-            equal("send", generated.kind(), ".imgmode single 下逐张普通发送（规则没被动过）");
-            equal(1, generated.nodes().size(), "一条消息里就一张图");
-            check(generated.names().get(0).startsWith("image-"), "发的是这次生成的图：" + generated.names());
-            generated.ack().complete(null);
-            check(f.quiet(800), "normal 下不报任务结算与领取计数；实际还发了：" + f.seen());
-            f.awaitPending(0);
-            equal(0, f.pending(), "自动领取照常生效（待领取清零）");
-            equal(1, f.generationCalls(), "确实出了一次图（假 SD 只收到一次 txt2img）");
+            List<String> out = f.run(f.groupEvent(GROUP, ".gen 3"), 15000);
+            note(".gen 3", out);
+            equal(0L, textCount(out), ".gen 3 成功后文本 0 条，实际\n" + joined(out));
+            long images = out.stream().filter(line -> line.startsWith("image:")).mapToLong(line -> line.split(",").length).sum();
+            equal(3L, images, "3 张图一张不少：" + joined(out));
         }
-        // 用户明确问参数时照旧回答：过滤只发生在"出图回执"，不在"用户查询"
+        // 用户显式查询与动作混在一条消息里：查询的答案必须留着，动作不再各发一条
         try (Fixture f = new Fixture()) {
             f.command(".mode normal");
-            String settingsText = f.command(".settings");
-            check(settingsText.contains("采样方法") && settingsText.contains("图片尺寸"),
-                    "normal 下用户明确问参数照旧回答：" + settingsText);
-        }
-        // 关闭自动领取时图片不会自己出现：常规档只留一句"发送 .get 领取"（要用户动手的提示不能吞）
-        try (Fixture f = new Fixture(false)) {
-            f.command(".mode normal");
-            f.bot.accept(f.groupEvent(GROUP, ".gen"));
-            String ack = f.awaitText(30000);
-            check(ack.contains("开始生成"), "肯定照发：" + ack);
-            String hint = f.awaitText(30000);
-            check(hint.contains(".get"), "关闭自动领取时给出领取办法：" + hint);
-            for (String name : PARAM_NAMES) check(!hint.contains(name), "这句提示里不含「" + name + "」：" + hint);
-            check(!hint.contains("任务 #"), "这句提示里不含任务号：" + hint);
-            check(hint.lines().count() <= 2, "这句提示是短的一两句：" + hint);
-            check(f.seen().stream().noneMatch(line -> line.startsWith("image:")), "关闭自动领取时不会自动发图：" + f.seen());
-            check(f.pending() >= 1, "图片留在待领取列表里等 .get：" + f.pending());
+            List<String> out = f.run(f.groupEvent(GROUP, ".size\n.gen"), 12000);
+            note(".size 与 .gen 两行", out);
+            checkAtMostOne(out, "多行消息（.size ; .gen）");
+            check(out.stream().anyMatch(line -> line.contains("图片尺寸")), "显式查询的答案还在：" + joined(out));
         }
     }
 
-    // ------------------------------------------------------------------ ⑤ normal 不许吞什么
+    // ------------------------------------------------------------------ ⑤ 失败仍是一条且可见
 
-    /** 失败 / 被拒绝 / 权限不足 / 用法错误 / 需要用户决定的提示，在 normal 下必须照旧发出来。 */
-    private static void normalKeepsFailuresVisible() throws Exception {
+    /** 失败 / 被拒绝 / 权限不足 / 用法错误 / 参数校验：normal 下**恰好 1 条**文本，且含关键原因词。 */
+    private static void normalKeepsFailuresToOneVisibleLine() throws Exception {
         // ① 出图失败（假 SD 的 txt2img 返回 500）
         try (Fixture f = new Fixture()) {
             f.command(".mode normal");
             f.generationFails = true;
-            f.bot.accept(f.groupEvent(GROUP, ".gen"));
-            String ack = f.awaitText(20000);
-            check(ack.contains("开始生成"), "肯定照发：" + ack);
-            String settle = f.awaitText(30000);
-            check(settle.contains("生成失败 1 次"), "失败次数照旧报出来：" + settle);
-            check(settle.contains("最近失败原因"), "失败原因照旧发出来（normal 绝不吞）：" + settle);
-            check(settle.contains("任务 #1"), "哪一条任务失败也说清楚：" + settle);
-            check(settle.contains("已完成"), "结算状态照旧在：" + settle);
-            check(f.seen().stream().noneMatch(line -> line.startsWith("image:")), "失败没有图片：" + f.seen());
+            List<String> out = f.run(f.groupEvent(GROUP, ".gen"), 12000);
+            note(".gen 出图失败", out);
+            equal(1L, textCount(out), "出图失败恰好 1 条文本（不是入队+结算两条）：\n" + joined(out));
+            String failure = textsOnly(out).get(0);
+            check(failure.contains("生成失败 1 次"), "失败次数说清楚：" + failure);
+            check(failure.contains("最近失败原因"), "失败原因说清楚（normal 绝不吞）：" + failure);
+            check(failure.contains("任务 #1"), "哪一条任务失败也说清楚：" + failure);
+            check(failure.contains("已完成"), "结算状态照旧在：" + failure);
+            check(out.stream().noneMatch(line -> line.startsWith("image:")), "失败没有图片：" + joined(out));
         }
         // ② VAE 冲突被拒（用户显式选了冲突的 VAE → 出图前防呆拒绝）
         try (Fixture f = new Fixture()) {
             f.command(".mode normal");
             f.bot.useVaeSupport(blockedVae());
-            f.bot.accept(f.groupEvent(GROUP, ".gen"));
-            f.awaitText(20000);
-            String refused = f.awaitText(30000);
+            List<String> out = f.run(f.groupEvent(GROUP, ".gen"), 12000);
+            note(".gen VAE 冲突被拒", out);
+            equal(1L, textCount(out), "被拒绝恰好 1 条文本：\n" + joined(out));
+            String refused = textsOnly(out).get(0);
             check(refused.contains("任务 #1 已拒绝"), "被拒绝照旧发出来：" + refused);
             check(refused.contains("这次生成被拒绝"), "拒绝理由照旧发出来：" + refused);
             check(refused.contains("拒绝原因"), "拒绝原因字段照旧发出来：" + refused);
             check(refused.contains(".vae auto") && refused.contains(".vae fix"), "改法照旧发出来：" + refused);
             equal(0, f.generationCalls(), "被拒绝时一次 txt2img 都不发");
-            check(f.seen().stream().noneMatch(line -> line.startsWith("image:")), "拒绝路径没有图片：" + f.seen());
+            check(out.stream().noneMatch(line -> line.startsWith("image:")), "拒绝路径没有图片：" + joined(out));
         }
-        // ③ 权限不足 / 用法错误 / 参数校验错误 / 需要用户决定的提示
+        // ③ 权限不足 / 用法错误 / 参数校验错误 / 需要用户决定的提示：各一条，都看得见
         try (Fixture f = new Fixture()) {
             f.command(".mode normal");
-            String denied = f.command(".chat toggle");
-            check(denied.contains("仅 owner"), "权限不足照旧发出来：" + denied);
-            String badMode = f.command(".mode 香蕉");
-            check(badMode.contains("用法") && badMode.contains("normal") && badMode.contains("debug"),
-                    "非法参数给用法：" + badMode);
-            String badGen = f.command(".gen abc");
-            check(badGen.contains("用法") && badGen.contains("gen"), "指令用法错误照旧发出来：" + badGen);
-            String zero = f.command(".gen 0");
-            check(zero.contains("正整数"), "参数取值错误照旧发出来：" + zero);
-            String empty = f.command(".get");
-            check(empty.contains("暂无待领取图片"), "需要用户动手的提示照旧发出（否则用户以为机器人坏了）：" + empty);
-            String noSuchLora = f.command(".lora status");
-            check(!noSuchLora.isBlank(), "普通查询照旧回答：" + noSuchLora);
-            // 明确问用法/帮助也要照旧
-            String help = f.command(".help");
-            check(help.contains(".mode [normal|debug]"), "normal 下 .help 照旧完整：" + line(help, ".mode ["));
+            List<String> denied = f.run(f.groupEvent(GROUP, ".chat toggle"), 4000);
+            note(".chat toggle（权限）", denied);
+            equal(1L, textCount(denied), "权限不足恰好一条：" + joined(denied));
+            check(textsOnly(denied).get(0).contains("仅 owner"), "权限不足照旧发出来：" + joined(denied));
+
+            List<String> badMode = f.run(f.groupEvent(GROUP, ".mode 香蕉"), 4000);
+            note(".mode 香蕉（用法）", badMode);
+            equal(1L, textCount(badMode), "非法参数恰好一条：" + joined(badMode));
+            String modeText = textsOnly(badMode).get(0);
+            check(modeText.contains("用法") && modeText.contains("normal") && modeText.contains("debug"),
+                    "非法参数给用法：" + modeText);
+
+            List<String> badGen = f.run(f.groupEvent(GROUP, ".gen abc"), 4000);
+            note(".gen abc（用法）", badGen);
+            equal(1L, textCount(badGen), "指令用法错误恰好一条：" + joined(badGen));
+            check(textsOnly(badGen).get(0).contains("用法") && textsOnly(badGen).get(0).contains("gen"),
+                    "指令用法错误照旧发出来：" + joined(badGen));
+
+            List<String> zero = f.run(f.groupEvent(GROUP, ".gen 0"), 4000);
+            note(".gen 0（参数校验）", zero);
+            equal(1L, textCount(zero), "参数取值错误恰好一条：" + joined(zero));
+            check(textsOnly(zero).get(0).contains("正整数"), "参数取值错误照旧发出来：" + joined(zero));
+
+            List<String> empty = f.run(f.groupEvent(GROUP, ".get"), 6000);
+            note(".get 暂无图片", empty);
+            equal(1L, textCount(empty), "需要用户动手的提示恰好一条：" + joined(empty));
+            check(textsOnly(empty).get(0).contains("暂无待领取图片"), "需要用户动手的提示照旧发出（否则用户以为机器人坏了）：" + joined(empty));
         }
     }
 
-    // ------------------------------------------------------------------ ⑥ 会话隔离
+    // ------------------------------------------------------------------ ⑥ 图片照常发（三种 .imgmode）
+
+    /** normal 只收文本，不动图片与 {@code .imgmode}：三种档位下图片都照常发出。 */
+    private static void normalDeliversImagesUnderEveryImageMode() throws Exception {
+        // auto：单张普通发送
+        try (Fixture f = new Fixture()) {
+            f.command(".mode normal");
+            f.command(".imgmode auto");
+            List<String> out = f.run(f.groupEvent(GROUP, ".gen"), 12000);
+            note("auto + .gen", out);
+            checkAtMostOne(out, "auto + .gen");
+            equal(1L, imageCount(out), "auto 下单张图照发：" + joined(out));
+            check(out.stream().anyMatch(line -> line.startsWith("image:send:image-")), "单张走普通发送：" + joined(out));
+        }
+        // single：多张也逐张普通发送
+        try (Fixture f = new Fixture()) {
+            f.command(".mode normal");
+            f.command(".imgmode single");
+            f.seed(3, "single-three");
+            List<String> images = f.run(f.groupEvent(GROUP, ".get"), 12000);
+            note("single + .get（3 张）", images);
+            equal(0L, textCount(images), "single 下领取不报计数：\n" + joined(images));
+            equal(3L, imageCount(images), "3 张逐条普通发送（规则没被动过）：" + joined(images));
+            check(images.stream().allMatch(line -> line.startsWith("image:send:")),
+                    "single 一律普通发送（一条一张）：" + joined(images));
+            f.awaitPending(0);
+            equal(0, f.pending(), "领取照常落盘");
+        }
+        // record：一张也合并转发
+        try (Fixture f = new Fixture()) {
+            f.command(".mode normal");
+            f.command(".imgmode record");
+            List<String> out = f.run(f.groupEvent(GROUP, ".gen"), 12000);
+            note("record + .gen", out);
+            checkAtMostOne(out, "record + .gen");
+            equal(1L, imageCount(out), "record 下单张也合并转发：" + joined(out));
+            check(out.stream().anyMatch(line -> line.startsWith("image:sendRecord:image-")),
+                    ".imgmode record 规则照旧：" + joined(out));
+        }
+        // 回溯（.rg）也照样只留图片
+        try (Fixture f = new Fixture()) {
+            f.command(".mode normal");
+            f.seed(2, "history-two");
+            List<String> out = f.run(f.groupEvent(GROUP, ".rg 2"), 10000);
+            note(".rg 2", out);
+            checkAtMostOne(out, ".rg 2");
+            equal(1L, imageCount(out), "回溯照发图片：" + joined(out));
+            check(out.stream().anyMatch(line -> line.startsWith("image:sendRecord:")), "两张按 auto 合成一条聊天记录：" + joined(out));
+        }
+    }
+
+    // ------------------------------------------------------------------ ⑦ 查询答案完整
+
+    /**
+     * 网页控制台的存档不受常规档影响：那里走的是回执收集器（/quest/#N 的正文），不是 QQ 消息。
+     * 常规档只合并"发给 QQ 的那一条"，控制台看到的仍然完整。
+     */
+    private static void normalLeavesTheConsoleArchiveWhole() throws Exception {
+        try (Fixture f = new Fixture()) {
+            String webKey = Bot.webConversationKey("web");
+            f.settings().setQqMode(webKey, Settings.QqMode.NORMAL);
+            equal(Settings.QqMode.NORMAL, f.settings().qqMode(webKey), "网页会话也能设成 normal（存储在同一个 qq_mode 段）");
+            int mark = f.mark();
+            Bot.WebCapture capture = f.bot.webCommand("web", List.of(".settings", ".size"));
+            long deadline = System.currentTimeMillis() + 15000;
+            while (!capture.done() && System.currentTimeMillis() < deadline) Thread.sleep(50);
+            check(capture.done(), "网页指令跑完（收集器已收工）");
+            check(capture.textCount() >= 2,
+                    "控制台存档仍然完整（两步指令的回复都在，没被'只留一条'合并）：实际 " + capture.textCount() + " 条，" + capture.firstText());
+            equal(0, f.since(mark).size(), "网页会话的回执不进 QQ（走收集器，QQ 侧一条都不发）：" + joined(f.since(mark)));
+        }
+    }
+
+    /** 用户显式查询在 normal 下答案完整：不许因为"只留一条"被削掉内容。 */
+    private static void normalAnswersQueriesInFull() throws Exception {
+        try (Fixture f = new Fixture()) {
+            f.command(".mode normal");
+            String settingsText = textsOnly(f.run(f.groupEvent(GROUP, ".settings"), 5000)).get(0);
+            check(settingsText.contains("采样方法") && settingsText.contains("图片尺寸") && settingsText.contains("迭代步数")
+                    && settingsText.contains("CFG") && settingsText.contains("种子") && settingsText.contains("基础模型")
+                    && settingsText.contains("来源"), "normal 下 .settings 答案完整：" + settingsText);
+            String sizeText = textsOnly(f.run(f.groupEvent(GROUP, ".size"), 5000)).get(0);
+            check(sizeText.contains("图片尺寸") && sizeText.contains("512"), "normal 下 .size 答案完整：" + sizeText);
+            String imgmode = textsOnly(f.run(f.groupEvent(GROUP, ".imgmode"), 5000)).get(0);
+            check(imgmode.contains("record") && imgmode.contains("single") && imgmode.contains("auto"),
+                    "normal 下 .imgmode 答案完整：" + imgmode);
+            String modeText = textsOnly(f.run(f.groupEvent(GROUP, ".mode"), 5000)).get(0);
+            check(modeText.contains("常规") && modeText.contains("normal") && modeText.contains("debug"),
+                    "normal 下 .mode 答案完整：" + modeText);
+            String status = textsOnly(f.run(f.groupEvent(GROUP, ".gen status"), 5000)).get(0);
+            check(status.contains("队列") && status.contains("自动领取"), "normal 下 .gen status 答案完整：" + status);
+            String prompt = textsOnly(f.run(f.groupEvent(GROUP, ".prompt"), 5000)).get(0);
+            check(prompt.contains("正向") && prompt.contains("来源"), "normal 下 .prompt 答案完整：" + prompt);
+            String loraList = textsOnly(f.run(f.groupEvent(GROUP, ".lora list"), 6000)).get(0);
+            check(!loraList.isBlank(), "normal 下 .lora list 有答案：" + loraList);
+            String vaeStatus = textsOnly(f.run(f.groupEvent(GROUP, ".vae status"), 6000)).get(0);
+            check(vaeStatus.contains("VAE"), "normal 下 .vae status 答案完整：" + vaeStatus);
+            String styleList = textsOnly(f.run(f.groupEvent(GROUP, ".style list"), 6000)).get(0);
+            check(styleList.contains("样式列表") && styleList.contains("样式"), "normal 下 .style list 答案完整：" + styleList);
+            String help = textsOnly(f.run(f.groupEvent(GROUP, ".help"), 5000)).get(0);
+            check(help.contains(".mode [normal|debug]") && help.contains(".imgmode [record|single|auto]")
+                    && help.contains(".vae [status|list|set"), "normal 下 .help 照旧完整：" + line(help, ".mode ["));
+            check(help.split(" / ", -1).length > 40, "normal 下 .help 没有被削短（行数 " + help.split(" / ", -1).length + "）");
+        }
+    }
+
+    // ------------------------------------------------------------------ ⑧ 会话隔离
 
     /** A 会话 normal 不影响 B 会话：B 仍然是 debug 全量输出（含生成参数与计数回执）。 */
     private static void modesArePerConversation() throws Exception {
@@ -351,13 +472,20 @@ public final class QqModeTest {
             String count = f.awaitText(20000);
             check(count.contains("本次领取完成，共 1 张"), "888 的领取计数回执照旧：" + count);
             f.awaitPending(0);
-
-            // 999 的 normal 没有外溢：它自己依然只发肯定与图片
             equal(Settings.QqMode.NORMAL, new Settings(f.root).qqMode(KEY_999), "999 仍是 normal");
+
+            // 999 的 normal 没有外溢：它自己出图只留图片（0 条文本）
+            List<String> quiet = f.run(f.groupEvent(GROUP, ".gen"), 12000);
+            note("999（normal）的 .gen", quiet);
+            checkAtMostOne(quiet, "999 的 .gen");
+            equal(1L, imageCount(quiet), "999 的图片照发：" + joined(quiet));
+            // 而 888 的 debug 内容一个字都没被 normal 削掉
+            String debugMode = f.groupCommand("888", ".mode");
+            check(debugMode.contains("完整回执"), "888 仍是完整回执：" + debugMode);
         }
     }
 
-    // ------------------------------------------------------------------ ⑦ 查看 / 非法参数
+    // ------------------------------------------------------------------ ⑨ 查看 / 非法参数
 
     /** .mode 不带参数显示当前值；非法值给用法且不改动已保存的设置；中文/斜杠/大小写都认。 */
     private static void currentValueAndInvalidArgument() throws Exception {
@@ -395,18 +523,15 @@ public final class QqModeTest {
         }
     }
 
-    // ------------------------------------------------------------------ ⑧ 切回 debug
+    // ------------------------------------------------------------------ ⑩ 切回 debug
 
     /** 切回 debug 之后输出与现状一致：参数清单、多步记录、结算与领取计数回执统统回来。 */
     private static void switchingBackToDebugRestoresEverything() throws Exception {
         try (Fixture f = new Fixture()) {
             f.command(".mode normal");
-            f.bot.accept(f.groupEvent(GROUP, ".gen"));
-            String quietAck = f.awaitText(30000);
-            check(!quietAck.contains("采样方法"), "常规下入队回执没有参数：" + quietAck);
-            Delivery first = f.awaitImage(30000);
-            first.ack().complete(null);
-            check(f.quiet(800), "常规下没有结算与领取计数回执：" + f.seen());
+            List<String> quiet = f.run(f.groupEvent(GROUP, ".gen"), 12000);
+            note("normal + .gen", quiet);
+            equal(0L, textCount(quiet), "常规下只留图片：" + joined(quiet));
             f.awaitPending(0);
 
             check(f.command(".mode debug").contains("已设为"), "切回 debug");
@@ -433,7 +558,7 @@ public final class QqModeTest {
         }
     }
 
-    // ------------------------------------------------------------------ ⑨ help / 控制台
+    // ------------------------------------------------------------------ ⑪ help / 控制台
 
     /** .help 只加一行；网页控制台裸词与聊天链路白名单都认得 .mode。 */
     private static void helpHasExactlyOneNewLine() throws Exception {
@@ -579,6 +704,8 @@ public final class QqModeTest {
         final ExecutorService executor;
         final SdClient client;
         final Bot bot;
+        /** Bot 自己用的那一份设置：改会话档位要让 Bot 立刻看见（不是重新读盘的那一份）。 */
+        final Settings live;
         final Wire wire = new Wire();
         private final JsonObject bridge = new JsonObject();
         private final AtomicInteger generations = new AtomicInteger();
@@ -616,10 +743,11 @@ public final class QqModeTest {
             config.add("sd", sd);
             Json.atomicWrite(root.resolve("config.json"), config);
             client = new SdClient(root, sd);
-            bot = new Bot(new Settings(root), client, wire);
+            live = new Settings(root);
+            bot = new Bot(live, client, wire);
         }
 
-        Settings settings() throws IOException { return new Settings(root); }
+        Settings settings() { return live; }
         /** 出图是否真的下发给假 SD（txt2img 调用次数）。 */
         int generationCalls() { return generations.get(); }
 
@@ -684,6 +812,14 @@ public final class QqModeTest {
             check(pending() == expected, "待领取张数应变成 " + expected + "，实际 " + pending() + "（ACK 没落盘？）");
         }
 
+        /** 上一条指令留下的待领取图片先领干净，免得影响下一条指令的统计。 */
+        void resolveArtifacts() throws Exception {
+            if (pending() <= 0) return;
+            bot.accept(groupEvent(GROUP, ".get"));
+            drain(6000);
+            awaitPending(0);
+        }
+
         // ---------------------------------------------------------- 出站等待
 
         int mark() { return wire.seen.size(); }
@@ -695,6 +831,23 @@ public final class QqModeTest {
             int before = wire.seen.size();
             Thread.sleep(millis);
             return wire.seen.size() == before;
+        }
+
+        /** 跑一条指令，把它产生的**全部**出站一条不落地收起来（图片自动确认）。 */
+        List<String> run(JsonObject event, long millis) throws Exception {
+            int before = mark();
+            bot.accept(event);
+            drain(millis);
+            return since(before);
+        }
+
+        /** 一边排空出站（图片一律确认），一边等异步步骤（出图、领取、后台任务）跑完。 */
+        void drain(long millis) throws InterruptedException {
+            long deadline = System.currentTimeMillis() + millis;
+            while (System.currentTimeMillis() < deadline) {
+                Delivery next = wire.queue.poll(150, TimeUnit.MILLISECONDS);
+                if (next != null && next.image()) next.ack().complete(null);
+            }
         }
 
         String awaitText(long millis) throws InterruptedException {
@@ -857,6 +1010,19 @@ public final class QqModeTest {
         List<String> result = new ArrayList<>();
         for (Path path : paths) result.add(path.getFileName().toString());
         return result;
+    }
+
+    // ------------------------------------------------------------------ 出站统计
+
+    private static long textCount(List<String> lines) { return lines.stream().filter(line -> line.startsWith("text:")).count(); }
+    private static long imageCount(List<String> lines) { return lines.stream().filter(line -> line.startsWith("image:")).count(); }
+    private static List<String> textsOnly(List<String> lines) { return lines.stream().filter(line -> line.startsWith("text:")).toList(); }
+    private static String joined(List<String> lines) { return String.join("\n", lines); }
+
+    /** 把一条指令产生的全部出站打印出来：这就是"一共发了几条"的证据。 */
+    private static void note(String label, List<String> out) {
+        System.out.println("--- " + label + "：出站 " + out.size() + " 条，其中文本 " + textCount(out) + " 条 ---");
+        for (String line : out) System.out.println("    " + line);
     }
 
     private static String line(String text, String needle) {
