@@ -209,6 +209,24 @@ public final class QuestScopeTest {
         config.add("webui", webui);
         Json.atomicWrite(root.resolve("config.json"), config);
         Files.writeString(root.resolve("data/deepseek-api-key.txt"), "test-key-not-real\n");
+        /* 盘上先放一条**本次改动之前写的**老回执：索引里没有 scope 字段（线上 478 条就是这样）。
+           它必须只出现在"不带 scope"的视图里 —— 老条目不属于任何会话，不许冒充某台手机的回执。 */
+        JsonObject legacyItem = new JsonObject();
+        legacyItem.addProperty("number", 1);
+        legacyItem.addProperty("command", ".legacy");
+        legacyItem.addProperty("startedAt", QuestIndex.stamp(System.currentTimeMillis() - 3_600_000));
+        legacyItem.addProperty("summary", "老回执：索引里没有归属字段");
+        legacyItem.addProperty("texts", 1);
+        legacyItem.addProperty("images", 0);
+        legacyItem.addProperty("done", true);
+        legacyItem.addProperty("unread", false);
+        legacyItem.addProperty("read", true);
+        JsonArray legacyQuests = new JsonArray();
+        legacyQuests.add(legacyItem);
+        JsonObject legacyIndex = new JsonObject();
+        legacyIndex.addProperty("version", 1);
+        legacyIndex.add("quests", legacyQuests);
+        Json.atomicWrite(root.resolve("data/quests.json"), legacyIndex);
 
         Settings settings = new Settings(root);
         settings.webSetting("port", new com.google.gson.JsonPrimitive(port));
@@ -233,13 +251,27 @@ public final class QuestScopeTest {
                 JsonObject phoneList = post(base, "/api/quests", scoped(DEV, "limit", 20));
                 check(phoneList.get("scoped").getAsBoolean() && phoneList.get("total").getAsInt() == 1
                                 && entry(phoneList, 0).get("number").getAsInt() == phoneNumber,
-                        "POST /api/quests {scope:dev-…} 只回这个会话那一条：" + phoneList);
+                        "POST /api/quests {scope:dev-…} 只回这个会话那一条（老的无归属条目不出现）：" + phoneList);
 
                 JsonObject consoleList = get(base, "/api/quests?limit=20");
-                check(!consoleList.get("scoped").getAsBoolean() && consoleList.get("total").getAsInt() == 2,
-                        "GET /api/quests（控制台不传 scope）照旧两条都在：" + consoleList);
+                check(!consoleList.get("scoped").getAsBoolean() && consoleList.get("total").getAsInt() == 3,
+                        "GET /api/quests（控制台不传 scope）照旧三条都在（含老的无归属那条）：" + consoleList);
                 check(consoleList.get("latest").getAsInt() == Math.max(consoleNumber, phoneNumber),
                         "控制台的 latest 照旧是全局最大号");
+
+                // 键名兼容：GET 查询串 ?scope= 与 POST body {scope} 必须等价（有人手敲链接/脚本都会用）
+                JsonObject phoneByQuery = get(base, "/api/quests?limit=20&scope=" + DEV);
+                check(phoneByQuery.get("total").getAsInt() == phoneList.get("total").getAsInt()
+                                && phoneByQuery.get("scoped").getAsBoolean(),
+                        "GET ?scope= 与 POST {scope} 等价：" + phoneByQuery);
+                JsonObject webByQuery = get(base, "/api/quests?limit=20&scope=" + WEB);
+                JsonObject webByBody = post(base, "/api/quests", scoped(WEB, "limit", 20));
+                check(webByQuery.get("total").getAsInt() == 1 && webByBody.get("total").getAsInt() == 1
+                                && entry(webByBody, 0).get("number").getAsInt() == consoleNumber,
+                        "web 会话只看得到自己那条（老条目与手机那条都不出现）：" + webByBody);
+                System.out.println("  [对照] 同一份索引：不带 scope → total=" + consoleList.get("total").getAsInt()
+                        + "（含老的无归属 #1）；scope=" + DEV + " → total=" + phoneList.get("total").getAsInt()
+                        + "；scope=" + WEB + " → total=" + webByBody.get("total").getAsInt());
 
                 JsonObject foreign = post(base, "/api/quest", scoped(DEV, "id", consoleNumber));
                 JsonObject consoleOpen = null;
