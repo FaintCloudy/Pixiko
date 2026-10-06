@@ -96,7 +96,8 @@ public final class ReceiptChatLogTest {
         }
         System.out.println("ReceiptChatLogTest: " + checks + " assertions passed：同一条回执 append 两次只有 1 条、"
                 + "多步回执（6 条正文 + 1 张图）逐条对齐且图在第 5 条上、页面 push 与服务端 append 交替 20 轮不丢不重、"
-                + "真 HTTP 的 /api/chat/log 读得到服务端 append 的条目且覆盖写之后仍补得回来。");
+                + "真 HTTP 的 /api/chat/log 读得到服务端 append 的条目、覆盖写少了末尾一条时补得回来、"
+                + "而页面把服务端追加过的条目全删了时一条都不复活、/api/chat/reset 照旧清空。");
     }
 
     // ---------------------------------------------------------------- 1) 幂等
