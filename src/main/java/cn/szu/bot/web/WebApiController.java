@@ -271,7 +271,8 @@ public class WebApiController {
             case "/api/chat/reset": {
                 writeChat(scope, new JsonArray());
                 // 「清空对话」要连服务端那份完整正文一起清，不然刷新页面历史又回来了。
-                chatLog.save(scope, new JsonArray());
+                // 走 clear（而不是 save 空数组）：连幂等账本一起清，服务端不会再"补回"刚清掉的那几条。
+                chatLog.clear(scope);
                 return WebJson.ok(new JsonObject());
             }
             case "/api/settings": {

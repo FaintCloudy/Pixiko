@@ -1,6 +1,7 @@
 package cn.szu.bot;
 
 import com.google.gson.JsonArray;
+import com.google.gson.JsonElement;
 import com.google.gson.JsonNull;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonPrimitive;
@@ -44,13 +45,241 @@ public final class ChatLogStoreTest {
             concurrency(root);
             nullAndJunk(root);
             warnObservation(root);
+            appendIdempotent(root);
+            appendReceiptFold(root);
+            appendVersusPush(root);
         } finally {
             TestCleanup.deleteQuietly(root);
         }
         check(!Files.exists(root), "临时根已清理干净：" + root);
         System.out.println("ChatLogStoreTest: " + checks + " assertions passed: 往返与深拷贝、坏文件、逐条规范化（含丢空条目）、"
                 + "缺文件静默与坏数据才 warn、超长文字截断、只留最后 200 条、512KB 裁剪、scope 净化不逃逸、"
-                + "无 BOM 与纯 LF、8 线程并发不半截、空输入不抛。");
+                + "无 BOM 与纯 LF、8 线程并发不半截、空输入不抛、"
+                + "服务端追加按「回执号 + 条内序号」幂等、多步回执逐条对齐且图并进上一条正文、"
+                + "页面整组 push 与服务端 append 交替不丢不重。");
+    }
+
+    // ---------------------------------------------------------------- 12) 服务端追加：幂等
+
+    /** 同一条回执消息 append 两次 → 日志里只有 1 条（断言条数与内容）。 */
+    static void appendIdempotent(Path root) throws Exception {
+        ChatLogStore store = new ChatLogStore(root);
+        List<ChatLogStore.Append> items = List.of(new ChatLogStore.Append("quest:7:1", "已加入生成队列", List.of()));
+        check(store.append("idem", items) == 1, "第一次 append 真的写了 1 条");
+        check(store.load("idem").size() == 1, "第一次 append 之后是 1 条");
+        check(store.append("idem", items) == 0, "同一条再 append 一次：不写（返回 0）");
+        check(store.load("idem").size() == 1, "同一条 append 两次仍然只有 1 条：" + store.load("idem"));
+        check("已加入生成队列".equals(store.load("idem").get(0).getAsJsonObject().get("text").getAsString()),
+                "留下的正是那一条正文");
+        check("bot".equals(store.load("idem").get(0).getAsJsonObject().get("role").getAsString()), "追加条目 role=bot");
+
+        // 换一个 store 实例（等价于机器人重启）：账本在磁盘上，照样不重复
+        ChatLogStore restarted = new ChatLogStore(root);
+        check(restarted.append("idem", items) == 0, "重启后同一条 append 依旧不写（账本持久）");
+        check(restarted.load("idem").size() == 1, "重启后仍然只有 1 条");
+
+        // 同一批里重复的键也算一次
+        List<ChatLogStore.Append> twice = List.of(
+                new ChatLogStore.Append("quest:8:1", "结算完成", List.of()),
+                new ChatLogStore.Append("quest:8:1", "结算完成", List.of()));
+        check(store.append("idem", twice) == 1, "同一批里同一个键只落 1 条");
+        check(store.load("idem").size() == 2, "现在一共 2 条：" + store.load("idem").size());
+
+        // 图片后到：同一条正文就地补成带图的版本，**绝不新开一条**
+        List<ChatLogStore.Append> withImage = List.of(
+                new ChatLogStore.Append("quest:8:1", "结算完成", List.of("data/generated/a.png")));
+        check(store.append("idem", withImage) == 1, "图后到：这一条被就地更新（算 1 次改动）");
+        JsonArray after = store.load("idem");
+        check(after.size() == 2, "图后到没有多出气泡：" + after.size());
+        JsonObject tail = after.get(1).getAsJsonObject();
+        check(tail.getAsJsonArray("images").size() == 1
+                        && "data/generated/a.png".equals(tail.getAsJsonArray("images").get(0).getAsString()),
+                "图挂在同一条正文上：" + tail);
+        check(store.append("idem", withImage) == 0 && store.load("idem").size() == 2, "带图版本再 append 一次也幂等");
+
+        // 空条目（既没文字也没图）不落
+        check(store.append("idem", List.of(new ChatLogStore.Append("quest:9:1", "", List.of()))) == 0,
+                "空条目不算一次追加");
+        check(store.load("idem").size() == 2, "空条目不落盘");
+
+        // 顺带钉住：账本是**旁挂文件**，正文文件的结构一个字都没变
+        Path file = ChatLogStore.fileFor(root, "idem");
+        JsonObject state = Json.parse(Files.readString(file, StandardCharsets.UTF_8));
+        check(state.keySet().toString().equals("[version, scope, savedAtMillis, entries]"),
+                "正文文件结构不变：" + state.keySet());
+        check(Files.isRegularFile(ChatLogStore.ledgerFileFor(root, "idem")), "幂等账本落在旁挂文件上");
+    }
+
+    // ---------------------------------------------------------------- 13) 多步回执的分组
+
+    /** 多步回执（6 条正文 + 1 张图，图在第 5 条之后）→ 每条正文各一条、图挂在第 5 条上。 */
+    static void appendReceiptFold(Path root) {
+        List<JsonArray> messages = new ArrayList<>();
+        for (int step = 1; step <= 4; step++) messages.add(textGroup("第 " + step + " 步完成"));
+        messages.add(textGroup("开始生成图片"));
+        messages.add(imageGroup("data/generated/pic.png"));
+        messages.add(textGroup("本次领取完成，共 1 张。"));
+        List<ChatLogStore.Append> items = ChatLogStore.receipt("31", messages);
+        check(items.size() == 6, "6 条正文 + 1 张图 → 6 条条目（图并进第 5 条正文，不新开）：" + items.size());
+        check("quest:31:1".equals(items.get(0).key()) && "quest:31:6".equals(items.get(5).key()),
+                "幂等键是回执号 + 条内序号：" + items.get(0).key() + " … " + items.get(5).key());
+        check(items.get(3).images().isEmpty(), "第 4 条没有图");
+        check(items.get(4).images().size() == 1 && "data/generated/pic.png".equals(items.get(4).images().get(0)),
+                "图挂在上一条正文（第 5 条）上：" + items.get(4).images());
+        check("开始生成图片".equals(items.get(4).text()), "第 5 条正文就是图前面那句");
+        check(items.get(5).images().isEmpty(), "第 6 条（图之后的领取）没有图");
+        check("本次领取完成，共 1 张。".equals(items.get(5).text()), "第 6 条正文是领取那句话");
+
+        ChatLogStore store = new ChatLogStore(root);
+        check(store.append("fold", items) == 6, "6 条各落一次");
+        JsonArray saved = store.load("fold");
+        check(saved.size() == 6, "正文里 6 条：" + saved.size());
+        for (int index = 0; index < 4; index++)
+            check(saved.get(index).getAsJsonObject().get("text").getAsString().startsWith("第 " + (index + 1) + " 步"),
+                    "前 4 条顺序与内容不变（第 " + (index + 1) + " 条）");
+        check(saved.get(4).getAsJsonObject().getAsJsonArray("images").size() == 1,
+                "第 5 条带上了那张图：" + saved.get(4));
+        check(!saved.get(5).getAsJsonObject().has("images"), "第 6 条没有图（图没有被塞到末尾那条）");
+        check(store.append("fold", ChatLogStore.receipt("31", messages)) == 0, "整条回执重推一次：一条都不重复");
+
+        // 纯图回执（一条正文都没有）：图自己占一条，且不会因此多出空气泡
+        List<JsonArray> onlyImage = List.of(imageGroup("data/generated/only.png"));
+        List<ChatLogStore.Append> lone = ChatLogStore.receipt("32", onlyImage);
+        check(lone.size() == 1 && lone.get(0).text().isEmpty() && lone.get(0).images().size() == 1,
+                "纯图回执 → 一条只有图的条目：" + lone);
+    }
+
+    // ---------------------------------------------------------------- 14) 页面 push 与服务端 append 交替
+
+    /**
+     * 并发口径：页面整组 push（{@link #save}）与服务端 append 交替发生 → 不出重复、不丢条目。
+     *
+     * <p>这里把两种真实形状都跑一遍：
+     * ① push 的那份**少了服务端已经 append 的条目**（页面快照旧了）→ 服务端把那条补回来（不丢）；
+     * ② push 的那份**已经带了**同样的条目（页面读到了服务端那一份）→ 认账、不重复写第二遍。
+     */
+    static void appendVersusPush(Path root) {
+        ChatLogStore store = new ChatLogStore(root);
+        JsonArray userSays = new JsonArray();
+        userSays.add(entry("user", "帮我生成一张"));
+        store.save("race2", userSays);
+
+        List<ChatLogStore.Append> receipt = List.of(
+                new ChatLogStore.Append("quest:41:1", "已加入生成队列", List.of()),
+                new ChatLogStore.Append("quest:41:2", "任务完成", List.of("data/generated/x.png")));
+        check(store.append("race2", receipt) == 2, "服务端追加 2 条");
+        check(store.load("race2").size() == 3, "现在 1 条用户 + 2 条回执：" + store.load("race2").size());
+
+        // ① 页面拿着一份旧快照（只有用户那条）整组 push → 服务端的两条必须找回来
+        JsonArray stalePage = new JsonArray();
+        stalePage.add(entry("user", "帮我生成一张"));
+        store.save("race2", stalePage);
+        JsonArray afterPush = store.load("race2");
+        check(afterPush.size() == 3, "页面整组 push 之后服务端追加的 2 条被补回来（不丢）：" + afterPush.size());
+        check("已加入生成队列".equals(afterPush.get(1).getAsJsonObject().get("text").getAsString()),
+                "补回来的是那两条回执，顺序不变");
+        check(afterPush.get(2).getAsJsonObject().getAsJsonArray("images").size() == 1,
+                "带图那条也原样回来：" + afterPush.get(2));
+
+        // ② 页面这次读到了服务端那一份（整组 push 里已经包含它们）→ 不许再写第二遍
+        JsonArray fresh = new JsonArray();
+        fresh.add(entry("user", "帮我生成一张"));
+        fresh.add(entry("bot", "已加入生成队列"));
+        JsonObject withImage = entry("bot", "任务完成");
+        JsonArray images = new JsonArray();
+        images.add("data/generated/x.png");
+        withImage.add("images", images);
+        fresh.add(withImage);
+        store.save("race2", fresh);
+        check(store.load("race2").size() == 3, "页面推的与服务端追的是同一批：不出重复：" + store.load("race2").size());
+        check(store.append("race2", receipt) == 0, "之后服务端再 append 同一条：一条都不写");
+        check(store.load("race2").size() == 3, "仍然 3 条：" + store.load("race2").size());
+
+        // ③ 页面推的这份**逐字节就是服务端追加过的那两条**（只是少了它自己的一条用户消息）：
+        //    服务端认账、一条都不补，也一条都不重复（比对是"完整形状"的，不靠下标、不靠前缀）。
+        JsonArray exactPage = new JsonArray();
+        exactPage.add(entry("bot", "已加入生成队列"));
+        JsonObject exactImage = entry("bot", "任务完成");
+        JsonArray exactImages = new JsonArray();
+        exactImages.add("data/generated/x.png");
+        exactImage.add("images", exactImages);
+        exactPage.add(exactImage);
+        store.save("race2", exactPage);
+        JsonArray cleared = store.load("race2");
+        check(cleared.size() == 2, "页面这份与服务端追加的逐字节一致：不补、不重复（2 条）：" + cleared.size());
+        check("已加入生成队列".equals(cleared.get(0).getAsJsonObject().get("text").getAsString())
+                        && "任务完成".equals(cleared.get(1).getAsJsonObject().get("text").getAsString()),
+                "两条顺序照旧：" + cleared);
+
+        // ③b 再推一份"少了服务端追加过的第二条"的（旧快照形状）→ 只把少的那条补回来，不加第二遍
+        JsonArray staleAgain = new JsonArray();
+        staleAgain.add(entry("user", "帮我生成一张"));
+        staleAgain.add(entry("bot", "已加入生成队列"));
+        store.save("race2", staleAgain);
+        JsonArray restored = store.load("race2");
+        check(restored.size() == 3, "少了一条回执：补回它（3 条）：" + restored.size());
+        check("任务完成".equals(restored.get(2).getAsJsonObject().get("text").getAsString())
+                        && restored.get(2).getAsJsonObject().getAsJsonArray("images").size() == 1,
+                "补回来的是带图那条，落在末尾：" + restored.get(2));
+
+        // ④ 交替并发：写线程 push、另一个线程 append，收尾时断言"不丢"
+        ExecutorService pool = Executors.newFixedThreadPool(2);
+        CountDownLatch start = new CountDownLatch(1);
+        List<Future<?>> futures = new ArrayList<>();
+        final int rounds = 30;
+        futures.add(pool.submit(() -> {
+            try {
+                start.await();
+                for (int round = 0; round < rounds; round++) {
+                    JsonArray page = new JsonArray();
+                    page.add(entry("user", "第 " + round + " 轮"));
+                    store.save("race3", page);
+                }
+            } catch (Throwable error) {
+                throw new RuntimeException(error);
+            }
+        }));
+        futures.add(pool.submit(() -> {
+            try {
+                start.await();
+                for (int round = 0; round < rounds; round++) {
+                    store.append("race3", List.of(new ChatLogStore.Append("quest:5" + round + ":1", "回执 " + round, List.of())));
+                }
+            } catch (Throwable error) {
+                throw new RuntimeException(error);
+            }
+        }));
+        start.countDown();
+        boolean failed = false;
+        for (Future<?> future : futures) {
+            try { future.get(120, TimeUnit.SECONDS); } catch (Exception error) { failed = true; }
+        }
+        pool.shutdown();
+        check(!failed, "push 与 append 交替 30 轮：两边都没抛");
+        JsonArray raced = store.load("race3");
+        check(raced.size() > 0 && raced.size() <= 200, "交替之后是一份合法正文（" + raced.size() + " 条）");
+        long receipts = 0;
+        for (JsonElement node : raced)
+            if (node.getAsJsonObject().get("text").getAsString().startsWith("回执 ")) receipts++;
+        check(receipts >= 1, "服务端 append 的条目至少留下一条（不因为页面 push 全丢）：" + receipts);
+    }
+
+    static JsonArray textGroup(String text) {
+        JsonArray group = new JsonArray();
+        JsonObject node = new JsonObject();
+        node.addProperty("type", "text");
+        node.addProperty("text", text);
+        group.add(node);
+        return group;
+    }
+
+    static JsonArray imageGroup(String file) {
+        JsonArray group = new JsonArray();
+        JsonObject node = new JsonObject();
+        node.addProperty("type", "image");
+        node.addProperty("file", file);
+        group.add(node);
+        return group;
     }
 
     // ---------------------------------------------------------------- 1) 往返

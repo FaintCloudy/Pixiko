@@ -2714,21 +2714,56 @@
   }
 
   /**
-   * 整份覆盖写服务端（`POST /api/chat/log/save {scope, entries}`）。
+   * 整份写服务端（`POST /api/chat/log/save {scope, entries}`）。
    *
-   * <p>空内容**不推**：服务端那份由 `/api/chat/reset` 负责清（见 {@link chatSnapshotClear}）。
-   * 失败（老后端 404/500、网络抖动）只记一次 console.warn 并关掉本次会话的存档，
-   * 本地快照与聊天链路完全不受影响。
+   * <p><b>推之前先并一次服务端那一份（并集）</b>：服务端现在也是这份正文的写入者之一 ——
+   * 它产生回执消息时会自己 append 一条（幂等键 = 回执号 + 条内序号，几分钟内就会出现在
+   * {@code /api/chat/log} 里）。如果本地这份是"上一次读到之后"的快照，直接整份覆盖回去就会把
+   * 服务端刚 append 的那条**抹掉**（用户报的「回执时不时消失一条」正是这个形状）。
+   * 并集只往本地补服务端有、本地没有的条目，**绝不删本地任何一条**，所以既不丢服务端的新消息，
+   * 也不会把用户本地更全的内容裁掉。
+   *
+   * <p>服务端读不到（老后端 404/500、网络抖动）就退回老行为：照旧推本地这一份，
+   * 失败只记一次 console.warn 并关掉本次会话的存档，本地快照与聊天链路完全不受影响。
    */
   function chatArchiveSend() {
     if (chatArchive.disabled) return Promise.resolve(null);
     const entries = chatSnapshot.entries.slice();
-    if (!entries.length) return Promise.resolve(null);
-    return api('/api/chat/log/save', { body: { scope: scope(), entries } }).catch((error) => {
-      chatArchive.disabled = true;
-      console.warn('对话存档不可用（本次会话只用本地快照，不影响聊天）：' + (error && error.message ? error.message : error));
-      return null;
+    if (!entries.length) return Promise.resolve(null);   // 空内容不推：清空交给 /api/chat/reset
+    return api('/api/chat/log', { body: { scope: scope() } }).then((payload) => {
+      // 服务端那一份先、本地独有的再接上：顺序仍然是"对话的先后"，只是不会漏掉服务端新 append 的条目。
+      const remote = (Array.isArray(payload && payload.entries) ? payload.entries : []).map(chatEntryClean).filter(Boolean);
+      const merged = remote.length ? unionChatEntries(remote, chatSnapshot.entries) : entries;
+      return api('/api/chat/log/save', { body: { scope: scope(), entries: merged } });
+    }).catch((error) => {
+      // 读那一步失败也不算灾难：退回"整份推本地"的老行为，能推就推。
+      return api('/api/chat/log/save', { body: { scope: scope(), entries } }).catch((failure) => {
+        chatArchive.disabled = true;
+        console.warn('对话存档不可用（本次会话只用本地快照，不影响聊天）：' + (failure && failure.message ? failure.message : failure));
+        return null;
+      });
     });
+  }
+
+  /**
+   * 两份正文的**并集**（服务端那份在前、本地独有的接在后面）：按 {@link chatArchiveKey}
+   * （角色 + 正文 + 图片，同一条重复出现时按出现次数配对）对齐，只补本地缺的，**不删任何一条**。
+   */
+  function unionChatEntries(remote, local) {
+    const known = new Map();
+    remote.forEach((entry) => {
+      const key = chatArchiveKey(entry);
+      known.set(key, (known.get(key) || 0) + 1);
+    });
+    const extra = [];
+    local.forEach((entry) => {
+      const key = chatArchiveKey(entry);
+      const left = known.get(key) || 0;
+      if (left > 0) { known.set(key, left - 1); return; }   // 服务端已经有了 → 不重复
+      extra.push(entry);                                    // 本地独有的 → 接在后面
+    });
+    if (!extra.length) return remote.slice();
+    return remote.concat(extra).slice(-CHAT_LOG_LIMIT);      // 与本地快照同一条 200 条上限
   }
 
   /**

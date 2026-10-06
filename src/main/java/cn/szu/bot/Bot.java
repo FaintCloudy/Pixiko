@@ -35,6 +35,7 @@ import cn.szu.bot.sd.LocalStyles;
 import cn.szu.bot.sd.SdClient;
 import cn.szu.bot.sd.UserPromptStore;
 import cn.szu.bot.sd.VaeGuard;
+import cn.szu.bot.web.ChatLogStore;
 
 public final class Bot implements AutoCloseable {
     @FunctionalInterface public interface Sender {
@@ -1325,6 +1326,10 @@ public final class Bot implements AutoCloseable {
         this.forwardRecords = sender.supportsRecord();
         // 回执正文落盘目录（data/quests/<number>.json）：回执不再过期，正文随时读得回来。
         this.questBodyDir = settings.root.resolve("data/quests");
+        // 对话正文（data/webui/<scope>-chat-log.json）的**服务端写入者**：网页会话产生回执消息时
+        // 顺手把同一条 append 进去（幂等键 = 回执号 + 条内序号），这样页面只读一个源就够，
+        // 不再需要靠前端去"猜身份"缝合回执与正文。页面整组 push（/api/chat/log/save）语义不变。
+        this.chatLog = new ChatLogStore(settings.root);
         // 回执索引：只存摘要与已读标记，列表在重启后也还在（读失败就是空索引，不影响回执）。
         this.questFile = settings.root.resolve("data/quests.json");
         this.questIndex = new QuestIndex();
@@ -7338,6 +7343,12 @@ public final class Bot implements AutoCloseable {
          * 落盘成功后清掉；写失败就留着，下次再试——这样磁盘上的正文总是最新的一份。
          */
         private volatile boolean bodyDirty;
+        /**
+         * 这条回执的 {@link #messages} 已经有多少组**推导并 append 进对话正文**了（见
+         * {@link #appendQuestToChatLog}）。只用来跳过"一个字都没变"的重复推导；真正防重复靠的是
+         * {@link ChatLogStore} 里的幂等键（回执号 + 条内序号），所以这个计数从 0 重来也不会写出重复。
+         */
+        private volatile int chatAppended;
         private volatile long lastActivityNanos = System.nanoTime();
         private volatile boolean closed;
         /** 这条指令的执行体已经跑完（回执可能还在陆续到达，见 quiet()）。 */
@@ -7504,6 +7515,12 @@ public final class Bot implements AutoCloseable {
     private final Path questFile;
     /** 回执正文落盘目录（data/quests/&lt;number&gt;.json）：回执不再过期，正文随时可读。 */
     private final Path questBodyDir;
+    /**
+     * 对话正文的落盘（data/webui/&lt;scope&gt;-chat-log.json）：网页会话产生回执消息时，服务端顺手
+     * append 一份（见 {@link #appendQuestToChatLog}）。页面整组 push 的那条路（{@code /api/chat/log/save}）
+     * 照旧可用 —— 两者共用一个 store 的锁，不会互相写坏。
+     */
+    private final ChatLogStore chatLog;
     /** 索引写盘节流：距上次写盘不足 2 秒、且内容没变，就不写——900ms 一次的轮询不能把磁盘写爆。 */
     private static final long QUEST_SAVE_INTERVAL_MILLIS = 2000;
     private volatile long questSavedMillis;
@@ -7887,12 +7904,42 @@ public final class Bot implements AutoCloseable {
     }
     /** 一条回执变了（来了文字/图片、指令跑完）：立刻刷新索引与磁盘正文，落盘节流只管索引。 */
     private void observeQuest(WebCapture capture) {
+        if (capture == null) return;
+        // 对话正文的追加**不依赖索引**：索引造不出来时回执照旧要进正文（两件事互不牵连）。
+        appendQuestToChatLog(capture);
         QuestIndex index = questIndex;
-        if (index == null || capture == null) return;
+        if (index == null) return;
         index.observe(capture);
         saveQuestBody(capture);
         sweepTrimmedQuests();
         persistQuests(false);
+    }
+    /** 测试用：把一条回执按"变了"处理一次（等价于捕获到新消息 / 指令跑完时的那一次刷新）。 */
+    void observeQuestForTests(WebCapture capture) { observeQuest(capture); }
+
+    /**
+     * 把这条回执已经攒下的出站消息 append 进它自己那个 scope 的**对话正文**
+     * （{@code data/webui/<scope>-chat-log.json}）——服务端由此成为对话正文的权威写入者之一。
+     *
+     * <p><b>为什么在这一层</b>：出站消息无论来自同步的指令步骤、还是异步的"生成完成/领取图片"，
+     * 都必经 {@code webAware} 捕获；捕获之后一定走 {@link #observeQuest}（"这条回执变了"的唯一信号）。
+     * 放在这里只有一个落点，同步与异步、文字与图片一视同仁。
+     *
+     * <p><b>幂等</b>：每次都用**整份 messages 重新推导**（{@link ChatLogStore#receipt}），逐条带
+     * "回执号 + 条内序号"的稳定键交给 {@link ChatLogStore#append}；重复调用、机器人重启、页面补拉
+     * 都只会落一次，图片后到则**就地补进**它前面那条正文（"先文字后图仍是同一个气泡"）。
+     *
+     * <p>不落 QQ 会话（scope 为空）、不落老构造器造出来的无归属回执：那些不是"网页会话的正文"。
+     * 也绝不影响回执本身：{@link ChatLogStore#append} 内部绝不抛，失败只 warn。
+     */
+    private void appendQuestToChatLog(WebCapture capture) {
+        if (capture == null || chatLog == null) return;
+        String scope = capture.scope();
+        if (scope == null || scope.isBlank() || capture.number <= 0) return;
+        List<JsonArray> messages = new ArrayList<>(capture.messages);
+        if (messages.isEmpty() || messages.size() <= capture.chatAppended) return;
+        chatLog.append(scope, ChatLogStore.receipt(String.valueOf(capture.number), messages));
+        capture.chatAppended = messages.size();
     }
     /**
      * 一条回执的正文落盘：{@code data/quests/&lt;number&gt;.json}（{@link Json#atomicWrite}，UTF-8 无 BOM）。

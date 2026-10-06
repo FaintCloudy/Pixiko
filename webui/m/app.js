@@ -2278,20 +2278,64 @@
   /** 800ms 防抖写回服务端正文（页面隐藏时另有补一次，见 installVisibilityFlush）。 */
   var saveChatLogDebounced = debounce(function () { saveChatLog(); }, 800);
   var saveChatLogInFlight = null;
+  /**
+   * 整份写回服务端正文，但**推之前先与服务端那一份并一次集**。
+   *
+   * <p>服务端现在也是这份正文的写入者之一（产生回执消息时自己 append 一条，幂等键 = 回执号 + 序号，
+   * 见 {@code ChatLogStore.append}）。手机端这一份是"上一次读到之后"的快照时，直接整份覆盖回去
+   * 就会把服务端刚 append 的那条抹掉（"回执时不时少一条"就是这个形状）。
+   * 并集只往本地补"服务端有、本地没有"的条目，**绝不删本地任何一条**。
+   *
+   * <p>服务端读不到就退回老行为：照旧推本地这一份（失败只 toast，不影响聊天）。
+   */
   async function saveChatLog() {
     if (!chat.loaded) return;                       // 还没读到服务端正文就先别写，免得把别人的覆盖掉
-    var payload = chat.entries.map(function (entry) {
-      var item = { role: entry.role, text: entry.text };
-      if (entry.images && entry.images.length) item.images = entry.images.slice(0);
-      return item;
-    });
     if (saveChatLogInFlight) return saveChatLogInFlight;   // 上一笔还没回来就跳过这一次（防抖下不会积压）
-    saveChatLogInFlight = PixikoM.api('/api/chat/log/save', { body: { scope: PixikoM.scope(), entries: payload } })
-      .catch(function (error) {
-        if (error.code !== 'unauthorized') PixikoM.toast('对话正文没存上：' + error.message);
-      })
-      .then(function () { saveChatLogInFlight = null; });
+    saveChatLogInFlight = (async function () {
+      var payload = chat.entries.map(function (entry) {
+        var item = { role: entry.role, text: entry.text };
+        if (entry.images && entry.images.length) item.images = entry.images.slice(0);
+        return item;
+      });
+      if (!payload.length) return;                  // 空内容不推：清空走 /api/chat/reset
+      var outgoing = payload;
+      try {
+        var remote = await PixikoM.api('/api/chat/log', { body: { scope: PixikoM.scope() } });
+        // 并集用**服务端原样的条目**（不是 chatNormalize 之后的：那个会补 seq/空 images，
+        // 并集比的是"角色 + 正文 + 图片"，键必须与本地这一份同口径）。
+        var list = remote && Array.isArray(remote.entries) ? remote.entries : [];
+        if (list.length) outgoing = unionChatEntries(list, payload);
+      } catch (error) { /* 读不到就照老行为整份推本地这一份 */ }
+      await PixikoM.api('/api/chat/log/save', { body: { scope: PixikoM.scope(), entries: outgoing } });
+    })().catch(function (error) {
+      if (error.code !== 'unauthorized') PixikoM.toast('对话正文没存上：' + error.message);
+    }).then(function () { saveChatLogInFlight = null; });
     return saveChatLogInFlight;
+  }
+
+  /**
+   * 两份正文的**并集**（服务端那份在前、本地独有的接在后面）：按"角色 + 正文 + 图片"对齐
+   * （同一条重复出现时按出现次数配对），只补本地缺的，**不删任何一条**。
+   */
+  function unionChatEntries(remote, local) {
+    var known = Object.create(null);
+    function keyOf(entry) {
+      var images = entry && entry.images && entry.images.length ? entry.images.join('\u0002') : '';
+      return String((entry && entry.role) || '') + '\u0001' + String((entry && entry.text) || '') + '\u0001' + images;
+    }
+    for (var i = 0; i < remote.length; i++) {
+      var key = keyOf(remote[i]);
+      known[key] = (known[key] || 0) + 1;
+    }
+    var extra = [];
+    for (var j = 0; j < local.length; j++) {
+      var localKey = keyOf(local[j]);
+      var left = known[localKey] || 0;
+      if (left > 0) { known[localKey] = left - 1; continue; }   // 服务端已经有了 → 不重复
+      extra.push(local[j]);                                     // 本地独有的 → 接在后面
+    }
+    if (!extra.length) return remote.slice(0);
+    return remote.concat(extra).slice(-200);                    // 与本地快照同一条 200 条上限
   }
 
   async function chatLoad() {
@@ -2512,6 +2556,65 @@
   }
 
   /**
+   * 「回执号 + 序号 → 正文里哪个气泡」的对齐表（**本页内存**，换页重建就没了，没有持久化的必要）。
+   *
+   * <p>为什么有它：服务端现在也是对话正文的写入者之一（产生回执消息时顺手 append，
+   * 幂等键就是"回执号 + 条内序号"）。有了这张表，补拉回执时第 N 段正文能**直接命中**同一条，
+   * 不必再靠"正文互为前缀"去猜 —— 猜错就是用户报过的「多条消息并成一个气泡」。
+   * 键用 {@code quest|序号}；同一段正文再来一次（先文字后图）也命中同一个气泡，所以不会长出新泡。
+   */
+  var receiptAlign = Object.create(null);
+
+  /** 对齐表的键：回执号 + 条内序号（与服务端 append 的幂等键同一个口径）。 */
+  function alignKey(payload, seq) {
+    var number = Number(payload && payload.quest) || 0;
+    return number > 0 ? number + '|' + seq : '';
+  }
+
+  /** 这一段正文（第 seq 段）是不是已经对齐到某个气泡了？没被本轮别的段占用才算命中。 */
+  function alignmentHit(payload, seq, used) {
+    var at = receiptAlign[alignKey(payload, seq)];
+    if (typeof at !== 'number' || at < 0 || at >= chat.entries.length) return -1;
+    var entry = chat.entries[at];
+    if (!entry || entry.role !== 'bot' || used[at]) return -1;
+    return at;
+  }
+
+  /** 记下/更新"这条回执的第 seq 段正文 = 正文里第 at 个条目"。 */
+  function rememberAlign(payload, seq, at) {
+    var key = alignKey(payload, seq);
+    if (!key || typeof at !== 'number' || at < 0) return;
+    receiptAlign[key] = at;
+  }
+
+  /**
+   * 服务端那一趟给每一张图定的"条内序号"（0 = 还没有正文，与 {@link ChatLogStore#receipt} 同口径）：
+   * 每个**带正文的**消息 +1，图片归到它**前面**那条正文上。`/api/quest` 回来的 `messages` 就是服务端
+   * 分组的原样，所以这里算出来的序号与"服务端 append 时用的键"一致，图片就能落到同一个气泡上。
+   *
+   * <p>老后端（或老回执）没有 `messages` 时返回空数组：调用方退回原来的"图并进最后一条正文"。
+   */
+  function imageAlignments(payload) {
+    var groups = payload && payload.messages;
+    var out = [];
+    if (!groups || !groups.length) return out;
+    var seq = 0;
+    for (var g = 0; g < groups.length; g++) {
+      var segments = groups[g] || [];
+      var hasText = false;
+      var files = [];
+      for (var s = 0; s < segments.length; s++) {
+        var segment = segments[s] || {};
+        if (segment.type === 'text' && String(segment.text || '').length) hasText = true;
+        else if (segment.type === 'image' && segment.file && files.indexOf(String(segment.file)) < 0) files.push(String(segment.file));
+      }
+      if (hasText) { seq++; continue; }
+      for (var f = 0; f < files.length; f++) out.push({ file: files[f], seq: seq });
+    }
+    return out;
+  }
+
+  /**
    * 把一条回执（`/api/quest` 的返回）并进对话正文 —— **每条消息各自成一个气泡**，且可以重复调用。
    *
    * <p>为什么不是简单地 append：页面重建后 `chatLoad()` 已经从服务端读回了正文，
@@ -2559,12 +2662,17 @@
     for (var t = 0; t < parts.length; t++) {
       var text = parts[t];
       if (!text) { targets[t] = null; continue; }
-      // 只认**还没被别的段认领**的条目：同一条回执里两段一模一样的正文是两条消息，不能挤一个气泡
-      var at = -1;
-      for (var k = chat.entries.length - 1; k >= 0; k--) {
-        var entry = chat.entries[k];
-        if (!entry || entry.role !== 'bot' || used[k] || !sameMessage(entry, text)) continue;
-        at = k; break;
+      // ① 先按**回执号 + 序号**直接对齐：服务端现在是对话正文的权威写入者之一，它 append 的条目
+      //    就带着这两个身份（顺序 + 内容都对得上）。命中就并进同一条，压根不进入下面的启发式。
+      var at = alignmentHit(payload, t, used);
+      if (at < 0) {
+        // ② 兜底（老后端 / 正文里那条还没被服务端 append 过）：沿用"正文相同或本地是它前缀"的对账。
+        //    只认**还没被别的段认领**的条目：同一条回执里两段一模一样的正文是两条消息，不能挤一个气泡
+        for (var k = chat.entries.length - 1; k >= 0; k--) {
+          var entry = chat.entries[k];
+          if (!entry || entry.role !== 'bot' || used[k] || !sameMessage(entry, text)) continue;
+          at = k; break;
+        }
       }
       if (at < 0) {
         var made = chatEntry('bot', text, []);
@@ -2577,15 +2685,29 @@
         targets[t] = chat.entries[at];
         if (text.length > (chat.entries[at].text || '').length) chat.entries[at].text = text;
       }
+      // 这一条对上了就把"这条回执的第几段正文 = 正文里哪个下标"记下来，给同一条回执的后续补拉用。
+      if (targets[t]) rememberAlign(payload, t, chat.entries.indexOf(targets[t]));
     }
     var changed = adopted;
 
     if (images.length) {
-      /* 图归到"这条消息"自己的气泡：这条回执最后一条有正文的消息。
-         —— 绝不为了图去新开一个气泡（那样「先无图后有图」会多出一个空泡），也绝不把图塞进别的
-         回执的气泡：只有整条回执本来就没有正文（纯图回执）才另起一个空泡。 */
+      /* 图归到"这条消息"自己的气泡。
+         **首选"回执号 + 序号"对齐**：服务端 append 时就把图挂在了它前面那条正文的同一个序号上，
+         所以按序号命中就与服务端落盘的形状**逐条一致**，也不会把图塞给后面那条正文
+         （那正是"先文字后图被拆成两个气泡 / 图跑到下一条上"的来源）。
+         命不中才退回老口径：这条回执最后一条有正文的消息；只有纯图回执才另起一个空泡。
+         —— 绝不为了图去新开一个气泡（那样「先无图后有图」会多出一个空泡）。 */
+      var mapped = imageAlignments(payload);
+      var seqHits = Object.create(null);
+      var imageTargets = Object.create(null);   // 图片路径 → 它应该挂进的那条条目
+      for (var m = 0; m < mapped.length; m++) {
+        var seq = mapped[m].seq;
+        if (seqHits[seq] === undefined) seqHits[seq] = seq > 0 ? alignmentHit(payload, seq, used) : -1;
+        var hit = seqHits[seq];
+        if (hit >= 0) imageTargets[mapped[m].file] = chat.entries[hit];   // 命中：图就挂在那条正文上
+      }
       var picture = null;
-      for (var p = targets.length - 1; p >= 0; p--) { if (targets[p]) { picture = targets[p]; break; } }
+      for (var p = targets.length - 1; p >= 0 && !picture; p--) { if (targets[p]) picture = targets[p]; }
       if (!picture && parts.length) {
         for (var q = chat.entries.length - 1; q >= 0 && !picture; q--) {
           var tail = chat.entries[q];
@@ -2603,9 +2725,13 @@
           changed++;
         }
       }
-      var mine = picture.images || [];
-      var missing = images.filter(function (src) { return mine.indexOf(src) < 0; });
-      if (missing.length) { picture.images = mine.concat(missing); changed++; }
+      for (var z = 0; z < images.length; z++) {
+        var target = imageTargets[images[z]] || picture;     // 对齐命中就挂那条正文，命不中退回兜底那条
+        var mine = target.images || [];
+        if (mine.indexOf(images[z]) >= 0) continue;
+        target.images = mine.concat([images[z]]);
+        changed++;
+      }
     }
 
     if (!changed) return 0;
