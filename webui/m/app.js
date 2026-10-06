@@ -51,6 +51,23 @@
    */
   var CAPTURE_FOLLOW_MAX_MS = 15 * 60 * 1000;
   var PROGRESS_POLL_MS = 1500;                 // 生成进度轮询间隔（与桌面版一致）
+  /**
+   * 「我正在跟哪条回执」在 localStorage 里的键。
+   *
+   * <p><b>为什么必须落盘</b>：跟单现场（captureId / 任务号）原先**只在内存里**（`chat.captureStop`
+   * 那个闭包）。安卓在后台回收渲染进程、或系统把 App 收掉再打开时，页面是**整页重来**的 ——
+   * 内存里的跟单现场一起没了，于是"服务端早就投递好的图，回到前台再也没人接"，
+   * 而对话正文（`data/webui/&lt;scope&gt;-chat-log.json`）是客户端存上去的，缺的那几张就永远缺着
+   * （用户报的「手机端挂起（在浏览其他应用）也收不到图」里，属于"页面被重建"的那一半）。
+   * 落盘之后，重建立刻能从服务端把这条回执补回来，并把跟单续上（见 {@link catchUpReceipts}）。
+   */
+  var FOLLOW_KEY = 'pixiko-follow-capture';
+  /** 补拉窗口：只补最近这么久的回执；更老的留在回执屏里看，不往对话正文里灌历史。 */
+  var CATCHUP_WINDOW_MS = 6 * 60 * 60 * 1000;
+  /** 一次补拉最多补几条（"正在跟的那条"另算）。防止冷启动把历史回执整片灌进对话。 */
+  var CATCHUP_MAX_QUESTS = 3;
+  /** 两次补拉之间的最小间隔：用户手势会频繁唤醒，别把请求打爆（回到前台那条路不受此限）。 */
+  var CATCHUP_MIN_GAP_MS = 10000;
 
   var TABS = [
     { id: 'chat', title: '对话' },
@@ -1267,6 +1284,9 @@
   PixikoM.pollWhileVisible = function (fn, ms) {
     var interval = Math.max(200, Number(ms) || 1000);
     var stopped = false, timer = null, running = false;
+    /* 这一拍是不是"被系统冻过之后补的"：传给 fn 的第一个参数（见下面看门狗）。
+       只有需要区分"正常到点"与"刚从挂起里出来"的调用方（对话屏的补拉链）会用它。 */
+    var stalledThisTick = false;
     /* 只看"还有没有这一屏"：`document.hidden` 不再参与 —— 有的安卓壳里它一直停在 true，
        拿它当闸门反而会把轮询永久掐死（那正是这套唤醒通道当初要绕开的坑）。 */
     function canRun() { return !stopped && !!currentId; }
@@ -1274,7 +1294,9 @@
       timer = null;
       if (!canRun() || running) { schedule(); return; }
       running = true;
-      try { await fn(); } catch (error) { /* 轮询失败不打断（错误由各屏自己呈现） */ }
+      var stalled = stalledThisTick;
+      stalledThisTick = false;
+      try { await fn(stalled); } catch (error) { /* 轮询失败不打断（错误由各屏自己呈现） */ }
       running = false;
       schedule();
     }
@@ -1295,11 +1317,29 @@
     }
     var stopWake = PixikoM.onWake(wake);
     document.addEventListener('visibilitychange', onVisibility);
-    /* 看门狗：事件没派发也不怕（安卓壳兜底）—— 定时器不在就补排。 */
+    /* 看门狗：事件没派发也不怕（安卓壳兜底）—— 定时器不在就补排。
+       还要认"被冻过"：页面被系统整体冻结（安卓把 WebView 挂起 / 浏览器把标签页冻住）时
+       定时器会一起停；解冻后这一轮看门狗**迟到**（间隔明显大于它自己的节拍），
+       那一刻必须立刻补一拍，并给这一拍打上 stalled 标记 —— 否则"挂起回来"要等下一个
+       4 秒轮次 + 补拉链自己的最小间隔，用户看到的就是「回来半天才出图」（用户报的正是这个）。
+       阈值按**看门狗自己的节拍**算（不是被轮询的 interval）：它每 1500ms 跑一次，
+       正常抖动最多几百毫秒，迟到 1 秒以上就只可能是"定时器被冻过"。
+       为什么不在看门狗里直接补拉：这里只是"拍子"的调度器，补什么由各屏自己决定。 */
+    var WATCHDOG_MS = 1500;
+    var lastWatchdogAt = Date.now();
     var watchdog = setInterval(function () {
       if (stopped) return;
+      var now = Date.now();
+      var stalled = now - lastWatchdogAt > WATCHDOG_MS + 1000;
+      lastWatchdogAt = now;
+      if (stalled) {
+        if (timer) { clearTimeout(timer); timer = null; }   // 作废在等的那一拍，立刻补
+        stalledThisTick = true;
+        schedule(true);
+        return;
+      }
       if (!timer) schedule(true);
-    }, 1500);
+    }, WATCHDOG_MS);
     timer = setTimeout(tick, Math.min(interval, 400));
     return function stop() {
       stopped = true;
@@ -2335,6 +2375,9 @@
     var queueRounds = 0;                      // 「回执已 done，但生成队列还没空」时多等的轮数
     var target = null;                        // 当前这条图文条目（新的内容往它上面并）
     var startedAt = Date.now();
+    /* 跟单现场落盘：页面被重建（挂起期间渲染进程被系统回收 / 下拉刷新 / 进程被收掉）之后，
+       启动时靠它把这条回执补回来并接着跟（见 catchUpReceipts）。收工时清掉（见下面的 settled 分支）。 */
+    if (id) rememberFollow({ scope: PixikoM.scope(), id: String(id), quest: Number(quest) || 0, at: Date.now() });
     chat.captureStop = PixikoM.pollWhileVisible(async function () {
       var data;
       try { data = await PixikoM.api('/api/capture', { body: { id: id, scope: PixikoM.scope() } }); }
@@ -2392,10 +2435,212 @@
       if (settled) {
         if (chat.captureStop) chat.captureStop();
         chat.captureStop = null;
+        forgetFollow();               // 跟单收工：下次启动不必再补它
         if (quest) PixikoM.refreshStatus().catch(function () { /* 角标刷不到不影响对话 */ });
       }
     }, CAPTURE_POLL_MS);
   }
+
+  /* ── 6b. 回执补拉：页面被重建 / 从挂起回到前台后，把「我这台设备」还没领到的回执补齐 ────────
+   *
+   * 用户报的「手机端挂起（在浏览其他应用）也收不到图」有两半，分开治：
+   *   ① **页面还活着、只是被冻住**：系统在后台会整体冻结 WebView 的定时器与网络（省电行为，
+   *      网页里对抗不了）。能做的是"回到前台立刻补一拍" —— 由 PixikoM.onWake（visibilitychange /
+   *      focus / pageshow / resume / 用户碰一下）＋ pollWhileVisible 的看门狗保证。
+   *   ② **页面被重建**：安卓在后台回收渲染进程、或用户下拉刷新、或进程被系统收掉再打开，
+   *      页面整页重来 —— 内存里的跟单现场（`chat.captureStop` 那个闭包）一起没了，
+   *      服务端早就投递好的图**再也没人接**；而对话正文是客户端存上去的，缺的那几张永远缺着。
+   *      这一半由这里治：跟单现场落盘（{@link #FOLLOW_KEY}）＋ 启动/回前台按 scope 补拉。
+   */
+
+  /** 读回跟单现场（原样，不做新旧判断）—— 只是给 {@link rememberFollow} 沿用"最早那次的时间"。 */
+  function readFollowRaw() {
+    var raw;
+    try { raw = localStorage.getItem(FOLLOW_KEY); } catch (error) { return null; }
+    if (!raw) return null;
+    try {
+      var record = JSON.parse(raw);
+      return record && typeof record === 'object' ? record : null;
+    } catch (error) { return null; }
+  }
+
+  /** 记下「正在跟哪条回执」（页面重建后靠它续上）。 */
+  function rememberFollow(record) {
+    if (!record || !record.id) return;
+    var previous = readFollowRaw();
+    /* 同一条回执继续跟：沿用**最早那次**的时间。否则每次重载都把窗口续命，
+       一条异常残留的回执能被无限跟下去（followCapture 的 15 分钟兜底就形同虚设）。 */
+    if (previous && String(previous.id) === String(record.id)
+      && Number(previous.quest) === Number(record.quest) && Number(previous.at) > 0) {
+      record.at = Number(previous.at);
+    }
+    try { localStorage.setItem(FOLLOW_KEY, JSON.stringify(record)); } catch (error) { /* 隐私模式：只在本次会话里有效 */ }
+  }
+
+  /** 这条回执收工了：清掉跟单现场。 */
+  function forgetFollow() {
+    try { localStorage.removeItem(FOLLOW_KEY); } catch (error) { /* ignore */ }
+  }
+
+  /**
+   * 读回跟单现场，**同一台设备、且不太老**才算数：
+   * scope 不同（外壳把这一页换给了另一台设备）或超过 {@link CAPTURE_FOLLOW_MAX_MS} 的一律丢掉。
+   */
+  function readFollow(scope) {
+    var record = readFollowRaw();
+    if (!record) return null;
+    if (String(record.scope === null || record.scope === undefined ? '' : record.scope) !== String(scope || '')) return null;
+    var at = Number(record.at) || 0;
+    if (!at || Date.now() - at > CAPTURE_FOLLOW_MAX_MS) return null;
+    return record;
+  }
+
+  /**
+   * 把一条回执（`/api/quest` 的返回）并进对话正文 —— **最多产生一条条目**，且可以重复调用。
+   *
+   * <p>为什么不是简单地 append 一条：页面重建后 `chatLoad()` 已经从服务端读回了正文，
+   * 那条回执的文字**可能已经在里面**（挂起前存上去的、只是缺图）。再 append 一条就会变成
+   * "同一条回执出现两遍（一份没图一份有图）"—— 用户报过的「回执重复」正是这个形状。
+   *
+   * <p>三档（顺序很重要）：
+   *   ① 已经有一条**正文完全相同**的：只补它缺的图；
+   *   ② 最后一条有正文的 bot 条目与它**互为前缀**（"先到文字、几秒到几十秒后到图"的正常时序）：并进那一条；
+   *   ③ 都没有：新增一条（一条回执 ≤1 条正文 —— `.mode normal` 那条不变量照样成立）。
+   *
+   * <p>幂等：只 append 缺的文字/图片，调多少次都不会变多（"同一批不重复"）。
+   *
+   * @returns {number} 真的有变化返回 1，什么都没动返回 0
+   */
+  function mergeReceiptIntoChat(payload) {
+    if (!payload || payload.error) return 0;
+    var texts = [];
+    var rawTexts = payload.texts || [];
+    for (var i = 0; i < rawTexts.length; i++) {
+      var value = rawTexts[i] === null || rawTexts[i] === undefined ? '' : String(rawTexts[i]);
+      if (value && texts.indexOf(value) < 0) texts.push(value);
+    }
+    var images = [];
+    var rawImages = payload.images || [];
+    for (var j = 0; j < rawImages.length; j++) {
+      var file = rawImages[j] && rawImages[j].file ? String(rawImages[j].file) : '';
+      if (file && images.indexOf(file) < 0) images.push(file);
+    }
+    if (!texts.length && !images.length) return 0;
+    var text = texts.join('\n');
+
+    var target = null;
+    for (var k = chat.entries.length - 1; k >= 0 && !target; k--) {
+      var entry = chat.entries[k];
+      if (!entry || entry.role !== 'bot') continue;
+      // ① 正文完全相同。没有正文的（纯图回执）只认"也还没有图的"，免得两条回执的图挤进同一口气泡。
+      if (text ? (entry.text || '') === text : (!entry.text && !(entry.images || []).length)) target = entry;
+    }
+    if (!target) {
+      // ② 只认**最后一条有正文的 bot 条目**：前缀关系对别的条目成立就并错批了。
+      for (var m = chat.entries.length - 1; m >= 0; m--) {
+        var last = chat.entries[m];
+        if (!last || last.role !== 'bot' || !last.text) continue;
+        if (text.indexOf(last.text) === 0 || last.text.indexOf(text) === 0) target = last;
+        break;
+      }
+    }
+
+    if (target) {
+      var mine = target.images || [];
+      var missing = images.filter(function (src) { return mine.indexOf(src) < 0; });
+      var grewText = !!text && text.length > (target.text || '').length && text.indexOf(target.text || '') === 0;
+      if (!missing.length && !grewText) return 0;
+      if (missing.length) target.images = mine.concat(missing);
+      if (grewText) target.text = text;      // 只在"服务端这一份更长"时补，反过来会把本地已有的截短
+    } else {
+      target = chatEntry('bot', text, images);
+      chat.entries.push(target);
+    }
+    if (chat.entries.length > CHAT_ENTRIES_CAP) chat.entries = chat.entries.slice(-CHAT_ENTRIES_CAP);
+    var placeholder = chat.host && chat.host.querySelector('[data-state="empty"]');
+    if (placeholder) clear(chat.host);
+    chatRenderAll();
+    chatFollow();
+    saveChatLogDebounced();
+    return 1;
+  }
+
+  /**
+   * 补拉链：从服务端把「正在跟的那条回执」与「这台设备还没领到的回执」补齐（幂等）。
+   *
+   * <p>三条来源，合起来覆盖"页面被重建"的各种成因：
+   *   <ol>
+   *     <li>{@link readFollow} 里那条正在跟的回执（挂起时被系统收掉的现场）—— 顺带把跟单**续上**；</li>
+   *     <li>这个 scope 的服务端回执列表里**有图**、且「未读 / 还在跑 / 比跟单那条更新」的几条
+   *         —— 覆盖挂起期间新到的回执（挑有图的：用户报的是收不到图）；</li>
+   *     <li>太老（超过 {@link CATCHUP_WINDOW_MS}）的一律不补 —— 历史回执留在回执屏里看。</li>
+   *   </ol>
+   *
+   * <p>只在对话屏挂好之后跑：正文还没读回来时补进去的条目会被 {@link chatLoad} 整屏重读冲掉。
+   *
+   * @param {boolean} [force] 回到前台 / 页面刚重建时为 true：立刻补，不受最小间隔限制
+   */
+  var catchUpAt = 0;
+  var catchUpInFlight = null;
+
+  function catchUpReceipts(force) {
+    if (catchUpInFlight) return catchUpInFlight;
+    if (!chat.loaded || currentId !== 'chat') return Promise.resolve(0);
+    var now = Date.now();
+    if (!force && now - catchUpAt < CATCHUP_MIN_GAP_MS) return Promise.resolve(0);
+    catchUpAt = now;
+
+    var scope = PixikoM.scope();
+    var follow = readFollow(scope);
+    var followQuest = follow ? Number(follow.quest) || 0 : 0;
+    var wanted = followQuest > 0 ? [followQuest] : [];
+    var followed = null;
+    var merged = 0;
+
+    catchUpInFlight = PixikoM.api('/api/quests', { body: { limit: 8, scope: scope } }).then(function (data) {
+      var rows = (data && data.quests) || [];
+      var extra = 0;
+      for (var i = 0; i < rows.length && extra < CATCHUP_MAX_QUESTS; i++) {
+        var row = rows[i] || {};
+        var number = Number(row.number) || 0;
+        if (number <= 0 || wanted.indexOf(number) >= 0) continue;
+        if (!(Number(row.images) > 0)) continue;                             // 只补有图的（用户报的是收不到图）
+        if (!(Number(row.ageMillis) <= CATCHUP_WINDOW_MS)) continue;          // 太老的留在回执屏
+        var missed = row.unread === true || row.busy === true || (followQuest > 0 && number > followQuest);
+        if (!missed) continue;
+        wanted.push(number);
+        extra++;
+      }
+      // 一条一条来：并发会让"并进哪一条条目"的前缀判断互相打架
+      return wanted.reduce(function (chain, number) {
+        return chain.then(function () {
+          return PixikoM.api('/api/quest', { body: { id: number, scope: scope } }).then(function (payload) {
+            if (followQuest > 0 && number === followQuest) followed = payload;
+            merged += mergeReceiptIntoChat(payload);
+          }).catch(function () { /* 单条失败不影响别的（回执可能刚被淘汰/不属于这个会话） */ });
+        });
+      }, Promise.resolve());
+    }).catch(function () { /* 列表拿不到：这一轮不补，下一轮或下次唤醒再来 */
+    }).then(function () {
+      catchUpInFlight = null;
+      /* 跟单续上：这条回执**还在跑**、当前又没人在跟，就接着跟它的 /api/capture
+         （页面重建前干到哪就接着干；收工条件与正常路径完全一样，见 followCapture）。
+
+         为什么必须判"还在跑"：命令跑完但出图队列还没空时也要跟（done 且 busy，图片还在路上）；
+         真跑完的（done 且不忙）或磁盘读回来的（closed，服务端明确说"收集器等同于已关闭"）
+         一律不跟 —— 那种回执的图已经由上面的 /api/quest 一次性取全了，再跟只是白打请求。 */
+      var stillRunning = !!followed && !followed.error && followed.closed !== true
+        && (followed.done !== true || followed.busy === true);
+      if (follow && follow.id && stillRunning && !chat.captureStop) {
+        followCapture(String(follow.id), followQuest > 0 ? followQuest : undefined);
+      }
+      return merged;
+    });
+    return catchUpInFlight;
+  }
+
+  /** 调试/自动化用：手动触发一次补拉（`force` 默认为 true）。 */
+  PixikoM.catchUpReceipts = function (force) { return catchUpReceipts(force !== false); };
 
   /** 清空对话：POST /api/chat/reset {scope} 之后再清本地。 */
   async function clearChat() {
@@ -2510,13 +2755,26 @@
     });
     send.addEventListener('click', function () { chatSend(); });
 
+    /* 首次读正文**立刻开始**，不等 4 秒轮询的第一拍（那一拍本身还有 min(interval,400)=400ms 的延迟）。
+       页面被重建时"回来多快能看到图"全看这一下 —— 那 400ms 是白等的（用户报的正是"回来收不到图"，
+       而系统的冻结期我们本来就无能为力，能省的每一毫秒都该省）。与下面 chat.poll 里那条链同一个口径，
+       两边都有 chat.loaded / chat.loading 挡着，不会重复读。 */
+    if (!chat.loaded) {
+      chatLoad().then(function () { return catchUpReceipts(true); })
+        .catch(function () { /* 读不回来就交给轮询下一拍 */ });
+    }
+
     /* 对话屏的轻轮询：只补服务端多出来的尾巴（别的入口出的图也能自己冒出来），
-       页面隐藏 / 不在这一屏 / 有浮层 都自动跳过；用户在输入或正在发消息时不读，避免打架。 */
-    chat.poll = PixikoM.pollWhileVisible(function () {
+       页面隐藏 / 不在这一屏 / 有浮层 都自动跳过；用户在输入或正在发消息时不读，避免打架。
+       首次读回正文之后紧接着补拉一次回执（catchUpReceipts）—— 页面刚被重建时，
+       缺的那几张图只存在于服务端的回执里，正文存档里根本没有（见 6b 那一段的说明）。
+       参数 `stalled` 来自 pollWhileVisible 的看门狗：这一拍是"被系统冻过之后补的"，
+       于是补拉要**绕过最小间隔**（"回到前台立刻补一拍"，不靠任何事件也不靠外壳）。 */
+    chat.poll = PixikoM.pollWhileVisible(function (stalled) {
       if (currentId !== 'chat') return;
-      if (!chat.loaded) return chatLoad();
+      if (!chat.loaded) return chatLoad().then(function () { return catchUpReceipts(true); });
       if (PixikoM.overlayBusy && PixikoM.overlayBusy()) return;
-      return chatPollMerge();
+      return Promise.resolve(chatPollMerge()).then(function () { return catchUpReceipts(!!stalled); });
     }, 4000);
   }
 
@@ -3473,6 +3731,15 @@
 
     // 状态轮询：只在"这一屏可见"时跑（pollWhileVisible 自己会判断），顺便喂回执角标。
     PixikoM.pollWhileVisible(function () { return PixikoM.refreshStatus(); }, 6000);
+
+    /* 「回到前台 / 页面刚重建」立刻补一拍回执（补拉链见 catchUpReceipts）。
+       挂起期间什么都不会发生（系统冻住了定时器与网络，对抗不了），唯一能做的是回来这一下
+       立刻把缺的图补齐。用户手势（touch/pointer/keydown）太频繁，走"最小间隔"那一档；
+       其余信号（visibilitychange / pageshow / focus / resume / online）都是"真的回来了"，立刻补。 */
+    PixikoM.onWake(function (why) {
+      if (currentId !== 'chat' || !chat.loaded) return;
+      catchUpReceipts(!/^user:/.test(String(why || '')));
+    });
 
     // 出图屏的进度轮询：常驻注册，pollWhileVisible 保证只在页面可见时跑，
     // 屏内再判断自己有没有被挂载过（没进过出图屏就不必拉）。
