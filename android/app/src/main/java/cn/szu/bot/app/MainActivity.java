@@ -45,6 +45,8 @@ import androidx.appcompat.widget.Toolbar;
 import androidx.core.content.ContextCompat;
 import androidx.swiperefreshlayout.widget.SwipeRefreshLayout;
 
+import java.io.File;
+
 /**
  * 主界面：把网页控制台整站装进 WebView。
  *
@@ -416,15 +418,33 @@ public class MainActivity extends AppCompatActivity {
             updateBannerChannel.setText(info.channelText());
             updateBannerChannel.setVisibility(View.VISIBLE);
         }
-        // 没有可下载的包（或没有 sha256）时不给「下载更新」按钮 —— 详见 UpdateInfo.blockReason()。
+        // 文案由更新状态机给出（与设置页那个一键按钮同一个函数、同一份 UpdateInfo）：
+        // 没有可下载的包时退化成「详情」（详见 UpdateInfo.blockReason()），
+        // 本地已经有当前版本的校验通过包时是「安装 X」—— 点下去的行为与这句话一致（见 startUpdateDownload）。
         Button download = findViewById(R.id.update_banner_download);
         if (download != null) {
-            boolean installable = info.canInstall();
-            download.setEnabled(installable);
-            download.setAlpha(installable ? 1f : 0.5f);
-            if (!installable) download.setText(R.string.update_banner_detail);
+            UpdateUiState.State state = bannerState(info);
+            download.setEnabled(state.enabled);
+            download.setAlpha(state.enabled ? 1f : 0.5f);
+            download.setText(getString(state.bannerRes, state.bannerArgs));
         }
         updateBanner.setVisibility(View.VISIBLE);
+    }
+
+    /**
+     * 横幅按钮的状态：<b>与设置页同源</b> —— 同一份 {@code UpdatePrefs.downloadedPath()} 记录、
+     * 同一份 {@link UpdateInfo}、同一个 {@link UpdateUiState#derive}。
+     *
+     * <p>本地那份缓存是不是「就是服务端当前这一版」用 {@link UpdateCache#looksVerifiedFor} 判
+     * （只比文件名，几微秒，绝不在主线程哈希几 MB 的文件）；真正安装之前，
+     * 设置页还会用实测 sha256 再核一遍（{@code promptInstall → checkInstallable}）。
+     */
+    private UpdateUiState.State bannerState(UpdateInfo info) {
+        String savedPath = new UpdatePrefs(this).downloadedPath();
+        File saved = savedPath.isEmpty() ? null : new File(savedPath);
+        boolean cacheReady = UpdateCache.looksVerifiedFor(info, saved);
+        return UpdateUiState.derive(true, true, false, info, Prefs.installedVersionCode(this),
+                cacheReady, false, 0, "");
     }
 
     private void hideUpdateBanner() {
@@ -677,18 +697,8 @@ public class MainActivity extends AppCompatActivity {
         // 双保险：AppCompat 的 hide()/show() 本来就会把这个 Toolbar 置成 GONE/VISIBLE，
         // 这里显式再同步一次，免得个别 ROM / AppCompat 版本上出现「栏还在、只是内容空了」。
         if (toolbar != null) toolbar.setVisibility(mobile ? View.GONE : View.VISIBLE);
-        applySwipeAvailability(mobile);
         Log.d("原生 ActionBar " + (mobile ? "已隐藏（当前是手机界面 /m，让位给网页自带的 app bar）"
                 : "已显示（当前是完整控制台 /，它没有自己的顶栏）"));
-    }
-
-    private void applySwipeAvailability(boolean mobile) {
-        if (swipe == null) return;
-        boolean enable = !mobile;
-        if (swipe.isEnabled() == enable) return;
-        swipe.setRefreshing(false);      // 关掉之前先把转圈收掉，别留一个卡住的指示器
-        swipe.setEnabled(enable);
-        Log.d("原生下拉刷新" + (enable ? "已启用（完整控制台 /）" : "已关闭（手机界面 /m 用网页自带的下拉刷新）"));
     }
 
     /** 加载首页（默认＝手机界面 {@code /m}；切到完整控制台后＝{@code /}）。 */
@@ -869,9 +879,6 @@ public class MainActivity extends AppCompatActivity {
             super.onPageFinished(view, url);
             progress.setVisibility(View.INVISIBLE);
             swipe.setRefreshing(false);
-            // 原生下拉刷新只在完整控制台启用：这里再对一次"眼前到底是哪一页"，
-            // 覆盖「历史前进/后退回到 /m 或 /」这类不经过 toggleUi() 的路径（判据同 applyActionBarVisibility）。
-            adoptUiPathFrom(url);
             if (mainFrameFailed) return;      // 失败页由 onReceivedError 负责，别把它当成正常页面
             currentUrl = url;
             attachNativeBridgeIfTrusted(url);
@@ -1273,6 +1280,26 @@ public class MainActivity extends AppCompatActivity {
         if (currentUrl != null) outState.putString("webview_state_url", currentUrl);
     }
 
+    /**
+     * WebView 生命周期：<b>必须成对</b>（{@code onPause} → {@code webView.onPause()}、
+     * {@code onResume} → {@code webView.onResume()}，见下面两个方法）。这里记两条判断依据：
+     *
+     * <p><b>① 刻意不调 {@code pauseTimers()}。</b> {@code WebView.onPause()} 按官方文档只暂停
+     * "可以安全暂停的处理"（动画、定位等），**不暂停 JavaScript**；{@code pauseTimers()} 才是
+     * "把这台设备上所有 WebView 的 JS 定时器一起停掉"。而手机端收图靠的正是网页里的轮询
+     * （{@code webui/m/app.js} 的 {@code pollWhileVisible} 在跟 {@code /api/capture} 与回执）——
+     * 停掉它等于把"挂起期间尽量把图收下来"这条路直接掐死，与用户的要求相反。
+     *
+     * <p><b>② 系统层面的冻结是边界，不是这里的 bug。</b> Android 12+ 会把缓存进程整体冻住
+     * （app freezer）、Doze 也会掐网络：那时网页里的定时器与 {@code fetch} 什么都不会发生，
+     * 这不是网页或外壳能绕开的（要真在后台持续收图，得有服务端推送或前台服务，不在本轮范围）。
+     * 这里能做、也必须做到的是：**回来这一下立刻让网页接着跑** —— 见 {@link #onResume()} 的
+     * {@link NativeHook#resumeScript()}，以及网页侧的补拉链 {@code catchUpReceipts}。
+     *
+     * <p>另外这里**不清任何会话状态**（没有 onStop 清理、也没有"回前台就 reload"）：
+     * "正在跟哪条回执"的内存现场丢了也没关系，网页侧已经落盘（{@code FOLLOW_KEY}）
+     * 并在重建后从服务端补回来。
+     */
     @Override
     protected void onPause() {
         super.onPause();
@@ -1282,7 +1309,24 @@ public class MainActivity extends AppCompatActivity {
     @Override
     protected void onResume() {
         super.onResume();
-        if (webView != null) webView.onResume();
+        if (webView == null) return;
+        webView.onResume();
+        wakeWebPage();
+    }
+
+    /**
+     * 回到前台：主动叫网页立刻补一拍（补拉链见 {@code webui/m/app.js} 的 {@code catchUpReceipts}）。
+     *
+     * <p>为什么不只靠网页自己的看门狗：网页的兜底是每 1.5 秒自查一次"定时器还在不在"，
+     * 最坏要等 1.5 秒；而安卓壳可能根本不派发 {@code visibilitychange}。
+     * 外壳在 onResume 里补这一句，网页的唤醒通道（{@code focus} / {@code resume}）当帧就触发补拉。
+     *
+     * <p>只对我们自己那台服务器的页面说（{@link #bridgeAttached}）：用户点开外链后不必去打扰人家。
+     */
+    private void wakeWebPage() {
+        if (!bridgeAttached) return;
+        webView.evaluateJavascript(NativeHook.resumeScript(),
+                value -> Log.d("回前台唤醒网页：" + value));
     }
 
     @Override

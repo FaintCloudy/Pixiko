@@ -26,8 +26,10 @@ import java.util.Locale;
  *       服务端不支持 Range（回 200）时就truncate 重下，不硬凑。</li>
  *   <li><b>校验不过就地销毁</b>：sha256 不符时把 {@code .part} 删掉再重试；重试仍然不符就报错返回，
  *       <b>绝不</b>把没校验过的文件交给安装器。</li>
- *   <li><b>已完成就复用</b>：目标 APK 已存在且哈希对得上，直接返回它（用户上次下了没装 / 装了没成功，
- *       不必重下几十 MB）。</li>
+ *   <li><b>已完成就复用</b>：目标 APK（名字里带版本号与 versionCode）已存在、<b>且哈希就是服务端当前
+ *       announced 的那个</b>，直接返回它（用户上次下了没装 / 装了没成功，不必重下几十 MB）。
+ *       名字或哈希对不上的旧包会被删掉重下 —— 「本地有文件就直接当已下载好」是<b>不</b>成立的，
+ *       判据见 {@link UpdateCache#planFor}。</li>
  *   <li><b>并发保护</b>：同一目录下只允许一个下载在进行（{@code BUSY}），避免用户连点两次按钮
  *       把同一个 {@code .part} 写花。</li>
  * </ul>
@@ -54,10 +56,15 @@ public final class SelfUpdate {
     static final int HTTP_PARTIAL_CONTENT = 206;
     static final int HTTP_RANGE_NOT_SATISFIABLE = 416;
 
-    /** 下载中的临时后缀（重试时按它的长度续传）。 */
-    private static final String PART_SUFFIX = ".part";
+    /**
+     * 下载中的临时后缀（重试时按它的长度续传）。
+     *
+     * <p>包级可见：{@link UpdateCache#purgeStale} 要按这两个后缀认出「哪些是我们下的包」——
+     * 两处必须用同一套后缀，否则清理会漏（后缀常量散成两处，将来改一处就会静默失效）。
+     */
+    static final String PART_SUFFIX = ".part";
     /** 校验过的成品后缀（{@code .apk} 结尾，FileProvider / 安装器都认）。 */
-    private static final String VERIFIED_SUFFIX = ".verified.apk";
+    static final String VERIFIED_SUFFIX = ".verified.apk";
 
     /** 同一时刻只允许一个下载（进程内）。 */
     private static final java.util.concurrent.atomic.AtomicBoolean BUSY =
@@ -123,6 +130,15 @@ public final class SelfUpdate {
     }
 
     private static Result downloadLocked(UpdateInfo info, File dir, ProgressListener listener) {
+        // -1) 先把「跟服务端当前这一版对不上」的旧包清掉：上一版残留的 .verified.apk 就是
+        //     「点下载更新却把旧包装上去」那次事故的主角，留着它只会让上层误以为「已经下载好」。
+        //     当前版本的 .part / 哈希核得过的成品会被保留（断点续传与「不用重下」都不受影响）。
+        UpdateCache.Purge purge = UpdateCache.purgeStale(dir, info);
+        if (purge.deletedFiles > 0) {
+            Log.i("下载前清理了 " + purge.deletedFiles + " 个与服务端当前版本不符的旧缓存（"
+                    + purge.deletedBytes + " 字节）");
+        }
+
         File part = new File(dir, targetName(info) + PART_SUFFIX);
         File done = new File(dir, targetName(info) + VERIFIED_SUFFIX);
 

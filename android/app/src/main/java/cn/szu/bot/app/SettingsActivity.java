@@ -23,6 +23,7 @@ import androidx.appcompat.widget.Toolbar;
 import androidx.core.content.ContextCompat;
 
 import java.io.File;
+import java.io.IOException;
 import java.util.List;
 
 /**
@@ -66,6 +67,9 @@ public class SettingsActivity extends AppCompatActivity {
     private TextView updateBadge;
     private TextView updateCurrent;
     private CheckBox updateAuto;
+    /** 一键更新（检查 → 下载 → 校验 → 拉起安装器，全在这一下里走完）。 */
+    private Button updateOneclick;
+    private TextView updateOneclickHint;
     private Button updateCheck;
     private ProgressBar updateProgress;
     private TextView updateInfoView;
@@ -84,6 +88,14 @@ public class SettingsActivity extends AppCompatActivity {
     private boolean awaitingInstallPermission;
     /** 下载进行中：挡掉重复点击。 */
     private boolean downloading;
+    /** 检查进行中（一键按钮要显示「正在检查更新…」）。 */
+    private boolean checking;
+    /** 这次运行已经查到过结论没有（结论是「已是最新」时 {@code availableUpdate} 仍是 null）。 */
+    private boolean checkedOnce;
+    /** 一键更新最近一次的失败原因；非空 ⇒ 按钮显示「重试更新」并把这一行原因摆出来。 */
+    private String oneClickFailure = "";
+    /** 最近一次下载百分比（一键按钮上要显示「下载中 37%」）。 */
+    private int oneClickPercent;
 
     /** 正在编辑的服务器 id；空串表示「新增」。 */
     private String editedId = "";
@@ -101,6 +113,8 @@ public class SettingsActivity extends AppCompatActivity {
             if (good && info != null) showAvailableUpdate(info);
             String text = intent.getStringExtra(MainActivity.EXTRA_UPDATE_STATUS_TEXT);
             if (text != null && !text.isEmpty()) setUpdateStatus(text, !good);
+            // 横幅那边（同一份 UpdateInfo）刚更新过状态 → 一键按钮的文案也要跟着变。
+            refreshOneClickButton();
         }
     };
 
@@ -155,6 +169,8 @@ public class SettingsActivity extends AppCompatActivity {
         updateBadge = findViewById(R.id.update_badge);
         updateCurrent = findViewById(R.id.update_current);
         updateAuto = findViewById(R.id.update_auto);
+        updateOneclick = findViewById(R.id.update_oneclick);
+        updateOneclickHint = findViewById(R.id.update_oneclick_hint);
         updateCheck = findViewById(R.id.update_check);
         updateProgress = findViewById(R.id.update_progress);
         updateInfoView = findViewById(R.id.update_info);
@@ -180,22 +196,13 @@ public class SettingsActivity extends AppCompatActivity {
                     Prefs.installedVersionName(this), Prefs.installedVersionCode(this)));
         }
         if (updateCheck != null) updateCheck.setOnClickListener(view -> manualCheckForUpdate());
-        if (updateDownload != null) updateDownload.setOnClickListener(view -> beginDownload());
+        // 一键更新：检查 → 下载（带进度）→ sha256 校验 → 拉起系统安装器，全在这一下里走完。
+        if (updateOneclick != null) updateOneclick.setOnClickListener(view -> oneClickUpdate());
+        // 这个按钮的文案由 refreshDownloadButtonLabel() 动态决定（「下载并安装」/「立即安装」），
+        // 点下去真的干什么也由同一份判据决定 —— 文案与行为不许各说各话。
+        if (updateDownload != null) updateDownload.setOnClickListener(view -> beginDownload(true));
         if (updateReleasePage != null) {
             updateReleasePage.setOnClickListener(view -> openReleasePage());
-        }
-
-        // 上次已经下好并校验过的包还在吗？在就直接给「立即安装」，不用重下几十 MB。
-        String savedPath = prefs.downloadedPath();
-        if (!savedPath.isEmpty()) {
-            File saved = new File(savedPath);
-            if (saved.isFile() && saved.length() > 0) {
-                downloadedApk = saved;
-                setUpdateStatus("上次下载的安装包还在（" + saved.getName() + "，"
-                        + humanBytes(saved.length()) + "），点「下载并安装」可以直接装，不用重下。", false);
-            } else {
-                prefs.clearDownloadedPath();
-            }
         }
 
         // 旋转/重建后不要把正在展示的更新信息丢掉。
@@ -203,19 +210,37 @@ public class SettingsActivity extends AppCompatActivity {
             restoreUpdateInfo(savedInstanceState);
         }
 
-        // 从横幅跳过来（用户已经点过「下载更新」）：进页面就开始下载。
+        // 从横幅跳过来（用户已经点过横幅上那个按钮）：按横幅那句话的语义务必一致 ——
+        // 横幅当时写的是「下载更新」就真的走下载/校验，「安装 X」就直接进安装流程。
         Intent intent = getIntent();
-        if (intent != null && intent.getBooleanExtra(EXTRA_AUTO_DOWNLOAD, false)) {
+        if (intent != null) {
             UpdateInfo fromIntent = MainActivity.updateInfoFrom(intent);
             if (fromIntent != null) showAvailableUpdate(fromIntent);
-            // 等一下再开始：让这一屏先画出来，用户能看见进度条从 0 开始。
-            mainHandler.postDelayed(this::beginDownload, 250L);
-        } else if (intent != null) {
-            UpdateInfo fromIntent = MainActivity.updateInfoFrom(intent);
-            if (fromIntent != null) showAvailableUpdate(fromIntent);
+            if (intent.getBooleanExtra(EXTRA_AUTO_DOWNLOAD, false)) {
+                // 等一下再开始：让这一屏先画出来，用户能看见进度条从 0 开始。
+                mainHandler.postDelayed(this::autoUpdateFromBanner, 250L);
+            }
         }
 
+        // 本地缓存那份包与服务端当前 announced 的版本对账：
+        // 对不上就删文件 + 清记录（「点下载更新却装上旧包」的另一半修法）。
+        reconcileCachedApk(availableUpdate);
+        refreshOneClickButton();
+
         registerStatusReceiver();
+    }
+
+    /**
+     * 横幅上那个按钮跳过来之后的动作：<b>状态机说什么就干什么</b>。
+     *
+     * <p>横幅的文案与设置页的一键按钮文案由同一个 {@link UpdateUiState#derive} 推出，
+     * 所以这里用同一个判据决定「直接安装」还是「下载」—— 用户在横幅上看到「安装 1.6.2」，
+     * 点进来就是安装；看到「下载更新」，进来就真的走一遍下载/校验（有进度）。
+     */
+    private void autoUpdateFromBanner() {
+        UpdateUiState.State state = currentOneClickState();
+        Log.i("从横幅跳过来：状态=" + state.phase + "，按钮文案跟着这个状态走");
+        beginDownload(state.phase == UpdateUiState.Phase.READY_TO_INSTALL);
     }
 
     private void registerStatusReceiver() {
@@ -246,12 +271,26 @@ public class SettingsActivity extends AppCompatActivity {
      * 手动检查：先清掉「稍后」记录（用户主动来查，说明他想看到提示），再在子线程查一次。
      */
     private void manualCheckForUpdate() {
+        startCheck(null);
+    }
+
+    /**
+     * 真的去查一次（手动「检查更新」与一键更新的第 1 步共用这一段）。
+     *
+     * @param afterCheck 查完之后接着做的事（一键更新传「下载/安装」这一步；手动检查传 {@code null}）。
+     *                   它在<b>主线程</b>、在结论已经落到界面上之后被调用。
+     */
+    private void startCheck(final Runnable afterCheck) {
         ServerConfig current = repository.current();
         if (current == null || current.base == null || current.base.isBlank()) {
-            setUpdateStatus("还没配置服务器地址，先去上面填一个。", true);
+            setUpdateStatus(getString(R.string.settings_oneclick_hint_no_server), true);
+            refreshOneClickButton();
             return;
         }
         new UpdatePrefs(this).clearIgnoredVersion();
+        checking = true;
+        oneClickFailure = "";
+        refreshOneClickButton();
         setUpdateStatus(getString(R.string.settings_update_checking) + "\n" + current.base, false);
         if (updateCheck != null) updateCheck.setEnabled(false);
         final String base = current.base;
@@ -260,29 +299,123 @@ public class SettingsActivity extends AppCompatActivity {
             UpdateChecker.Outcome outcome = UpdateChecker.check(base, token, null);
             mainHandler.post(() -> {
                 if (isFinishing() || isDestroyed()) return;
+                checking = false;
                 if (updateCheck != null) updateCheck.setEnabled(true);
                 applyOutcome(outcome, true);
+                if (afterCheck != null) afterCheck.run();
+                refreshOneClickButton();
             });
         }, "pixiko-update-check").start();
+    }
+
+    /**
+     * <b>一键更新</b>（设置页那个显眼按钮）：没查过就先查，然后下载（带进度）→ sha256 校验 →
+     * 交给系统安装器。中间任何一步失败都会把原因写在状态栏、按钮变「重试更新」，绝不静默。
+     *
+     * <p>它<b>不</b>看 {@code UpdatePrefs.ignoredVersionCode()}：横幅上点「稍后」只影响横幅，
+     * 不影响这里（用户主动进设置页来更新，就不该被「稍后」挡住）。
+     */
+    private void oneClickUpdate() {
+        ServerConfig server = repository.current();
+        if (server == null || server.base == null || server.base.isBlank()) {
+            oneClickFailure = "";
+            refreshOneClickButton();
+            setUpdateStatus(getString(R.string.settings_oneclick_hint_no_server), true);
+            return;
+        }
+        oneClickFailure = "";
+        oneClickPercent = 0;
+        if (availableUpdate != null && !availableUpdate.isNewerThan(Prefs.installedVersionCode(this))) {
+            // 已经有结论且「不比本机新」：什么都不做（按钮本来也是禁用的）。
+            refreshOneClickButton();
+            setUpdateStatus(getString(R.string.settings_update_up_to_date,
+                    availableUpdate.version.isEmpty() ? ("versionCode " + availableUpdate.versionCode)
+                            : availableUpdate.version), false);
+            return;
+        }
+        if (availableUpdate == null) {
+            // 第 1 步：这次运行还没查过 → 先查，查完自动接着走第 2 步。
+            Log.i("一键更新：先检查更新（" + server.base + "）");
+            startCheck(this::oneClickDownloadStep);
+            return;
+        }
+        oneClickDownloadStep();
+    }
+
+    /** 一键更新的第 2 步：下载 + 校验 + 安装（整条路径都复用 {@link #beginDownload}）。 */
+    private void oneClickDownloadStep() {
+        if (availableUpdate == null) {
+            // 两种可能：①检查失败（原因已经记进 oneClickFailure，按钮是「重试更新」）；
+            // ②检查成功但没有比本机更新的版本（按钮是「已是最新版本」，本来就是禁用的）。
+            if (oneClickFailure.isEmpty()) {
+                Log.i("一键更新：服务端没有比本机更新的版本，什么都不做");
+            } else {
+                Log.w("一键更新：检查没成功，等用户重试（原因见状态栏）：" + oneClickFailure);
+            }
+            refreshOneClickButton();
+            return;
+        }
+        UpdateUiState.State state = currentOneClickState();
+        // 「已下载且校验通过」才允许直接进安装；否则一定走一遍下载/校验（有进度）。
+        beginDownload(state.phase == UpdateUiState.Phase.READY_TO_INSTALL);
+    }
+
+    /**
+     * 当前的更新界面状态：<b>两个界面（设置页一键按钮 / 主界面横幅）都由这一个函数推出文案</b>，
+     * 所以不存在「横幅说下载、点进去却安装」这种自相矛盾。
+     */
+    private UpdateUiState.State currentOneClickState() {
+        ServerConfig server = repository.current();
+        boolean hasServer = server != null && server.base != null && !server.base.isBlank();
+        boolean cacheReady = availableUpdate != null
+                && UpdateCache.looksVerifiedFor(availableUpdate, downloadedApk);
+        return UpdateUiState.derive(hasServer, checkedOnce, checking, availableUpdate,
+                Prefs.installedVersionCode(this), cacheReady, downloading, oneClickPercent, oneClickFailure);
+    }
+
+    /** 把状态机算出来的文案/可用性贴到一键按钮上（并显示那一行失败原因）。 */
+    private void refreshOneClickButton() {
+        if (updateOneclick == null) return;
+        UpdateUiState.State state = currentOneClickState();
+        updateOneclick.setEnabled(state.enabled);
+        updateOneclick.setAlpha(state.enabled ? 1f : 0.6f);
+        updateOneclick.setText(getString(state.labelRes, state.labelArgs));
+        if (updateOneclickHint != null) {
+            // 没配服务器时那行小字就说清「先去填地址」，配了就说清这一下会走完哪几步。
+            updateOneclickHint.setText(state.phase == UpdateUiState.Phase.NO_SERVER
+                    ? R.string.settings_oneclick_hint_no_server
+                    : R.string.settings_oneclick_boundary);
+        }
+        if (state.phase == UpdateUiState.Phase.FAILED && !state.reason.isEmpty()) {
+            // 「失败 → 重试更新 + 一行简短原因」：原因就摆在状态栏里。
+            setUpdateStatus(state.reason, true);
+        }
     }
 
     /** 把一次检查结论落到界面上（手动/自动共用）。 */
     private void applyOutcome(UpdateChecker.Outcome outcome, boolean manual) {
         if (outcome == null) return;
         if (!outcome.ok || outcome.info == null) {
+            oneClickFailure = outcome.message;
             setUpdateStatus(outcome.message, true);
             broadcastStatus(outcome.message, false, null);
+            refreshOneClickButton();
             return;
         }
         UpdateInfo info = outcome.info;
+        checkedOnce = true;          // 有结论了：再区分「已是最新」与「还没查过」
         if (!info.isNewerThan(Prefs.installedVersionCode(this))) {
             String text = getString(R.string.settings_update_up_to_date, info.version);
+            oneClickFailure = "";
             setUpdateStatus(text, false);
             if (manual) broadcastStatus(text, false, null);
+            refreshOneClickButton();
             return;
         }
+        oneClickFailure = "";
         showAvailableUpdate(info);
         broadcastStatus(describeUpdateLine(info), true, info);
+        refreshOneClickButton();
     }
 
     /** 「发现新版本 1.6.1（当前 1.6.0，6.0 MB）。」——设置页与横幅共用同一套措辞。 */
@@ -292,9 +425,11 @@ public class SettingsActivity extends AppCompatActivity {
         return getString(R.string.settings_update_available, version, Prefs.installedVersionName(this), size);
     }
 
-    /** 有新版本：亮红点 + 显示版本/大小/渠道/说明 + 显示「下载并安装」。 */
+    /** 有新版本：亮红点 + 显示版本/大小/渠道/说明 + 显示「下载并安装」/「立即安装」。 */
     private void showAvailableUpdate(UpdateInfo info) {
         availableUpdate = info;
+        // 服务端当前是哪个包，此刻才知道 —— 顺便把本地那份对不上的旧缓存清掉。
+        reconcileCachedApk(info);
         if (updateBadge != null) updateBadge.setVisibility(View.VISIBLE);
 
         StringBuilder text = new StringBuilder(describeUpdateLine(info));
@@ -317,7 +452,71 @@ public class SettingsActivity extends AppCompatActivity {
         if (updateReleasePage != null) {
             updateReleasePage.setVisibility(info.releaseUrl.isEmpty() ? View.GONE : View.VISIBLE);
         }
-        if (downloadedApk == null) setUpdateStatus(blocked.isEmpty() ? "可以下载了。" : blocked, !blocked.isEmpty());
+        refreshDownloadButtonLabel();
+        if (downloadedApk == null) {
+            setUpdateStatus(blocked.isEmpty() ? "可以下载了。" : blocked, !blocked.isEmpty());
+        } else {
+            // 按钮此时已经是「立即安装」：这里把理由摆在用户眼前（sha256 已与服务端当前版本核对通过）。
+            setUpdateStatus("本地已有与服务端当前版本一致（sha256 核对通过）的安装包，点「立即安装」直接装。", false);
+        }
+    }
+
+    /**
+     * 把「本地那份安装包」与服务端<b>当前</b> announced 的版本对账，然后同步按钮文案。
+     *
+     * <p>以前的写法只判断「记录里的文件在不在」，于是 {@code cacheDir/update} 里上一版的残留包
+     * 会被当成「已经下载好」，点「下载更新」直接把它交给安装器 —— 这就是用户报的
+     * 「不会下载而是直接安装老的」。现在唯一认账的条件是
+     * {@link UpdateCache#isCachedFor}：文件名就是当前版本 <b>且</b> sha256 等于服务端当前 announced 的那个；
+     * 对不上就把文件删掉、把 {@code UpdatePrefs} 里的记录清掉。
+     *
+     * <p>{@code info} 为空（这次还没查到/查失败）时<b>什么都不动</b>：既不能证明本地那份对，
+     * 也没有理由删它；只是不把它当成「已下载好」，于是不会出现盲装。
+     */
+    private void reconcileCachedApk(UpdateInfo info) {
+        UpdatePrefs prefs = new UpdatePrefs(this);
+        if (info == null || !info.canInstall()) {
+            downloadedApk = null;
+            refreshDownloadButtonLabel();
+            refreshOneClickButton();
+            return;
+        }
+        UpdateCache.Purge purge = UpdateCache.purgeStale(Prefs.updateDir(this), info);
+        if (purge.deletedFiles > 0) {
+            Log.i("已清理 " + purge.deletedFiles + " 个与服务端当前版本不符的缓存文件（"
+                    + purge.deletedBytes + " 字节）");
+        }
+        String savedPath = prefs.downloadedPath();
+        File saved = savedPath.isEmpty() ? null : new File(savedPath);
+        if (saved == null || !UpdateCache.isCachedFor(info, saved)) {
+            if (saved != null) {
+                boolean deleted = saved.isFile() && saved.delete();
+                prefs.clearDownloadedPath();
+                Log.i("本地缓存的安装包与服务端当前版本对不上（" + saved.getName() + "），"
+                        + (deleted ? "已删除并清掉记录" : "记录已清掉"));
+            }
+            downloadedApk = null;
+            refreshDownloadButtonLabel();
+            refreshOneClickButton();
+            return;
+        }
+        downloadedApk = saved;
+        Log.i("本地缓存的安装包就是服务端当前这一版（sha256 核对通过）：" + saved.getName()
+                + "（" + saved.length() + " 字节）");
+        refreshDownloadButtonLabel();
+        refreshOneClickButton();
+    }
+
+    /**
+     * 按钮文案必须和「点下去会干什么」一致：
+     * 本地已经有<b>当前版本且 sha256 核对通过</b>的包 → 「立即安装」；否则 → 「下载并安装」。
+     */
+    private void refreshDownloadButtonLabel() {
+        if (updateDownload == null) return;
+        boolean readyToInstall = downloadedApk != null && downloadedApk.isFile();
+        updateDownload.setText(readyToInstall
+                ? R.string.settings_update_install_now
+                : R.string.settings_update_download);
     }
 
     private void openReleasePage() {
@@ -335,8 +534,20 @@ public class SettingsActivity extends AppCompatActivity {
      *
      * <p>下载目录用 {@link Prefs#updateDir}（{@code cacheDir/update}），FileProvider 白名单里
      * 只放了这一个子目录（见 {@code res/xml/file_paths.xml}）。
+     *
+     * <p><b>「点下载更新却把旧包装上去」的修法就在这里</b>：以前只要 {@code downloadedApk} 那个文件还在
+     * 就直接进安装流程，而 {@code cacheDir/update} 里刻意残留着上一版下好的包（设计是「升级后才清、
+     * 宁可不删」），于是装上去的是旧包。现在唯一的判据是 {@link UpdateCache#planFor}：
+     * 只有本地那份<b>确实等于服务端当前 announced 的 sha256</b>（且文件名就是当前版本）时才算
+     * 「已下载好」；否则它当场被删掉，然后老老实实重新下载（有进度）。
+     *
+     * @param allowCachedInstall 设置页自己的按钮传 {@code true}（此时按钮文案已经被
+     *                           {@link #refreshDownloadButtonLabel()} 改成「立即安装」）；
+     *                           从横幅「下载更新」跳过来传 {@code false} —— 那就一定走一遍
+     *                           下载/校验路径（同一个包 {@link SelfUpdate} 会直接复用，不会白下），
+     *                           保证横幅上「下载更新」这四个字不是谎话。
      */
-    private void beginDownload() {
+    private void beginDownload(boolean allowCachedInstall) {
         if (downloading) return;
         final UpdateInfo info = availableUpdate;
         if (info == null) {
@@ -347,12 +558,40 @@ public class SettingsActivity extends AppCompatActivity {
             setUpdateStatus(info.blockReason(), true);
             return;
         }
-        // 已经下好且校验过：直接进安装流程（用户按的是「下载并安装」，这一步就是「安装」）。
-        if (downloadedApk != null && downloadedApk.isFile()) {
-            promptInstall(downloadedApk);
+
+        final int installed = Prefs.installedVersionCode(this);
+        UpdateCache.Decision plan = UpdateCache.planFor(info, downloadedApk, installed);
+        Log.i("点下载更新 → 决策 " + plan.verdict + "（" + plan.message + "）");
+        if (plan.deletedStale) {
+            new UpdatePrefs(this).clearDownloadedPath();
+            downloadedApk = null;
+            refreshDownloadButtonLabel();
+            refreshOneClickButton();
+        }
+        if (plan.isUpToDate()) {
+            // 服务端报的 versionCode 不比本机大（或压根没有可安装的包）：既不下载也不安装。
+            // 「versionCode 不比本机大就不提示/不安装」这条既有判据在这里不许退化。
+            setUpdateStatus(plan.message, false);
+            refreshOneClickButton();
             return;
         }
+        if (allowCachedInstall && plan.isInstall()) {
+            downloadedApk = plan.apk;
+            setUpdateStatus(plan.message, false);
+            refreshOneClickButton();
+            promptInstall(plan.apk, info);
+            return;
+        }
+        if (plan.isInstall()) {
+            Log.i("从横幅「下载更新」进来：走下载/校验这条路径"
+                    + "（同一份包 SelfUpdate 会直接复用，不会重复下几十 MB）");
+        }
 
+        // 走到这里就必须真的下载：先把跟服务端当前版本对不上的缓存与记录清干净，
+        // 免得「已下载」这个状态被旧包继续冒充。
+        downloadedApk = null;
+        new UpdatePrefs(this).clearDownloadedPath();
+        if (updateDownload != null) updateDownload.setText(R.string.settings_update_download);
         downloading = true;
         if (updateDownload != null) updateDownload.setEnabled(false);
         if (updateProgress != null) {
@@ -360,9 +599,18 @@ public class SettingsActivity extends AppCompatActivity {
             updateProgress.setProgress(0);
         }
         setUpdateStatus("开始下载（" + (info.sizeText().isEmpty() ? "大小未知" : info.sizeText()) + "）…", false);
+        oneClickPercent = 0;
+        refreshOneClickButton();
 
         final File dir = Prefs.updateDir(this);
         new Thread(() -> {
+            // 下载前再清一次（这里在子线程，删几 MB 的文件不占主线程）：当前版本的 .part 会被保留，
+            // 所以「上一次下到一半」仍然能断点续传。
+            UpdateCache.Purge purge = UpdateCache.purgeStale(dir, info);
+            if (purge.deletedFiles > 0) {
+                Log.i("下载前清理了 " + purge.deletedFiles + " 个与服务端当前版本不符的旧缓存（"
+                        + purge.deletedBytes + " 字节）");
+            }
             SelfUpdate.Result result = SelfUpdate.download(info, dir, (downloaded, total) ->
                     mainHandler.post(() -> showDownloadProgress(downloaded, total)));
             mainHandler.post(() -> {
@@ -378,21 +626,30 @@ public class SettingsActivity extends AppCompatActivity {
     private void finishDownload(UpdateInfo info, SelfUpdate.Result result) {
         if (result == null || !result.ok || result.apk == null) {
             String message = result == null ? "下载失败（没有结果）" : result.message;
-            setUpdateStatus(message + "\n可以点「下载并安装」重试（会从断点接着下）。", true);
+            // 一键按钮要变成「重试更新」，并把这行原因摆出来（不许静默）。
+            oneClickFailure = message;
+            setUpdateStatus(message + "\n可以点「重试更新」或「下载并安装」重试（会从断点接着下）。", true);
             Log.w("自我更新下载失败：" + message);
+            oneClickPercent = 0;
+            refreshDownloadButtonLabel();
+            refreshOneClickButton();
             return;
         }
+        oneClickFailure = "";
+        oneClickPercent = 100;
         downloadedApk = result.apk;
         new UpdatePrefs(this).setDownloadedPath(result.apk.getAbsolutePath());
+        refreshDownloadButtonLabel();
+        refreshOneClickButton();
         Log.i("自我更新：下载并校验通过，" + result.apk.getAbsolutePath() + "，sha256=" + result.sha256);
 
         if (result.message.startsWith("已复用")) {
-            setUpdateStatus("已在本地找到上次校验通过的安装包，跳过下载。", false);
+            setUpdateStatus("已在本地找到上次校验通过的安装包（sha256 与当前版本一致），跳过下载。", false);
         } else {
             setUpdateStatus(getString(R.string.settings_update_verified,
                     result.sha256.substring(0, Math.min(16, result.sha256.length())) + "…"), false);
         }
-        promptInstall(result.apk);
+        promptInstall(result.apk, info);
     }
 
     /** 进度条：有总长度就按百分比，没有就转不确定态（不能让用户盯着一个永远 0% 的条）。 */
@@ -402,10 +659,13 @@ public class SettingsActivity extends AppCompatActivity {
             int percent = (int) Math.min(100L, downloaded * 100L / total);
             updateProgress.setIndeterminate(false);
             updateProgress.setProgress(percent);
+            oneClickPercent = percent;                 // 一键按钮上也要显示「下载中 37%」
+            refreshOneClickButton();
             setUpdateStatus(getString(R.string.settings_update_downloading, percent,
                     humanBytes(downloaded), humanBytes(total)), false);
         } else {
             updateProgress.setIndeterminate(true);
+            refreshOneClickButton();
             setUpdateStatus(getString(R.string.settings_update_downloading_unknown, humanBytes(downloaded)), false);
         }
     }
@@ -416,8 +676,49 @@ public class SettingsActivity extends AppCompatActivity {
      * <p><b>先说清楚这里为什么不能自动装完</b>：普通 app 没有静默安装的权力
      * （那要 root 或 device-owner/系统签名），所以这里只能拉起系统安装器，由用户在系统弹窗里
      * 点一下「安装」。缺「安装未知应用」授权时，先把用户引到系统设置去开，回来再自动继续。
+     *
+     * <p><b>第二件事：这里是全 app 唯一安装出口，必须先过闸门。</b>进 Intent 之前一定核两样东西
+     * （见 {@link UpdateInstaller#checkInstallable}）：
+     * <ol>
+     *   <li>这份文件的 sha256 就是服务端当前 announced 的那个 —— 不匹配的包<b>永不</b>进入安装 Intent；</li>
+     *   <li>包里的 versionCode 比本机大（读不到包里那个值时就只信 sha256）。</li>
+     * </ol>
+     * 被拒的包会当场删掉并清记录，免得它下次又被当成「已下载好」。
      */
-    private void promptInstall(File apk) {
+    private void promptInstall(File apk, UpdateInfo info) {
+        String actualSha;
+        try {
+            actualSha = Sha256.of(apk);
+        } catch (IOException error) {
+            Log.w("读不了要安装的包，拒绝安装", error);
+            oneClickFailure = "读不了这个安装包，已清掉记录，请重新下载。";
+            setUpdateStatus("读不了这个安装包（" + Log.describe(error) + "），已清掉记录，请重新下载。", true);
+            new UpdatePrefs(this).clearDownloadedPath();
+            downloadedApk = null;
+            refreshDownloadButtonLabel();
+            refreshOneClickButton();
+            return;
+        }
+        UpdateInstaller.Gate gate = UpdateInstaller.checkInstallable(
+                info == null ? "" : info.sha256,
+                actualSha,
+                UpdateInstaller.readApkVersionCode(this, apk),
+                Prefs.installedVersionCode(this));
+        if (!gate.allowed) {
+            Log.w("拒绝安装（不会交给系统安装器）：" + gate.reason);
+            if (apk.isFile() && apk.delete()) Log.i("已删除被拒绝的安装包：" + apk.getName());
+            oneClickFailure = gate.reason;
+            new UpdatePrefs(this).clearDownloadedPath();
+            downloadedApk = null;
+            oneClickPercent = 0;
+            refreshDownloadButtonLabel();
+            refreshOneClickButton();
+            setUpdateStatus(gate.reason, true);
+            return;
+        }
+        oneClickFailure = "";
+        refreshOneClickButton();
+
         if (!UpdateInstaller.canRequestPackageInstalls(this)) {
             awaitingInstallPermission = true;
             setUpdateStatus(getString(R.string.settings_update_unknown_sources), true);
@@ -529,12 +830,16 @@ public class SettingsActivity extends AppCompatActivity {
         if (awaitingInstallPermission) {
             if (UpdateInstaller.canRequestPackageInstalls(this)) {
                 awaitingInstallPermission = false;
-                File apk = downloadedApk != null ? downloadedApk
-                        : (new UpdatePrefs(this).downloadedPath().isEmpty()
-                        ? null : new File(new UpdatePrefs(this).downloadedPath()));
+                // 回来时版本可能已经变了（比如服务端在这期间又发了新版）：先重新对账，
+                // 只认「就是服务端当前这一版」的那份包；对不上就什么都不装（提示去重新下载）。
+                reconcileCachedApk(availableUpdate);
+                File apk = downloadedApk;
                 if (apk != null && apk.isFile()) {
-                    Log.i("「安装未知应用」已授权，自动接着安装");
-                    promptInstall(apk);
+                    Log.i("「安装未知应用」已授权，自动接着安装：" + apk.getName());
+                    promptInstall(apk, availableUpdate);
+                } else {
+                    setUpdateStatus("本地那份安装包已经跟服务端当前版本对不上（或已被清理），"
+                            + "请点「检查更新」重新下载。", true);
                 }
             } else {
                 setUpdateStatus(getString(R.string.settings_update_unknown_sources), true);

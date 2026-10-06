@@ -70,6 +70,86 @@ public final class UpdateInstaller {
 
     private UpdateInstaller() { }
 
+    /**
+     * <b>安装前的最后一道闸门</b>：允许 / 拒绝 + 一句能给用户看的原因。
+     *
+     * <p>为什么要有这么一层：{@code cacheDir/update} 里可能躺着<b>上一版</b>下好的包
+     * （设计上是「升级后才清、宁可不删」）。用户报过「点下载更新不下载，直接把旧的包装上」，
+     * 所以「什么包才允许进安装 Intent」必须是一条<b>可断言</b>的规则，而不是散在 UI 分支里的 if。
+     */
+    public static final class Gate {
+        public final boolean allowed;
+        /** 被拒时的人话原因（放行时是空串）。 */
+        public final String reason;
+
+        Gate(boolean allowed, String reason) {
+            this.allowed = allowed;
+            this.reason = reason == null ? "" : reason;
+        }
+
+        @Override public String toString() {
+            return allowed ? "Gate{放行}" : "Gate{拒绝：" + reason + "}";
+        }
+    }
+
+    /**
+     * <b>纯函数版的安装判据</b>（不碰 android.*，所以能在 JVM 单测里逐条钉死）。
+     *
+     * <p>两条铁律，缺一就不放行：
+     * <ol>
+     *   <li><b>sha256 必须匹配服务端当前 announced 的那个</b>。算出来的哈希与服务端说的不一致、
+     *       或者服务端压根没给一个合法的 64 位 sha256 —— 一律拒绝。不管这个包是从哪来的。</li>
+     *   <li><b>versionCode 必须比本机大</b>（装上去才有变化）。{@code apkVersionCode <= 0}
+     *       表示「读不到包里那个 versionCode」，这时按约定<b>只信 sha256</b>，不因此拒绝。</li>
+     * </ol>
+     *
+     * @param expectedSha256      服务端当前 announced 的 sha256
+     * @param actualSha256        对本地那份文件实测出来的 sha256
+     * @param apkVersionCode      从 APK 里读出来的 versionCode；读不到传 {@code -1}
+     * @param installedVersionCode 本机当前 versionCode
+     */
+    public static Gate checkInstallable(String expectedSha256, String actualSha256,
+                                        int apkVersionCode, int installedVersionCode) {
+        if (!Sha256.looksLikeSha256(expectedSha256)) {
+            return new Gate(false, "服务端没有给出可校验的 sha256（64 位十六进制），拒绝安装。");
+        }
+        if (!Sha256.matches(actualSha256, expectedSha256)) {
+            return new Gate(false, "安装包的 sha256 与服务端当前版本不一致（算出来 " + head(actualSha256)
+                    + "…，服务端说 " + head(expectedSha256) + "…），已拒绝安装。");
+        }
+        if (apkVersionCode > 0 && apkVersionCode <= installedVersionCode) {
+            return new Gate(false, "这个安装包的 versionCode（" + apkVersionCode + "）不比本机（"
+                    + installedVersionCode + "）大，装了也没有变化，已拒绝安装。");
+        }
+        return new Gate(true, "");
+    }
+
+    /**
+     * 读 <b>APK 文件里</b>的 versionCode（比文件名/服务端声明都可信）。
+     *
+     * <p>用 {@code getPackageArchiveInfo} 现读：它只解析包的 manifest，不安装、也不需要任何权限。
+     * 读不到（文件不是合法 APK、被截断、包管理器不认）返回 {@code -1}，调用方按
+     * {@link #checkInstallable} 的约定「只信 sha256」处理，<b>绝不</b>因为读不到就放行。
+     */
+    public static int readApkVersionCode(Context context, File apk) {
+        if (context == null || apk == null || !apk.isFile()) return -1;
+        try {
+            android.content.pm.PackageInfo info = context.getPackageManager()
+                    .getPackageArchiveInfo(apk.getAbsolutePath(), 0);
+            return info == null ? -1 : info.versionCode;
+        } catch (RuntimeException error) {
+            // 个别 ROM 的 PackageManager 会在这里抛；按「读不到」处理，交给 sha256 兜底。
+            Log.w("读不出安装包里的 versionCode（按只信 sha256 处理）", error);
+            return -1;
+        }
+    }
+
+    /** 文案里只放哈希前几位。 */
+    private static String head(String hex) {
+        String text = hex == null ? "" : hex;
+        return text.length() <= 12 ? text : text.substring(0, 12);
+    }
+
     /** 组装 Intent 时要用的那几个常量值。 */
     public static InstallAction apkInstallAction() {
         return new InstallAction(
@@ -97,6 +177,10 @@ public final class UpdateInstaller {
 
     /**
      * 把下载好的（已通过 sha256 校验的）APK 变成安装 Intent。
+     *
+     * <p><b>调用约定</b>：这是全 app <b>唯一</b>会把 APK 交进系统安装器的地方，调用方必须先过
+     * {@link #checkInstallable}（见 {@code SettingsActivity.promptInstall}）—— 也就是说
+     * 「sha256 不匹配 / versionCode 不比本机大的包」永远到不了这一行。
      *
      * @throws IOException 拿不到 FileProvider URI（file_paths 白名单没覆盖这个路径时会这样）
      */

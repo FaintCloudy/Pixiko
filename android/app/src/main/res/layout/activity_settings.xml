@@ -264,6 +264,27 @@
             android:text="@string/settings_update_auto"
             android:textColor="@color/pixiko_text" />
 
+        <!-- ============ 一键更新：显眼位置（就在「检查更新」上面），文案由 UpdateUiState 状态机决定 ============
+             它和横幅上那个按钮同源（同一份 UpdateInfo / UpdatePrefs，同一个状态机），所以两处不会各说各话。
+             文案随状态变：已是最新版本 / 更新到 1.6.2 / 下载中 37% / 安装 1.6.2 / 重试更新。 -->
+        <Button
+            android:id="@+id/update_oneclick"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="6dp"
+            android:text="@string/settings_oneclick_unchecked"
+            android:textSize="16sp"
+            android:textStyle="bold" />
+
+        <TextView
+            android:id="@+id/update_oneclick_hint"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="2dp"
+            android:text="@string/settings_oneclick_boundary"
+            android:textColor="@color/pixiko_muted"
+            android:textSize="11sp" />
+
         <Button
             android:id="@+id/update_check"
             android:layout_width="match_parent"

@@ -90,4 +90,19 @@
     <string name="settings_update_no_package">服务端说最新是 %1$s，但没给可下载的安装包（apkUrl 为空），本次只能先看更新说明。</string>
     <string name="settings_update_notes_title">更新说明</string>
     <string name="settings_update_release_page">打开发行页</string>
+
+    <!-- ================= 设置页「一键更新」按钮（文案由 UpdateUiState 状态机决定） ================= -->
+    <!-- 用户要的是「在设置页直接一下点完：检查 → 下载（带进度）→ sha256 校验 → 拉起系统安装器」。
+         文案必须与点下去真的干什么一致，所以每个状态一条，不允许各处各写一份。 -->
+    <string name="settings_oneclick_no_server">先配置服务器地址</string>
+    <string name="settings_oneclick_unchecked">检查并更新</string>
+    <string name="settings_oneclick_checking">正在检查更新…</string>
+    <string name="settings_oneclick_up_to_date">已是最新版本</string>
+    <string name="settings_oneclick_update_to">更新到 %1$s</string>
+    <string name="settings_oneclick_no_package">更新到 %1$s（暂无安装包）</string>
+    <string name="settings_oneclick_downloading">下载中 %1$d%%</string>
+    <string name="settings_oneclick_install">安装 %1$s</string>
+    <string name="settings_oneclick_retry">重试更新</string>
+    <string name="settings_oneclick_hint_no_server">还没配置服务器地址：先在上面填一个并「保存」，这个按钮才会生效。</string>
+    <string name="settings_oneclick_boundary">点一下就走完：检查更新 → 下载（显示进度）→ sha256 校验 → 拉起系统安装器。最后一步的「安装」需要你在系统弹窗里点（静默替换要 root 或系统签名，普通 app 做不到）。</string>
 </resources>
