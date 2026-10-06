@@ -290,8 +290,11 @@ public final class ReceiptChatLogTest {
             }
             check(matched == questTexts.size(), "真回执的每条正文都在 /api/chat/log 里（" + matched + "/" + questTexts.size() + "）");
 
-            // 页面整组 push 一份只有用户那条的旧快照：服务端 append 的条目必须还在
-            JsonArray page = new JsonArray();
+            // 页面整组 push 一份"少了末尾一条"的快照（读完之后服务端又追加了一条的现场）：
+            // 少的那条必须被补回末尾（recoverAppended 的判据见 ChatLogStore#save）。
+            JsonArray page = entries.deepCopy();
+            String tailText = page.get(page.size() - 1).getAsJsonObject().get("text").getAsString();
+            page.remove(page.size() - 1);
             JsonObject user = new JsonObject();
             user.addProperty("role", "user");
             user.addProperty("text", "页面旧快照");
@@ -301,7 +304,25 @@ public final class ReceiptChatLogTest {
             save.add("entries", page);
             post(base + "/api/chat/log/save", save);
             JsonArray after = post(base + "/api/chat/log", scoped(null, 0)).getAsJsonArray("entries");
-            check(after.size() >= entries.size(), "整组覆盖写之后服务端 append 的条目仍被补回（" + after.size() + " ≥ " + entries.size() + "）");
+            check(after.size() == entries.size() + 1,
+                    "整组覆盖写少了末尾一条：那条被补回末尾，另加了页面自己那条（" + after.size() + " = " + entries.size() + " + 1）");
+            check(tailText.equals(Json.str(after.get(after.size() - 1).getAsJsonObject(), "text", "")),
+                    "补回来的正是被抹掉的那条末尾正文：" + tailText);
+
+            // 页面整组 push 一份"一条服务端条目都没留"的（= 用户把回执条目全删了）：
+            // 一条都不许复活 —— 账本比正文活得久，老写法会把用户删掉的历史塞回对话末尾。
+            JsonArray wipe = new JsonArray();
+            JsonObject mine = new JsonObject();
+            mine.addProperty("role", "user");
+            mine.addProperty("text", "全删了只剩这句");
+            wipe.add(mine);
+            JsonObject wipeSave = new JsonObject();
+            wipeSave.addProperty("scope", SCOPE);
+            wipeSave.add("entries", wipe);
+            post(base + "/api/chat/log/save", wipeSave);
+            JsonArray wiped = post(base + "/api/chat/log", scoped(null, 0)).getAsJsonArray("entries");
+            check(wiped.size() == 1 && "全删了只剩这句".equals(Json.str(wiped.get(0).getAsJsonObject(), "text", "")),
+                    "页面把服务端追加过的条目全删了：一条都不补回来（" + wiped.size() + " 条）");
 
             post(base + "/api/chat/reset", scoped(null, 0));
             check(post(base + "/api/chat/log", scoped(null, 0)).getAsJsonArray("entries").size() == 0,
