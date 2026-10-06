@@ -297,6 +297,50 @@ public class MainActivity extends AppCompatActivity {
             hideErrorPage();
             webView.reload();
         });
+        // 首帧就要定一次：默认入口是 /m，而 /m 下原生这份是关掉的（原因见 applySwipeAvailability）。
+        // 不在这里定的话，从冷启动到第一次 onPageFinished 之间会有一段"原生下拉还开着"的窗口。
+        applySwipeAvailability(mobileUiSelected());
+    }
+
+    /**
+     * 原生下拉刷新（{@link SwipeRefreshLayout}）只在<b>完整控制台 {@code /}</b> 下启用，
+     * 进<b>手机界面 {@code /m}</b> 就关掉（{@code swipe.setEnabled(false)}）。
+     *
+     * <p><b>为什么必须这么做（1.6.1 修过、1.6.2 又丢过一次，别再顺手删掉）</b>：
+     * {@code SwipeRefreshLayout} 判断"子视图还能不能往上滚"用的是
+     * {@code getChildAt(0).canScrollVertically(-1)}，而 {@code activity_main.xml} 里它的
+     * <b>直接子视图</b>是为了叠一层原生错误页而加的 {@code FrameLayout} —— 这个 FrameLayout
+     * 自己不滚动，真正滚动的是网页里 {@code overflow:auto} 的容器（{@code /m} 是 {@code #m-main}）。
+     * 于是父类<b>永远</b>认为"已经到顶了"：列表滚在中间时手指往上滑也被当成下拉，一松手就
+     * {@code reload()} —— 用户看到的就是「<b>上滑必刷新</b>」。
+     *
+     * <p>{@code /m} 本来就<b>自带</b>一套网页版下拉刷新（{@code webui/m/app.js} 的
+     * {@code PixikoM.ptrInstall}，判据是真实的 {@code scrollTop}，比原生这条准得多），
+     * 所以这里把原生那份关掉，两套不会打架、也不会再误触发。完整控制台 {@code /} 没有网页版
+     * 下拉刷新，原生那份照旧保留。
+     *
+     * <p>调用时机（<b>三处都要在</b>，缺一条路径就会有一类页面回到"上滑必刷新"）：
+     * <ul>
+     *   <li>{@link #applyActionBarVisibility()} —— {@link #onCreate}、{@link #loadHome()}
+     *       （启动 / {@link #toggleUi()} 切换 / 换服务器 / 从设置页回来）、
+     *       {@link #adoptUiPathFrom(String)}（网页自己跳到 {@code /m} 或 {@code /}，含 hash 路由）；</li>
+     *   <li>{@link PixikoWebViewClient#onPageFinished} —— 前进/后退回到 {@code /m} 这条
+     *       <b>唯一不经过</b> {@code loadHome()} 的路；</li>
+     *   <li>{@link #configureSwipe()} —— 首帧（findViewById 之后、第一次 onPageFinished 之前）。</li>
+     * </ul>
+     *
+     * <p>另有一层兜底：容器换成了 {@link PixikoSwipeRefreshLayout}，它的
+     * {@code canChildScrollUp()} 问的是真正会滚的 WebView，而不是不滚的 FrameLayout。
+     */
+    private void applySwipeAvailability(boolean mobile) {
+        if (swipe == null) return;             // onCreate 里 applyActionBarVisibility() 早于 findViewById(R.id.swipe)
+        if (mobile) {
+            swipe.setEnabled(false);
+            // 顺带把可能还在转的圈收掉：切到 /m 时留一个转圈最容易被当成"卡住了"。
+            swipe.setRefreshing(false);
+        } else {
+            swipe.setEnabled(true);
+        }
     }
 
     private void bindErrorPage() {
@@ -687,6 +731,10 @@ public class MainActivity extends AppCompatActivity {
      * <p>调用时机：{@link #onCreate}（覆盖恢复路径）、{@link #loadHome()}（覆盖启动、
      * {@link #toggleUi()}、换服务器、从设置页回来这几条路径）、
      * {@link #adoptUiPathFrom(String)}（网页自己跳到 /m 或 / 时）。
+     *
+     * <p>这里同时是<b>原生下拉刷新开关</b>的挂点：{@code /m} 与 {@code /} 的差别不止那条栏，
+     * 下拉刷新的归属也正好一样（见 {@link #applySwipeAvailability(boolean)}），
+     * 所以两个"当前是不是 /m"的处置放在同一处、用同一个 {@code mobile} 判据，免得将来只改一半。
      */
     private void applyActionBarVisibility() {
         boolean mobile = mobileUiSelected();
@@ -697,8 +745,11 @@ public class MainActivity extends AppCompatActivity {
         // 双保险：AppCompat 的 hide()/show() 本来就会把这个 Toolbar 置成 GONE/VISIBLE，
         // 这里显式再同步一次，免得个别 ROM / AppCompat 版本上出现「栏还在、只是内容空了」。
         if (toolbar != null) toolbar.setVisibility(mobile ? View.GONE : View.VISIBLE);
+        // 原生下拉刷新同理：/m 交给网页自带的那套，/ 才用原生（原因见 applySwipeAvailability）。
+        applySwipeAvailability(mobile);
         Log.d("原生 ActionBar " + (mobile ? "已隐藏（当前是手机界面 /m，让位给网页自带的 app bar）"
-                : "已显示（当前是完整控制台 /，它没有自己的顶栏）"));
+                : "已显示（当前是完整控制台 /，它没有自己的顶栏）")
+                + "；原生下拉刷新 " + (mobile ? "已关闭（/m 用网页版）" : "已启用"));
     }
 
     /** 加载首页（默认＝手机界面 {@code /m}；切到完整控制台后＝{@code /}）。 */
@@ -881,6 +932,10 @@ public class MainActivity extends AppCompatActivity {
             swipe.setRefreshing(false);
             if (mainFrameFailed) return;      // 失败页由 onReceivedError 负责，别把它当成正常页面
             currentUrl = url;
+            // 前进/后退回到 /m 也要收起原生下拉刷新：这条路径不经过 loadHome()/toggleUi()，
+            // onPageFinished 是唯一会经过的钩子。判据与 applyActionBarVisibility 一致
+            // （pref 在 doUpdateVisitedHistory → adoptUiPathFrom 里已按这一页纠正过），详见 applySwipeAvailability。
+            applySwipeAvailability(mobileUiSelected());
             attachNativeBridgeIfTrusted(url);
             injectHookScript();
             injectDeviceScope(url);

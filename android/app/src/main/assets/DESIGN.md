@@ -142,6 +142,21 @@ http 且没写端口时补 **8787**（与 `config.json → webui.port` 默认值
 `webView.canGoBack()` → `goBack()`；否则「不在首页」→ 回首页；已经在首页 → 2 秒内双击退出
 （第一次 Toast「再按一次退出」）。
 
+### 3.10 下拉刷新归谁 —— `MainActivity.applySwipeAvailability(boolean)` + `PixikoSwipeRefreshLayout`
+
+**这两处一个都别删**（1.6.1 修过「`/m` 上滑必刷新」，1.6.2 整段丢了、问题复发过一次）：
+
+* 病根：`SwipeRefreshLayout` 判断「子视图还能不能往上滚」用的是 `getChildAt(0).canScrollVertically(-1)`，
+  而 `activity_main.xml` 里它的**直接子视图**是为了叠错误页才加的**不滚动的 `FrameLayout`**，
+  真正滚动的是网页里 `overflow:auto` 的容器（`/m` 是 `#m-main`）→ 父类**永远**认为「已在顶部」，
+  列表滚在中间时往上滑也被当成下拉，松手就 `reload()`。
+* 主修：`/m` 下 `swipe.setEnabled(false)`（`/m` **自带**网页版下拉刷新 `PixikoM.ptrInstall`，
+  判据是真实 `scrollTop`）；完整控制台 `/` 下 `setEnabled(true)`。挂点**三处**：
+  `applyActionBarVisibility()`（onCreate / loadHome=toggleUi+换服务器 / adoptUiPathFrom 含 hash 路由）、
+  `onPageFinished`（前进/后退回到 `/m` 这条**不经过 loadHome** 的路）、`configureSwipe()`（首帧）。
+* 兜底：容器换成自家的 `cn.szu.bot.app.PixikoSwipeRefreshLayout`，`canChildScrollUp()` 问真正会滚的 WebView。
+* 回归用例：`WebViewLifecycleCheckTest.mobileEntryTurnsNativePullToRefreshOff`（读源码断言这条链还在、且至少两处调用）。
+
 ## 4. 权限与安全
 
 | 权限 | 用途 | 说明 |

@@ -2369,11 +2369,13 @@
    */
   function followCapture(id, quest) {
     if (chat.captureStop) chat.captureStop();
-    var seenText = Object.create(null);
     var seenImages = Object.create(null);
     var idleRounds = 0;
     var queueRounds = 0;                      // 「回执已 done，但生成队列还没空」时多等的轮数
-    var target = null;                        // 当前这条图文条目（新的内容往它上面并）
+    /* 这条回执**每一条消息各自的条目**：消息下标 → 气泡。
+       一条回执本来就有多条不同正文（汇总 / 每步 / 结算 / 领取），它们各自成泡才对；
+       只有"同一条消息的重复版本"（先无图后有图）才并进同一个气泡 —— 判据见下面的索引对账。 */
+    var parts = [];
     var startedAt = Date.now();
     /* 跟单现场落盘：页面被重建（挂起期间渲染进程被系统回收 / 下拉刷新 / 进程被收掉）之后，
        启动时靠它把这条回执补回来并接着跟（见 catchUpReceipts）。收工时清掉（见下面的 settled 分支）。 */
@@ -2386,36 +2388,50 @@
         chat.captureStop = null;
         return;
       }
-      var fresh = [];
+      /* 去重只按**图片路径**：文字一律按索引认（同一条回执里两段一模一样的正文也是两条消息）。 */
       var texts = (data && data.texts) || [];
-      for (var i = 0; i < texts.length; i++) {
-        var text = String(texts[i] || '');
-        if (!text || seenText[text]) continue;
-        seenText[text] = true; fresh.push(text);
-      }
+      var allImages = (data && data.images) || [];
       var images = [];
-      var rawImages = (data && data.images) || [];
-      for (var j = 0; j < rawImages.length; j++) {
-        var file = rawImages[j] && rawImages[j].file ? String(rawImages[j].file) : '';
+      for (var j = 0; j < allImages.length; j++) {
+        var file = allImages[j] && allImages[j].file ? String(allImages[j].file) : '';
         if (!file || seenImages[file]) continue;
         seenImages[file] = true; images.push(file);
       }
 
-      if (fresh.length || images.length) {
+      /* `/api/capture` 每轮给的是**到此刻为止的整份正文**（一条一个元素），索引就是消息身份。
+         按索引认条目：同一个索引 = 同一条消息（可能只是"多了图"）→ 并进它那个气泡；
+         索引是新的 = 另一条消息 → **新开一个气泡**。绝不按正文前缀猜。 */
+      var touched = [];            // 这一轮动过的条目（按消息顺序）
+      var added = false;           // 这一轮真的有新东西（新消息 / 新图）：没有就别反复存账本
+      for (var t = 0; t < texts.length; t++) {
+        var part = String(texts[t] || '');
+        if (!part) continue;
+        if (!parts[t]) {
+          var entry = chatEntry('bot', part, []);
+          if (quest) entry.quest = quest;
+          parts[t] = entry;
+          chat.entries.push(entry);
+          added = true;
+        }
+        touched.push(parts[t]);
+      }
+      if (touched.length || images.length) {
         idleRounds = 0;
-        if (!target) {
-          target = chatEntry('bot', '', []);
-          if (quest) target.quest = quest;
-          // 回执正文可能很长：单独用一条"回执"样式，不混进普通回复
-          chat.entries.push(target);
+        if (touched.length) {
           var placeholder2 = chat.host && chat.host.querySelector('[data-state="empty"]');
           if (placeholder2) clear(chat.host);
         }
-        if (fresh.length) target.text = (target.text ? target.text + '\n' : '') + fresh.join('\n');
-        if (images.length) target.images = (target.images || []).concat(images);
-        chatRenderAll();
-        chatFollow();                 // 回执里的文字/图片是异步到达的：只在用户本来就在底部附近才跟随
-        saveChatLogDebounced();
+        if (images.length) {
+          /* 图归到"这条消息"自己的气泡上：这一轮刚到的最后一条消息（先无图后有图 → 并进同一个），
+             没有新文字时就沿用最后一条消息的气泡。回执本来没有正文、只有图（纯图回执）才新开一个空泡。 */
+          var picture = touched.length ? touched[touched.length - 1] : (parts.length ? parts[parts.length - 1] : null);
+          if (!picture) { picture = chatEntry('bot', '', []); chat.entries.push(picture); }
+          picture.images = (picture.images || []).concat(images);
+          added = true;
+        }
+        chatRenderAll();            // 新增条目与"后到的图"都走 chatSyncEntries 的增量路径
+        chatFollow();               // 回执里的文字/图片是异步到达的：只在用户本来就在底部附近才跟随
+        if (added) saveChatLogDebounced();
       } else {
         idleRounds++;
       }
@@ -2496,28 +2512,30 @@
   }
 
   /**
-   * 把一条回执（`/api/quest` 的返回）并进对话正文 —— **最多产生一条条目**，且可以重复调用。
+   * 把一条回执（`/api/quest` 的返回）并进对话正文 —— **每条消息各自成一个气泡**，且可以重复调用。
    *
-   * <p>为什么不是简单地 append 一条：页面重建后 `chatLoad()` 已经从服务端读回了正文，
+   * <p>为什么不是简单地 append：页面重建后 `chatLoad()` 已经从服务端读回了正文，
    * 那条回执的文字**可能已经在里面**（挂起前存上去的、只是缺图）。再 append 一条就会变成
    * "同一条回执出现两遍（一份没图一份有图）"—— 用户报过的「回执重复」正是这个形状。
    *
-   * <p>三档（顺序很重要）：
-   *   ① 已经有一条**正文完全相同**的：只补它缺的图；
-   *   ② 最后一条有正文的 bot 条目与它**互为前缀**（"先到文字、几秒到几十秒后到图"的正常时序）：并进那一条；
-   *   ③ 都没有：新增一条（一条回执 ≤1 条正文 —— `.mode normal` 那条不变量照样成立）。
+   * <p><b>按消息身份对账，不按正文前缀猜</b>：`payload.texts` 的下标就是服务端的消息序号，
+   * 一个下标 = 一条消息 = 一个气泡。下标是新的 → 新开一个气泡（多步回执的汇总 / 每步 / 结算 / 领取
+   * 本来就该各占一个）；只有"同一条消息的重复版本"（先无图后有图、服务端这一段比本地更长）才并进
+   * 同一个气泡。老写法把几条正文 `join('\n')` 成一条、又对"最后一条有正文的 bot 条目"做**互为前缀**
+   * 判断，于是「多步执行完成：2/2 条…」「任务 #12 已完成…」「本次领取完成…」这种共享前缀的不同消息
+   * 被并成一个气泡 —— 用户报的「多个信息合并成一个气泡」。
    *
-   * <p>幂等：只 append 缺的文字/图片，调多少次都不会变多（"同一批不重复"）。
+   * <p>幂等：同一份 payload 反复调用只补缺的文字/图片，绝不重复新增（"同一批不重复"）。
    *
    * @returns {number} 真的有变化返回 1，什么都没动返回 0
    */
   function mergeReceiptIntoChat(payload) {
     if (!payload || payload.error) return 0;
-    var texts = [];
+    /* 消息序号 → 这一段正文（**空段保留**：索引就是身份，不能因为空就往下挤）。 */
+    var parts = [];
     var rawTexts = payload.texts || [];
     for (var i = 0; i < rawTexts.length; i++) {
-      var value = rawTexts[i] === null || rawTexts[i] === undefined ? '' : String(rawTexts[i]);
-      if (value && texts.indexOf(value) < 0) texts.push(value);
+      parts[i] = rawTexts[i] === null || rawTexts[i] === undefined ? '' : String(rawTexts[i]);
     }
     var images = [];
     var rawImages = payload.images || [];
@@ -2525,37 +2543,72 @@
       var file = rawImages[j] && rawImages[j].file ? String(rawImages[j].file) : '';
       if (file && images.indexOf(file) < 0) images.push(file);
     }
-    if (!texts.length && !images.length) return 0;
-    var text = texts.join('\n');
+    if (!parts.length && !images.length) return 0;
 
-    var target = null;
-    for (var k = chat.entries.length - 1; k >= 0 && !target; k--) {
-      var entry = chat.entries[k];
-      if (!entry || entry.role !== 'bot') continue;
-      // ① 正文完全相同。没有正文的（纯图回执）只认"也还没有图的"，免得两条回执的图挤进同一口气泡。
-      if (text ? (entry.text || '') === text : (!entry.text && !(entry.images || []).length)) target = entry;
+    /* 先把"这一段正文已经在哪个气泡里"对出来。对账只看**存在的条目**：
+       ① 正文完全相同 → 同一条消息（本地那份可能缺图或短了一截）；
+       ② 本地那条是它**严格前缀**且它是本地那条长出来的 → 同一条消息的成长版。
+       都不成立就新开一个气泡：没有稳定 id 时宁可各占一个，也不拿前缀去猜。 */
+    var used = Object.create(null);      // 这个气泡已经被本回执的哪一段认领了（含本轮新建的）
+    var targets = [];
+    var adopted = 0;
+    /** 这个气泡是不是这一段正文的「同一条消息」：正文相同，或本地那条是它长出来的前缀。 */
+    function sameMessage(entry, text) {
+      return !!entry.text && (entry.text === text || text.indexOf(entry.text) === 0);
     }
-    if (!target) {
-      // ② 只认**最后一条有正文的 bot 条目**：前缀关系对别的条目成立就并错批了。
-      for (var m = chat.entries.length - 1; m >= 0; m--) {
-        var last = chat.entries[m];
-        if (!last || last.role !== 'bot' || !last.text) continue;
-        if (text.indexOf(last.text) === 0 || last.text.indexOf(text) === 0) target = last;
-        break;
+    for (var t = 0; t < parts.length; t++) {
+      var text = parts[t];
+      if (!text) { targets[t] = null; continue; }
+      // 只认**还没被别的段认领**的条目：同一条回执里两段一模一样的正文是两条消息，不能挤一个气泡
+      var at = -1;
+      for (var k = chat.entries.length - 1; k >= 0; k--) {
+        var entry = chat.entries[k];
+        if (!entry || entry.role !== 'bot' || used[k] || !sameMessage(entry, text)) continue;
+        at = k; break;
+      }
+      if (at < 0) {
+        var made = chatEntry('bot', text, []);
+        chat.entries.push(made);
+        used[chat.entries.length - 1] = true;
+        targets[t] = made;
+        adopted++;
+      } else {
+        used[at] = true;
+        targets[t] = chat.entries[at];
+        if (text.length > (chat.entries[at].text || '').length) chat.entries[at].text = text;
       }
     }
+    var changed = adopted;
 
-    if (target) {
-      var mine = target.images || [];
+    if (images.length) {
+      /* 图归到"这条消息"自己的气泡：这条回执最后一条有正文的消息。
+         —— 绝不为了图去新开一个气泡（那样「先无图后有图」会多出一个空泡），也绝不把图塞进别的
+         回执的气泡：只有整条回执本来就没有正文（纯图回执）才另起一个空泡。 */
+      var picture = null;
+      for (var p = targets.length - 1; p >= 0; p--) { if (targets[p]) { picture = targets[p]; break; } }
+      if (!picture && parts.length) {
+        for (var q = chat.entries.length - 1; q >= 0 && !picture; q--) {
+          var tail = chat.entries[q];
+          if (tail && tail.role === 'bot' && tail.text) picture = tail;
+        }
+      }
+      if (!picture) {
+        for (var r = chat.entries.length - 1; r >= 0 && !picture; r--) {
+          var blank = chat.entries[r];
+          if (blank && blank.role === 'bot' && !blank.text && !(blank.images || []).length) picture = blank;
+        }
+        if (!picture) {
+          picture = chatEntry('bot', '', []);
+          chat.entries.push(picture);
+          changed++;
+        }
+      }
+      var mine = picture.images || [];
       var missing = images.filter(function (src) { return mine.indexOf(src) < 0; });
-      var grewText = !!text && text.length > (target.text || '').length && text.indexOf(target.text || '') === 0;
-      if (!missing.length && !grewText) return 0;
-      if (missing.length) target.images = mine.concat(missing);
-      if (grewText) target.text = text;      // 只在"服务端这一份更长"时补，反过来会把本地已有的截短
-    } else {
-      target = chatEntry('bot', text, images);
-      chat.entries.push(target);
+      if (missing.length) { picture.images = mine.concat(missing); changed++; }
     }
+
+    if (!changed) return 0;
     if (chat.entries.length > CHAT_ENTRIES_CAP) chat.entries = chat.entries.slice(-CHAT_ENTRIES_CAP);
     var placeholder = chat.host && chat.host.querySelector('[data-state="empty"]');
     if (placeholder) clear(chat.host);

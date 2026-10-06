@@ -105,7 +105,14 @@
         </LinearLayout>
     </LinearLayout>
 
-    <androidx.swiperefreshlayout.widget.SwipeRefreshLayout
+    <!--
+      这里刻意用自家子类 cn.szu.bot.app.PixikoSwipeRefreshLayout 而不是
+      androidx.swiperefreshlayout.widget.SwipeRefreshLayout：父类的 canChildScrollUp() 问的是
+      **直接子视图**（下面那个不滚动的 FrameLayout）能不能往上滚，于是永远答"到顶了"，
+      列表滚在中间时往上滑也会被当成下拉 → 「上滑必刷新」。子类改成问真正的 WebView。
+      详见 PixikoSwipeRefreshLayout 的类注释；/m 下原生这份还额外被 applySwipeAvailability 关掉。
+    -->
+    <cn.szu.bot.app.PixikoSwipeRefreshLayout
         android:id="@+id/swipe"
         android:layout_width="match_parent"
         android:layout_height="0dp"
@@ -187,5 +194,5 @@
                 </LinearLayout>
             </ScrollView>
         </FrameLayout>
-    </androidx.swiperefreshlayout.widget.SwipeRefreshLayout>
+    </cn.szu.bot.app.PixikoSwipeRefreshLayout>
 </LinearLayout>
