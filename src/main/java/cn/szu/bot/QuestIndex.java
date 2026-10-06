@@ -44,6 +44,13 @@ public final class QuestIndex {
     /** 一条回执的索引项（正文不在里面）。 */
     public static final class Entry {
         final int number;
+        /**
+         * 这条回执属于哪个网页会话（{@code web} / {@code dev-xxxxxxxxxxxx} / 旧的 QQ 号）。
+         *
+         * <p>空串 = 不知道（本次改动之前写下的旧索引、或老版本的正文文件）。旧条目**不冒充**任何一个
+         * 会话：带 scope 的列表（手机端）看不到它们，不带 scope 的列表（控制台）照旧全都能看到。
+         */
+        String scope = "";
         String command = "";
         long startedMillis;
         String summary = "";
@@ -74,17 +81,35 @@ public final class QuestIndex {
     public synchronized int size() { return entries.size(); }
 
     /** 未读条数（顶层 unread）。 */
-    public synchronized int unread() {
+    public synchronized int unread() { return unread(null); }
+
+    /** 某个会话的未读条数（{@code scope} 为空 = 所有会话，与 {@link #unread()} 同一个数）。 */
+    public synchronized int unread(String scope) {
         int count = 0;
-        for (Entry entry : entries.values()) if (entry.unread) count++;
+        for (Entry entry : entries.values()) if (entry.unread && visible(entry, scope)) count++;
         return count;
     }
 
     /** 最大任务号（没有就是 0）。 */
-    public synchronized int latest() {
+    public synchronized int latest() { return latest(null); }
+
+    /** 某个会话里最大的任务号（{@code scope} 为空 = 所有会话）。 */
+    public synchronized int latest(String scope) {
         int latest = 0;
-        for (int number : entries.keySet()) latest = Math.max(latest, number);
+        for (Entry entry : entries.values()) if (visible(entry, scope)) latest = Math.max(latest, entry.number);
         return latest;
+    }
+
+    /**
+     * 一条索引项在"某个会话的视图"里可见吗。
+     *
+     * <p>{@code scope} 为空 = 不筛（控制台与老客户端的行为一字未改）；非空 = 只认这个会话自己的条目。
+     * 空 scope 的旧条目不属于任何会话，因此**不出现**在任何带 scope 的视图里 —— 宁可少给，也不把
+     * 控制台的回执塞进某台手机的列表（那正是用户报的「回执重复杂糅」）。
+     */
+    private static boolean visible(Entry entry, String scope) {
+        if (scope == null || scope.isBlank()) return true;
+        return scope.equals(entry.scope == null ? "" : entry.scope);
     }
 
     /** 开始一轮刷新：先全部当成"内容已不在内存"，再由 {@link #observe} 把活着的重新点亮（只影响 busy）。 */
@@ -107,17 +132,21 @@ public final class QuestIndex {
             entries.put(entry.number, entry);
         }
         String command = capture.command() == null ? "" : capture.command();
+        // 回执归属：由创建它的那次 /api/command 的 scope 定下来，之后（含落盘重载）不再变。
+        String scope = capture.scope() == null ? "" : capture.scope();
         int texts = capture.textCount();
         int images = capture.imageCount();
         String summary = summary(capture.firstText());
         boolean done = capture.done();
         boolean changed = created
+                || !scope.equals(entry.scope)
                 || !command.equals(entry.command)
                 || entry.texts != texts
                 || entry.images != images
                 || !summary.equals(entry.summary)
                 || entry.done != done;
         if (entry.startedMillis <= 0) entry.startedMillis = System.currentTimeMillis() - Math.max(0, capture.ageMillis());
+        entry.scope = scope;
         entry.command = command;
         entry.texts = texts;
         entry.images = images;
@@ -147,15 +176,33 @@ public final class QuestIndex {
     }
 
     /** 全部标为已读；返回本次真正从"未读"变"已读"的条数。 */
-    public synchronized int markAllRead() {
-        return markRead(new ArrayList<>(entries.keySet()));
+    public synchronized int markAllRead() { return markAllRead(null); }
+
+    /**
+     * 某个会话里的全部标为已读（{@code scope} 为空 = 所有会话）。
+     *
+     * <p>为什么必须按会话：手机端的「全部已读」以前会把控制台的未读也一起清掉（那是另一个会话的状态）。
+     */
+    public synchronized int markAllRead(String scope) {
+        int marked = 0;
+        for (Entry entry : entries.values()) {
+            if (!visible(entry, scope)) continue;
+            boolean changed = entry.unread;
+            if (entry.unread) { entry.unread = false; marked++; }
+            if (!entry.read) { entry.read = true; changed = true; }
+            if (changed) revision++;
+        }
+        return marked;
     }
 
     /** {@code /api/status} 里那一小块：未读条数与最大任务号。 */
-    public synchronized JsonObject counts() {
+    public synchronized JsonObject counts() { return counts(null); }
+
+    /** 某个会话的 {@code /api/status} 那一小块（{@code scope} 为空 = 所有会话）。 */
+    public synchronized JsonObject counts(String scope) {
         JsonObject result = new JsonObject();
-        result.addProperty("unread", unread());
-        result.addProperty("latest", latest());
+        result.addProperty("unread", unread(scope));
+        result.addProperty("latest", latest(scope));
         return result;
     }
 
@@ -165,18 +212,35 @@ public final class QuestIndex {
      * @param limit          最多返回多少条（越界会被钳到 1..{@value #MAX_ENTRIES}）
      * @param retainedMinutes 回执正文保留多少分钟（顶层原样回报给网页；0 = 不过期）
      */
-    public synchronized JsonObject json(int limit, int retainedMinutes) {
+    public synchronized JsonObject json(int limit, int retainedMinutes) { return json(limit, retainedMinutes, null); }
+
+    /**
+     * 某个会话的列表（{@code scope} 为空 = 所有会话，与上面那个两参数版本一字不差）。
+     *
+     * <p>带 scope 时，{@code quests} 只含这个会话自己的条目，**{@code unread} / {@code latest} /
+     * {@code total} 也一起按这个会话算** —— 否则手机端的列表与角标会互相打架（列表里没有那条，
+     * 角标却按它计数）。顶层多一个 {@code scoped} 告诉客户端"这次真的按会话筛过了"。
+     */
+    public synchronized JsonObject json(int limit, int retainedMinutes, String scope) {
         int wanted = Math.max(1, Math.min(MAX_ENTRIES, limit));
         List<Entry> sorted = new ArrayList<>(entries.values());
         sorted.sort(Comparator.comparingInt((Entry entry) -> entry.number).reversed());
         JsonArray quests = new JsonArray();
-        for (int index = 0; index < sorted.size() && index < wanted; index++) quests.add(item(sorted.get(index)));
+        int unread = 0, latest = 0, total = 0;
+        for (Entry entry : sorted) {
+            if (!visible(entry, scope)) continue;
+            total++;
+            if (entry.unread) unread++;
+            latest = Math.max(latest, entry.number);
+            if (quests.size() < wanted) quests.add(item(entry));
+        }
         JsonObject result = new JsonObject();
         result.add("quests", quests);
-        result.addProperty("unread", unread());
-        result.addProperty("latest", latest());
-        result.addProperty("total", entries.size());
+        result.addProperty("unread", unread);
+        result.addProperty("latest", latest);
+        result.addProperty("total", total);
         result.addProperty("retainedMinutes", retainedMinutes);
+        result.addProperty("scoped", scope != null && !scope.isBlank());
         return result;
     }
 
@@ -186,9 +250,17 @@ public final class QuestIndex {
      * <p>{@code /api/quest} 在磁盘上也找不到正文时用它兜底，这样 /quest#N 这种直接打开的链接
      * 至少还能看到摘要而不是一句冷冰冰的报错；找不到返回 null。
      */
-    public synchronized JsonObject item(int number) {
+    public synchronized JsonObject item(int number) { return item(number, null); }
+
+    /**
+     * 某个会话里的一条索引项（{@code scope} 为空 = 不筛）。
+     *
+     * <p>带 scope 时，别的会话的任务号一律返回 null —— 调用方（{@code /api/quest}）据此如实告诉
+     * 这台手机"这条回执不属于这个会话"，而不是把控制台的回执正文端过去。
+     */
+    public synchronized JsonObject item(int number, String scope) {
         Entry entry = entries.get(number);
-        return entry == null ? null : item(entry);
+        return entry == null || !visible(entry, scope) ? null : item(entry);
     }
 
     /** 一条索引项 → 网页用的 JSON（一条恰好 11 个字段，不带任何正文数组）。 */
@@ -227,6 +299,9 @@ public final class QuestIndex {
                 int number = Json.num(node, "number", 0);
                 if (number <= 0 || entries.containsKey(number)) continue;
                 Entry entry = new Entry(number);
+                // 老索引里没有 scope（本次改动之前写下的）：留空串 = 不知道属于谁，
+                // 只有不带 scope 的视图（控制台）看得到，绝不冒充某台手机的回执。
+                entry.scope = Json.str(node, "scope", "");
                 entry.command = Json.str(node, "command", "");
                 entry.summary = Json.str(node, "summary", "");
                 entry.texts = Math.max(0, Json.num(node, "texts", 0));
@@ -255,6 +330,7 @@ public final class QuestIndex {
             for (Entry entry : sorted) {
                 JsonObject node = new JsonObject();
                 node.addProperty("number", entry.number);
+                node.addProperty("scope", entry.scope == null ? "" : entry.scope);
                 node.addProperty("command", entry.command);
                 node.addProperty("startedAt", stamp(entry.startedMillis));
                 node.addProperty("summary", entry.summary);

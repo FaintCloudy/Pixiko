@@ -306,9 +306,13 @@
     }
     if (list.sumText) {
       var total = Array.isArray(rows) ? rows.length : (Array.isArray(state && state.questList) ? state.questList.length : 0);
-      list.sumText.textContent = '共 ' + total + ' 条回执 · '
+      var line = '共 ' + total + ' 条回执 · '
         + (Number(unread) > 0 ? '未读 ' + Math.max(0, Number(unread)) + ' 条' : '全部已读')
         + (Number(latest) > 0 ? ' · 最新 #' + Math.max(0, Number(latest)) : '');
+      /* 归属说明：控制台与别的设备的回执被挡在外面时如实说出来（菜单里能一键看全部）。 */
+      if (list.filtering && list.hidden > 0) line += ' · 已隐藏其它会话 ' + list.hidden + ' 条';
+      else if (!list.filtering && !list.serverScoped && ledgerSize() === 0) line += ' · 含控制台/其它设备的回执';
+      list.sumText.textContent = line;
     }
   }
 
@@ -358,7 +362,32 @@
   var LIST_POLL_MS = 3000;          // 列表实时刷新：与出图屏同频（可见时每 3 秒一次）
   var list = { root: null, body: null, refresh: null, sumBadge: null, sumText: null, quests: null,
     unread: 0, latest: 0, error: '', loading: false, timer: null, lastAt: 0,
-    rowNodes: Object.create(null), percent: 0 };
+    rowNodes: Object.create(null), percent: 0,
+    /* 归属过滤的现场：服务端这次筛没筛（响应里的 scoped）、本机账本挡掉了几条、现在筛没筛。 */
+    serverScoped: false, hidden: 0, filtering: false };
+
+  /**
+   * 「只看这台手机发起的回执」开关（本机 localStorage，不分 scope —— 它就是这一台设备的偏好）。
+   *
+   * <p>默认**开**。只有当"本机账本为空"（这台手机还没下发过任何指令）时才不生效：
+   * 那时一条都不挡，免得用户打开回执看到一片空白（列表底部会把原因写清楚）。
+   */
+  var HIDE_FOREIGN_KEY = 'pixiko-quest-hide-foreign';
+  function hideForeign() {
+    try { var raw = localStorage.getItem(HIDE_FOREIGN_KEY); return raw === null ? true : raw === '1'; }
+    catch (error) { return true; }
+  }
+  function setHideForeign(value) {
+    try { localStorage.setItem(HIDE_FOREIGN_KEY, value ? '1' : '0'); } catch (error) { /* 隐私模式：只在本次会话里生效 */ }
+  }
+  /** 这条回执是不是"这台手机自己发起的"（账本由 app.js 在 /api/command、/api/chat 成功时写入）。 */
+  function isOurs(quest) {
+    if (!P.questLedger || typeof P.questLedger.has !== 'function') return true;   // 没有账本能力就别筛
+    return P.questLedger.has(P.scope(), num(quest && quest.number, 0));
+  }
+  function ledgerSize() {
+    return P.questLedger && typeof P.questLedger.size === 'function' ? P.questLedger.size(P.scope()) : 0;
+  }
 
   /** 建一行（只建骨架 + 绑一次点击；内容统统由 {@link fillRow} 改）。 */
   function rowFor(quest) {
@@ -504,15 +533,34 @@
     list.loading = true;
     list.lastAt = Date.now();
     if (!list.quests) renderList();
-    var pending = P.api('/api/quests', { body: { limit: LIMIT } });
+    var pending = P.api('/api/quests', { body: { limit: LIMIT, scope: P.scope() } });
     return Promise.resolve(pending).then(function (data) {
-      var quests = data && Array.isArray(data.quests) ? data.quests : [];
+      var rows = data && Array.isArray(data.quests) ? data.quests : [];
+      /*
+       * 归属过滤（「回执重复杂糅」的那一半）：
+       *   · 服务端已经按 scope 筛过（`scoped:true`）→ 原样用，客户端不再插一手；
+       *   · 还没筛（老服务端 / 本次改动尚未重启）→ 用本机账本把控制台与别的设备的回执挡在外面；
+       *   · 账本为空（这台手机还没下发过指令）→ 一条都不挡，绝不显示一个空列表。
+       * 挡掉的条数记在 list.hidden 里，摘要行会如实说明，菜单里也能一键看全部。
+       */
+      list.serverScoped = !!(data && data.scoped === true);
+      var filtering = !list.serverScoped && ledgerSize() > 0 && hideForeign();
+      var quests = filtering ? rows.filter(isOurs) : rows;
+      list.filtering = filtering;
+      list.hidden = rows.length - quests.length;
       list.quests = quests;
-      list.unread = Number.isFinite(Number(data && data.unread))
-        ? Math.max(0, Number(data.unread))
-        : quests.filter(function (item) { return item && item.unread; }).length;
-      list.latest = Number.isFinite(Number(data && data.latest)) ? Number(data.latest) : 0;
+      list.unread = filtering
+        ? quests.filter(function (item) { return item && item.unread; }).length
+        : (Number.isFinite(Number(data && data.unread))
+          ? Math.max(0, Number(data.unread))
+          : quests.filter(function (item) { return item && item.unread; }).length);
+      list.latest = filtering
+        ? quests.reduce(function (max, item) { return Math.max(max, num(item && item.number, 0)); }, 0)
+        : (Number.isFinite(Number(data && data.latest)) ? Number(data.latest) : 0);
       list.error = '';
+      /* 发布给外壳：未读角标在服务端还没按会话筛时要用这一份（见 app.js 的 refreshStatus）。 */
+      P.questView = { filtering: filtering, scoped: list.serverScoped, unread: list.unread,
+        latest: list.latest, hidden: list.hidden };
       syncCore(quests, list.unread, list.latest);
       renderList();
       return data;
@@ -603,8 +651,38 @@
         { text: '全部标为已读', onSelect: function () { markAllRead(); } },
         { text: '跳到最新（#' + (list.latest || 0) + '）', onSelect: function () { jumpLatest(); } },
         { text: '刷新列表', onSelect: function () { loadList(true); } }
-      ]
+      ].concat(foreignItems())
     }));
+  }
+
+  /**
+   * 「只看本机 / 显示全部」这一项（服务端已经按 scope 筛时不出现：那时没有"别人的回执"可切换）。
+   *
+   * <p>本机账本为空（这台手机还没下发过任何指令）时也不出现 —— 那时列表本来就是全量，
+   * 给一个点了没反应的开关只会让人困惑，摘要行里已经把原因写清楚了。
+   */
+  function foreignItems() {
+    if (list.serverScoped) return [];
+    var size = ledgerSize();
+    if (!size) return [];
+    if (hideForeign()) {
+      return [{
+        text: '显示全部会话的回执（' + size + ' 条本机）',
+        onSelect: function () {
+          setHideForeign(false);
+          toast('已显示全部回执（含控制台与其它设备）');
+          loadList(false);
+        }
+      }];
+    }
+    return [{
+      text: '只看这台手机的回执（账本 ' + size + ' 条）',
+      onSelect: function () {
+        setHideForeign(true);
+        toast('只看这台手机发起的回执');
+        loadList(false);
+      }
+    }];
   }
 
   function openDetail(number) {
@@ -618,6 +696,8 @@
     detail.pullSince = 0;
     detail.stepNodes = [];      // 新条目：DOM 会被整屏重挂，增量记账跟着清
     detail.stepCount = 0;
+    detail.idleRounds = 0;      // 收尾宽限：换条目重新计时
+    detail.lastSig = '';
     if (typeof P.go === 'function') P.go('quest-detail');
   }
 
@@ -681,7 +761,7 @@
     return [
       { text: '全部标为已读', onSelect: function () { markAllRead(); } },
       { text: '跳到最新（#' + (list.latest || 0) + '）', onSelect: function () { jumpLatest(); } }
-    ];
+    ].concat(foreignItems());
   }
 
   P.register('quest', { title: '回执', mount: mountList, refresh: refreshList, menu: listMenu });
@@ -691,7 +771,9 @@
      换条目（openDetail）或整屏重挂（mountDetail）时必须清掉 —— 那时 DOM 已经不在，留着会串页。 */
   var detail = { root: null, body: null, head: null, headNodes: null, number: 0, payload: null, error: '',
     loading: false, files: [], extras: [], timer: null, progress: null, stepNodes: [], stepCount: 0,
-    owned: [], ownedDirs: Object.create(null), pullSince: 0, window: null };
+    owned: [], ownedDirs: Object.create(null), pullSince: 0, window: null,
+    /* 「服务端说跑完了」之后的宽限：done && !busy 与"图真的进正文"之间还有一小段窗口，见 startDetail。 */
+    idleRounds: 0, lastSig: '' };
 
   /**
    * 这条回执**自己**的图片（只认 `/api/quest` 的 `messages`/`images` —— 服务端权威，不含"提前拉进来的" extras）。
@@ -1386,6 +1468,11 @@
         var dir = imageDirOf(file);
         if (dir) detail.ownedDirs[dir] = true;
       });
+      /* 正文签名变了（来了文字/图片）= 有新内容 → 收尾宽限重新计时（见 startDetail 的轮询）。 */
+      var sig = (Array.isArray(detail.payload.messages) ? detail.payload.messages.length : 0)
+        + '/' + (Array.isArray(detail.payload.texts) ? detail.payload.texts.length : 0)
+        + '/' + (Array.isArray(detail.payload.images) ? detail.payload.images.length : 0);
+      if (sig !== detail.lastSig) { detail.lastSig = sig; detail.idleRounds = 0; }
       renderDetail();
       var running = !detail.payload.error && !(detail.payload.done && !detail.payload.busy);
       /* 先把"生成时间窗 + 目录归属"算好，再决定要不要并提前到达的图 —— 并发/交错的任务就靠它分开。 */
@@ -1428,6 +1515,8 @@
     }
     detail.progress = { visible: false, percent: 0, label: '', card: null, fill: null, text: null };
     detail.loading = true;
+    detail.idleRounds = 0;
+    detail.lastSig = '';
     renderDetail();
     var main = document.getElementById('m-main');
     if (main) main.scrollTop = 0;
@@ -1451,7 +1540,17 @@
         var payload = detail.payload;
         if (!payload) return;
         var running = !payload.error && !(payload.done && !payload.busy);
-        if (!running) return;
+        if (!running) {
+          /*
+           * 「done && !busy」**不等于**"图已经进正文"：服务端先把任务移出生成队列（busy 因此变 false，
+           * 见 Bot.settleGenerationJob 里的 generationJobs.remove），再由另一个线程把图片投递进回执
+           * （getImages → outboxDelivery）。实测这段窗口约 46ms —— 3 秒轮询正好落进去，图就永远不出现
+           * （用户报的「有概率不回图片」；概率 ≈ 窗口/轮询间隔）。
+           * 所以静默后再宽限 3 轮（约 9 秒）；期间正文只要有一丁点变化就重新计时（见 loadDetail 里的签名）。
+           */
+          detail.idleRounds = (detail.idleRounds || 0) + 1;
+          if (detail.idleRounds >= 3) return;
+        }
         loadDetail(detail.number, true);
       }, 3000);
     }

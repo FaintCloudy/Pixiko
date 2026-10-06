@@ -45,6 +45,11 @@
   var REQUEST_TIMEOUT = 20000;                 // 普通请求超时（3G/局域网抖动留点余量）
   var LONG_REQUEST_TIMEOUT = 120000;           // /api/chat 要等模型，给足两分钟
   var CAPTURE_POLL_MS = 1200;                  // 回执轮询间隔
+  /**
+   * 跟一条回执的**时长上限**：出图可能要几分钟（`.gen 5`），所以给得比较宽；它只是防"异常残留"，
+   * 正常路径由"生成队列空了 + 静默两轮"收工（与 Bot#webActive 的 15 分钟残留判定同口径）。
+   */
+  var CAPTURE_FOLLOW_MAX_MS = 15 * 60 * 1000;
   var PROGRESS_POLL_MS = 1500;                 // 生成进度轮询间隔（与桌面版一致）
 
   var TABS = [
@@ -328,18 +333,22 @@
     var token = PixikoM.token();
     if (token) headers['Authorization'] = 'Bearer ' + token;
 
+    // 这次请求实际用的 scope（调用方显式给了就用它）：回执账本要按它记账。
+    var sentScope = PixikoM.scope();
+
     var body;
     if (options.body !== undefined && options.body !== null) {
       var payload = options.body;
       // scope 统一在这里补：所有 /api 接口都从 body.scope 取（见 WebApiController.api()）。
       if (typeof payload === 'object' && !Array.isArray(payload) && !('scope' in payload)) {
-        payload = Object.assign({}, payload, { scope: PixikoM.scope() });
+        payload = Object.assign({}, payload, { scope: sentScope });
       }
+      if (payload && typeof payload === 'object' && typeof payload.scope === 'string') sentScope = payload.scope;
       body = JSON.stringify(payload);
       headers['Content-Type'] = 'application/json; charset=utf-8';
     } else if (method === 'POST') {
       // 有些接口 requirePost，且要 scope；空体也给一个合法 JSON。
-      body = JSON.stringify({ scope: PixikoM.scope() });
+      body = JSON.stringify({ scope: sentScope });
       headers['Content-Type'] = 'application/json; charset=utf-8';
     }
 
@@ -371,6 +380,11 @@
       throw tagged(message, 'http', response.status);
     }
     if (data === null) throw tagged('机器人回了一段不是 JSON 的内容。', 'http', response.status);
+    /* 本机发起的指令：它产生的回执号记进账本（回执屏据此区分"这台手机的"与"控制台/别的设备的"）。
+       只认这两个真正"发起指令"的入口：/api/quest、/api/capture 只是读，读了别人的不能算自己的。 */
+    if ((path === '/api/command' || path === '/api/chat') && data && Number(data.quest) > 0) {
+      PixikoM.questLedger.note(sentScope, data.quest);
+    }
     return data;
   };
 
@@ -423,6 +437,61 @@
     try { localStorage.setItem(SCOPE_KEY, clean); } catch (error) { /* ignore */ }
     resolvedScope = clean;
     return clean;
+  };
+
+  /* ── 1e. 本机回执账本：这台手机自己发起过的回执 ───────────────────────────────
+   * 为什么需要：回执/任务类接口（/api/quests、/api/quest、/api/capture）在服务端一直是**全局**的，
+   * 回执行里也没有任何归属字段 —— 于是手机端的回执列表会把控制台、别的设备的回执一起列出来
+   * （用户报的「回执重复杂糅」）。
+   *
+   * 服务端已经补上了按 scope 过滤（`/api/quests` 的响应里 `scoped:true` 表示这次真的按会话筛过，
+   * 见 Bot#webQuests），但那份改动要**重启机器人**才生效；在那之前，客户端先用这份账本把
+   * "不是这台手机发起的"回执挡在列表外（见 screen-quest.js 的 loadList）。
+   *
+   * 只在**本机发起指令**的两个入口写入（/api/command 与 /api/chat 的成功响应），别的接口一律不写 ——
+   * 否则"看一眼别人的回执"就把它记成自己的了。按 scope 分账，与对话正文一个口径。
+   */
+  var QUEST_LEDGER_KEY = 'pixiko-quest-ledger';
+  var QUEST_LEDGER_CAP = 500;                  // 每个 scope 最多记多少条（够翻历史，也不让 localStorage 无限长）
+  var questLedger = null;
+  function ledgerBook() {
+    if (questLedger) return questLedger;
+    try {
+      var parsed = JSON.parse(localStorage.getItem(QUEST_LEDGER_KEY) || '{}');
+      questLedger = parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {};
+    } catch (error) { questLedger = {}; }
+    return questLedger;
+  }
+  function ledgerWrite() {
+    try { localStorage.setItem(QUEST_LEDGER_KEY, JSON.stringify(ledgerBook())); }
+    catch (error) { /* 隐私模式/localStorage 满：账本记不住只是少了这层兜底，不影响别的 */ }
+  }
+  function ledgerList(scope) {
+    var list = ledgerBook()[String(scope === null || scope === undefined ? '' : scope)];
+    return Array.isArray(list) ? list : [];
+  }
+  /** 本机回执账本（供回执屏过滤；服务端按 scope 过滤生效后它自动退居二线）。 */
+  PixikoM.questLedger = {
+    /** 记下一条"这台手机发起的"回执号（幂等）。 */
+    note: function (scope, quest) {
+      var number = Number(quest);
+      if (!(number > 0)) return;
+      var key = String(scope === null || scope === undefined ? '' : scope);
+      var book = ledgerBook();
+      var list = Array.isArray(book[key]) ? book[key] : [];
+      if (list.indexOf(number) >= 0) return;
+      list.push(number);
+      while (list.length > QUEST_LEDGER_CAP) list.shift();
+      book[key] = list;
+      ledgerWrite();
+    },
+    has: function (scope, quest) { return ledgerList(scope).indexOf(Number(quest)) >= 0; },
+    size: function (scope) { return ledgerList(scope).length; },
+    clear: function (scope) {
+      var book = ledgerBook();
+      delete book[String(scope === null || scope === undefined ? '' : scope)];
+      ledgerWrite();
+    }
   };
 
   /** 轻提示（自动消失，可叠多条）。 */
@@ -1273,11 +1342,17 @@
       PixikoM.state.status = data || null;
       PixikoM.state.generation = data && data.generation ? data.generation : null;
       var quests = (data && data.quests) || {};
-      PixikoM.state.quests = {
-        unread: fmtNum(quests.unread, 0),
-        latest: fmtNum(quests.latest, 0),
-        total: fmtNum(quests.total, fmtNum(quests.unread, 0))
-      };
+      var unread = fmtNum(quests.unread, 0);
+      var latest = fmtNum(quests.latest, 0);
+      /* 未读角标的权威来源：服务端按会话筛过（quests.scoped）就用它；
+         还没筛（老服务端/未重启）而回执屏已经在用本机账本过滤时，用**列表自己算的**那个数 ——
+         否则会出现"角标 6 条、点进去 1 条"（用户报的同一类不一致）。 */
+      var view = PixikoM.questView;
+      if (view && view.filtering && !(quests.scoped === true)) {
+        unread = fmtNum(view.unread, unread);
+        latest = fmtNum(view.latest, latest);
+      }
+      PixikoM.state.quests = { unread: unread, latest: latest, total: fmtNum(quests.total, unread) };
       PixikoM.state.lastError = null;
       renderQuestBadge();
       emit('status', PixikoM.state);
@@ -1980,11 +2055,17 @@
   void legacyScrollChatToBottomRemoved;
 
   /**
-   * 把 `chat.entries` 同步进 DOM —— **增量**：只 append 还没画过的条目。
+   * 把 `chat.entries` 同步进 DOM —— **增量**：只 append 还没画过的条目，内容变了的原地换掉。
    *
    * <p>为什么要增量：回执跟随时每轮 `chatRenderAll()` 都会 `clear(chat.host)` 整屏重建，
    * 已经加载好的 `<img>` 被反复销毁重建 —— 浏览器要重新建连接、重新解码，"每次加载都有延迟"
    * 就是它（`loading=lazy` 的图还会被重新判定成屏外）。现在已画过的气泡原样不动。
+   *
+   * <p>为什么还要认"内容变了"：回执的文字与图片是**分几次**到达的（先来文字、几秒到几十秒后
+   * 才来图片，见 followCapture）。只 append 的话，先画好的那条气泡**永远不会再更新** ——
+   * 服务端把图发出来了、`chat.entries` 里也有了、存档也写进去了，用户眼前那一条却还是没图
+   * （用户报的「下命令之后不回图片」在对话屏里就是它）。所以给每个气泡记一份内容签名
+   * （{@link chatEntrySig}），对不上的那一格原地换成新节点（只换这一格，别的图不动、不重新解码）。
    *
    * <p>认"画过没画过"用 `entry.seq`（`chatEntry`/`chatNormalize` 都发单调递增号），
    * 记在气泡的 `data-seq` 上；数量对不上（比如被别的分支清过）就退回整屏重建一次。
@@ -2006,12 +2087,26 @@
       chat.entries.forEach(function (entry) {
         var node = chatBubble(entry);
         node.setAttribute('data-seq', String(entry.seq));
+        node.setAttribute('data-sig', chatEntrySig(entry));
         chat.host.appendChild(node);
       });
     } else {
+      // ① 已经画过、但内容变了的（回执跟随时"后到的图片"就落在这里）：只换这一格
+      for (var k = 0; k < painted.length; k++) {
+        var known = chat.entries[k];
+        if (!known) break;
+        var want = chatEntrySig(known);
+        if (painted[k].getAttribute('data-sig') === want) continue;
+        var redraw = chatBubble(known);
+        redraw.setAttribute('data-seq', String(known.seq));
+        redraw.setAttribute('data-sig', want);
+        if (painted[k].parentNode) painted[k].parentNode.replaceChild(redraw, painted[k]);
+      }
+      // ② 还没画过的尾巴：照旧 append
       for (var i = painted.length; i < chat.entries.length; i++) {
         var fresh = chatBubble(chat.entries[i]);
         fresh.setAttribute('data-seq', String(chat.entries[i].seq));
+        fresh.setAttribute('data-sig', chatEntrySig(chat.entries[i]));
         chat.host.appendChild(fresh);
       }
     }
@@ -2045,21 +2140,44 @@
       var fresh = chatNormalize(data && data.entries);
       if (!fresh.length) return 0;
       var have = Object.create(null);
-      chat.entries.forEach(function (entry) { var key = chatEntrySig(entry); have[key] = (have[key] || 0) + 1; });
-      var added = 0;
+      var byText = Object.create(null);
+      chat.entries.forEach(function (entry) {
+        var key = chatEntrySig(entry);
+        have[key] = (have[key] || 0) + 1;
+        var textKey = entry.role + '\u0001' + entry.text;
+        (byText[textKey] || (byText[textKey] = [])).push(entry);
+      });
+      var added = 0, changed = 0;
       fresh.forEach(function (entry) {
         var key = chatEntrySig(entry);
         if (have[key]) { have[key]--; return; }
+        /* 服务端这一条本地没有完全一样的：先看是不是"同一条的完整版"——
+           本地那条先落了文字（还没图）就被防抖存了上去，图片到达后服务端那份已经是带图的。
+           以前这种情况会被当成新条目 **再 append 一条**，于是同一段回执在对话里出现两遍
+           （一份没图、一份有图）—— 用户报的「回执重复」。这里改成"并进本地那一条"。 */
+        var same = byText[entry.role + '\u0001' + entry.text];
+        var target = same && same.length ? same.shift() : null;
+        if (target) {
+          var mine = target.images || [];
+          var missing = (entry.images || []).filter(function (src) { return mine.indexOf(src) < 0; });
+          if (missing.length) {
+            target.images = mine.concat(missing);
+            have[key] = (have[key] || 0) + 1;      // 记上，免得同一份再并一次
+            changed++;
+            return;
+          }
+        }
         chat.entries.push(entry);
         added++;
       });
-      if (!added) return 0;
+      if (!added && !changed) return 0;
       if (chat.entries.length > CHAT_ENTRIES_CAP) chat.entries = chat.entries.slice(-CHAT_ENTRIES_CAP);
       var placeholder = chat.host && chat.host.querySelector('[data-state="empty"]');
       if (placeholder) clear(chat.host);
       chatRenderAll();
       chatFollow();                 // 只有用户本来就在底部附近才跟着走（不抢正在上翻的视口）
-      return added;
+      if (changed && !added) saveChatLogDebounced();   // 本地内容变了：把完整版存回去，别再产生分叉
+      return added || changed;
     }).catch(function () { return null; });
   }
 
@@ -2200,14 +2318,23 @@
 
   /**
    * 跟着一条回执轮询 POST /api/capture {id}，把陆续到达的文本与图片追加成**一条图文条目**（去重）。
-   * 结束条件：closed === true（或 done 后再等两轮没有新内容）。
+   * 结束条件：closed === true，或「done 且静默两轮**且生成队列也空了**」。
+   *
+   * <p><b>为什么不能只看 done</b>：`/gen` 这类指令把出图丢进队列就返回，`done` 在**受理后几十毫秒**
+   * 就变成 true（实测：受理 0.0s、done 0.2s、图进正文 19.8s）。老写法只看 `done && 静默两轮`
+   * 于是 3.7 秒就收工，图 16 秒后才回来 —— **图发到了服务端，页面却早就不接了**
+   * （用户报的「下命令之后有概率不回图片」；在对话屏里这几乎是必然，不是概率）。
+   * 现在收工前再问一次只读的 {@link /api/progress}：SD 还在生成、或生成队列里还有任务就继续跟；
+   * 队列空了再多等两轮（覆盖"图已投递、正要落进回执"的那几十毫秒），并且整体有时长兜底，绝不无限跟。
    */
   function followCapture(id, quest) {
     if (chat.captureStop) chat.captureStop();
     var seenText = Object.create(null);
     var seenImages = Object.create(null);
     var idleRounds = 0;
+    var queueRounds = 0;                      // 「回执已 done，但生成队列还没空」时多等的轮数
     var target = null;                        // 当前这条图文条目（新的内容往它上面并）
+    var startedAt = Date.now();
     chat.captureStop = PixikoM.pollWhileVisible(async function () {
       var data;
       try { data = await PixikoM.api('/api/capture', { body: { id: id, scope: PixikoM.scope() } }); }
@@ -2250,7 +2377,18 @@
         idleRounds++;
       }
 
-      var settled = !!(data && (data.closed || (data.done && idleRounds >= 2)));
+      var settled = !!(data && data.closed);
+      if (!settled && data && data.done && idleRounds >= 2) {
+        var live = null;
+        try { live = await PixikoM.api('/api/progress', { body: { scope: PixikoM.scope() } }); }
+        catch (error) { live = null; }
+        var pending = !!(live && (live.running || Number(live.queue) > 0));
+        if (pending) queueRounds = 0; else queueRounds++;
+        if (queueRounds >= 2) settled = true;
+      }
+      if (!settled && Date.now() - startedAt > CAPTURE_FOLLOW_MAX_MS) {
+        settled = true;               // 兜底：异常残留的回执不会让这个轮询永远跑下去
+      }
       if (settled) {
         if (chat.captureStop) chat.captureStop();
         chat.captureStop = null;

@@ -4207,7 +4207,7 @@ public final class Bot implements AutoCloseable {
         if (link.isBlank()) throw new IllegalArgumentException("请给出要下载的 Civitai 模型链接。");
         if (Double.isNaN(weight) || weight < 0 || weight > 2) throw new IllegalArgumentException("权重范围 0–2，默认 1。");
         requireLoraPermission(webEvent(scope == null ? "" : scope, "lora download"));
-        WebCapture receipt = newCapture(".lora download " + link);
+        WebCapture receipt = newCapture(".lora download " + link, scope == null ? "" : scope);
         if (!startLoraJob(null, receipt, "正在下载 LoRA，完成后自动保存展示图样式并加载模型。", true, true, () -> downloadAndLoad(link, weight))) {
             webCaptures.remove(receipt.id());
             return loraBusyJson();
@@ -4224,7 +4224,7 @@ public final class Bot implements AutoCloseable {
     public JsonObject webLoraCover(String name, String scope) {
         String value = name == null || name.isBlank() ? "all" : name.strip();
         requireLoraPermission(webEvent(scope == null ? "" : scope, "lora cover"));
-        WebCapture receipt = newCapture(".lora cover " + value);
+        WebCapture receipt = newCapture(".lora cover " + value, scope == null ? "" : scope);
         if (!startLoraJob(null, receipt, "正在补抓 Civitai 展示图。", true, () -> loraCover(null, value))) {
             webCaptures.remove(receipt.id());
             return loraBusyJson();
@@ -7346,10 +7346,26 @@ public final class Bot implements AutoCloseable {
         private volatile long readNanos;
         /** 网页 /api/image 能读到的目录（data/generated）：内嵌图片要落盘才能显示。 */
         private final Path imageRoot;
-        WebCapture(String id, String command) { this(id, command, null); }
-        WebCapture(String id, String command, Path imageRoot) { this.id = id; this.command = command; this.imageRoot = imageRoot; }
+        /** 这条回执的会话归属（见下面那个四参数构造器的说明）。 */
+        private final String scope;
+        WebCapture(String id, String command) { this(id, command, null, ""); }
+        WebCapture(String id, String command, Path imageRoot) { this(id, command, imageRoot, ""); }
+        /**
+         * @param scope 这条回执属于哪个网页会话（{@code web} 控制台 / {@code dev-xxxxxxxxxxxx} 某台手机）。
+         *              创建它的那次 {@code /api/command} 或 {@code /api/chat} 的 scope 说了算。回执/任务类
+         *              接口以前"不看 scope"，于是任何一台设备都能在列表与详情里看到控制台、别的设备的回执
+         *              （用户报的「回执重复杂糅」）。现在带上它，列表、单条与 {@code /api/status} 的角标都能按会话筛。
+         */
+        WebCapture(String id, String command, Path imageRoot, String scope) {
+            this.id = id;
+            this.command = command;
+            this.imageRoot = imageRoot;
+            this.scope = scope == null ? "" : scope;
+        }
         public String id() { return id; }
         public String command() { return command; }
+        /** 这条回执的会话归属（空串 = 不知道；老构造器与老测试用它，那种回执只有不带 scope 的视图看得到）。 */
+        public String scope() { return scope; }
         public int number() { return number; }
         /** 索引用的摘要信息：文字条数、图片条数、第一段文字（列表接口只回这些，不回正文数组）。 */
         public int textCount() { return texts.size(); }
@@ -7695,7 +7711,7 @@ public final class Bot implements AutoCloseable {
     public WebCapture webCommand(String scope, List<String> commands) {
         String label = String.join(" ; ", commands);
         WebCapture capture = new WebCapture(UUID.randomUUID().toString(), label,
-                settings.root.resolve("data/generated"));
+                settings.root.resolve("data/generated"), scope);
         JsonObject event = webEvent(scope, label);
         // 把回执 id 写进事件：异步步骤（LoRA 列表/下载、图片发送、生成完成）拿着同一份事件回来时，
         // 消息仍然进这条指令自己的回执，不会串到并发发出的另一条指令上。
@@ -7731,30 +7747,53 @@ public final class Bot implements AutoCloseable {
      * 已经重启/被淘汰就从 {@code data/quests/&lt;number&gt;.json} 读回来（多一个 {@code fromDisk:true}），
      * 只有磁盘上也没有才如实说"不在了"。
      */
-    public JsonObject webQuest(int number) {
+    public JsonObject webQuest(int number) { return webQuest(number, null); }
+
+    /**
+     * 按任务号取一条回执，可以限定会话（{@code scope} 为空 = 不筛，与老行为一字不差）。
+     *
+     * <p>带 scope 时**只认这个会话自己的回执**：别的会话（控制台 / 另一台手机）的任务号一律按
+     * "不在了"处理，也不把它标成已读 —— 这正是"跨 scope 混入"的另一半（列表筛了、详情没筛，
+     * 手机照样能把控制台的回执正文整篇拉出来看）。
+     */
+    public JsonObject webQuest(int number, String scope) {
         pruneWebCaptures();
-        int wanted = number > 0 ? number : latestQuest();
+        int wanted = number > 0 ? number : latestQuest(scope);
         WebCapture capture = null;
         if (wanted > 0) {
-            for (WebCapture item : webCaptures.values()) if (item.number == wanted) { capture = item; break; }
+            for (WebCapture item : webCaptures.values()) {
+                if (item.number != wanted) continue;
+                if (!visibleToScope(item.scope(), scope)) continue;
+                capture = item;
+                break;
+            }
         }
         if (capture == null) {
+            boolean foreign = wanted > 0 && questIndex.item(wanted, null) != null && questIndex.item(wanted, scope) == null;
+            if (foreign) {
+                // 号存在、但不属于这个会话：正文一个字都不给，也不改它的已读状态。
+                JsonObject denied = new JsonObject();
+                denied.addProperty("quest", number);
+                denied.addProperty("latest", latestQuest(scope));
+                denied.addProperty("error", "回执 #" + number + " 不属于这个会话（scope=" + scope + "）。");
+                return denied;
+            }
             // 内容不在了也照样算"打开过"：索引里那一条（如果还在）标为已读，列表里不再算未读。
             markQuestRead(wanted);
-            JsonObject stored = wanted > 0 ? questFromDisk(wanted) : null;
+            JsonObject stored = wanted > 0 ? questFromDisk(wanted, scope) : null;
             if (stored != null) {
-                stored.addProperty("latest", latestQuest());
+                stored.addProperty("latest", latestQuest(scope));
                 return stored;
             }
             JsonObject missing = new JsonObject();
             missing.addProperty("quest", number);
-            missing.addProperty("latest", latestQuest());
+            missing.addProperty("latest", latestQuest(scope));
             // 正文文件也没了（被索引上限裁掉或被手工删掉）时，索引里还有摘要就把摘要一起给出去：
             // /quest#N 这种直接打开的链接至少能看到"有过这么一条任务"，不用只吃一句报错。
-            JsonObject stale = wanted > 0 ? questIndex.item(wanted) : null;
+            JsonObject stale = wanted > 0 ? questIndex.item(wanted, scope) : null;
             if (stale != null) {
                 stale.addProperty("quest", number);
-                stale.addProperty("latest", latestQuest());
+                stale.addProperty("latest", latestQuest(scope));
                 stale.addProperty("error", "回执 #" + number + " 不在了：磁盘上没有正文文件（data/quests/"
                         + number + ".json），下面是索引里的摘要。");
                 return stale;
@@ -7769,20 +7808,31 @@ public final class Bot implements AutoCloseable {
         // "还在跑"必须把出图队列算进去：生成一张图要几十秒，只报 busy（DeepSeek/LoRA）
         // 会让回执页在生成期间就停表——用户就永远等不到那张图。
         JsonObject result = capture.json(webBusy() || generationQueued());
-        result.addProperty("latest", latestQuest());
+        result.addProperty("latest", latestQuest(scope));
         return result;
+    }
+
+    /** 一条回执的 scope 在"某个会话的视图"里可见吗（{@code scope} 为空 = 不筛；空归属只有不筛时才可见）。 */
+    private static boolean visibleToScope(String entryScope, String scope) {
+        if (scope == null || scope.isBlank()) return true;
+        return scope.equals(entryScope == null ? "" : entryScope);
     }
     /** 出图队列里还有任务吗（含正在生成的那一个）。 */
     public boolean generationQueued() {
         synchronized (generationLock) { return !generationJobs.isEmpty(); }
     }
     /** 最近一条回执的任务号（没有就是 0）：内存里没有就退回索引里的最大号（重启后照样有效）。 */
-    public int latestQuest() {
+    public int latestQuest() { return latestQuest(null); }
+
+    /** 某个会话里最近一条回执的任务号（{@code scope} 为空 = 所有会话，与老行为一致）。 */
+    public int latestQuest(String scope) {
         pruneWebCaptures();
         int latest = 0;
-        for (WebCapture item : webCaptures.values()) latest = Math.max(latest, item.number);
+        for (WebCapture item : webCaptures.values()) {
+            if (visibleToScope(item.scope(), scope)) latest = Math.max(latest, item.number);
+        }
         QuestIndex index = questIndex;
-        if (index != null) latest = Math.max(latest, index.latest());
+        if (index != null) latest = Math.max(latest, index.latest(scope));
         return latest;
     }
     /**
@@ -7791,20 +7841,31 @@ public final class Bot implements AutoCloseable {
      * <p>只回元信息与摘要，**不回任何正文数组**；正文一律在 {@code data/quests/&lt;n&gt;.json}，
      * 所以 {@code expired} 永远是 false、{@code retainedMinutes} 恒为 0（表示不过期）。
      */
-    public JsonObject webQuests(int limit) {
+    public JsonObject webQuests(int limit) { return webQuests(limit, null); }
+
+    /**
+     * 某个会话的回执列表（{@code scope} 为空 = 所有会话，与老行为一字不差）。
+     *
+     * <p>手机端（{@code /m?scope=dev-…}）每次请求都会带上自己的 scope，于是它只看得到自己下过的
+     * 回执；控制台（桌面 app.js）从不带 scope，列表照旧是全部 —— 两边互不可见，控制台一条也不少。
+     */
+    public JsonObject webQuests(int limit, String scope) {
         observeQuests();
-        return questIndex.json(limit, 0);
+        return questIndex.json(limit, 0, scope);
     }
     /**
      * 批量标记已读：numbers 里的任务号（索引里没有的忽略），或者 all=true 全部。
      * 返回 {@code {"unread":N,"marked":M}}，marked 是本次真正从"未读"变"已读"的条数。
      */
-    public JsonObject webMarkQuestsRead(Set<Integer> numbers, boolean all) {
+    public JsonObject webMarkQuestsRead(Set<Integer> numbers, boolean all) { return webMarkQuestsRead(numbers, all, null); }
+
+    /** 某个会话里的批量标记已读（{@code scope} 为空 = 所有会话；all=true 时只清这个会话的未读）。 */
+    public JsonObject webMarkQuestsRead(Set<Integer> numbers, boolean all, String scope) {
         observeQuests();
-        int marked = all ? questIndex.markAllRead() : questIndex.markRead(numbers);
+        int marked = all ? questIndex.markAllRead(scope) : questIndex.markRead(numbers);
         persistQuests(true);
         JsonObject result = new JsonObject();
-        result.addProperty("unread", questIndex.unread());
+        result.addProperty("unread", questIndex.unread(scope));
         result.addProperty("marked", marked);
         return result;
     }
@@ -7848,6 +7909,8 @@ public final class Bot implements AutoCloseable {
             JsonObject body = new JsonObject();
             body.addProperty("version", 1);
             body.addProperty("number", capture.number);
+            // 归属也落盘：收集器被淘汰/机器人重启之后，从磁盘读回正文时仍然知道这是谁的回执。
+            body.addProperty("scope", capture.scope());
             body.addProperty("command", capture.command());
             body.addProperty("startedAt", QuestIndex.stamp(capture.startedMillis()));
             body.addProperty("done", capture.done());
@@ -7867,11 +7930,20 @@ public final class Bot implements AutoCloseable {
      *
      * <p>没有这个文件、或者文件坏了都返回 null（坏文件只写日志，当作"没有正文"）。
      */
-    private JsonObject questFromDisk(int number) {
+    private JsonObject questFromDisk(int number) { return questFromDisk(number, null); }
+
+    /**
+     * 磁盘正文的读取（可以限定会话，{@code scope} 为空 = 不筛）。
+     *
+     * <p>老正文文件里没有 {@code scope}（本次改动之前写的）→ 归属算"不知道"，带 scope 的视图一律不认它：
+     * 宁可让手机端少看到一条旧回执，也不把控制台的回执当成它的。
+     */
+    private JsonObject questFromDisk(int number, String scope) {
         Path file = questBodyFile(number);
         if (file == null || !Files.isRegularFile(file)) return null;
         try {
             JsonObject stored = Json.parse(Files.readString(file, StandardCharsets.UTF_8));
+            if (!visibleToScope(Json.str(stored, "scope", ""), scope)) return null;
             JsonObject result = new JsonObject();
             // 磁盘上的回执没有活着的收集器 id：给一个稳定可读的标识，字段本身照旧保留。
             result.addProperty("id", "quest-" + number);
@@ -7959,8 +8031,9 @@ public final class Bot implements AutoCloseable {
      * 建一条回执（内部接口触发的任务也得有回执，不然"每次任务一个回执"就漏了）。
      * 和 {@link #webCommand} 一样登记进 webCaptures，网页照常轮询、/quest/#N 也能看。
      */
-    private WebCapture newCapture(String label) {
-        WebCapture capture = new WebCapture(UUID.randomUUID().toString(), label, settings.root.resolve("data/generated"));
+    private WebCapture newCapture(String label) { return newCapture(label, ""); }
+    private WebCapture newCapture(String label, String scope) {
+        WebCapture capture = new WebCapture(UUID.randomUUID().toString(), label, settings.root.resolve("data/generated"), scope);
         webCaptures.put(capture.id(), capture);
         observeQuest(capture);
         return capture;
@@ -8116,7 +8189,15 @@ public final class Bot implements AutoCloseable {
      * 网页状态面板的数据。网页与 QQ 两侧独立：这里只报网页自己用得上的东西
      * （模型/生成参数/队列/图片/词库约束/Civitai 账号），不含 owner QQ、admin 名单、地图等 QQ 侧信息。
      */
-    public JsonObject webStatus() throws Exception {
+    public JsonObject webStatus() throws Exception { return webStatus(null); }
+
+    /**
+     * 网页状态面板的数据（{@code scope} 为空 = 角标按所有会话算，与老行为一致）。
+     *
+     * <p>带 scope 时（手机端的请求）那一小块 {@code quests} 也只数这个会话的：列表按会话筛了、
+     * 角标却数全部的话，用户会看到"徽标 6 条、点进去 1 条"。
+     */
+    public JsonObject webStatus(String scope) throws Exception {
         JsonObject result = new JsonObject();
         result.addProperty("botName", settings.botName());
         result.addProperty("scope", settings.webScope());
@@ -8180,7 +8261,7 @@ public final class Bot implements AutoCloseable {
         result.addProperty("loraStatus", loraStatus);
         // 任务回执：列表页的角标只看这两个数（未读几条、最新是几号），不用把整份列表拉下来。
         observeQuests();
-        result.add("quests", questIndex.counts());
+        result.add("quests", questIndex.counts(scope));
         return result;
     }
 

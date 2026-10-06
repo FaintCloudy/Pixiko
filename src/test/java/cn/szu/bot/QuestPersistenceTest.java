@@ -39,8 +39,8 @@ import cn.szu.bot.web.WebUiServer;
 public final class QuestPersistenceTest {
     private static final String TOKEN = "test-token-123456";
     private static final HttpClient HTTP = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(5)).build();
-    /** 落盘格式的契约字段：一个都不能多、一个都不能少。 */
-    private static final Set<String> BODY_KEYS = Set.of("version", "number", "command", "startedAt", "done",
+    /** 落盘格式的契约字段：一个都不能多、一个都不能少（{@code scope} = 这条回执属于哪个网页会话）。 */
+    private static final Set<String> BODY_KEYS = Set.of("version", "number", "scope", "command", "startedAt", "done",
             "texts", "images", "messages");
     private static final Bot.Sender SENDER = new Bot.Sender() {
         @Override public CompletableFuture<Void> send(JsonObject event, JsonArray segments) {
@@ -73,7 +73,7 @@ public final class QuestPersistenceTest {
             remove(cappedRoot);
         }
         System.out.println("QuestPersistenceTest: " + checks + " assertions passed：正文落盘（UTF-8 无 BOM、"
-                + "契约 8 字段、图片只写引用）、关停重启后 /api/quest 从磁盘回填完整正文（fromDisk/expired/busy）、"
+                + "契约 9 字段（含归属 scope）、图片只写引用）、关停重启后 /api/quest 从磁盘回填完整正文（fromDisk/expired/busy）、"
                 + "/api/quests 的 expired 恒为 false 且 retainedMinutes=0、内存按条数淘汰后仍能读回、"
                 + "缺/坏正文文件只说'不在了'、索引上限裁掉的最旧那条连正文一起删、"
                 + "写盘失败只写日志不影响 /api/quests、索引丢了按磁盘最大号发号");
@@ -104,7 +104,9 @@ public final class QuestPersistenceTest {
                 check(!(bytes.length >= 3 && (bytes[0] & 0xFF) == 0xEF && (bytes[1] & 0xFF) == 0xBB
                                 && (bytes[2] & 0xFF) == 0xBF), "正文文件是 UTF-8 无 BOM");
                 JsonObject stored = Json.parse(Files.readString(body, StandardCharsets.UTF_8));
-                check(stored.keySet().equals(BODY_KEYS), "正文就是契约里的 8 个字段：" + stored.keySet());
+                check(stored.keySet().equals(BODY_KEYS), "正文就是契约里的 9 个字段：" + stored.keySet());
+                check(stored.get("scope").getAsString().equals("web"),
+                        "归属一并落盘（这条指令是控制台 scope 发的）：" + stored.get("scope"));
                 check(stored.get("version").getAsInt() == 1 && stored.get("number").getAsInt() == first
                                 && stored.get("done").getAsBoolean(), "version/number/done 如实写入：" + stored.keySet());
                 check(stored.get("command").getAsString().equals(".help"), "command 一并落盘：" + stored.get("command"));

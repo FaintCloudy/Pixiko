@@ -104,7 +104,7 @@ public class WebApiController {
     private ResponseEntity<?> route(HttpServletRequest request, String path, JsonObject body, String scope) throws Exception {
         String method = request.getMethod();
         switch (path) {
-            case "/api/status": return WebJson.ok(bot.webStatus());
+            case "/api/status": return WebJson.ok(bot.webStatus(questScope(request, body)));
             case "/api/functions": return WebJson.ok(bot.webFunctions(scope));
             case "/api/presets": return WebJson.ok(bot.webPresets());
             case "/api/options": return WebJson.ok(bot.webOptions());
@@ -213,9 +213,11 @@ public class WebApiController {
                 return WebJson.of(HttpStatus.ACCEPTED, capture.json(bot.webBusy()));
             }
             // 任务回执（/quest/#22）：按任务号取那一条，实时返回指令结果与图片。
-            case "/api/quest": return WebJson.ok(bot.webQuest(Json.num(body, "id", 0)));
+            // scope：带上就只认这个会话的回执（手机端每次都带），不带就是老行为（控制台）。
+            case "/api/quest": return WebJson.ok(bot.webQuest(Json.num(body, "id", 0), questScope(request, body)));
             // 任务回执列表（摘要 + 未读标记）：正文仍然只有 /api/quest 才回，列表里一条正文都不带。
-            case "/api/quests": return WebJson.ok(bot.webQuests(questLimit(request, body)));
+            // 不传 scope = 不过滤（控制台一字未改）；传了 = 只看这个会话自己的回执（手机端）。
+            case "/api/quests": return WebJson.ok(bot.webQuests(questLimit(request, body), questScope(request, body)));
             case "/api/quests/read": {
                 requirePost(method);
                 // numbers 是任务号数组（不存在的忽略），all=true 表示全部标为已读。
@@ -225,7 +227,7 @@ public class WebApiController {
                 for (JsonElement item : items) {
                     try { numbers.add(item.getAsInt()); } catch (RuntimeException ignored) { /* 非数字的号忽略 */ }
                 }
-                return WebJson.ok(bot.webMarkQuestsRead(numbers, Json.bool(body, "all", false)));
+                return WebJson.ok(bot.webMarkQuestsRead(numbers, Json.bool(body, "all", false), questScope(request, body)));
             }
             case "/api/capture": {
                 Bot.WebCapture capture = bot.webCapture(Json.str(body, "id", ""));
@@ -443,6 +445,27 @@ public class WebApiController {
         String value = request.getParameter("limit");
         if (value == null || value.isBlank()) return 50;
         try { return Integer.parseInt(value.strip()); } catch (NumberFormatException ignored) { return 50; }
+    }
+
+    /**
+     * 回执/任务类接口的"会话过滤"参数：**请求里没给 scope 就返回 {@code null}（= 不筛）**。
+     *
+     * <p>为什么不直接用 {@link #api} 算好的那个 scope：它省略时会被填成控制台的
+     * {@link Settings#webScope()}（{@code "web"}），拿它去筛等于"控制台只看得到 web 会话的回执"——
+     * 桌面控制台（{@code webui/app.js} 的 api() 只发自己的 body、从不补 scope）会突然少掉一大半回执。
+     * 这里坚持「不传 = 保持现状」，控制台一条不少；手机端每次请求都带自己的 {@code dev-…}，于是只看得到自己的。
+     *
+     * <p>body 与查询串都认（{@code POST {scope}} 是手机端的写法，{@code GET ?scope=} 也照收）。
+     */
+    static String questScope(HttpServletRequest request, JsonObject body) {
+        String value = body == null ? "" : Json.str(body, "scope", "");
+        if (value.isBlank()) {
+            String query = request.getParameter("scope");
+            value = query == null ? "" : query;
+        }
+        value = value.strip();
+        // resolveScope 只做"存储键形状"的统一（非法形状退回 web），与 /api/** 其它接口同一个口径。
+        return value.isEmpty() ? null : resolveScope(value);
     }
 
     /** 本机 LoRA 的展示图（civitai.lora_dir 里的 <模型名>.preview.png），路径校验在 Bot 里做。 */
