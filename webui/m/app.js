@@ -24,8 +24,24 @@
   /* ── 1. 常量与工具 ───────────────────────────────────────────────────── */
 
   var TOKEN_KEY = 'kotori-webui-token';        // 同源 localStorage，Android 外壳会自动写
-  var SCOPE_KEY = 'pixiko-scope';              // scope 存在本地，默认 web
+  var SCOPE_KEY = 'pixiko-scope';              // 控制台/浏览器的 scope 键，本地，默认 web
   var DEFAULT_SCOPE = 'web';
+  /**
+   * 本机（这一台手机）的设备 scope 在 localStorage 里的镜像键。
+   *
+   * <p>**刻意不复用 pixiko-scope**：两套界面同源（同一台服务器的 localStorage 是同一个），
+   * 共用键会让设备 scope 漏进桌面控制台、或者控制台手改的 scope 覆盖掉设备身份。
+   * 键名与 Android 侧的 NativeHook.DEVICE_SCOPE_KEY 必须完全一致。
+   */
+  var DEVICE_SCOPE_KEY = 'pixiko-device-scope';
+  /**
+   * 设备 scope 的形状：dev- 加 12 位小写十六进制。
+   *
+   * <p>为什么由 Android 外壳给而不是网页自己随机生成：scope 就是「这台设备是谁」（卸载重装才会变），
+   * 必须落在 SharedPreferences 里 —— 网页的 localStorage 会被「清除网页缓存」之类的操作清掉。
+   * 只认这个形状是为了不被 URL 上随手塞的字符串牵着走（页面的 scope 决定它读写哪一份对话）。
+   */
+  var DEVICE_SCOPE_PATTERN = /^dev-[0-9a-f]{12}$/;
   var REQUEST_TIMEOUT = 20000;                 // 普通请求超时（3G/局域网抖动留点余量）
   var LONG_REQUEST_TIMEOUT = 120000;           // /api/chat 要等模型，给足两分钟
   var CAPTURE_POLL_MS = 1200;                  // 回执轮询间隔
@@ -114,6 +130,98 @@
     return isFinite(n) ? n : (fallback === undefined ? 0 : fallback);
   }
 
+  /* ── 1b. 设备 scope：这一台手机自己的对话身份 ─────────────────────────── */
+
+  /**
+   * 从地址上取设备 scope：/m?scope=dev-xxxxxxxxxxxx。
+   *
+   * <p>只读 location.search（查询串），**不读 hash 里那份**：hash 是页面自己的路由
+   * （#/chat、#/quest/12…），改 hash 不会动查询串，所以查询串上的 scope 天然扛得住
+   * 页面内跳转、深链接与刷新（Android 的下拉刷新是整页 reload，重新请求的还是这个地址）。
+   */
+  function scopeFromUrl() {
+    try {
+      var search = String(location.search || '');
+      if (!search) return '';
+      var match = /[?&]scope=([^&#]*)/.exec(search);
+      if (!match) return '';
+      var value = String(decodeURIComponent(match[1])).trim();
+      return DEVICE_SCOPE_PATTERN.test(value) ? value : '';
+    } catch (error) { return ''; }
+  }
+
+  /**
+   * 外壳直接注入的备用通道（window.__PIXIKO_SCOPE，见 Android 的 NativeHook.deviceScopeScript）。
+   * 只在「地址上没写」时兜底。
+   */
+  function scopeFromWindow() {
+    try {
+      var value = window.__PIXIKO_SCOPE;
+      if (typeof value !== 'string') return '';
+      var text = value.trim();
+      return DEVICE_SCOPE_PATTERN.test(text) ? text : '';
+    } catch (error) { return ''; }
+  }
+
+  function readStore(key) {
+    try { return localStorage.getItem(key) || ''; } catch (error) { return ''; }
+  }
+
+  function writeStore(key, value) {
+    try { localStorage.setItem(key, String(value)); } catch (error) { /* 隐私模式写不进去就只在本次会话里生效 */ }
+  }
+
+  /** 本机镜像里记着的设备 scope（外壳在上一页写过，或者启动时从地址上抄下来的）。 */
+  function scopeFromStore() {
+    var value = readStore(DEVICE_SCOPE_KEY).trim();
+    return DEVICE_SCOPE_PATTERN.test(value) ? value : '';
+  }
+
+  /** 启动时就把地址上的 scope 定下来：这样第一次 PixikoM.scope() 调用（boot 里的状态轮询）已经拿到正确值。 */
+  var resolvedScope = scopeFromUrl() || scopeFromWindow() || scopeFromStore();
+
+  /**
+   * 把权威 scope 写进本机镜像（只在真的不一样时写）。
+   *
+   * <p>为什么必须**无条件**同步、而不是只在"和内存里的 resolvedScope 不同"时才写：
+   * 模块初始化时 resolvedScope 已经等于地址上的值了，之后再调用 resolveScope 就永远看不到差异 ——
+   * 镜像键会一直空着，于是整页重载（Android 下拉刷新）时万一地址少了参数就没得兜。
+   */
+  function syncMirror(value) {
+    if (scopeFromStore() !== value) writeStore(DEVICE_SCOPE_KEY, value);
+  }
+
+  /**
+   * 解析当前该用的 scope，并顺手把结果固化到本机镜像。
+   *
+   * <p>优先级（**外壳给的设备 scope 永远压过页面自己存的东西**，否则「每台设备独立」就是假的）：
+   * <ol>
+   *   <li>地址上的 ?scope=dev-… —— Android 外壳每次加载 /m 都带（权威，扛得住整页重载）；</li>
+   *   <li>window.__PIXIKO_SCOPE —— 外壳注入的备用通道；</li>
+   *   <li>本机镜像 pixiko-device-scope —— 上面两条都没有时（页面内刷新、外壳没来得及注入）；</li>
+   *   <li>控制台/浏览器用的 pixiko-scope —— 只是**降级**路径：从手机浏览器直接打开
+   *       http://主机:8787/m 时没有外壳、也没有镜像，此时沿用老行为（默认 web），
+   *       页面照常能用、不报错、不白屏；</li>
+   *   <li>DEFAULT_SCOPE（web）。</li>
+   * </ol>
+   *
+   * <p>**只认 dev-… 形状**：地址上被人手塞一个 ?scope=alice 不会被当成设备 scope，
+   * 免得页面被随手拼的查询串牵着去读写别人的对话。
+   */
+  function resolveScope() {
+    var fromUrl = scopeFromUrl();
+    if (fromUrl) { syncMirror(fromUrl); resolvedScope = fromUrl; return resolvedScope; }
+    var fromWindow = scopeFromWindow();
+    if (fromWindow) { syncMirror(fromWindow); resolvedScope = fromWindow; return resolvedScope; }
+    if (resolvedScope && scopeFromStore() === resolvedScope) return resolvedScope;
+    var stored = scopeFromStore();
+    if (stored) { resolvedScope = stored; return resolvedScope; }
+    // 降级：没有外壳给的设备 scope。沿用老行为（pixiko-scope，默认 web），页面照常可用。
+    var fallback = readStore(SCOPE_KEY).trim() || DEFAULT_SCOPE;
+    resolvedScope = fallback;
+    return resolvedScope;
+  }
+
   /* ── 2. PixikoM：契约实现 ────────────────────────────────────────────── */
   /**
    * 全局契约对象。**签名与行为对四个并行开发的代理是冻结的**，改动必须同步所有人。
@@ -137,6 +245,15 @@
   /** 已经 mount 过的屏幕 id（mount 只在首次进入时调一次）。 */
   var mounted = Object.create(null);
   var currentId = null;
+
+  /**
+   * 上一次路由时生效的 scope，以及「守卫是否已经武装」。
+   *
+   * <p>武装的时机见 boot()：首次路由**之前**才记下当时的 scope，否则首屏那一次 applyRoute
+   * 会被当成「scope 变了」，白白把页面刷一遍。
+   */
+  var routedScope = null;
+  var scopeGuardArmed = false;
 
   /**
    * 注册一个屏幕。
@@ -274,12 +391,37 @@
       else localStorage.setItem(TOKEN_KEY, String(value));
     } catch (error) { /* 隐私模式下写不进去就算了 */ }
   };
-  PixikoM.scope = function () {
-    try { return localStorage.getItem(SCOPE_KEY) || DEFAULT_SCOPE; } catch (error) { return DEFAULT_SCOPE; }
+  /**
+   * 当前这一屏该用的 scope —— **所有对话相关请求都走它**（PixikoM.api 统一往 body 里补 scope）。
+   *
+   * <p>解析规则见 resolveScope：外壳给的设备 scope（?scope=dev-… / window.__PIXIKO_SCOPE）
+   * 永远优先，其次本机镜像，最后才降级到老的 pixiko-scope（默认 web）。
+   * 每次调用都重算：Android 外壳可以在页面已经开着的时候改地址栏，或者注入 window.__PIXIKO_SCOPE。
+   */
+  PixikoM.scope = function () { return resolveScope(); };
+
+  /** 本机设备 scope（dev-…）；没有外壳、走了降级路径时返回空串。诊断与「关于」面板用。 */
+  PixikoM.deviceScope = function () {
+    var value = resolveScope();
+    return DEVICE_SCOPE_PATTERN.test(value) ? value : '';
   };
+
+  /** 现在这个 scope 是不是外壳给的设备 scope（界面用它决定「能否手改 scope」）。 */
+  PixikoM.scopeManaged = function () { return !!PixikoM.deviceScope(); };
+
+  /**
+   * 改 scope。**只有「降级模式」（没有设备 scope）才真的改**：
+   * 一旦外壳给了设备 scope，这台设备的对话身份就由外壳（SharedPreferences 里的 UUID）说了算，
+   * 网页里手改会立刻被下一次 resolveScope() 覆盖回去 —— 所以这里返回**实际生效**的值，
+   * 免得界面显示一个假的 scope。
+   *
+   * @returns {string} 实际生效的 scope
+   */
   PixikoM.setScope = function (value) {
     var clean = String(value === null || value === undefined ? '' : value).trim() || DEFAULT_SCOPE;
+    if (PixikoM.deviceScope()) return PixikoM.scope();
     try { localStorage.setItem(SCOPE_KEY, clean); } catch (error) { /* ignore */ }
+    resolvedScope = clean;
     return clean;
   };
 
@@ -1264,6 +1406,17 @@
     var raw = String(location.hash || '').replace(/^#\/?/, '').split('?')[0].split('/')[0];
     var id = raw || 'chat';
     if (!screens[id] && TITLES[id] === undefined && !raw) id = 'chat';
+    // scope 变了（外壳改了地址栏、或注入进了 window.__PIXIKO_SCOPE）＝ 眼前这一屏的数据已经属于「另一个人」。
+    // 这里**只做一件事：整页重载**。为什么不就地重挂屏幕 —— 每屏的 mount 只在首次进入时跑一次，
+    // 就地重挂要挨个通知六个 screen-*.js 丢掉自己的缓存（列表、图集、记账表都在各自闭包里），
+    // 漏一个就会拿旧 scope 的内容接着显示。重载是唯一「所有状态一起归零」的做法，而且外壳的下拉刷新
+    // 本来就是整页重载（MainActivity 的 SwipeRefreshLayout → webView.reload），这条路已经跑熟了。
+    var liveScope = PixikoM.scope();
+    if (scopeGuardArmed && liveScope !== routedScope) {
+      routedScope = liveScope;
+      location.reload();
+      return;
+    }
     if (id === currentId && mounted[id]) { renderBar(); renderTabs(); return; }
 
     // 离开旧屏：所有屏幕的滚动位置各自保留（display:none 不会丢 scrollTop）
@@ -3139,6 +3292,10 @@
   function boot() {
     if (booted) return;
     booted = true;
+    // 先把这一页的对话身份定下来（外壳给的设备 scope → 本机镜像 → 老行为）：
+    // 同时会**固化进本机镜像**（localStorage 的 pixiko-device-scope），于是**整页重载**
+    // （Android 的下拉刷新就是 webView.reload）之后即使地址上没带 scope，也还是同一台设备的对话。
+    PixikoM.scope();
     installDeviceFrame();
     installTabs();
     installPullToRefresh();
@@ -3158,6 +3315,10 @@
     });
 
     window.addEventListener('hashchange', applyRoute);
+    // 首次路由之前把 scope 守卫武装起来：记下此刻解析出的 scope，之后任何一次
+    // 「解析结果与它不同」都视为外壳把这一页换给了另一个设备 scope → 整页重跑（见 applyRoute）。
+    routedScope = PixikoM.scope();
+    scopeGuardArmed = true;
     applyRoute();
     if (!location.hash) location.replace('#/chat');
     // 给自动化/外壳用：**首次路由跑完并且画面稳定之后**才置位。

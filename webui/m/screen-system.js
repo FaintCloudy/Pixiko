@@ -631,7 +631,9 @@
       var affinity = status.affinity || {};
       var mood = status.mood || {};
       body.appendChild(kv('机器人', status.botName));
-      body.appendChild(kv('会话 scope', status.scope));
+      // 注意：/api/status 的 scope 是**服务端给控制台定的** settings.webScope()（"web"），
+      // 与这一页（手机端）真正在用的设备 scope 不是一回事，所以标签写清「控制台」。
+      body.appendChild(kv('控制台 scope', status.scope));
       body.appendChild(kv('网页端口', status.webPort));
       body.appendChild(kv('聊天开关', chat.global ? '开启' : '关闭', chat.global ? 'ok' : 'bad'));
       body.appendChild(kv('回复上限', (chat.frequency === undefined ? '—' : chat.frequency + ' 次/分钟')));
@@ -988,7 +990,9 @@
       var mood = status.mood || {};
       body.appendChild(kv('好感度', affinity.score === undefined ? '—' : affinity.score + '（' + (affinity.tier || '—') + '）'));
       body.appendChild(kv('情绪', mood.mood === undefined ? '—' : String(mood.mood)));
-      body.appendChild(kv('会话 scope', status.scope));
+      // 注意：/api/status 的 scope 是**服务端给控制台定的** settings.webScope()（"web"），
+      // 与这一页（手机端）真正在用的设备 scope 不是一回事，所以标签写清「控制台」。
+      body.appendChild(kv('控制台 scope', status.scope));
     }
 
     var switches = byId('sy-cc-switches');
@@ -1252,10 +1256,17 @@
     var token = '';
     try { token = String(api().token() || ''); } catch (error) { token = ''; }
     var scope = scopeOf();
+    var managed = false;
+    try { managed = !!(api() && api().scopeManaged && api().scopeManaged()); } catch (error) { managed = false; }
     node.appendChild(kv('服务器地址', location.origin));
     node.appendChild(kv('访问令牌', token ? ('已配置（' + token.length + ' 位，不显示内容）') : '未配置', token ? 'ok' : 'bad'));
     node.appendChild(kv('令牌长度', token ? token.length + ' 位' : '0 位'));
     node.appendChild(kv('scope', scope || '（默认）'));
+    if (managed) {
+      // 设备 scope 由 Android 外壳给（装完首次运行生成，卸载重装才变），见 webui/m/app.js 的 resolveScope。
+      node.appendChild(make('div', 'sy-note', '这一台手机自己一段对话：scope 由 Android 外壳按本机设备标识给（'
+        + scope + '），与控制台的 scope 互不可见。这个值由外壳决定，网页里改不动；重装 App 才会换一个新的。'));
+    }
     var actions = make('div', 'sy-actions');
     var test = button('sy-btn', '测试连接', 'sy-sv-test');
     test.addEventListener('click', function () {
@@ -1265,7 +1276,7 @@
       api().api('/api/status', { method: 'POST', body: {} }).then(function (status) {
         fillServerStatus(status);
         out.className = 'sy-note ok';
-        out.textContent = '连接正常：' + (status.botName || '机器人') + ' · 端口 ' + status.webPort + ' · 会话 ' + status.scope;
+        out.textContent = '连接正常：' + (status.botName || '机器人') + ' · 端口 ' + status.webPort + ' · 控制台 scope ' + status.scope;
         toast('连接正常');
       }, function (error) {
         classify(error).then(function (text) {
@@ -1276,7 +1287,14 @@
       });
     });
     var change = button('sy-btn ghost', '切换 scope', 'sy-sv-scope');
+    if (managed) {
+      // 有设备 scope 时「换 scope」是个陷阱：换了也会被 resolveScope() 立刻覆盖回去，
+      // 界面上却像已经换了。这里干脆禁用，并在点击时如实说明。
+      change.disabled = true;
+      change.setAttribute('title', '设备 scope 由 Android 外壳决定，网页里不能改');
+    }
     change.addEventListener('click', function () {
+      if (managed) { toast('设备 scope 由 Android 外壳决定（这一台手机一段对话），网页里改不动'); return; }
       promptBox('切换 scope', scopeOf() || 'web', '例如 web / alice', '切换').then(function (next) {
         var value = String(next || '').trim();
         if (!value || value === scopeOf()) return;

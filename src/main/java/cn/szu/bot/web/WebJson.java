@@ -56,6 +56,16 @@ final class WebJson {
                 .body(body);
     }
 
+    /** 二进制响应（APK）：状态码 + 任意响应头 + 字节体。Content-Length 由 Spring 按 body 长度给。 */
+    static ResponseEntity<byte[]> bytes(HttpStatus status, byte[] body, String contentType, String cacheControl,
+                                        HttpHeaders extraHeaders) {
+        return ResponseEntity.status(status)
+                .header(HttpHeaders.CONTENT_TYPE, contentType)
+                .header(HttpHeaders.CACHE_CONTROL, cacheControl)
+                .headers(extraHeaders)
+                .body(body);
+    }
+
     static String contentTypeOf(String name) {
         return name.endsWith(".html") ? "text/html; charset=utf-8"
                 : name.endsWith(".js") ? "application/javascript; charset=utf-8"

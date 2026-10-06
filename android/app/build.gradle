@@ -17,8 +17,8 @@ android {
         applicationId "cn.szu.bot.app"
         minSdk 26
         targetSdk 34
-        versionCode 160
-        versionName "1.6.0"
+        versionCode 161
+        versionName "1.6.1"
         // 没有自定义 vector drawable / 多密度拆分，保持单一 APK。
         resourceConfigurations += ['zh', 'en']
 
@@ -67,6 +67,27 @@ android {
         checkReleaseBuilds false
         abortOnError false
     }
+
+    testOptions {
+        unitTests {
+            // 失败时把断言消息、被断言的值以及测试里 System.out 打的「实测证据」一起显示出来。
+            // 交付报告里那些「假服务收到了什么请求 / 进度回调到多少」就是这样拿到的。
+            all {
+                testLogging {
+                    events 'failed', 'passed', 'skipped'
+                    exceptionFormat 'full'
+                    showStandardStreams = true
+                    // 每个用例一行，别把整个测试套件的输出搅在一起。
+                    showExceptions = true
+                    showCauses = true
+                    showStackTraces = true
+                }
+            }
+            // 刻意**不**开 returnDefaultValues：那会让所有没 mock 的 Android API 静默返回默认值，
+            // 把「忘了 mock」变成「测试悄悄通过」。日志那一处需要替换出口，已经由 Log.setSink 单独解决。
+            returnDefaultValues = false
+        }
+    }
 }
 
 dependencies {
@@ -78,4 +99,10 @@ dependencies {
     implementation 'com.google.android.material:material:1.12.0'
     // WebViewCompat/WebViewFeature（深色模式与 WebView 版本判断用得上）。
     implementation 'androidx.webkit:webkit:1.11.0'
+
+    // ---- 下面两个**只进 testImplementation**，一个字节都不会打进 APK ----
+    // 原因：Android 框架里的 org.json 在 JVM 单测里是 stub（调一下就抛 "not mocked"），
+    // 而更新检查的 JSON 解析必须能真的跑断言，所以单测这边挂一份真正的实现。
+    testImplementation 'junit:junit:4.13.2'
+    testImplementation 'org.json:json:20231013'
 }

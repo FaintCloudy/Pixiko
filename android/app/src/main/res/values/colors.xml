@@ -7,5 +7,9 @@
     <color name="pixiko_muted">#FF9AA3B2</color>
     <color name="pixiko_accent">#FF7AA2F7</color>
     <color name="pixiko_divider">#FF2A2F3A</color>
+    <!-- 「发现新版本」横幅的底色：比 pixiko_bar 亮一档、带一点点蓝，明显但不刺眼（不打断操作）。 -->
+    <color name="pixiko_update_banner">#FF1E2A44</color>
+    <!-- 设置页「有新版本」红点。 -->
+    <color name="pixiko_danger">#FFB3261E</color>
     <color name="pixiko_ic_launcher_background">#FF12141A</color>
 </resources>

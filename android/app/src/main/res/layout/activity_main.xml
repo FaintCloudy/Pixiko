@@ -35,6 +35,76 @@
         android:progressTint="@color/pixiko_accent"
         android:visibility="invisible" />
 
+    <!--
+      「发现新版本」横幅：**明显但不打断** —— 贴在最上面一条，网页可以照常滚动/操作，
+      用户可以不理它，也可以点「稍后」（本次运行内不再出现）。
+      默认 gone，只有真的查到更新的 versionCode 时才由 MainActivity.showUpdateBanner() 显示。
+    -->
+    <LinearLayout
+        android:id="@+id/update_banner"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:background="@color/pixiko_update_banner"
+        android:orientation="vertical"
+        android:paddingStart="12dp"
+        android:paddingTop="8dp"
+        android:paddingEnd="12dp"
+        android:paddingBottom="8dp"
+        android:visibility="gone">
+
+        <TextView
+            android:id="@+id/update_banner_text"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:textColor="@color/pixiko_text"
+            android:textSize="14sp"
+            android:textStyle="bold" />
+
+        <TextView
+            android:id="@+id/update_banner_channel"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="2dp"
+            android:textColor="@color/pixiko_muted"
+            android:textSize="11sp" />
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="6dp"
+            android:orientation="horizontal">
+
+            <Button
+                android:id="@+id/update_banner_download"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:minWidth="0dp"
+                android:text="@string/update_banner_action"
+                android:textSize="13sp" />
+
+            <Button
+                android:id="@+id/update_banner_detail"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_marginStart="6dp"
+                android:layout_weight="1"
+                android:minWidth="0dp"
+                android:text="@string/update_banner_detail"
+                android:textSize="13sp" />
+
+            <Button
+                android:id="@+id/update_banner_later"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_marginStart="6dp"
+                android:layout_weight="1"
+                android:minWidth="0dp"
+                android:text="@string/update_banner_later"
+                android:textSize="13sp" />
+        </LinearLayout>
+    </LinearLayout>
+
     <androidx.swiperefreshlayout.widget.SwipeRefreshLayout
         android:id="@+id/swipe"
         android:layout_width="match_parent"

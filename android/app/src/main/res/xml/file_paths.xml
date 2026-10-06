@@ -1,10 +1,22 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
-  FileProvider 的路径白名单：只暴露 cacheDir/share（分享图片时下载的临时文件）。
-  不暴露 files/、更不暴露外部存储——避免把 app 私有数据意外开个口子。
+  FileProvider 的路径白名单：只放出两个**子目录**，不放开整个私有目录。
+
+  1) cacheDir/share   —— 分享图片时落地的临时文件（ImageStore.share）。
+  2) cacheDir/update  —— 自我更新下载并校验好的 APK（SelfUpdate / UpdateInstaller），
+                         安装时由 FileProvider 转成 content:// 交给系统安装器。
+
+  刻意**不**暴露 files/、不暴露 cacheDir 根、更不暴露外部存储：
+  白名单每一项都是一个可以拿出去（分享/安装）的目录，多一项就多一个口子。
+  路径必须与代码里的目录**完全对应**：不匹配时 FileProvider.getUriForFile 会抛
+  IllegalArgumentException（UpdateInstaller 把它转成一句人话错误，而不是崩掉）。
 -->
 <paths xmlns:android="http://schemas.android.com/apk/res/android">
     <cache-path
         name="shared_images"
         path="share/" />
+    <!-- 与 Prefs.updateDir() 的 new File(cacheDir, "update") 一一对应。 -->
+    <cache-path
+        name="update_apks"
+        path="update/" />
 </paths>

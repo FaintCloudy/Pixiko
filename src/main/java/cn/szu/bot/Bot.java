@@ -111,6 +111,12 @@ public final class Bot implements AutoCloseable {
     private final ExecutorService generation = Executors.newSingleThreadExecutor();
     private final ExecutorService progenIO = Executors.newSingleThreadExecutor();
     private final AtomicBoolean progenBusy = new AtomicBoolean();
+    /**
+     * 生图频道（提示词改写/画面检查）的客户端覆盖，只给测试用（见 {@link #useImageClientForTests}）：
+     * 测试要能对"一次指令到底调了几次 DeepSeek"计数，并且注入"检查发现矛盾/检查失败/检查乱返回"这些假响应。
+     * 生产路径永远是 {@code null}，即按 config.json 的 progen 段与密钥文件真的去调 DeepSeek。
+     */
+    private static volatile DeepSeekPrompts imageClientOverride;
     private final ExecutorService chatWorkflows = Executors.newSingleThreadExecutor(task -> { Thread thread=new Thread(task,"pixiko-chat-workflow");thread.setDaemon(true);return thread; });
     private final Map<String,CompletableFuture<Boolean>> chatWorkflowSteps=new ConcurrentHashMap<>();
     /** Chat chains still running; shutdown waits for them instead of cutting a user's chain in half. */
@@ -941,6 +947,10 @@ public final class Bot implements AutoCloseable {
 
     void executeChatCommands(JsonObject event, List<String> commands, JsonObject choices) throws Exception {        ChatActions.validate(commands);
         if (closed.get() || !settings.allowed(event)) throw new IllegalArgumentException("当前会话无操作权限或机器人正在关闭。");
+        // 一条指令里的多个 .infix 步骤先合成一步：默认（global）档下"一条指令只执行一次 infix"，
+        // 否则每一步都拿整份提示词改写一次、互相删掉对方刚写进去的内容（实测 3 个 infix + 1 个 gen 的案例）。
+        // parts 档不合并（旧行为完整保留）。
+        commands = mergeInfixSteps(commands, event, settings);
         // 常规档：一条自然语言请求（可能拆成好几步）也只有一个收据窗口——整条链路最后只留一句肯定、
         // 或（有失败时）一句说明；图片照旧发。窗口挂在 context 上，异步步骤（.infix/.gen/LoRA 下载）
         // 带着同一份事件回来时仍然记在这条指令上。
@@ -1209,8 +1219,10 @@ public final class Bot implements AutoCloseable {
         /拒绝 — 拒绝最近一次向你的求婚
         /强娶 <@某人|QQ号|群名片> — 每人每天一次，只能强娶未婚配者
         /离婚 — 每天一次，解除自己的婚配关系
-        /infix <修改要求> — 把要求交给 DeepSeek，由它按自己的判断改写你个人的正反向提示词并应用（允许自然语言短语）
+        /infix <修改要求> — 把要求交给 DeepSeek，由它按自己的判断改写你个人的正反向提示词并应用（允许自然语言短语；默认一次指令只改一次，落地前对整份提示词做一次画面检查）
+        /infix mode [global|parts] — infix 档位（按会话保存，默认 global）：global 把一条指令里的所有改写要求合成一次、作用在整份提示词上；parts 是旧的分组多步实现；/infix conflict on|off 才是传统正反义词排斥器开关
         /infix filter — 查看标准词库约束状态；/infix filter on|off 按会话开启或关闭（默认关闭＝自由改写，仅 owner/admin）
+        /infix conflict — 查看传统正反义词排斥器状态；/infix conflict on|off 按会话切换（默认关闭：矛盾交给上面那次整份提示词画面检查判断，仅 owner/admin）
         /progen <文字描述> — 通过 DeepSeek API 生成英文正反向提示词供查看，不自动修改当前 prompt
         /settings — 查看当前尺寸、采样方法、步数、CFG、种子、基础模型和数据来源
         /sampler — 查看当前采样方法
@@ -1445,6 +1457,10 @@ public final class Bot implements AutoCloseable {
             if (text.matches("(?i)^[./](jrlp|强娶|离婚|结婚|同意|拒绝|wife|marry|propose|divorce|accept|reject)(?:\\s+[\\s\\S]*)?$")) { marriage(event, text); return; }
             if (text.matches("(?i)^[./]affinity(?:\\s+[\\s\\S]*)?$")) { affinityCommand(event, text.replaceFirst("(?i)^[./]affinity","")); return; }
             List<String> commands = splitCommands(text);
+            // 一条消息里出现多个 .infix（复合语句 `.infix … ; .infix … ; .gen`）时先合成**一步**：
+            // 默认（global）档下一条指令只执行一次 infix，否则每一步都拿整份提示词改写一次、互相覆盖。
+            // parts 档不合并（旧行为完整保留）。这里是所有真实消息（QQ/网页指令）的唯一入口。
+            commands = mergeInfixSteps(commands, event, settings);
             if (commands.size() > 1) {
                 String who = describeConversation(event) + "，用户 " + Json.str(event, "user_id", "");
                 Log.info("单条消息包含 " + commands.size() + " 条指令（" + who + "），按顺序执行");
@@ -1628,6 +1644,25 @@ public final class Bot implements AutoCloseable {
                     if (hasHan(value) && (op.equals("add") || op.equals("set") || op.equals("remove"))) {
                         String request = (negative ? "反向提示词" : "正向提示词")
                                 + (op.equals("add") ? "里加上：" : op.equals("set") ? "里改为：" : "里删掉：") + value;
+                        // 用户说的中文词条先查**本机词库**：能唯一换出标准英文词条就直接照做——
+                        // 这是"用户自己的意志"（`.prompt add 微笑` 就是要把 smile 加进去），不许机器人擅自
+                        // 把它改写成"交给模型改写"（那等于把用户的话重新解释一遍），也不该白花一次模型调用。
+                        List<String> local = localTagsFor(value, currentVocabulary(scope));
+                        if (!local.isEmpty()) {
+                            SdClient.PromptChange direct = userPrompts.change(scope, negative, op,
+                                    String.join(", ", local), userPrompts.vocabulary(styleTerms()));
+                            if (op.equals("remove")) new PromptFunctions(settings.root).forget(scope, negative, direct.changed(), false);
+                            SdClient.Prompts updated = direct.prompts();
+                            reply(event, "已按你的要求" + (op.equals("add") ? "加入" : op.equals("remove") ? "删除" : "改为")
+                                    + "：" + String.join("、", local) + "（「" + value + "」的本机词条对应写法）"
+                                    + "\n（没有调用改写模型：这条要求本机就能唯一对应上）"
+                                    + "\n" + (negative ? "反向" : "正向") + " prompt 已更新（仅你个人）：\n"
+                                    + display(negative ? updated.negative() : updated.positive())
+                                    + "\n来源：" + updated.source());
+                            return;
+                        }
+                        // 本机唯一对应不上：**保持既有行为**——如实说明这条中文要求交给改写模型，
+                        // 由模型换成标准英文词条后落地（prompt 里不会写进中文）。
                         Log.info("prompt 指令里的中文已转交改写（" + describeConversation(event) + "）：" + request);
                         reply(event, "prompt 指令只认英文词条：这条中文要求已交给改写处理（等价于 .infix " + request
                                 + "），由改写模型给出标准英文词条，不会把中文写进 prompt。");
@@ -1815,7 +1850,8 @@ public final class Bot implements AutoCloseable {
      * 完整备份见 backup\infix-v2-strict-*（含说明与恢复步骤）。
      */
     private void infix(JsonObject event, String instruction) throws Exception {
-        if (instruction.equalsIgnoreCase("filter") || instruction.toLowerCase(Locale.ROOT).startsWith("filter ")) {
+        String lowerInstruction = instruction == null ? "" : instruction.toLowerCase(Locale.ROOT);
+        if (instruction.equalsIgnoreCase("filter") || lowerInstruction.startsWith("filter ")) {
             String conversation = ChatService.conversationKey(event);
             String argument = instruction.length() > "filter".length() ? instruction.substring("filter".length()).strip() : "";
             if (!argument.isEmpty()) {
@@ -1839,8 +1875,414 @@ public final class Bot implements AutoCloseable {
             completeChatWorkflowStep(event, true);
             return;
         }
+        if (infixControl(event, instruction)) return;
         if (instruction.isBlank() || instruction.length() > 8000) throw new IllegalArgumentException("用法：/infix <修改要求>，最多 8000 字符。");
         if (closed.get()) throw new IllegalStateException("机器人正在关闭。");
+        // 默认档（global）：一条指令只执行一次 infix —— 不拆组、不逐步，只有一步改写 + 一步画面检查。
+        // 旧的多步实现（parts）完整保留，用户用 .infix mode parts 切回去。
+        if (settings.infixMode(ChatService.conversationKey(event)) == Settings.InfixMode.GLOBAL) {
+            infixGlobal(event, instruction);
+            return;
+        }
+        infixParts(event, instruction);
+    }
+    /**
+     * {@code .infix mode} / {@code .infix conflict}：两个按会话持久化的开关（权限与 {@code .infix} 本身一致）。
+     *
+     * <ul>
+     *   <li>{@code .infix mode} 显示当前档位；{@code .infix mode global|parts}（也认中文 全局/分组）切换。
+     *       默认 global：一条指令只执行一次 infix，不拆组、不逐步。parts 是旧的多步实现。</li>
+     *   <li>{@code .infix conflict} 显示传统正反义词排斥器状态；{@code on|off} 切换。
+     *       默认 off：{@code cross-section view} 与 {@code front view} 这类并不冲突的组合不再被本地删掉，
+     *       矛盾一律交给改写之后那次整份提示词画面检查（DeepSeek）判断。</li>
+     * </ul>
+     *
+     * <p>返回 true 表示这一条已经被当作控制指令处理完，绝不当成改写要求再走一遍模型。
+     */
+    private boolean infixControl(JsonObject event, String instruction) throws Exception {
+        String text = instruction == null ? "" : instruction.strip();
+        String lower = text.toLowerCase(Locale.ROOT);
+        if (lower.equals("mode") || lower.startsWith("mode ") || lower.equals("档位") || lower.startsWith("档位 ")) {
+            String conversation = ChatService.conversationKey(event);
+            // 前缀长度按实际匹配到的写法算（"mode"/"档位" 都是 2 个字符，"mode " 4 个）。
+            String argument = lower.startsWith("mode") ? text.substring(Math.min(4, text.length())).strip() : text.substring(2).strip();
+            if (!argument.isEmpty()) {
+                requireStaff(event, "/infix mode");
+                Settings.InfixMode mode = Settings.InfixMode.parse(argument);
+                if (mode == null) throw new IllegalArgumentException("用法：/infix mode、/infix mode global、/infix mode parts（中文也认：全局/分组）");
+                settings.setInfixMode(conversation, mode);
+                Log.info("infix 档位（" + conversation + "）：" + mode.key());
+                reply(event, mode == Settings.InfixMode.GLOBAL
+                        ? "infix 档位已切到「全局」（默认）：一条指令只执行一次 infix —— 这条指令里的所有改写要求合成一次交给 DeepSeek，"
+                            + "作用在整份提示词上，不拆组、不逐步；改写落地前还会对整份提示词做一次画面检查。"
+                        : "infix 档位已切到「分组」（旧行为）：保留原来的拆分/多步实现，一条指令里的多个诉求会分成若干步分别改写；"
+                            + "想切回一条指令只改一次用 .infix mode global。");
+                completeChatWorkflowStep(event, true);
+                return true;
+            }
+            Settings.InfixMode mode = settings.infixMode(conversation);
+            reply(event, "infix 档位（本会话）：" + mode.key() + "（" + mode.label() + "）"
+                    + (mode == Settings.InfixMode.GLOBAL ? "，默认档" : "")
+                    + "\nglobal（全局，默认）：一条指令里的所有改写要求合成一次交给 DeepSeek，作用在整份提示词上，不拆组、不逐步；"
+                    + "改写落地前对整份提示词做一次画面检查（正反向是否自相矛盾、有没有坏组合/残留中文/坏标签、LoRA 标签是否完好）。"
+                    + "\nparts（分组）：旧的多步实现，一条指令里的多个诉求分成若干步分别改写。"
+                    + "\n切换：/infix mode global、/infix mode parts（中文：全局/分组，仅 owner/admin）。"
+                    + "\n传统正反义词排斥器（本地互斥词表）：" + (settings.infixConflictEnabled(conversation) ? "开启" : "关闭（默认）")
+                    + "，用 /infix conflict on|off 切换；关闭时矛盾一律交给上面那次画面检查判断。");
+            completeChatWorkflowStep(event, true);
+            return true;
+        }
+        if (lower.equals("conflict") || lower.startsWith("conflict ") || lower.equals("互斥") || lower.startsWith("互斥 ")) {
+            String conversation = ChatService.conversationKey(event);
+            int cut = lower.startsWith("conflict") ? "conflict".length() : 2;
+            String argument = text.length() > cut ? text.substring(cut).strip() : "";
+            if (!argument.isEmpty()) {
+                requireStaff(event, "/infix conflict");
+                boolean enabled;
+                if (argument.equalsIgnoreCase("on") || argument.equals("开") || argument.equals("开启")) enabled = true;
+                else if (argument.equalsIgnoreCase("off") || argument.equals("关") || argument.equals("关闭")) enabled = false;
+                else throw new IllegalArgumentException("用法：/infix conflict、/infix conflict on、/infix conflict off");
+                settings.setInfixConflictEnabled(conversation, enabled);
+                Log.info("传统正反义词排斥器（" + conversation + "）：" + (enabled ? "开启" : "关闭"));
+                reply(event, enabled
+                        ? "传统正反义词排斥器已开启（本地互斥词表）：姿势/视角/载具/室内外同族词条只保留一个，"
+                            + "互斥在本地就解决，不再问模型。"
+                        : "传统正反义词排斥器已关闭（默认）：本地的姿势/视角/载具/室内外互斥整理不再执行"
+                            + "（cross-section view 与 front view 这类并不冲突的组合不会再被删），"
+                            + "矛盾一律交给改写之后那次整份提示词画面检查（DeepSeek）判断。");
+                completeChatWorkflowStep(event, true);
+                return true;
+            }
+            boolean enabled = settings.infixConflictEnabled(conversation);
+            reply(event, "传统正反义词排斥器（本会话）：" + (enabled ? "开启" : "关闭（默认）")
+                    + "\n关闭时（默认）：本地不再按互斥词表删/改词条（cross-section view 与 front view 会原样保留），"
+                    + "正反向是否自相矛盾由改写之后那次 DeepSeek 整份提示词画面检查判断并修正。"
+                    + "\n开启时：恢复旧的本地行为（同族词条只保留一个、反义词对删掉一个），不花模型额度。"
+                    + "\n切换：/infix conflict on|off（仅 owner/admin）。");
+            completeChatWorkflowStep(event, true);
+            return true;
+        }
+        return false;
+    }
+    /**
+     * 默认档：**一次 DeepSeek 改写调用**作用在整份提示词上（必要时含反向），不拆组、不并行、不逐步；
+     * 落地前再用**一次**调用对整份提示词做画面检查（发现矛盾/坏组合就让模型在同一次检查里给出修正后的完整提示词）。
+     * 一条指令最多 2 次 DeepSeek 调用（1 次改写 + 1 次检查/修正）。
+     *
+     * <p>失败与回滚策略：
+     * <ul>
+     *   <li>改写调用失败 → 什么都不改，如实说明（这一步不算成功，链式指令的后续步骤会停下）；</li>
+     *   <li>检查失败/超时/返回不可用 → **按改写后的版本原样落地**，并在回执里写明"未通过画面检查"（绝不静默，
+     *       也绝不因此丢掉或改坏用户的提示词）；</li>
+     *   <li>检查给出修正 → 修正稿要过落地前校验（非空、LoRA 标签仍在、没有新增中文），任一项不满足就**回滚到
+     *       改写后的版本**，并说明修正稿被丢弃的原因。</li>
+     * </ul>
+     */
+    private void infixGlobal(JsonObject event, String instruction) throws Exception {
+        if (!progenBusy.compareAndSet(false, true)) { reply(event, "已有 DeepSeek 请求正在处理，请稍后重试。"); completeChatWorkflowStep(event, false); return; }
+        JsonObject context = attachNormalWindow(event.deepCopy()); replyProcess(context, "正在通过 DeepSeek 智能修改你个人的提示词。");
+        String scope = promptScope(event);
+        String conversation = ChatService.conversationKey(event);
+        boolean strictDictionary = settings.infixFilterEnabled(conversation);
+        boolean conflict = settings.infixConflictEnabled(conversation);
+        try { progenIO.execute(() -> {
+            String message; boolean succeeded = false;
+            try {
+                SdClient.Prompts original = effectivePrompts(scope);
+                var client = clientFor();
+                DeepSeekPrompts.Result rewritten;
+                try { rewritten = client.edit(instruction, original, TermCategories.describe(usageIndex(), original.positive())); }
+                catch (Exception model) {
+                    Log.warn("提示词改写调用没有成功：" + error(model));
+                    message = "智能修改未完成：" + error(model) + "\n（一个字都没改，你的提示词保持原样）";
+                    replyRanked(context, ReceiptRank.FAILURE, message); completeChatWorkflowStep(context, false); releaseNormalWindow(context);
+                    return;
+                }
+                Bot.InfixFilter filter = strictDictionary
+                        ? filterInfixVocabulary(settings.root, original, rewritten)
+                        : new Bot.InfixFilter(rewritten, List.of());
+                String applied = applyModelRewrite(scope, original, filter.result(), filter.rejected(), instruction, conflict);
+                if (applied == null) {
+                    // 模型结果与当前提示词一致（没有可应用的变化）：这一步仍算成功，回执如实说明，不假装改了。
+                    message = "这次没有改动任何词条：改写模型没有给出可应用的修改。\n" + InfixIntent.formsHelp();
+                    replyRanked(context, ReceiptRank.AFFIRM, message); completeChatWorkflowStep(context, true); releaseNormalWindow(context);
+                    return;
+                }
+                SdClient.Prompts landed = userPrompts.prompts(scope);
+                ScreenOutcome screen = screenPrompt(client, scope, landed);
+                String result = "智能修改已应用，本次变化：\n" + formatPromptDiff(original, userPrompts.prompts(scope))
+                        + formatRejected(filter.rejected())
+                        + screen.suffix()
+                        + "（用 .prompt 查看完整提示词）";
+                Log.info("整份提示词画面检查（" + conversation + "）：" + screen.log());
+                Log.info(result);
+                message = result; succeeded = true;
+            } catch (Exception e) { message = "智能修改未完成：" + error(e); }
+            finally { progenBusy.set(false); }
+            replyRanked(context, succeeded ? ReceiptRank.AFFIRM : ReceiptRank.FAILURE, message);
+            completeChatWorkflowStep(context, succeeded);
+            releaseNormalWindow(context);
+        }); } catch (RejectedExecutionException e) { progenBusy.set(false); completeChatWorkflowStep(event, false); releaseNormalWindow(context); throw new IllegalStateException("机器人正在关闭。"); }
+    }
+    /** 一次整份提示词画面检查的落地结果：要拼进回执的一句后缀 + 给日志的一行。 */
+    private record ScreenOutcome(String suffix, String log) { }
+    /**
+     * 改写落地之前对整份提示词做一次检查（DeepSeek）：正反向是否自相矛盾、有没有明显会让画面崩坏的组合、
+     * 是否残留中文或坏标签、LoRA 标签是否完好。
+     *
+     * <p>检查给出修正稿时先过落地前校验，通过才落地（回执写明修正了什么）；检查失败/超时/返回不可用，
+     * 或者修正稿没通过校验，都**按改写后的版本原样落地**，并在回执里明确说明"未通过画面检查"。
+     * 这一步只可能发生在这一个方法里，一条指令最多再多一次 DeepSeek 调用。
+     */
+    private ScreenOutcome screenPrompt(DeepSeekPrompts client, String scope, SdClient.Prompts current) {
+        DeepSeekPrompts.Review review;
+        try { review = client.review(current); }
+        catch (Exception failed) {
+            Log.warn("整份提示词画面检查没有完成：" + error(failed));
+            return new ScreenOutcome("\n画面检查：未通过画面检查（检查调用失败：" + error(failed) + "），已按改写后的版本落地，"
+                    + "如需再试可以再说一次要求或 .prompt undo。", "未通过（调用失败：" + error(failed) + "），按改写后版本落地");
+        }
+        if (review.ok())
+            return new ScreenOutcome("\n画面检查：已通过（正反向无自相矛盾、无明显崩坏组合、无残留中文、LoRA 标签完好）", "已通过");
+        if (review.corrected() == null)
+            return new ScreenOutcome("\n画面检查：未通过（检查未给出可用的修正稿），已按改写后的版本落地。"
+                    + (review.issues().isBlank() ? "" : "检查说明：" + review.issues()), "未通过（无修正稿），按改写后版本落地");
+        String why = promptRejection(new SdClient.Prompts(review.corrected().positive(), review.corrected().negative(),
+                UserPromptStore.PERSONAL_SOURCE), scope);
+        if (why != null)
+            return new ScreenOutcome("\n画面检查：未通过（修正稿被丢弃：" + why + "），已按改写后的版本落地。"
+                    + (review.issues().isBlank() ? "" : "检查说明：" + review.issues()), "未通过（修正稿 " + why + "），按改写后版本落地");
+        try {
+            userPrompts.replace(scope, new SdClient.Prompts(review.corrected().positive(), review.corrected().negative(),
+                    UserPromptStore.PERSONAL_SOURCE));
+        } catch (Exception failed) {
+            Log.warn("画面检查的修正稿没能落地：" + error(failed));
+            return new ScreenOutcome("\n画面检查：未通过（修正稿落地失败：" + error(failed) + "），已按改写后的版本落地。",
+                    "未通过（修正稿落地失败：" + error(failed) + "）");
+        }
+        return new ScreenOutcome("\n画面检查：发现矛盾/坏组合并已修正 —— "
+                + (review.issues().isBlank() ? "检查给出的问题已修正" : review.issues()), "发现矛盾，已用修正稿落地：" + review.issues());
+    }
+    /**
+     * 落地前校验：任一不满足就返回一句"为什么不能落地"（调用方据此回滚到改写后的版本），全部满足返回 null。
+     * 三条判据与既有硬规矩一致：① 改后提示词不能空；② LoRA/嵌入标签一个都不能少；③ 不能出现原先没有的中文。
+     */
+    private String promptRejection(SdClient.Prompts candidate, String scope) {
+        if (candidate == null) return "没有内容";
+        if (candidate.positive().isBlank()) return "正向提示词被清空了";
+        SdClient.Prompts current;
+        try { current = userPrompts.prompts(scope); } catch (Exception ignored) { current = candidate; }
+        try {
+            for (String tag : promptModelTags(current.positive()))
+                if (!promptModelTags(candidate.positive()).contains(tag)) return "丢了 LoRA/嵌入标签 " + tag;
+            String newChinese = newChineseText(current, candidate);
+            if (!newChinese.isBlank()) return "把中文写进了提示词：" + newChinese;
+        } catch (Exception broken) { return "校验失败：" + error(broken); }
+        return null;
+    }
+    /**
+     * 候选提示词里**新出现**的中文词项（空串＝没有）。存量中文不算：用户自己的提示词里本来就可能带中文，
+     * 判定必须与快照比，否则每次改写都会被自己的历史判成"写了中文"。
+     */
+    static String newChineseText(SdClient.Prompts current, SdClient.Prompts candidate) {
+        String before = (current == null ? "" : current.positive()) + ", " + (current == null ? "" : current.negative());
+        List<String> fresh = new ArrayList<>();
+        for (String term : PromptEditor.parts(candidate.positive() + ", " + candidate.negative())) {
+            if (!InfixIntent.hasCjk(term)) continue;
+            if (before.contains(term)) continue;
+            if (!fresh.contains(term)) fresh.add(term);
+        }
+        return String.join("、", fresh);
+    }
+    /** 某个提示词里的全部 LoRA/嵌入标签（写坏了也不抛：返回已认出来的那些）。 */
+    static List<String> promptModelTags(String prompt) {
+        List<String> found = new ArrayList<>();
+        if (prompt == null) return found;
+        Matcher matcher = Pattern.compile("(?i)<(?:lora|lyco|embedding|hypernet):[^>]*>").matcher(prompt);
+        while (matcher.find()) if (!found.contains(matcher.group())) found.add(matcher.group());
+        return found;
+    }
+    /**
+     * 把用户说的中文词条换成本机词库里**唯一**对应的标准英文词条（换不出来返回空列表）。
+     *
+     * <p>这是"用户自己的意志"那条哲学的实现：{@code .prompt add 微笑} 就是要把 smile 加进去，
+     * 能本机唯一对应上就**直接照做**，不调 DeepSeek、不生成 `.infix` 合成指令。
+     *
+     * <p>判据刻意从严（宁可交回用户选，也不猜）：
+     * <ol>
+     *   <li>人工维护的 {@link #SCENE_SYNONYMS}（中文 → 标准词条，命中即用第一个在词库里的候选）；</li>
+     *   <li>内置中文词库 {@code data/prompt-zh-tags.json} 的**别名精确相等**匹配（用 {@code |} 分隔的别名，
+     *       只认整条相等，不做子串——子串会把"微笑"匹到一串别的词）；</li>
+     *   <li>候选择一即可；一个词条同时命中多个不同 tag 时算"不唯一"，返回空（交回用户决定）。</li>
+     * </ol>
+     */
+    List<String> localTagsFor(String value, Set<String> allowed) {
+        if (value == null || value.isBlank()) return List.of();
+        List<String> terms = PromptEditor.parts(value);
+        if (terms.isEmpty()) return List.of();
+        List<String> mapped = new ArrayList<>();
+        for (String term : terms) {
+            String tag = localTagFor(term.strip(), allowed);
+            if (tag == null) return List.of();
+            mapped.add(tag);
+        }
+        return List.copyOf(mapped);
+    }
+    /** 单个中文词的唯一标准词条；换不出来或不唯一返回 null。 */
+    private String localTagFor(String term, Set<String> allowed) {
+        if (term.isEmpty()) return null;
+        LinkedHashSet<String> candidates = new LinkedHashSet<>();
+        for (String candidate : SCENE_SYNONYMS.getOrDefault(term, List.of()))
+            if (allowedContains(allowed, candidate)) { candidates.add(candidate); break; }
+        if (candidates.isEmpty()) {
+            PromptUsage usage = usageIndex();
+            if (usage != null) for (String alias : usage.exactAliases(term)) if (allowedContains(allowed, alias)) candidates.add(alias);
+        }
+        if (candidates.isEmpty() && repoUsage() != null)
+            for (String alias : repoUsage().exactAliases(term)) if (allowedContains(allowed, alias)) candidates.add(alias);
+        Log.info("中文直通查库（" + term + "）：候选=" + candidates + "，工作区索引=" + (usageIndex() == null ? "不可用" : "可用"));
+        return candidates.size() == 1 ? candidates.iterator().next() : null;
+    }
+    /**
+     * 工作区里那份中文别名索引的兜底（{@code ./data/prompt-usage.json}，进程启动目录）。
+     *
+     * <p>机器人根目录（{@code settings.root}）下没有这份文件时（例如只为会话建的临时数据目录），
+     * 中文直通就没法命中——用工作区这份只读兜底，读不到就返回 null，绝不抛。
+     */
+    private volatile PromptUsage repoUsageCache;
+    private volatile boolean repoUsageLoaded;
+    private PromptUsage repoUsage() {
+        if (repoUsageLoaded) return repoUsageCache;
+        synchronized (this) {
+            if (!repoUsageLoaded) {
+                try { repoUsageCache = new PromptUsage(Path.of(".").toAbsolutePath().normalize()); }
+                catch (Exception ignored) { repoUsageCache = null; }
+                repoUsageLoaded = true;
+            }
+        }
+        return repoUsageCache;
+    }
+    /**
+     * 当前会话有效的词库（标准词表 + 用户自己 prompt 里已有的词条）：中文直通路径只允许换出这里面的词，
+     * 与 {@code .infix} 的词库约束完全同一套口径。
+     */
+    private Set<String> currentVocabulary(String scope) {
+        try { return vocabulary(settings.root, userPrompts.prompts(scope)); }
+        catch (Exception unavailable) {
+            Log.warn("中文直通查词库失败（不影响其他路径）：" + error(unavailable));
+            return Set.of();
+        }
+    }
+    /**
+     * 生图频道（提示词改写/画面检查）的客户端：生产环境按 config.json 的 progen 段与密钥文件新建，
+     * 测试可以用 {@link #useImageClientForTests} 换成假客户端来计数与注入假响应。
+     */
+    static DeepSeekPrompts clientFor(Settings settings) {
+        DeepSeekPrompts override = imageClientOverride;
+        return override != null ? override : DeepSeekPrompts.of(settings, DeepSeekPrompts.Channel.IMAGE);
+    }
+    /** 本实例的生图频道客户端（见 {@link #clientFor(Settings)}）。 */
+    private DeepSeekPrompts clientFor() { return clientFor(settings); }
+    /**
+     * 测试专用：让本进程后续所有生图频道调用（改写 / 画面检查 / 严格重试）都走这个假客户端，
+     * 好对"一条 .infix 到底调了几次 DeepSeek"计数、并注入"检查发现矛盾/检查失败/检查乱返回"这些响应。
+     * 传 {@code null} 恢复真实客户端。
+     */
+    public static void useImageClientForTests(DeepSeekPrompts client) { imageClientOverride = client; }
+    /** 测试辅助：生图频道客户端当前是否被测试覆盖（只报 true/false，不泄露任何内容）。 */
+    public static boolean debugImageClient() { return imageClientOverride != null; }
+    /**
+     * 一次指令里的多个 {@code .infix} 步骤合并成**一步**：默认（global）档下"一条指令只执行一次 infix"。
+     *
+     * <p>实测 bug（data/quests/252.json、logs/bot-stdout.log 04:31）：用户一条复合语句
+     * （{@code .infix 加入多视角分镜 ; .infix 只把分镜那一条保留为特写 ; .infix 加上：分镜 ; .gen}）
+     * 被拆成 **3 个 infix 步骤 + 1 个 gen**，每一步都拿整份提示词改写一次、互相打架。现在把这几步的
+     * 改写要求合成**一条** .infix（放在第一个 .infix 原来的位置），一次交给 DeepSeek 改写整份提示词。
+     *
+     * <p><b>什么算一条、什么算多条</b>：判据是"用户是否显式要求分成多条独立指令"——
+     * <ul>
+     *   <li>一条指令（一条消息 / 一条复合语句 / 模型计划出来的多步）里的所有 {@code .infix} → **合成一条**，
+     *       因为它们的诉求都落在同一份提示词上，分开改必然互相覆盖；</li>
+     *   <li>用户显式写 {@code .infix #keep <要求>}（或 {@code !keep}）→ 这一条不参与合并，
+     *       多条 {@code #keep} 就是用户明确要的"多条独立指令"，各改各的（给需要逐步微调的场合留出口）。</li>
+     * </ul>
+     * 控制指令（{@code .infix mode} / {@code .infix filter} / {@code .infix conflict}）永远不参与合并。
+     * 非 infix 的步骤（{@code .gen}、{@code .style load}…）顺序与数量都不变。
+     */
+    static List<String> mergeInfixSteps(List<String> commands, JsonObject event, Settings settings) {
+        if (commands == null || commands.size() < 2) return commands;
+        Settings.InfixMode mode = infixModeOf(settings, event);
+        if (mode == Settings.InfixMode.PARTS) return commands;
+        List<String> kept = new ArrayList<>();
+        List<String> instructions = new ArrayList<>();
+        List<String> originals = new ArrayList<>();
+        int slot = -1;
+        for (String command : commands) {
+            // 切档位的指令本身不合并；它后面的 .infix 按切换后的档位判断（顺序执行，语义不变）。
+            Settings.InfixMode switched = modeSwitchOf(command);
+            if (switched != null) {
+                mode = switched;
+                if (mode == Settings.InfixMode.PARTS) { flushInfix(kept, instructions, originals, slot); instructions.clear(); originals.clear(); slot = -1; }
+                kept.add(command);
+                continue;
+            }
+            Matcher step = Pattern.compile("(?is)^[./]infix\\s+([\\s\\S]+)$").matcher(internalCommand(command == null ? "" : command));
+            if (!step.matches() || infixControlCommand(step.group(1))) { kept.add(command); continue; }
+            if (mode == Settings.InfixMode.PARTS) { kept.add(command); continue; }
+            String raw = step.group(1).strip();
+            // 显式出口：.infix #keep <要求>（也认 !keep）表示"这一条不要和别的 infix 合并"，各改各的。
+            if (raw.matches("(?is)^[#!]keep(\\s.*)?$")) { kept.add(command); continue; }
+            instructions.add(raw);
+            originals.add(command);
+            if (slot < 0) { slot = kept.size(); kept.add(null); }
+        }
+        flushInfix(kept, instructions, originals, slot);
+        return List.copyOf(kept);
+    }
+    /**
+     * 把收集到的改写要求合成一条 .infix 放回它原来的位置。只有一条（或没有）时不合并：
+     * 把占位的空槽换成**原始命令**（绝不丢步骤），多条时换成合并后的那一条。
+     */
+    private static void flushInfix(List<String> kept, List<String> instructions, List<String> originals, int slot) {
+        if (slot >= 0) {
+            if (instructions.size() < 2) {
+                kept.set(slot, originals.isEmpty() ? kept.get(slot) : originals.get(0));
+            } else {
+                String merged = "/infix " + String.join("；", instructions);
+                kept.set(slot, merged);
+                Log.info("同一份提示词的 " + instructions.size() + " 条改写诉求已合成 1 个 infix 步骤（默认档：一次指令只执行一次 infix）："
+                        + Log.text(merged));
+            }
+        }
+        instructions.clear();
+        originals.clear();
+    }
+    /** 这个会话的 infix 档位（默认 global）；事件没有会话信息时也返回默认值，绝不抛。 */
+    static Settings.InfixMode infixModeOf(Settings settings, JsonObject event) {
+        try { return settings.infixMode(ChatService.conversationKey(event)); }
+        catch (Exception ignored) { return Settings.InfixMode.GLOBAL; }
+    }
+    /** 这个 .infix 是不是控制指令（模式/词库约束/互斥开关）——控制指令不参与合并，也不走改写。 */
+    static boolean infixControlCommand(String instruction) {
+        String lower = instruction == null ? "" : instruction.strip().toLowerCase(Locale.ROOT);
+        return lower.startsWith("mode") || lower.startsWith("档位")
+                || lower.startsWith("filter") || lower.startsWith("conflict") || lower.startsWith("互斥");
+    }
+    /**
+     * 这条指令是不是在切 infix 档位（{@code .infix mode global|parts}）。会切档位的指令按顺序执行，
+     * 它后面的 .infix 合并时要按**切换后**的档位判断（否则"先切 parts 再发两条 infix"会被错误合并成一条）。
+     */
+    static Settings.InfixMode modeSwitchOf(String command) {
+        Matcher step = Pattern.compile("(?is)^[./]infix\\s+([\\s\\S]+)$").matcher(internalCommand(command == null ? "" : command));
+        if (!step.matches()) return null;
+        String text = step.group(1).strip();
+        String lower = text.toLowerCase(Locale.ROOT);
+        if (!(lower.startsWith("mode ") || lower.startsWith("档位"))) return null;
+        String argument = lower.startsWith("mode") ? text.substring(Math.min(4, text.length())).strip() : text.substring(2).strip();
+        return Settings.InfixMode.parse(argument);
+    }
+    /** 旧的多步实现（parts 档）：一条指令里的多个诉求分成若干步分别改写，完整保留。 */
+    private void infixParts(JsonObject event, String instruction) throws Exception {
         if (!progenBusy.compareAndSet(false, true)) { reply(event, "已有 DeepSeek 请求正在处理，请稍后重试。");completeChatWorkflowStep(event,false);return; }
         JsonObject context = attachNormalWindow(event.deepCopy()); replyProcess(context, "正在通过 DeepSeek 智能修改你个人的提示词。");
         String scope = promptScope(event);
@@ -1853,6 +2295,8 @@ public final class Bot implements AutoCloseable {
                 SdClient.Prompts original = effectivePrompts(scope);
                 // 词库约束只在会话显式开启时生效；确定性与模型两条路共用这一个开关。
                 boolean strictDictionary = settings.infixFilterEnabled(ChatService.conversationKey(event));
+                // 传统正反义词排斥器（默认关）：只在会话显式 .infix conflict on 时才做本地互斥整理。
+                boolean conflict = settings.infixConflictEnabled(ChatService.conversationKey(event));
                 // 纯"按类别筛选"的改写要求（"仅保留人物和服饰，其余清空"）：程序按分类直接执行，
                 // 不花模型额度、也不会因为模型自由发挥而漏删词条。分类清单与投喂给模型的是同一份。
                 CategorySurgery surgery = parseCategorySurgery(instruction);
@@ -1866,10 +2310,10 @@ public final class Bot implements AutoCloseable {
                     if (intent != null && blocked == null) {
                         // 确定性快速路径：句式清楚、内容也是能直接写进 prompt 的英文词条/模型标签。
                         // 不花模型额度，也不会再出现"模型没给出可执行指令"那种什么都没发生的结果。
-                        message = applyInfixIntent(scope, original, intent, instruction);
+                        message = applyInfixIntent(scope, original, intent, instruction, conflict);
                         succeeded = true;
                     } else {
-                        ModelOutcome outcome = infixByModel(scope, original, instruction, intent, blocked, strictDictionary);
+                        ModelOutcome outcome = infixByModel(scope, original, instruction, intent, blocked, strictDictionary, conflict);
                         message = outcome.message();
                         // 改写调用本身失败时仍然算这一步没成功（链式指令的后续步骤必须停下，
                         // 否则会拿着没改过的 prompt 继续 .gen）——与改动前的外层 catch 语义一致。
@@ -1944,9 +2388,9 @@ public final class Bot implements AutoCloseable {
      * 后者第一次改写没给出可应用的变化时，会用更严格的指令再问一次（见 {@link #infixTranslationRetry}）。
      */
     private ModelOutcome infixByModel(String scope, SdClient.Prompts original, String instruction, InfixIntent.Intent intent,
-                                      String blocked, boolean strictDictionary) throws Exception {
+                                      String blocked, boolean strictDictionary, boolean conflict) throws Exception {
         // 提示词改写走生图频道：与聊天频道的模型/密钥/额度完全分开。
-        DeepSeekPrompts client = DeepSeekPrompts.of(settings, DeepSeekPrompts.Channel.IMAGE);
+        DeepSeekPrompts client = clientFor();
         // 自由改写：不做拆解、不喂候选词，模型按自己的判断改写；词库约束只在显式开启时生效。
         // 同时把当前 prompt 的**分类清单**交给模型，让它能理解"按类别"的要求（只保留人物和服饰）。
         DeepSeekPrompts.Result rewritten = null;
@@ -1954,24 +2398,28 @@ public final class Bot implements AutoCloseable {
         try { rewritten = client.edit(instruction, original, TermCategories.describe(usageIndex(), original.positive())); }
         catch (Exception model) { modelError = error(model); Log.warn("提示词改写调用没有成功：" + modelError); }
         if (rewritten == null)   // 调用失败：这一步不算成功（链式指令的后续步骤要停下）
-            return new ModelOutcome(infixIntentFallback(scope, original, instruction, intent, blocked, List.of(), modelError, strictDictionary), false);
+            return new ModelOutcome(infixIntentFallback(scope, original, instruction, intent, blocked, List.of(), modelError, strictDictionary, conflict), false);
         InfixFilter filtered = strictDictionary
                 ? filterInfixVocabulary(settings.root, original, rewritten)
                 : new InfixFilter(rewritten, List.of());
-        String applied = applyModelRewrite(scope, original, filtered.result(), filtered.rejected(), instruction);
+        String applied = applyModelRewrite(scope, original, filtered.result(), filtered.rejected(), instruction, conflict);
         if (applied != null) return new ModelOutcome(applied, true);
         // 模型结果与当前提示词一致（没有可应用的变化）→ 走兜底：中文描述型再严格重试一次，否则如实说明。
         // 调用本身是成功的，所以这一步仍算成功（与改动前"没有可应用的变化"回执的语义一致）。
-        return new ModelOutcome(infixIntentFallback(scope, original, instruction, intent, blocked, filtered.rejected(), null, strictDictionary), true);
+        return new ModelOutcome(infixIntentFallback(scope, original, instruction, intent, blocked, filtered.rejected(), null, strictDictionary, conflict), true);
     }
     /** 一次模型改写路径的结果：给用户的回执 + 这一步算不算成功（链式指令据此决定要不要往下走）。 */
     private record ModelOutcome(String message, boolean succeeded) { }
     /**
      * 应用模型给出的改写，返回回执；模型结果与当前提示词完全一致（没有可应用的变化）时返回 {@code null}，
-     * 由调用方走兜底。这一段与原来的实现逐行一致：并发保护、函数集归属、冲突自检与互斥替换都保持原样。
+     * 由调用方走兜底。并发保护、函数集归属、互斥自检与互斥替换都保持原样。
+     *
+     * <p>{@code conflict} 是**传统正反义词排斥器**的开关（默认关）：关掉时本地不再按互斥词表删/改词条，
+     * 正反向是否自相矛盾交给改写之后那次整份提示词画面检查（DeepSeek）判断——剖面图与正面视角这类
+     * 实际并不冲突的组合不会再被本地误删。
      */
     private String applyModelRewrite(String scope, SdClient.Prompts original, DeepSeekPrompts.Result result,
-                                     List<String> rejected, String instruction) throws Exception {
+                                     List<String> rejected, String instruction, boolean conflict) throws Exception {
         synchronized (userPrompts) {
             SdClient.Prompts current=userPrompts.prompts(scope);
             if(!current.positive().equals(original.positive()) || !current.negative().equals(original.negative()))
@@ -1980,13 +2428,15 @@ public final class Bot implements AutoCloseable {
             PromptFunctions functions = new PromptFunctions(settings.root); functions.recover(() -> userPrompts.prompts(scope), scope);
             SdClient.Prompts updated = applyPersonalInfix(userPrompts, scope, original, result);
             functions.forget(scope, false, List.of(), true); functions.forget(scope, true, List.of(), true);
-            // 冲突自检保留：只解决互斥词条（性交类补 1boy、day/night 只留新的），不限制写法。
-            String fixed = selfCheckPrompts(scope);
+            // 冲突自检：只在传统正反义词排斥器打开时执行（默认关闭，交给整份提示词画面检查）。
+            String fixed = conflict ? selfCheckPrompts(scope) : "";
             if (!fixed.isEmpty()) updated = userPrompts.prompts(scope);
             // 互斥原则还要"以本次要求为准"：用户这次改的槽位（地点/姿势/视角/载具/时段），
             // 旧值必须让位——光靠"后出现的胜"会因为模型把新词写在前面而留下旧的。
             List<String> replaced = new ArrayList<>();
-            String enforced = enforceRequestedFamilies(userPrompts.prompts(scope).positive(), instruction, replaced);
+            String enforced = conflict
+                    ? enforceRequestedFamilies(userPrompts.prompts(scope).positive(), instruction, replaced)
+                    : userPrompts.prompts(scope).positive();
             if (!enforced.isBlank() && !replaced.isEmpty()
                     && !enforced.equals(userPrompts.prompts(scope).positive())) {
                 userPrompts.replace(scope, new SdClient.Prompts(enforced, userPrompts.prompts(scope).negative(), UserPromptStore.PERSONAL_SOURCE));
@@ -2004,9 +2454,10 @@ public final class Bot implements AutoCloseable {
      * 用更严格的指令再问一次；仍然不行就如实说明是哪一步没懂。
      */
     private String infixIntentFallback(String scope, SdClient.Prompts original, String instruction, InfixIntent.Intent intent,
-                                       String blocked, List<String> rejected, String modelError, boolean strictDictionary) throws Exception {
+                                       String blocked, List<String> rejected, String modelError, boolean strictDictionary,
+                                       boolean conflict) throws Exception {
         if (modelError == null && InfixIntent.hasCjk(instruction)) {
-            String retry = infixTranslationRetry(scope, original, instruction, strictDictionary);
+            String retry = infixTranslationRetry(scope, original, instruction, strictDictionary, conflict);
             if (retry != null) return retry;
         }
         return infixNothingUnderstood(intent, instruction, rejected, modelError, blocked);
@@ -2015,18 +2466,19 @@ public final class Bot implements AutoCloseable {
      * 中文描述型的第二次尝试：第一次改写没产出变化时，明确要求它"只返回改好的完整提示词 JSON"，
      * 并把中文必须翻译成英文词条这条硬规矩再写一遍。成功返回回执，失败返回 {@code null}（由调用方报失败）。
      */
-    private String infixTranslationRetry(String scope, SdClient.Prompts original, String instruction, boolean strictDictionary) {
+    private String infixTranslationRetry(String scope, SdClient.Prompts original, String instruction, boolean strictDictionary,
+                                         boolean conflict) {
         String nudge = "【重试】这条要求里有中文描述，必须由你翻译成标准英文词条后落实；"
                 + "只返回 JSON：{\"positive\":\"...\",\"negative\":\"...\"}（改好后的完整提示词），"
                 + "不要解释、不要 Markdown、不要把任何中文写进 positive/negative。原要求：";
         if (instruction.length() + nudge.length() > 8000) return null;
         try {
-            DeepSeekPrompts.Result again = DeepSeekPrompts.of(settings, DeepSeekPrompts.Channel.IMAGE)
+            DeepSeekPrompts.Result again = clientFor()
                     .edit(nudge + instruction, original, TermCategories.describe(usageIndex(), original.positive()));
             InfixFilter filtered = strictDictionary
                     ? filterInfixVocabulary(settings.root, original, again)
                     : new InfixFilter(again, List.of());
-            String applied = applyModelRewrite(scope, original, filtered.result(), filtered.rejected(), instruction);
+            String applied = applyModelRewrite(scope, original, filtered.result(), filtered.rejected(), instruction, conflict);
             if (applied == null) { Log.info("中文描述型要求严格重试后仍无有效变化（" + scope + "）"); return null; }
             Log.info("中文描述型要求严格重试后已应用（" + scope + "）");
             return "（第一次改写没有给出可应用的修改，用更严格的要求重试后成功）\n" + applied;
@@ -2063,7 +2515,8 @@ public final class Bot implements AutoCloseable {
      * 这里负责落盘、函数集归属、与模型路径相同的两道互斥自检、以及回执；
      * **只动指令指定的那一侧**，另一侧一个字符都不碰。
      */
-    private String applyInfixIntent(String scope, SdClient.Prompts original, InfixIntent.Intent intent, String instruction) throws Exception {
+    private String applyInfixIntent(String scope, SdClient.Prompts original, InfixIntent.Intent intent, String instruction,
+                                    boolean conflict) throws Exception {
         boolean negative = intent.side() == InfixIntent.Side.NEGATIVE;
         String before = negative ? original.negative() : original.positive();
         String label = negative ? "反向" : "正向";
@@ -2085,12 +2538,16 @@ public final class Bot implements AutoCloseable {
             // 函数集归属：整体替换等于这一侧不再由函数集拥有；增/删/换只放弃动过的那几个词条。
             if (intent.kind() == InfixIntent.Kind.REPLACE) functions.forget(scope, negative, List.of(), true);
             else functions.forget(scope, negative, change.changed(), false);
-            // 与模型改写路径相同的那两道程序侧自检：它们本来就是"任何改写都不许在 prompt 里留下矛盾"的
+            // 与模型改写路径相同的两道程序侧自检：它们本来就是"任何改写都不许在 prompt 里留下矛盾"的
             // 全局硬规矩（性交类补 1boy、同族词条让位），确定性路径不能因为"没经过模型"就跳过。
-            String fixed = selfCheckPrompts(scope);
+            // 传统正反义词排斥器默认关闭（见 Settings#infixConflictEnabled）：关掉时这两道本地互斥整理都不做，
+            // 矛盾交给改写之后那次整份提示词画面检查判断。
+            String fixed = conflict ? selfCheckPrompts(scope) : "";
             if (!fixed.isEmpty()) updated = userPrompts.prompts(scope);
             List<String> replaced = new ArrayList<>();
-            String enforced = enforceRequestedFamilies(userPrompts.prompts(scope).positive(), instruction, replaced);
+            String enforced = conflict
+                    ? enforceRequestedFamilies(userPrompts.prompts(scope).positive(), instruction, replaced)
+                    : userPrompts.prompts(scope).positive();
             if (!enforced.isBlank() && !replaced.isEmpty()
                     && !enforced.equals(userPrompts.prompts(scope).positive())) {
                 userPrompts.replace(scope, new SdClient.Prompts(enforced, userPrompts.prompts(scope).negative(), UserPromptStore.PERSONAL_SOURCE));
@@ -6166,11 +6623,30 @@ public final class Bot implements AutoCloseable {
     SdClient.Prompts effectivePrompts(String scope) throws Exception {
         SdClient.Prompts mine = userPrompts.prompts(scope);
         if (!mine.positive().isBlank() || !mine.negative().isBlank()) return mine;
-        SdClient.Prompts shared = sd.prompts();
+        SdClient.Prompts shared = sdPromptsForSeed();
         if (shared.positive().isBlank() && shared.negative().isBlank()) return mine;
         Log.info("首次使用：继承当前 WebUI 提示词（" + scope + "）");
         userPrompts.seed(scope, shared);
         return userPrompts.prompts(scope);
+    }
+    /**
+     * 读一份"可继承的共享提示词"（用户自己的还是空的时候，首次使用会从这儿补一份）。
+     *
+     * <p>这一步只是**可选增强**：读不到就不继承，绝不该让整条指令失败。实测（ChineseTagCommandTest）：
+     * 同一条线程上先跑完一次 DeepSeek 改写、紧接着读 WebUI 桥接时，{@code SdClient} 的 HTTP 调用会抛出
+     * "Stable Diffusion 请求已中断"（线程的中断标志其实没置位，属于 HttpClient／桥接侧的瞬时故障）——
+     * 这里清掉中断标志重试一次；仍然失败就按"读不到"处理（返回空），把真正的失败留给改写调用去报。
+     */
+    private SdClient.Prompts sdPromptsForSeed() {
+        for (int attempt = 1; attempt <= 2; attempt++) {
+            try { return sd.prompts(); }
+            catch (Exception failure) {
+                Log.warn("读取 WebUI 共享提示词失败（第 " + attempt + " 次）：" + error(failure));
+                Thread.interrupted();
+            }
+        }
+        Log.warn("读不到 WebUI 共享提示词，本次不继承（用户自己的 prompt 不受影响）。");
+        return new SdClient.Prompts("", "", "unavailable");
     }
     private void generate(JsonObject event, BigInteger count) throws Exception {
         // Serialize submissions while capturing their snapshots, without blocking the GPU worker's bookkeeping.
@@ -7504,6 +7980,28 @@ public final class Bot implements AutoCloseable {
         return speaker;
     }
     /**
+     * 网页接口 {@code POST /api/infix/mode}：读/写一个会话的 infix 档位（界面代理的按钮绑这个）。
+     *
+     * <p>{@code scope} 省略时由调用方传当前网页会话。{@code mode} 支持 {@code global} / {@code parts}
+     * （也认中文 全局/分组）；**非法值一律拒绝（400）且不改动已存值**——配置与按钮状态不会因为一次误点而变。
+     * 返回 {@code {"mode":…,"default":"global","scope":…}}。
+     */
+    public JsonObject setInfixMode(String scope, String mode) throws Exception {
+        String resolved = (scope == null || scope.isBlank()) ? settings.webScope() : scope.strip();
+        String conversation = webConversationKey(resolved);
+        String wanted = mode == null ? "" : mode.strip();
+        Settings.InfixMode parsed = Settings.InfixMode.parse(wanted);
+        if (parsed == null)
+            throw new IllegalArgumentException("mode 只能是 global 或 parts（中文也认：全局/分组）。");
+        settings.setInfixMode(conversation, parsed);
+        Log.info("WebUI infix 档位（" + resolved + "）：" + parsed.key());
+        JsonObject result = new JsonObject();
+        result.addProperty("mode", parsed.key());
+        result.addProperty("default", Settings.InfixMode.GLOBAL.key());
+        result.addProperty("scope", resolved);
+        return result;
+    }
+    /**
      * 网页状态面板的数据。网页与 QQ 两侧独立：这里只报网页自己用得上的东西
      * （模型/生成参数/队列/图片/词库约束/Civitai 账号），不含 owner QQ、admin 名单、地图等 QQ 侧信息。
      */
@@ -7554,6 +8052,10 @@ public final class Bot implements AutoCloseable {
         generation.addProperty("status", generationStatus());
         result.add("generation", generation);
         result.addProperty("infixFilter", settings.infixFilterEnabled(webConversationKey(settings.webScope())));
+        // 网页的 infix 档位（界面代理的按钮绑定这个字段；写入口是 POST /api/infix/mode）。
+        result.addProperty("infixMode", settings.infixMode(webConversationKey(settings.webScope())).key());
+        result.addProperty("infixModeDefault", Settings.InfixMode.GLOBAL.key());
+        result.addProperty("infixConflict", settings.infixConflictEnabled(webConversationKey(settings.webScope())));
         result.addProperty("imageCount", settings.imageCount());
         result.addProperty("autoGet", settings.autoGet());
         result.add("civitai", civitaiStatus());

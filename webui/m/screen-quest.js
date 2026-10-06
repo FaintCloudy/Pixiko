@@ -125,10 +125,14 @@
          `<img>` 只写 width:100% + height:auto。行高由图片自己撑开（grid-auto-rows:auto）。 */
       '.q-grid{display:grid;grid-template-columns:repeat(2,1fr);grid-auto-rows:auto;gap:8px;margin-top:4px;align-items:start}',
       '.q-grid:has(.q-tile:only-child){grid-template-columns:1fr}',   /* 只有一张图 → 占满整行，不留半边空列 */
-      '.q-tile{position:relative;display:block;width:100%;aspect-ratio:4/3;padding:0;margin:0;border:1px solid #24314e;',
+      /* 尺寸上限（用户报的「回执的图片预览不能过大」）：与对话气泡同一条口径 ——
+         按原图比例撑满列宽时竖图会顶满整屏，所以给宿主加 34vh 上限 + contain 居中。
+         横图够不到上限，行为照旧；查看器里仍是原图。 */
+      '.q-tile{position:relative;display:flex;align-items:center;justify-content:center;width:100%;aspect-ratio:4/3;',
+      '  max-height:34vh;padding:0;margin:0;border:1px solid #24314e;',
       '  border-radius:12px;overflow:hidden;background:#0f1728;cursor:pointer;touch-action:manipulation}',
       '.q-tile:active{transform:scale(.97)}',
-      '.q-tile img{width:100%;height:auto;object-fit:fill;display:block}',
+      '.q-tile img{width:100%;height:auto;max-height:100%;object-fit:contain;display:block}',
       '.q-tile.q-fail{display:flex;align-items:center;justify-content:center;color:#93a4c4;font-size:11px;text-align:center}'
     ].join('');
     document.head.appendChild(style);
@@ -150,7 +154,41 @@
     while (node.firstChild) node.removeChild(node.firstChild);
   }
   function toast(text) { if (text && typeof P.toast === 'function') { try { P.toast(String(text)); } catch (error) { /* 提示失败不影响功能 */ } } }
-  function text(value) { return value === undefined || value === null ? '' : String(value); }
+  /**
+   * 一张卡片的小标题：**按这一条消息自己的内容**取名，不再一律写「第 N 步」。
+   *
+   * <p>用户报的「回执条目正文内容混乱」根因就在这里：一条回执的 messages 里既有
+   * 「多步执行完成：2/2 条（全部成功）」这种汇总、也有【1】.infix…【2】.gen 这种真正的步骤、
+   * 还有「任务 #2 已完成…」「已生成的图片将自动领取。」这种状态，甚至一条纯图片消息。
+   * 老写法把它们**逐条编号成"第 1 步 / 第 2 步…"**，于是"步骤 1"是汇总、
+   * "*步骤 3"是收图状态，用户看到的就是对不上的编号 + 一堆碎块。
+   *
+   * <p>判据（从最有信息量的开始）：
+   * <ol>
+   *   <li>以 `【N】…` 开头 → 用方括号里那截当标题（`.infix 加入…` / `.gen`）；</li>
+   *   <li>首行短（≤24 字）且不是正文句 → 直接用它（例如「任务 #2 已完成：1/1…」）；</li>
+   *   <li>纯图片 → 「生成的图片」；</li>
+   *   <li>都没有 → 回退成「第 N 步」（保留老行为，不再乱编号的场合才用）。</li>
+   * </ol>
+   */
+  function stepTitle(stepText, index, hasPic) {
+    var body = text(stepText);
+    var lines = body.split('\n');
+    var first = (lines[0] || '').trim();
+    var marker = /^【\s*(\d+)\s*】\s*([^\n]*)$/.exec(first);
+    if (marker && marker[2].trim()) {
+      var label = marker[2].trim();
+      return (label.length > 30 ? label.slice(0, 30) + '…' : label);
+    }
+    if (first && first.length <= 24 && !/[。！？]$/.test(first)) return first;
+    if (hasPic) return '生成的图片';
+    if (!first) return '第 ' + (index + 1) + ' 步';
+    // 长首行：**优先在标点处断开**，别把话切成半句（"已加入生成队列，任务 #3，共…"）。
+    var head = first.slice(0, 24);
+    var cut = Math.max(head.lastIndexOf('：'), head.lastIndexOf('，'), head.lastIndexOf('、'));
+    if (cut >= 6) head = head.slice(0, cut);
+    return head + '…';
+  }
   function num(value, fallback) {
     var n = Number(value);
     return Number.isFinite(n) ? n : (fallback === undefined ? 0 : fallback);
@@ -1215,7 +1253,7 @@
       node.classList.toggle('q-err', /(^|\n)[^\n]{0,16}(失败|错误|不正确|无效|超时|拒绝|找不到)[:：]/.test(stepText));
       var head = node.firstChild;
       var body = node.lastChild;
-      var title = isMessages ? '第 ' + (index + 1) + ' 步' : '输出';
+      var title = stepTitle(stepText, index, hasPic);
       if (head && head.textContent !== title) head.textContent = title;
       if (body && body.textContent !== stepText) body.textContent = stepText;
       if (body) body.style.display = stepText ? '' : 'none';

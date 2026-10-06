@@ -16,6 +16,9 @@
      预填到「服务器设置」的地址框里，方便装机后直接连；只是预填，不自动连接、不绕令牌）。
      构建结束时会把「本次烧进去的地址」和生成的 BuildConfig 那一行打印出来。
      探测规则见下面「0.5 探测本机局域网地址」一段；-NoDefaultHost 可完全关掉。
+    7. -CheckVersion <x.y.z>：**只读**核对 app\build.gradle 的 versionName 是否等于本次发行号
+       （发版硬门槛：安卓版版本号＝发行号，见 RELEASE.md「发行清单（每版必做）」），
+       打印 PASS/FAIL 后**直接退出**——不探测网卡、不跑 gradle、不写文件、不构建。
 
   幂等：可重复运行；每次都会覆盖 -OutDir 下的同名 APK。
   失败时打印 gradle 输出的最后 40 行并 exit 非 0。
@@ -67,9 +70,17 @@
   读 webui.port 用的 config.json 路径。默认 F:\Bot\config.json；只读，绝不写。
   读不到就退回 8787（与 UrlHelper.DEFAULT_PORT 一致）。
 
+.PARAMETER CheckVersion
+  **只读的版本号核对**：传入本次发行号（`1.7.0` 或 `v1.7.0`），脚本只读 `app\build.gradle` 的
+  `versionName` / `versionCode` 与它比对，打印 PASS/FAIL 后**直接退出**（不探测网卡、不跑 gradle、
+  不写任何文件、不构建）。**版本号不一致时以退出码 5 结束**，其余为 0。
+  规则来源：**每一版发行都必须同时提供安卓版，且安卓版版本号＝本次发行号**，
+  见 `RELEASE.md`「发行清单（每版必做）」。
+
 .EXAMPLE
   powershell -ExecutionPolicy Bypass -File .\build-apk.ps1
   powershell -ExecutionPolicy Bypass -File .\build-apk.ps1 -Task assembleRelease -OutDir D:\out
+  powershell -ExecutionPolicy Bypass -File .\build-apk.ps1 -CheckVersion 1.7.0
 #>
 
 [CmdletBinding()]
@@ -84,6 +95,7 @@ param(
     [string] $DefaultHost = '',
     [switch] $NoDefaultHost,
     [string] $ConfigPath = 'F:\Bot\config.json',
+    [string] $CheckVersion = '',
     [switch] $NoProxy,
     [string] $Proxy      = 'http://127.0.0.1:7890'
 )
@@ -113,6 +125,67 @@ function Invoke-Native {
 $ProjectDir = $PSScriptRoot
 if ([string]::IsNullOrWhiteSpace($ProjectDir)) {
     throw "无法确定脚本所在目录（`$PSScriptRoot 为空）。请用 -File 方式调用本脚本。"
+}
+
+# ---------------------------------------------------------------- 0.0 -CheckVersion：只读版本号核对
+# 发版硬门槛（见仓库 RELEASE.md「发行清单（每版必做）」）：
+#   「每一版发行都必须同时提供安卓版，且安卓版版本号＝本次发行号（同一个发行号）」
+# 给了 -CheckVersion 就只做这一件事：读 app\build.gradle 的 versionName / versionCode，
+# 与传入的发行号比对，打印 PASS/FAIL，然后直接退出。
+# 这里刻意放在最前面（在写日志/探测网卡/检查工具链之前）：
+#   ① 只读，不写任何文件（下面那些步骤会建目录、写 gradle 日志）；
+#   ② 不需要 JDK / Android SDK 在场也能核对版本号（发版本前随时可跑）；
+#   ③ 不传 -CheckVersion 时，下面这段完全不生效——默认构建行为与加它之前一字不差。
+if (-not [string]::IsNullOrWhiteSpace($CheckVersion)) {
+    $wantVersion = $CheckVersion.Trim() -replace '^[vV]', ''
+    Write-Host ""
+    Write-Host "==== Pixiko Android 版本号核对（只读，不构建） ====" -ForegroundColor White
+    Write-Host "  期望发行号 : $wantVersion   （来自 -CheckVersion；原样传入 '$CheckVersion'）"
+    Write-Host "  build.gradle: $(Join-Path $ProjectDir 'app\build.gradle')"
+
+    $checkGradle = Join-Path $ProjectDir 'app\build.gradle'
+    if (-not (Test-Path -LiteralPath $checkGradle)) {
+        Write-Host "  FAIL : 找不到 app\build.gradle，无法核对版本号" -ForegroundColor Red
+        exit 5
+    }
+    # 显式按 UTF-8 读（与 build.gradle 本身的编码一致；只读，绝不写）。
+    $checkText = [System.IO.File]::ReadAllText($checkGradle, [System.Text.Encoding]::UTF8)
+    $checkName = $null
+    $checkCode = $null
+    if ($checkText -match 'versionName\s*[= ]\s*["'']([^"'']+)["'']') { $checkName = $Matches[1] }
+    if ($checkText -match 'versionCode\s*[= ]\s*(\d+)')                 { $checkCode = [int]$Matches[1] }
+
+    Write-Host "  versionName : $checkName"
+    Write-Host "  versionCode : $checkCode"
+
+    if ([string]::IsNullOrWhiteSpace($checkName)) {
+        Write-Host "  FAIL : 没能在 app\build.gradle 里解析出 versionName" -ForegroundColor Red
+        exit 5
+    }
+    if ($checkName -ne $wantVersion) {
+        Write-Host "  FAIL : versionName '$checkName' ≠ 本次发行号 '$wantVersion'" -ForegroundColor Red
+        Write-Host "         —— 要么把 app\build.gradle 的 versionName 改成 '$wantVersion'（versionCode 同步递增），" -ForegroundColor Red
+        Write-Host "            要么本次发行号本来就该是 '$checkName'。**不许**为了过校验去改校验。" -ForegroundColor Red
+        exit 5
+    }
+
+    # versionCode：正数、且与「major*100 + minor*10 + patch」这个既有口径一致时给一句确认；
+    # 两位 patch 的老版本（v1.0.11–v1.0.18 那种）套不上这个公式，只提示、不判失败。
+    $parts = @($wantVersion.Split('.'))
+    if ($checkCode -le 0) {
+        Write-Host "  WARN : versionCode 不是正数（$checkCode）" -ForegroundColor Yellow
+    } elseif ($parts.Count -eq 3 -and $parts[0] -match '^\d+$' -and $parts[1] -match '^\d+$' -and $parts[2] -match '^\d+$') {
+        $expectCode = [int]$parts[0] * 100 + [int]$parts[1] * 10 + [int]$parts[2]
+        if ($checkCode -eq $expectCode) {
+            Write-Host "  OK   : versionCode $checkCode 与口径 major*100+minor*10+patch 一致" -ForegroundColor Green
+        } else {
+            Write-Host "  WARN : versionCode $checkCode ≠ 按口径算出的 $expectCode（只要求比上一版大即可，请自行确认确实在递增）" -ForegroundColor Yellow
+        }
+    }
+
+    Write-Host "  PASS : versionName ＝ 本次发行号 '$wantVersion'" -ForegroundColor Green
+    Write-Host "==== 版本号核对通过（未构建、未写任何文件） ====" -ForegroundColor Green
+    exit 0
 }
 
 Write-Host ""

@@ -8,6 +8,7 @@ import cn.szu.bot.chat.DeepSeekPrompts;
 import cn.szu.bot.civitai.CivitaiClient;
 import com.google.gson.*;
 import jakarta.servlet.http.HttpServletRequest;
+import jakarta.servlet.http.HttpServletResponse;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.RequestBody;
@@ -38,11 +39,19 @@ public class WebApiController {
     private final Bot bot;
     /** 对话页正文的持久化存档（完整正文：文字 + 图片路径 + 指令回执）；纯文字那份 LLM 历史仍走 chatFile。 */
     private final ChatLogStore chatLog;
+    /**
+     * 安卓端自动更新（问版本 + 下 APK）：只读、免令牌（放行在 {@link WebAuthFilter#shouldNotFilter}，
+     * 那里在路由匹配之前跑），哈希缓存挂在它身上。渠道开关见 {@link AppUpdate} 的类注释。
+     */
+    private final AppUpdate appUpdate;
 
     public WebApiController(Settings settings, Bot bot) {
         this.settings = settings;
         this.bot = bot;
         this.chatLog = new ChatLogStore(settings.root);
+        // 每次请求重读配置：把 app_update.channel 从 dev 改成 release 立刻生效，不用重启机器人。
+        this.appUpdate = new AppUpdate(AppUpdate.configFor(settings), AppUpdate::defaultCandidates,
+                settings.root, () -> AppUpdate.configFor(settings));
     }
 
     @RequestMapping(value = "/api/**", method = {RequestMethod.POST, RequestMethod.GET})
@@ -51,7 +60,7 @@ public class WebApiController {
         String path = request.getRequestURI();
         try {
             JsonObject body = parseBody(raw);
-            String scope = Json.str(body, "scope", settings.webScope());
+            String scope = resolveScope(Json.str(body, "scope", settings.webScope()));
             return route(request, path, body, scope);
         } catch (IllegalArgumentException error) {
             return WebJson.of(HttpStatus.BAD_REQUEST, WebJson.error(error.getMessage()));
@@ -63,6 +72,33 @@ public class WebApiController {
         } finally {
             Log.clearWeb();
         }
+    }
+
+    /**
+     * 服务端给请求定的 scope（「这是谁的对话」）。请求体里给了 {@code scope} 就用它，否则用控制台默认的
+     * {@link Settings#webScope()}（{@code "web"}）。
+     *
+     * <p>这里多一道<b>非常窄</b>的净化，只做一件事：把明显不是"一个 scope"的输入挡回去，退回默认。
+     * 为什么需要：scope 同时是服务端两处存储的键 ——
+     * {@code ChatLogStore.safeScope} 只留 {@code [A-Za-z0-9_.-]}（其余换 {@code _}、上限 64），
+     * {@code UserPromptStore.scopeOf} 只放行 {@code [A-Za-z][A-Za-z0-9_-]{0,31}}，<b>其余一律塌成
+     * {@code "default"}</b>。于是像 {@code "device A"} 这种带空格的 scope 会先被换成 {@code device_A}
+     * （聊天正文）又被换成 {@code default}（个人提示词）—— 两条路走散，不同设备可能因此挤进同一份提示词。
+     * 与其让"每台设备一段自己的对话"在某个角落被悄悄合并，不如在这里就把它退回默认值：
+     * 合法形状（Android 外壳给的 {@code dev-<12 位十六进制>}、控制台的 {@code web}、旧的 QQ 号）全都原样通过。
+     *
+     * <p>这<b>不是</b>权限或安全边界（WebUI 是单用户的，令牌就是全部授权），只是"别把存储键搞散"的一致性守卫。
+     */
+    static String resolveScope(String raw) {
+        String value = raw == null ? "" : raw.strip();
+        if (value.isEmpty()) return "web";
+        for (int index = 0; index < value.length(); index++) {
+            char ch = value.charAt(index);
+            boolean ok = (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9')
+                    || ch == '_' || ch == '-' || ch == '.';
+            if (!ok) return "web";
+        }
+        return value.length() > 64 ? "web" : value;
     }
 
     private ResponseEntity<?> route(HttpServletRequest request, String path, JsonObject body, String scope) throws Exception {
@@ -241,6 +277,12 @@ public class WebApiController {
                 applySetting(body);
                 return WebJson.ok(bot.webStatus());
             }
+            // infix 档位按钮（界面代理绑定这个接口）：global（默认，一条指令只改一次）/ parts（旧的分组多步）。
+            // 非法 mode 一律 400 且**不改**已存值；scope 省略时用当前网页会话。
+            case "/api/infix/mode": {
+                requirePost(method);
+                return WebJson.ok(bot.setInfixMode(Json.str(body, "scope", settings.webScope()), Json.str(body, "mode", "")));
+            }
             case "/api/generation": {
                 // 「生成参数」卡：没有「应用」按钮，网页每次改动都直接发到这里立即生效。
                 requirePost(method);
@@ -316,6 +358,22 @@ public class WebApiController {
                 return WebJson.ok(bot.webTaskAction(Json.str(body, "action", ""), Json.str(body, "number", "")));
             }
             case "/api/image": return serveImage(imageQuery(request, body), imageWidth(request, body));
+            // 安卓端自动更新（只读、**不需要令牌**：放行在 WebAuthFilter，过滤器在路由匹配之前跑）。
+            // POST /api/app/update 问「有没有新版本」，GET /api/app/apk 下当前渠道那份 APK 的字节流。
+            // 契约固定：apkUrl 用请求的 Host 拼，不下发任何凭据字段；方法不对回 405，不静默。
+            case "/api/app/update": {
+                // 契约是 POST。别的控制台接口用 requirePost（400），这里明确回 405：安卓端能一眼分清
+                // 「方法用错」和「参数用错」，也符合 HTTP 语义。
+                if (!"POST".equals(method))
+                    return WebJson.of(HttpStatus.METHOD_NOT_ALLOWED, WebJson.error("请使用 POST。"));
+                return WebJson.ok(appUpdate.info(request));
+            }
+            case "/api/app/apk": {
+                // 契约是 GET（安卓端探测时误用过 POST）：方法不对明确回 405，不静默。
+                if (!"GET".equals(method) && !"HEAD".equals(method))
+                    return WebJson.of(HttpStatus.METHOD_NOT_ALLOWED, WebJson.error("请使用 GET。"));
+                return appUpdate.apk(request, imageQuery(request, body));
+            }
             default: return WebJson.of(HttpStatus.NOT_FOUND, WebJson.error("未知接口：" + path));
         }
     }

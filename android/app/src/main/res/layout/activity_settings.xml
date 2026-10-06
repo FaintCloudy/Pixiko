@@ -207,5 +207,135 @@
             android:text="@string/settings_security_note"
             android:textColor="@color/pixiko_muted"
             android:textSize="12sp" />
+
+        <!-- ==================== 应用更新 ==================== -->
+        <View
+            android:layout_width="match_parent"
+            android:layout_height="1dp"
+            android:layout_marginTop="20dp"
+            android:background="@color/pixiko_divider" />
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="16dp"
+            android:gravity="center_vertical"
+            android:orientation="horizontal">
+
+            <TextView
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:text="@string/settings_update_title"
+                android:textColor="@color/pixiko_text"
+                android:textSize="17sp"
+                android:textStyle="bold" />
+
+            <!-- 设置页的红点：有新版本时才亮（明显但不打断）。 -->
+            <TextView
+                android:id="@+id/update_badge"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:background="@color/pixiko_danger"
+                android:paddingStart="8dp"
+                android:paddingTop="2dp"
+                android:paddingEnd="8dp"
+                android:paddingBottom="2dp"
+                android:text="@string/settings_update_badge"
+                android:textColor="@color/pixiko_text"
+                android:textSize="11sp"
+                android:visibility="gone" />
+        </LinearLayout>
+
+        <TextView
+            android:id="@+id/update_current"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="4dp"
+            android:textColor="@color/pixiko_muted"
+            android:textSize="12sp" />
+
+        <CheckBox
+            android:id="@+id/update_auto"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="4dp"
+            android:checked="true"
+            android:text="@string/settings_update_auto"
+            android:textColor="@color/pixiko_text" />
+
+        <Button
+            android:id="@+id/update_check"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="4dp"
+            android:text="@string/settings_update_check" />
+
+        <!-- 更新包下载进度（百分比由 Content-Length 算出）。 -->
+        <ProgressBar
+            android:id="@+id/update_progress"
+            style="?android:attr/progressBarStyleHorizontal"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:indeterminate="false"
+            android:max="100"
+            android:visibility="gone" />
+
+        <!-- 有新版本时才显示：新版本号 / 字节大小 / 渠道（开发还是正式）/ 更新说明 -->
+        <TextView
+            android:id="@+id/update_info"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:lineSpacingExtra="2dp"
+            android:textColor="@color/pixiko_accent"
+            android:textSize="13sp"
+            android:visibility="gone" />
+
+        <LinearLayout
+            android:id="@+id/update_actions"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="4dp"
+            android:orientation="horizontal"
+            android:visibility="gone">
+
+            <Button
+                android:id="@+id/update_download"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:text="@string/settings_update_download" />
+
+            <Button
+                android:id="@+id/update_release_page"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_marginStart="8dp"
+                android:layout_weight="1"
+                android:text="@string/settings_update_release_page"
+                android:visibility="gone" />
+        </LinearLayout>
+
+        <!-- 更新流程的状态/结果（下载、校验、安装、失败原因都写在这）。 -->
+        <TextView
+            android:id="@+id/update_status"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:lineSpacingExtra="2dp"
+            android:textColor="@color/pixiko_text"
+            android:textSize="13sp" />
+
+        <!-- **必须保留**：这条把「自我更新能做到哪一步」讲清楚，不许改成含糊说法。 -->
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="10dp"
+            android:lineSpacingExtra="3dp"
+            android:text="@string/settings_update_boundary"
+            android:textColor="@color/pixiko_muted"
+            android:textSize="12sp" />
     </LinearLayout>
 </ScrollView>

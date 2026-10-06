@@ -5,13 +5,17 @@ import android.app.Activity;
 import android.app.AlertDialog;
 import android.app.DownloadManager;
 import android.content.ActivityNotFoundException;
+import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
+import android.content.IntentFilter;
 import android.content.pm.PackageManager;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Environment;
+import android.os.Handler;
+import android.os.Looper;
 import android.view.Menu;
 import android.view.MenuItem;
 import android.view.View;
@@ -28,6 +32,7 @@ import android.webkit.WebSettings;
 import android.webkit.WebStorage;
 import android.webkit.WebView;
 import android.webkit.WebViewClient;
+import android.widget.Button;
 import android.widget.ProgressBar;
 import android.widget.TextView;
 
@@ -69,6 +74,34 @@ public class MainActivity extends AppCompatActivity {
     /** 网页 console 输出的 logcat tag（与原生日志的 PixikoApp 分开，见 onConsoleMessage）。 */
     private static final String WEB_TAG = "PixikoWeb";
 
+    /**
+     * 自动检查更新的延迟。
+     *
+     * <p>为什么要延迟：启动那几秒是 WebView 建进程、解析网页、拉首屏数据的时候，更新检查虽然已经在
+     * 子线程上，但会跟首屏抢带宽/CPU。等 6 秒再发那一个几百字节的 POST，用户完全感觉不到，
+     * 首屏却干净了。这是本功能<b>不阻塞首屏</b>的具体做法（另一层保证：整个检查都在子线程）。
+     */
+    private static final long AUTO_UPDATE_CHECK_DELAY_MS = 6_000L;
+
+    /** 跨 Activity 通知「有新版本」的广播（MainActivity 横幅 ↔ SettingsActivity 红点）。 */
+    static final String ACTION_UPDATE_STATUS = "cn.szu.bot.app.action.UPDATE_STATUS";
+
+    /** extra：一句话结论。 */
+    static final String EXTRA_UPDATE_STATUS_TEXT = "status_text";
+    /** extra：这个结论要不要按「好消息」显示（有新版本 = true）。 */
+    static final String EXTRA_UPDATE_STATUS_GOOD = "status_good";
+    /** extra：有新版本时把 UpdateInfo 的关键字段带过去，设置页不用再查一次。 */
+    static final String EXTRA_UPDATE_VERSION = "version";
+    static final String EXTRA_UPDATE_VERSION_CODE = "versionCode";
+    static final String EXTRA_UPDATE_SIZE = "sizeBytes";
+    static final String EXTRA_UPDATE_SHA256 = "sha256";
+    static final String EXTRA_UPDATE_APK_URL = "apkUrl";
+    static final String EXTRA_UPDATE_RELEASE_URL = "releaseUrl";
+    static final String EXTRA_UPDATE_PUBLISHED_AT = "publishedAt";
+    static final String EXTRA_UPDATE_NOTES = "notes";
+    static final String EXTRA_UPDATE_CHANNEL = "channel";
+    static final String EXTRA_UPDATE_CHANNEL_NOTE = "channelNote";
+
     private ServerRepository repository;
     private ServerConfig current;
 
@@ -78,6 +111,28 @@ public class MainActivity extends AppCompatActivity {
     private WebView webView;
     private View errorPage;
     private TextView errorDetail;
+
+    /** 「发现新版本」横幅及其控件（默认整条 GONE，只有真查到更新才显示）。 */
+    private View updateBanner;
+    private TextView updateBannerText;
+    private TextView updateBannerChannel;
+    /** 最近一次检查到的更新；用户在横幅上点「下载更新」时要用它。 */
+    private UpdateInfo pendingUpdate;
+
+    /** 主线程 Handler：延迟检查更新、以及把子线程结果贴回 UI。 */
+    private final Handler mainHandler = new Handler(Looper.getMainLooper());
+    /** 自动检查的延迟任务，onDestroy 里要撤掉（否则 Activity 没了还在跑）。 */
+    private Runnable autoCheckTask;
+
+    /** 更新横幅 ↔ 设置页红点的广播（见 onUpdateStatus 与 update_status_receiver）。 */
+    private final BroadcastReceiver updateStatusReceiver = new BroadcastReceiver() {
+        @Override public void onReceive(Context context, Intent intent) {
+            onUpdateStatusBroadcast(intent);
+        }
+    };
+
+    /** 这次运行是否已经排期过自动检查（旋转/重建/多次调用只查一次）。 */
+    private boolean autoCheckScheduled;
 
     /** 网页令牌是否已经注入过（同一轮加载只处理一次，见 {@link #maybeInjectToken}）。 */
     private boolean tokenInjected;
@@ -95,6 +150,12 @@ public class MainActivity extends AppCompatActivity {
 
     private static final String PREF_UI = "pixiko_ui";
     private static final String KEY_KEEP_SCREEN_ON = "keep_screen_on";
+
+    /**
+     * 本机的设备 scope（{@code dev-xxxxxxxxxxxx}，见 {@link DeviceScope}）。
+     * {@code null} ＝ 还没取过；{@link #deviceScope()} 里懒取一次就缓存下来。
+     */
+    private String deviceScope;
 
     /**
      * 用户选的是「手机界面（/m）」还是「完整控制台（/）」。
@@ -116,6 +177,10 @@ public class MainActivity extends AppCompatActivity {
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         setContentView(R.layout.activity_main);
+
+        // 设备身份要**尽早**落实：它决定 /m 的 scope（每台手机各自一段对话），
+        // 而且要在任何 loadUrl / 保存恢复之前就已生成，免得异常路径上漏掉。
+        deviceScope();
 
         repository = new ServerRepository(this);
         current = repository.current();
@@ -145,10 +210,18 @@ public class MainActivity extends AppCompatActivity {
         errorDetail = findViewById(R.id.error_detail);
 
         bindErrorPage();
+        bindUpdateBanner();
         configureWebView();
         configureSwipe();
         applyKeepScreenOnState();
         requestLegacyStoragePermissionIfNeeded();
+        // 跨 Activity 的更新状态通道（设置页点完「检查更新」后横幅要能跟着变）。
+        // Android 13+ 起 registerReceiver 要显式写 exported，这里只收自己进程内的广播，所以是 NOT_EXPORTED。
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            registerReceiver(updateStatusReceiver, new IntentFilter(ACTION_UPDATE_STATUS), Context.RECEIVER_NOT_EXPORTED);
+        } else {
+            registerReceiver(updateStatusReceiver, new IntentFilter(ACTION_UPDATE_STATUS));
+        }
 
         getOnBackPressedDispatcher().addCallback(this, new OnBackPressedCallback(true) {
             @Override public void handleOnBackPressed() { handleBack(); }
@@ -161,6 +234,9 @@ public class MainActivity extends AppCompatActivity {
         } else {
             loadHome();
         }
+        // 从这里就开始计时（而不是等 onPageFinished）：首屏慢的时候也要保证「启动后几秒就检查」这个语义。
+        // 重复调用是安全的 —— scheduleAutoUpdateCheck 里的 autoCheckScheduled 保证只排一次。
+        scheduleAutoUpdateCheck();
     }
 
     // ------------------------------------------------------------------ WebView 配置
@@ -231,6 +307,250 @@ public class MainActivity extends AppCompatActivity {
         findViewById(R.id.error_browser).setOnClickListener(view -> openInBrowser());
     }
 
+    // ------------------------------------------------------------------ 检查更新（横幅）
+
+    private void bindUpdateBanner() {
+        updateBanner = findViewById(R.id.update_banner);
+        updateBannerText = findViewById(R.id.update_banner_text);
+        updateBannerChannel = findViewById(R.id.update_banner_channel);
+        if (updateBanner == null) return;
+
+        Button download = findViewById(R.id.update_banner_download);
+        Button detail = findViewById(R.id.update_banner_detail);
+        Button later = findViewById(R.id.update_banner_later);
+        if (download != null) download.setOnClickListener(view -> startUpdateDownload());
+        if (detail != null) detail.setOnClickListener(view -> showUpdateDetail());
+        // 「稍后」：记下这个 versionCode，本次运行内不再弹（下个版本出来时会重新提示）。
+        if (later != null) {
+            later.setOnClickListener(view -> {
+                if (pendingUpdate != null) {
+                    new UpdatePrefs(this).ignoreVersion(pendingUpdate.versionCode);
+                    Log.i("用户点了「稍后」，本版本不再提示：versionCode=" + pendingUpdate.versionCode);
+                }
+                hideUpdateBanner();
+            });
+        }
+    }
+
+    /**
+     * 安排一次自动检查：**延迟若干秒**、在**子线程**上跑，绝不阻塞首屏。
+     *
+     * <p>三个前置条件都满足才发这一次请求，省掉没意义的网络动作与日志：
+     * <ol>
+     *   <li>设置里那个开关是开的（默认开）；</li>
+     *   <li>已经配了服务器（一台都没配时连地址都没有，检查必然失败）；</li>
+     *   <li>这次运行还没检查过（{@code autoCheckScheduled} 挡住旋转/重入）。</li>
+     * </ol>
+     */
+    private void scheduleAutoUpdateCheck() {
+        if (autoCheckScheduled) return;
+        if (current == null) return;
+        if (!new UpdatePrefs(this).autoCheck()) {
+            Log.d("自动检查更新：设置里关掉了，跳过");
+            return;
+        }
+        autoCheckScheduled = true;
+        final String base = current.base;
+        final String token = current.token;
+        autoCheckTask = () -> checkForUpdate(base, token, false);
+        mainHandler.postDelayed(autoCheckTask, AUTO_UPDATE_CHECK_DELAY_MS);
+        Log.d("自动检查更新已排期：" + AUTO_UPDATE_CHECK_DELAY_MS / 1000 + " 秒后在子线程检查 " + base);
+    }
+
+    /**
+     * 真的去查一次。<b>必须在子线程调用</b>（网络 IO）。
+     *
+     * @param manual 是不是用户手动点的（手动时忽略「稍后」记录，并把结果也发广播给设置页）
+     */
+    private void checkForUpdate(final String base, final String token, final boolean manual) {
+        UpdateChecker.Outcome outcome = UpdateChecker.check(base, token, null);
+        if (outcome.ok && outcome.info != null) {
+            UpdateInfo info = outcome.info;
+            if (!info.isNewerThan(Prefs.installedVersionCode(this))) {
+                // 没有更新（或本机反而更新）：安静收场。手动检查时给一句「已是最新」的反馈。
+                Log.d("更新检查完成：没有比本机 versionCode=" + Prefs.installedVersionCode(this)
+                        + " 更新的版本（服务端 version=" + info.version + " code=" + info.versionCode + "）");
+                if (manual) {
+                    pushUpdateStatus(getString(R.string.settings_update_up_to_date, info.version), false, null);
+                }
+                return;
+            }
+            // 有新版本：用户点过「稍后」的**同一个** versionCode 不再打扰（手动检查不受此限）。
+            int ignored = new UpdatePrefs(this).ignoredVersionCode();
+            if (!manual && ignored == info.versionCode) {
+                Log.d("新版本 versionCode=" + info.versionCode + " 已被用户「稍后」，本次不再提示");
+                return;
+            }
+            Log.i("发现新版本：" + info.version + "（versionCode " + info.versionCode + "，本机 "
+                    + Prefs.installedVersionCode(this) + "），" + info.sizeText() + "，渠道="
+                    + (info.channel.isEmpty() ? "(未标注)" : info.channel)
+                    + (info.canInstall() ? "，可下载" : "，但服务端没给可下载的包"));
+            pushUpdateStatus(describeUpdate(info), true, info);
+            return;
+        }
+        Log.w("更新检查没成功：" + outcome.message);
+        if (manual) pushUpdateStatus(outcome.message, false, null);
+    }
+
+    /** 「发现新版本 1.7.0（当前 1.6.0）· 6.0 MB」这句横幅主文案。 */
+    private String describeUpdate(UpdateInfo info) {
+        StringBuilder text = new StringBuilder();
+        text.append(getString(R.string.update_banner_title, displayVersion(info), Prefs.installedVersionName(this)));
+        String size = info.sizeText();
+        if (!size.isEmpty()) text.append(" · ").append(size);
+        return text.toString();
+    }
+
+    /** 服务端没给 version 字符串时退回 versionCode 显示，别显示一个空白。 */
+    private String displayVersion(UpdateInfo info) {
+        return info.version.isEmpty() ? ("versionCode " + info.versionCode) : info.version;
+    }
+
+    private void showUpdateBanner(UpdateInfo info) {
+        if (updateBanner == null) return;
+        if (isFinishing() || isDestroyed()) return;
+        pendingUpdate = info;
+        if (updateBannerText != null) updateBannerText.setText(describeUpdate(info));
+        if (updateBannerChannel != null) {
+            // 渠道那一行很重要：现阶段服务端下发的是「带局域网地址的测试包」，必须让用户看见。
+            updateBannerChannel.setText(info.channelText());
+            updateBannerChannel.setVisibility(View.VISIBLE);
+        }
+        // 没有可下载的包（或没有 sha256）时不给「下载更新」按钮 —— 详见 UpdateInfo.blockReason()。
+        Button download = findViewById(R.id.update_banner_download);
+        if (download != null) {
+            boolean installable = info.canInstall();
+            download.setEnabled(installable);
+            download.setAlpha(installable ? 1f : 0.5f);
+            if (!installable) download.setText(R.string.update_banner_detail);
+        }
+        updateBanner.setVisibility(View.VISIBLE);
+    }
+
+    private void hideUpdateBanner() {
+        pendingUpdate = null;
+        if (updateBanner != null) updateBanner.setVisibility(View.GONE);
+    }
+
+    /** 「详情」：把版本号 / 大小 / 渠道 / 更新说明摊开给用户看（不打断，弹窗可关）。 */
+    private void showUpdateDetail() {
+        UpdateInfo info = pendingUpdate;
+        if (info == null) return;
+        StringBuilder message = new StringBuilder();
+        message.append("新版本：").append(displayVersion(info))
+                .append("（versionCode ").append(info.versionCode).append("）\n");
+        message.append("当前版本：").append(Prefs.installedVersionName(this))
+                .append("（versionCode ").append(Prefs.installedVersionCode(this)).append("）\n");
+        if (!info.sizeText().isEmpty()) message.append("安装包大小：").append(info.sizeText()).append('\n');
+        message.append("渠道：").append(info.channelText()).append('\n');
+        if (!info.publishedAt.isEmpty()) message.append("发布时间：").append(info.publishedAt).append('\n');
+        if (!info.sha256.isEmpty()) message.append("sha256：").append(info.sha256.substring(0, Math.min(16, info.sha256.length()))).append("…\n");
+        if (!info.notes.isEmpty()) message.append("\n").append(getString(R.string.settings_update_notes_title)).append("：\n").append(info.notes);
+        String blocked = info.blockReason();
+        if (!blocked.isEmpty()) message.append("\n\n").append(blocked);
+
+        new AlertDialog.Builder(this, R.style.Theme_Pixiko_Dialog)
+                .setTitle(R.string.settings_update_title)
+                .setMessage(message.toString())
+                .setNegativeButton(R.string.update_banner_later, (dialog, which) -> {
+                    new UpdatePrefs(MainActivity.this).ignoreVersion(info.versionCode);
+                    hideUpdateBanner();
+                })
+                .setPositiveButton(info.canInstall() ? R.string.update_banner_action : R.string.about_ok,
+                        (dialog, which) -> {
+                            if (info.canInstall()) startUpdateDownload();
+                        })
+                .show();
+    }
+
+    /**
+     * 用户点了「下载更新」：把下载/校验/安装这一整套交给 {@link SettingsActivity} 的「应用更新」区去做。
+     *
+     * <p>为什么不就地下载：下载进度、校验结果、失败重试、以及「缺安装权限时去系统设置」这些都需要
+     * 一块稳定的 UI 落点，而横幅在 {@code /m} 下是很窄的一条、还可能被网页内容挤走。
+     * 更新区在设置页里是常驻的，进程被杀也能从那里接着装。
+     */
+    private void startUpdateDownload() {
+        Intent intent = new Intent(this, SettingsActivity.class);
+        intent.putExtra(SettingsActivity.EXTRA_AUTO_DOWNLOAD, true);
+        putUpdateInfoExtra(intent, pendingUpdate);
+        startActivityForResult(intent, REQUEST_SETTINGS);
+    }
+
+    /** 把 UpdateInfo 拆成 Intent extras（能塞的字段都塞，设置页就不用再查一次）。 */
+    static void putUpdateInfoExtra(Intent intent, UpdateInfo info) {
+        if (intent == null || info == null) return;
+        intent.putExtra(EXTRA_UPDATE_VERSION, info.version);
+        intent.putExtra(EXTRA_UPDATE_VERSION_CODE, info.versionCode);
+        intent.putExtra(EXTRA_UPDATE_SIZE, info.sizeBytes);
+        intent.putExtra(EXTRA_UPDATE_SHA256, info.sha256);
+        intent.putExtra(EXTRA_UPDATE_APK_URL, info.apkUrl);
+        intent.putExtra(EXTRA_UPDATE_RELEASE_URL, info.releaseUrl);
+        intent.putExtra(EXTRA_UPDATE_NOTES, info.notes);
+        intent.putExtra(EXTRA_UPDATE_CHANNEL, info.channel);
+        intent.putExtra(EXTRA_UPDATE_CHANNEL_NOTE, info.channelNote);
+    }
+
+    /** 从 extras 还原一个 UpdateInfo（缺字段时按空处理，绝不因为 extra 缺失而崩）。 */
+    static UpdateInfo updateInfoFrom(Intent intent) {
+        if (intent == null || !intent.hasExtra(EXTRA_UPDATE_VERSION_CODE)) return null;
+        return new UpdateInfo(
+                intent.getStringExtra(EXTRA_UPDATE_VERSION),
+                intent.getIntExtra(EXTRA_UPDATE_VERSION_CODE, -1),
+                intent.getLongExtra(EXTRA_UPDATE_SIZE, -1L),
+                intent.getStringExtra(EXTRA_UPDATE_SHA256),
+                intent.getStringExtra(EXTRA_UPDATE_APK_URL),
+                intent.getStringExtra(EXTRA_UPDATE_RELEASE_URL),
+                intent.getCharSequenceExtra(EXTRA_UPDATE_PUBLISHED_AT) == null
+                        ? "" : intent.getCharSequenceExtra(EXTRA_UPDATE_PUBLISHED_AT).toString(),
+                intent.getStringExtra(EXTRA_UPDATE_NOTES),
+                intent.getStringExtra(EXTRA_UPDATE_CHANNEL),
+                intent.getStringExtra(EXTRA_UPDATE_CHANNEL_NOTE));
+    }
+
+    /** 子线程算完 → 主线程贴横幅（并广播给设置页）。 */
+    private void pushUpdateStatus(final String statusText, final boolean good, final UpdateInfo info) {
+        mainHandler.post(() -> {
+            if (isFinishing() || isDestroyed()) return;
+            if (good && info != null) showUpdateBanner(info);
+            Intent broadcast = new Intent(ACTION_UPDATE_STATUS)
+                    .setPackage(getPackageName())
+                    .putExtra(EXTRA_UPDATE_STATUS_TEXT, statusText)
+                    .putExtra(EXTRA_UPDATE_STATUS_GOOD, good);
+            putUpdateInfoExtra(broadcast, info);
+            sendBroadcast(broadcast);
+        });
+    }
+
+    /** 收到设置页发来的更新状态：同步横幅。 */
+    private void onUpdateStatusBroadcast(Intent intent) {
+        if (intent == null) return;
+        boolean good = intent.getBooleanExtra(EXTRA_UPDATE_STATUS_GOOD, false);
+        UpdateInfo info = updateInfoFrom(intent);
+        if (good && info != null) {
+            showUpdateBanner(info);
+        } else {
+            // 设置页里点了「检查更新」但没查到更新/查失败了 → 横幅收起来（避免显示过期信息）。
+            hideUpdateBanner();
+        }
+        String text = intent.getStringExtra(EXTRA_UPDATE_STATUS_TEXT);
+        if (text != null && !text.isEmpty()) ToastBus.shortToast(this, text);
+    }
+
+    /** onDestroy：把延迟任务与广播接收器都撤掉，别让它们拖着已销毁的 Activity。 */
+    private void releaseUpdateWiring() {
+        if (autoCheckTask != null) {
+            mainHandler.removeCallbacks(autoCheckTask);
+            autoCheckTask = null;
+        }
+        try {
+            unregisterReceiver(updateStatusReceiver);
+        } catch (IllegalArgumentException error) {
+            // 没注册成功就退出（例如 onCreate 提前 return 的那条路径）—— 这是正常的，不用报错。
+            Log.d("更新状态广播接收器未注册，无需反注册");
+        }
+    }
+
     // ------------------------------------------------------------------ 加载与状态
 
     /**
@@ -259,9 +579,33 @@ public class MainActivity extends AppCompatActivity {
     /**
      * 首页地址：服务器根地址不变，只换路径后缀——默认 {@code http://host:8787/m}，
      * 切到完整控制台后是 {@code http://host:8787/}。
+     *
+     * <p>手机界面（{@code /m}）要带上<b>本机的设备 scope</b>：{@code /m?scope=dev-xxxxxxxxxxxx}。
+     * 这是「每台手机的对话各自独立」的入口——{@code webui/m/app.js} 只认这个 scope，
+     * 于是这台手机的对话落在服务端 {@code data/webui/dev-xxxxxxxxxxxx-chat-log.json}，
+     * 与控制台的 {@code web} 互不可见。见 {@link #deviceScope} 与 {@link DeviceScope#pageUrl}。
+     *
+     * <p>完整控制台（{@code /}）<b>不带</b>这个参数：它的 scope 来自 {@code /api/status} 回的
+     * {@code settings.webScope()}（{@code "web"}），保持原样。
      */
     private String homeUrl() {
-        return UrlHelper.join(current.base, uiPath());
+        String path = uiPath();
+        if (UrlHelper.PATH_CONSOLE.equals(path)) return UrlHelper.join(current.base, path);
+        return DeviceScope.pageUrl(current.base, path, deviceScope());
+    }
+
+    /**
+     * 本机的设备 scope（形如 {@code dev-1a2b3c4d5e6f}）。首次调用时生成并落进
+     * SharedPreferences（{@link DeviceScope#deviceId}），之后每次启动都是同一个值 ——
+     * 卸载重装才会换一个，也就是"重装后重新开一段自己的对话"。
+     *
+     * <p>调用时机：{@link #onCreate} 里立刻取一次（同步读一个 UUID，开销可忽略），
+     * 这样 {@code homeUrl()}、{@link #onSaveInstanceState} 恢复路径、
+     * {@code openInBrowser()} 拿到的都是同一个值，也不会因为异常路径漏生成。
+     */
+    private String deviceScope() {
+        if (deviceScope == null) deviceScope = DeviceScope.scope(this);
+        return deviceScope;
     }
 
     /** 去掉查询串/锚点与尾斜杠，专供地址比较（{@code /m} 与 {@code /m/}、{@code /} 与无尾斜杠等价）。 */
@@ -333,8 +677,18 @@ public class MainActivity extends AppCompatActivity {
         // 双保险：AppCompat 的 hide()/show() 本来就会把这个 Toolbar 置成 GONE/VISIBLE，
         // 这里显式再同步一次，免得个别 ROM / AppCompat 版本上出现「栏还在、只是内容空了」。
         if (toolbar != null) toolbar.setVisibility(mobile ? View.GONE : View.VISIBLE);
+        applySwipeAvailability(mobile);
         Log.d("原生 ActionBar " + (mobile ? "已隐藏（当前是手机界面 /m，让位给网页自带的 app bar）"
                 : "已显示（当前是完整控制台 /，它没有自己的顶栏）"));
+    }
+
+    private void applySwipeAvailability(boolean mobile) {
+        if (swipe == null) return;
+        boolean enable = !mobile;
+        if (swipe.isEnabled() == enable) return;
+        swipe.setRefreshing(false);      // 关掉之前先把转圈收掉，别留一个卡住的指示器
+        swipe.setEnabled(enable);
+        Log.d("原生下拉刷新" + (enable ? "已启用（完整控制台 /）" : "已关闭（手机界面 /m 用网页自带的下拉刷新）"));
     }
 
     /** 加载首页（默认＝手机界面 {@code /m}；切到完整控制台后＝{@code /}）。 */
@@ -444,6 +798,26 @@ public class MainActivity extends AppCompatActivity {
         webView.evaluateJavascript(NativeHook.hookScript(), value -> Log.d("图片长按钩子注入结果：" + value));
     }
 
+    /**
+     * 备用通道：把设备 scope 注入成 {@code window.__PIXIKO_SCOPE}。
+     *
+     * <p>主通道是地址上的 {@code ?scope=…}（见 {@link #homeUrl()}），注入这份是为了
+     * "外壳越过地址栏直接说话"这一条路也通（网页端两条都认，见 {@code webui/m/app.js}）。
+     * 只在手机界面（{@code /m}）注入：完整控制台（{@code /}）有自己的 scope 来源，别去打扰它。
+     *
+     * <p>刻意<b>不</b>用返回值触发 reload：地址上本来就带着同一个值，值一样时脚本回 {@code 'same'}，
+     * 不一样时网页自己会把本机镜像改过来，不需要整页刷新（刷新反而会让用户看到闪一下）。
+     */
+    private void injectDeviceScope(String url) {
+        if (!bridgeAttached) return;
+        String path = UrlHelper.stripQuery(url == null ? "" : url);
+        String mobile = UrlHelper.stripQuery(UrlHelper.join(current.base, UrlHelper.PATH_MOBILE));
+        if (!path.equals(mobile)) return;
+        String scope = deviceScope();
+        webView.evaluateJavascript(NativeHook.deviceScopeScript(scope),
+                value -> Log.d("设备 scope 注入结果：" + value + "（scope=" + scope + "）"));
+    }
+
     // ------------------------------------------------------------------ WebViewClient
 
     private class PixikoWebViewClient extends WebViewClient {
@@ -495,13 +869,19 @@ public class MainActivity extends AppCompatActivity {
             super.onPageFinished(view, url);
             progress.setVisibility(View.INVISIBLE);
             swipe.setRefreshing(false);
+            // 原生下拉刷新只在完整控制台启用：这里再对一次"眼前到底是哪一页"，
+            // 覆盖「历史前进/后退回到 /m 或 /」这类不经过 toggleUi() 的路径（判据同 applyActionBarVisibility）。
+            adoptUiPathFrom(url);
             if (mainFrameFailed) return;      // 失败页由 onReceivedError 负责，别把它当成正常页面
             currentUrl = url;
             attachNativeBridgeIfTrusted(url);
             injectHookScript();
+            injectDeviceScope(url);
             // 有些 ROM 的 WebView 在 onPageStarted 时 localStorage 还没准备好，这里补一次注入。
             if (!tokenInjected) maybeInjectToken();
             Log.d("页面加载完成：" + UrlHelper.stripQuery(url));
+            // 首屏已经好了，这才安排自动检查更新（延迟 + 子线程，见 scheduleAutoUpdateCheck）。
+            scheduleAutoUpdateCheck();
         }
 
         @Override
@@ -907,6 +1287,7 @@ public class MainActivity extends AppCompatActivity {
 
     @Override
     protected void onDestroy() {
+        releaseUpdateWiring();
         if (bridge != null) bridge.shutdown();
         if (webView != null) {
             webView.removeJavascriptInterface(NativeHook.INTERFACE_NAME);

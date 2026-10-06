@@ -18,7 +18,7 @@
     // 面板底部回执栏的图片是增量追加的：记住当前那张图集卡 / 单张卡，新图到了就地更新，不整块重建。
     receiptGallery: null, receiptSingle: null, receiptSingleFile: '',
     // 「回执」栏：全部回执列表 + 未查看（unread）标记。字段与 /api/quests 契约一致。
-    quests: { unread: 0, latest: 0, retainedMinutes: 0 }, questPollTimer: null, questUnreadTimer: null,
+    quests: { unread: 0, latest: 0, total: 0, retainedMinutes: 0 }, questPollTimer: null, questListTimer: null,
     questList: null, questListError: '', questListLoading: false, questListWarned: false,
     loras: null, loraGroups: null, terminalHistory: [], terminalCursor: 0,
     // Civitai 搜索的翻页状态：搜索词与当前页留在前端，翻页时不用重敲。
@@ -448,21 +448,46 @@
     setTimeout(() => { cloud.classList.remove('show'); setTimeout(() => cloud.remove(), 300); }, ttl);
   }
 
-  // `signature` 是上一次真正重画 #quest-body 时的渲染签名：一样就只更新头部文字，绝不整块重建（见 renderQuest）。
-  const questWatch = { timer: null, number: 0, signature: '' };
+  /**
+   * 右栏详情跟进的运行时状态。`signature` 是上一次真正重画 #quest-body 时的渲染签名（一样就只更新头部文字，见 renderQuest）。
+   *
+   * <p>`gen`（代）是"这一条回执"的代号：换条 / 停表 / 离开页面都会 +1，在飞的那一轮回来时对不上就**直接丢掉**，
+   * 不会把上一条的结果画到新正文上（也不会有旧号被旧定时器继续拉）。
+   * `running` 是"上一次拿到的状态还在跑吗"：用来判断"我们是不是看着它跑完的" ——
+   * 只有看着它跑完才值得再补**唯一一次**慢档（接住完成之后才落下来的图/结算）。
+   */
+  const questWatch = { timer: null, number: 0, signature: '', gen: 0, running: false };
 
   /** 会话里记住「当前打开的回执号」与各处的滚动位置：切页面/切会话回来时接着看。 */
   const QUEST_CURRENT_KEY = 'pixiko-quest-current';
   const QUEST_SCROLL_PREFIX = 'pixiko-quest-scroll:';
   const CHAT_SCROLL_PREFIX = 'pixiko-chat-scroll:';
   const PAGE_SCROLL_PREFIX = 'pixiko-scroll:';
-  /** 生成期间实时视图（进度卡 + 图集预览）的轮询间隔；与 questWatch.timer（900ms 回执轮询）各走各的表。 */
+  /** 生成期间实时视图（进度卡 + 图集预览）的轮询间隔；与 {@link QUEST_DETAIL_INTERVAL}（右栏详情）各走各的表。 */
   const QUEST_LIVE_INTERVAL = 1500;
   /**
-   * 回执页「有没有新回执」的检测间隔：`/api/status` 很轻（只看 quests.unread / quests.latest），
-   * 5 秒问一次；latest 或 unread 一涨就立刻刷新左栏列表。跨页面的 30 秒徽标轮询（questPollTimer）照旧保留。
+   * 右栏详情（`POST /api/quest`）的跟进节奏：**右栏确实跟着一条还没跑完的回执**时 900ms 一轮。
+   *
+   * <p>**该跑才跑**（原先是"起了就一直跑，跑完也不停"）：轮到 `done` 就收表；
+   * 只有"我们看着它跑完的"那一次再多补一轮慢档（见 {@link QUEST_DETAIL_TAIL_MS}），
+   * 用来接住"完成之后才落下来的图片/结算"；用户点开的是一条**早就完成**的回执时，拉一轮就够，静置。
+   * 页面隐藏 / 离开回执页都会收表（切回可见由 visibilitychange 补一次）。
    */
-  const QUEST_UNREAD_INTERVAL = 5000;
+  const QUEST_DETAIL_INTERVAL = 900;
+  /** 跑完之后**唯一一次**补拉的延迟（慢档 2.5 秒 = 与列表轮询同拍）。 */
+  const QUEST_DETAIL_TAIL_MS = 2500;
+  /**
+   * 回执页「检测到新任务就自动刷新回执」的轮询间隔：**2.5 秒**读一次只读的 `/api/quests?limit=50`。
+   *
+   * <p>这条**替代**了原来 5 秒一次的 `/api/status`（那条只认 quests.latest / quests.unread 两个数），
+   * 不是并列新增 —— 回执页上仍然只有这**一条**轮询（跨页面的 30 秒徽标轮询 questPollTimer 照旧保留）。
+   * 改成直接读列表是因为「新任务」不止"号变大"一种形态（见 {@link mergeQuestList} 的判据）：
+   * 正在生成的那条从 busy 变 done、消息条数/摘要推进，只有拿到列表快照才判得准；
+   * 而增量同步（{@link questSyncRows}）保证"同一份快照再同步一次，DOM 一个节点都不动"，
+   * 所以读整张列表并没有闪烁代价。间隔 2.5 秒：比原来那条 5 秒更勤，但换来"≤3 秒出现新回执行"。
+   * 页面隐藏 / 不在回执页 / 面板不 active 时一个请求都不发（见 {@link questPanelVisible}）。
+   */
+  const QUEST_LIST_INTERVAL = 2500;
   /**
    * 占位格的宽限期：两张图之间的下发间隙里 `/api/tasks` 会一瞬间返回空数组、或那条任务 `running:false`
    * （done<total），这不是「收掉占位格」的理由。只有**连续** QUEST_PLAN_GRACE_POLLS 轮都拿不到
@@ -541,32 +566,87 @@
 
   /**
    * 回执页：跟着一条回执实时刷新（指令结果 + 生成图片都在里面）。
-   * 跑完就停表；换任务号（点另一条云）会重新开始跟。
+   *
+   * <p>**先停旧表再开新的**（`stopQuestDetailWatch()` 在最前）：换任务号（点另一条云/点列表行）、
+   * 重进页面都会走这里，旧的那条不会留下孤儿定时器继续拉（`gen` 一换，在飞的那一轮也作废）。
+   * 要不要**继续**跟由 {@link questDetailTick} 按那一轮的结果决定：还在跑才起表，跑完就停。
    * 只有「地址里的 #N / 会话里记住的那条 / 点列表行 / 点回执云」才打开正文（也因此才标为已读）；
    * 都没有时右栏只给提示，连一次 /api/quest 都不发。
    */
   async function loadQuest(number) {
-    clearInterval(questWatch.timer);
+    stopQuestDetailWatch();                    // 先停旧表（就地收干净 + 作废在飞的那一轮）
+    const gen = questWatch.gen;                // 这一次跟进的代号
     questWatch.number = Number(number) || questNumberFromLocation() || questStoredNumber() || 0;
+    questWatch.running = false;                // 新的一条：还没看到状态，别把上一条的"在跑"带过来
     if (!questWatch.number) { renderQuestHint(); return; }
     questStoreNumber(questWatch.number);
-    const tick = async () => {
-      let data;
-      try { data = await api('/api/quest', { body: { id: questWatch.number } }); }
-      catch (error) {
-        clearInterval(questWatch.timer);
-        if (String(error.message) !== 'unauthorized') setText('quest-state', '读取失败：' + error.message);
-        return;
-      }
-      renderQuest(data);
-      if (data.done && !data.busy) {
-        clearInterval(questWatch.timer);
-        renderQuestList();                 // 跑完了：列表里那条从「进行中…」变成已完成
-        refreshQuestListQuietly();
-      }
-    };
-    await tick();
-    questWatch.timer = setInterval(tick, 900);
+    await questDetailTick(gen);
+  }
+
+  /**
+   * 一轮详情：拿到 → 画 → **决定还要不要继续跟**（该跑才跑的唯一出口）。
+   *
+   *  - `gen` 对不上（换条/停表/离开页面）：这一份过期结果直接丢掉，既不画也不继续排表；
+   *  - 还在跑（`!done || busy`）：起/续 900ms 的表 —— 进度得跟得上；
+   *  - 跑完了：**停表**。只有"上一次看到它还在跑"（`questWatch.running`，也就是我们看着它跑完的）
+   *    才再补**唯一一次**慢档，接住完成之后才落下来的图片/结算；用户点开的是一条早就完成的回执，
+   *    拉这一轮就结束（不再有任何定时器）。
+   */
+  async function questDetailTick(gen) {
+    if (gen !== questWatch.gen) return;        // 收过表/换过条：连这次请求都不发（旧表的一拍不该落到新号上）
+    let data;
+    try { data = await api('/api/quest', { body: { id: questWatch.number } }); }
+    catch (error) {
+      if (gen !== questWatch.gen) return;
+      if (String(error.message) !== 'unauthorized') setText('quest-state', '读取失败：' + error.message);
+      stopQuestDetailWatch();                  // 读不到就收表：不在坏网络上每 900ms 空转（点「刷新」或重开这条即可）
+      return;
+    }
+    if (gen !== questWatch.gen) return;        // 已经换了别的回执 / 收过表：这一份过期结果丢掉
+    renderQuest(data);
+    const running = !data.done || data.busy;
+    const wasRunning = questWatch.running;
+    questWatch.running = running;
+    if (running) { startQuestDetailWatch(gen); return; }
+    renderQuestList();                         // 跑完了：列表里那条从「进行中…」变成已完成（本地增量重画，不发请求）
+    if (wasRunning) {                          // 我们看着它跑完的：再补唯一一次慢档（接住之后才落下来的图/结算）
+      stopQuestDetailWatch();
+      const tailGen = questWatch.gen;
+      questWatch.timer = setTimeout(() => { questDetailTick(tailGen).catch(() => {}); }, QUEST_DETAIL_TAIL_MS);
+      return;
+    }
+    stopQuestDetailWatch();                    // 点开的是一条早就完成的回执：一轮就够，静置（0 请求）
+  }
+
+  /** 还在跑：起/续那张 900ms 的表（已经起着就复用，绝不叠加）。 */
+  function startQuestDetailWatch(gen) {
+    if (questWatch.timer !== null) return;
+    questWatch.timer = setInterval(() => { questDetailTick(gen).catch(() => {}); }, QUEST_DETAIL_INTERVAL);
+  }
+
+  /**
+   * 收掉右栏详情那张表：`gen` +1（在飞的那一轮作废）并把定时器清干净 ——
+   * 换条 / 跑完 / 读失败 / 页面隐藏 / 离开页面都走这一个出口，绝不留孤儿定时器。
+   * 句柄可能是 `setInterval` 也可能是慢档的 `setTimeout`，两个 clear 都叫一遍（同一套 id 空间，多叫一次无害）。
+   */
+  function stopQuestDetailWatch() {
+    questWatch.gen++;
+    if (questWatch.timer !== null) {
+      clearInterval(questWatch.timer);
+      clearTimeout(questWatch.timer);
+      questWatch.timer = null;
+    }
+  }
+
+  /**
+   * 切回可见时补一次：**只有右栏确实跟着一条回执**（`questWatch.number`）才拉，
+   * 而且拉完照样交给 {@link questDetailTick} 判"要不要继续跟"（还在跑 → 重新起表；已完成 → 停）。
+   * 页面上不留过期正文：用户切回来看到的第一帧就是刚补的这一份。
+   */
+  function resumeQuestDetailWatch() {
+    if (PAGE !== 'quest' || document.visibilityState === 'hidden') return;
+    if (!questWatch.number) return;
+    questDetailTick(questWatch.gen).catch(() => {});
   }
 
   /**
@@ -686,7 +766,7 @@
   /**
    * 当前回执的实时视图：`#quest-body` 顶部那张进度卡，以及生成期间提前到达的图片。
    * 只问 /api/progress（单张图内部的采样）、/api/tasks（图片级 done/total）、/api/images（一完成就出现的图），
-   * 与 questWatch.timer 的 900ms 回执轮询完全独立：空闲就停表，绝不留悬挂的定时器。
+   * 与 questWatch 的详情轮询（{@link QUEST_DETAIL_INTERVAL}，同样"该跑才跑"）完全独立：空闲就停表，绝不留悬挂的定时器。
    */
   const questLive = {
     number: 0, timer: null, ticked: false, openAt: 0,
@@ -930,7 +1010,7 @@
       if (result && result.message) toast(String(result.message).split('\n')[0]);
       await loadTasks().catch(() => {});
       await questLiveTick();                                       // /api/tasks + /api/progress 重拉一次，卡片就地变「已取消」
-      refreshQuestListQuietly().catch(() => {});                    // 左栏那条「进行中…」跟着刷（不等它，卡片已经先画好了）
+      pollQuestListQuietly().catch(() => {});                      // 左栏那条「进行中…」跟着刷（复用 2.5 秒那条表的同一函数，不等它，卡片已经先画好了）
     } catch (error) {
       if (String(error.message) !== 'unauthorized') toast(error.message);
     }
@@ -1568,16 +1648,248 @@
   function questListState(text) {
     const node = $('quest-list-state');
     if (!node) return;
-    node.textContent = text || '';
-    node.hidden = !text;
+    const value = text || '';
+    // 值一样就一个字节都不写：这段文字每 2.5 秒都会被"合并后的快照"重算一次，
+    // 每次无脑写 textContent 都会换掉那个文本节点（MutationObserver 里就是一次白改）。
+    if (node.textContent !== value) node.textContent = value;
+    if (node.hidden !== !value) node.hidden = !value;
+  }
+
+  /**
+   * 左栏列表的**增量渲染**状态：number → 行节点。
+   *
+   * <p>以前每次刷新都是 `#quest-list.innerHTML = ''` 再整块重建：行被从文档里摘下来又挂回去，
+   * 未读点、进行中的转圈、滚动位置全跟着重置，肉眼就是"闪一下"（与图片网格那批"幽灵占位"同源）。
+   * 现在刷新的最小单位是**一行**：出现了新编号才插一行、状态变了只改那一行、消失的才摘掉，
+   * 已经在位的行节点一律原地复用（引用不变）。
+   */
+  const questRows = new Map();
+  /** 上一次同步时每行的内容指纹（见 {@link questRowSignature}）：判"既有行的状态变了没有"。 */
+  const questRowPrints = new Map();
+  /** 最近一次增量同步的变化摘要；「新任务」判据与「有新回执 ↓」提示都读它。 */
+  const questLastSync = { added: [], changed: [], removed: [] };
+  /**
+   * 本地"已经看过"的记账：number → 点开那一刻这条回执的消息条数（texts + images）。
+   *
+   * <p>点开一行时前端先把未读点抹掉（不等后端），而列表每 2.5 秒就被服务端快照整体覆盖一次 ——
+   * 后端那一步（`/api/quests/read`）只要慢半拍，未读点就会被轮询**弹回来**。
+   * 所以这里记下当时的消息数：轮询拿回来的条数 ≤ 记账值时这条按"已读"算；
+   * 真的又多出消息了（> 记账）才清掉记账、按服务端说的未读算。
+   */
+  const questReadMarks = new Map();
+  /** 列表顶部的「有新回执 ↓」提示（懒建；整表替换时会被重新挂上）。 */
+  let questNewHint = null;
+  /** 行内部的固定子节点（建行时就那几个，从此不再变）：WeakMap 缓存，免得每轮对 50 行各查 5 次。 */
+  const questRowParts = new WeakMap();
+
+  /** 回执面板此刻是否真的可见：本页就是回执栏目、面板 active、标签页没被切到后台。 */
+  function questPanelVisible() {
+    if (PAGE !== 'quest' || document.visibilityState === 'hidden') return false;
+    const box = $('quest-list');
+    const panel = box && box.closest ? box.closest('.panel') : null;
+    return !!panel && panel.classList.contains('active');
+  }
+
+  /**
+   * 列表顶部的「有新回执 ↓」提示：新回执插在列表顶部时**不抢视图**（不动 scrollTop、不换选中项），
+   * 只在用户没停在顶部的时候弹这个；点一下回到顶部（滚回顶部本身也会让它消失）。
+   */
+  function questListHint() {
+    const box = $('quest-list');
+    if (!box) return null;
+    if (questNewHint && questNewHint.parentNode === box) return questNewHint;
+    const hint = el('button', 'quest-new-hint', '有新回执 ↓');
+    hint.type = 'button';
+    hint.hidden = true;
+    hint.setAttribute('aria-label', '有新回执，点这里回到列表顶部');
+    hint.addEventListener('click', () => {
+      const list = $('quest-list');
+      if (list) list.scrollTop = 0;
+      hint.hidden = true;
+    });
+    box.insertBefore(hint, box.firstChild);
+    questNewHint = hint;
+    return hint;
+  }
+
+  /** 建一行（只在"这条回执第一次出现"时调；之后一律 {@link questFillRow} 原地更新）。 */
+  function questRowFor(number) {
+    const row = el('button', 'quest-row');
+    row.type = 'button';
+    row.setAttribute('role', 'listitem');
+    row.setAttribute('data-number', String(number));
+    row.appendChild(el('span', 'quest-dot', ''));            // 未读圆点（已读时保持占位，行高不跳）
+    const main = el('div', 'quest-row-main');
+    const line = el('div', 'quest-row-line');
+    line.appendChild(el('span', 'quest-row-num', '#' + number));
+    line.appendChild(el('span', 'quest-row-cmd', ''));
+    line.appendChild(el('span', 'quest-row-state', ''));
+    main.appendChild(line);
+    main.appendChild(el('div', 'quest-row-summary', ''));
+    row.appendChild(main);
+    questRowParts.set(row, { line, cmd: line.querySelector('.quest-row-cmd'),
+      state: line.querySelector('.quest-row-state'), summary: main.querySelector('.quest-row-summary') });
+    // 点行时取的是 dataset 里的号（不是建行时闭包里的号）：行会被复用，闭包里的号会过期。
+    row.addEventListener('click', () => openQuest(Number(row.dataset.number) || 0));
+    return row;
+  }
+
+  /**
+   * 一行的内容指纹：**只收决定这行长什么样的字段**（号、指令、进行/完成、已读、消息条数、摘要）。
+   * `ageMillis` 不进指纹 —— 它每一轮都在变，进了指纹就等于"每轮都算状态推进"；
+   * 相对时间（"3 分钟前"）由 {@link questFillRow} 自己按需更新，不参与"新任务"判据。
+   */
+  function questRowSignature(item) {
+    return [Number(item.number), String(item.command || ''), item.done ? 'd' : '-', item.busy ? 'b' : '-',
+      item.unread ? 'u' : '-', Number(item.texts) || 0, Number(item.images) || 0, String(item.summary || '')].join('\u0002');
+  }
+
+  /** 原地更新一行（**不新建行、不重建子节点**）：字段一样就一个字都不写。 */
+  function questFillRow(row, item, current) {
+    const number = Number(item.number);
+    const running = !item.done || item.busy;
+    const unread = !!item.unread;
+    const unreadMessages = Math.max(0, (Number(item.texts) || 0) + (Number(item.images) || 0));   // 后端只有 texts>0 才算未读
+    const showUnreadCount = unread && unreadMessages > 0;
+    const cls = 'quest-row' + (unread ? ' unread' : '') + (running ? ' running' : '') + (number === current ? ' current' : '');
+    if (row.className !== cls) row.className = cls;
+    const label = '回执 #' + number + '：' + (item.command || '（无指令）')
+      + '，' + (running ? '进行中' : relativeTime(item.ageMillis))
+      + (showUnreadCount ? '，未读 ' + unreadMessages + ' 条消息' : (unread ? '，未读' : ''));
+    if (row.getAttribute('aria-label') !== label) row.setAttribute('aria-label', label);
+    if (number === current) { if (row.getAttribute('aria-current') !== 'true') row.setAttribute('aria-current', 'true'); }
+    else if (row.hasAttribute('aria-current')) row.removeAttribute('aria-current');
+    const parts = questRowParts.get(row) || {};
+    const set = (node, text) => { if (node && node.textContent !== text) node.textContent = text; };
+    set(parts.cmd, item.command || '（无指令）');
+    set(parts.state, running ? '进行中…' : relativeTime(item.ageMillis));
+    set(parts.summary, item.summary || (running ? '（还在跑，暂无摘要）' : '（没有摘要）'));
+    if (parts.line) {
+      // 进行中的转圈：需要时插一次、不需要时摘掉 —— 绝不重建整行
+      const spin = parts.line.querySelector('.quest-row-spin');
+      if (running && !spin) parts.line.appendChild(el('span', 'spin quest-row-spin'));
+      else if (!running && spin) spin.remove();
+      // 未读条数徽标：钉在行内最右侧（CSS 里 order:9），条数没变就不动它
+      let pill = parts.line.querySelector('.quest-unread-count');
+      if (showUnreadCount) {
+        if (!pill) { pill = el('span', 'quest-unread-count'); parts.line.appendChild(pill); }
+        set(pill, String(unreadMessages));
+        const title = '未读 ' + unreadMessages + ' 条消息';
+        if (pill.title !== title) { pill.title = title; pill.setAttribute('aria-label', title); }
+      } else if (pill) pill.remove();
+    }
+  }
+
+  /**
+   * 增量同步左栏列表：**只插新行 / 原地更新变化的行 / 摘掉消失的行**，返回变化摘要。
+   * 顺序按服务端给的顺序（最新在上）；已经在位的一律不碰（`insertBefore` 会把节点摘下来再插回去）。
+   */
+  function questSyncRows(items) {
+    const box = $('quest-list');
+    const added = [], changed = [], removed = [];
+    questLastSync.added = added; questLastSync.changed = changed; questLastSync.removed = removed;
+    if (!box) return questLastSync;
+    const hint = questListHint();
+    const list = (items || []).filter((item) => item && Number(item.number) > 0);
+    const wanted = new Set(list.map((item) => Number(item.number)));
+    for (const [number, row] of [...questRows]) {
+      if (wanted.has(number)) continue;
+      row.remove(); questRows.delete(number); questRowPrints.delete(number); removed.push(number);
+    }
+    const current = Number(questWatch.number) || questNumberFromLocation() || 0;
+    let anchor = hint ? hint.nextSibling : box.firstChild;
+    list.forEach((item) => {
+      const number = Number(item.number);
+      let row = questRows.get(number);
+      const isNew = !row;
+      if (isNew) { row = questRowFor(number); questRows.set(number, row); added.push(number); }
+      if (row === anchor) anchor = row.nextSibling;                            // 已在位：一个字节都不动
+      else { box.insertBefore(row, anchor); anchor = row.nextSibling; }
+      const print = questRowSignature(item);
+      if (isNew || questRowPrints.get(number) !== print) {
+        if (!isNew) changed.push(number);                                      // 既有行的状态/进度推进
+        questRowPrints.set(number, print);
+      }
+      questFillRow(row, item, current);                                        // 指纹没变也走一遍：相对时间按需自己推进
+    });
+    return questLastSync;
+  }
+
+  /** 摘掉列表里所有回执行（只用于空列表 / 接口降级这种整表替换，不用于日常刷新）。 */
+  function questClearRows() {
+    [...questRows.values()].forEach((row) => row.remove());
+    questRows.clear();
+    questRowPrints.clear();
+    questLastSync.added = []; questLastSync.changed = []; questLastSync.removed = [];
+  }
+
+  /**
+   * 把服务端的一份列表快照并进本地状态（**只读**：这里不对服务端写任何东西）。
+   *
+   * <p>权威值：`unread`（未读总数）、`latest`（最新回执号）、`total`（回执总数）、`retainedMinutes`
+   * 一律以服务端为准；唯一例外是 {@link questReadMarks} 里记着的那几条（用户刚点开、后端还没确认），
+   * 它们按"已读"算，未读总数也相应减掉，免得轮询把用户刚点掉的未读点又顶回来。
+   *
+   * <p>「**有新任务**」的判据（任一成立就算，`hasNew` 交给轮询决定要不要弹提示）：
+   * ① **出现新的回执编号** —— 前后两份快照的 number 集合做差。不只看"最大号变大"：列表只有 50 条，
+   *    窗口滑动时最大号可能只差一位、甚至补发的旧号会让最大号不变，集合差更稳；
+   * ② **服务端总数变大**（`total` 是权威计数，不受 limit 截断影响 —— 列表被截断时它最可靠）；
+   * ③ **最新号变大**（`latest`）；
+   * ④ **未读总数变大**（新回执 = 至少一条新消息）；
+   * ⑤ **既有行的状态推进**（指纹变化：进行中 → 完成、消息条数 / 摘要 / 指令变了）。
+   */
+  function mergeQuestList(data) {
+    const before = { numbers: new Set(questRowPrints.keys()), total: Number(state.quests.total) || 0,
+      latest: Number(state.quests.latest) || 0, unread: questUnreadCount() };
+    const items = (Array.isArray(data.quests) ? data.quests : []).filter((item) => item && Number(item.number) > 0);
+    const numbers = new Set(items.map((item) => Number(item.number)));
+    // 本地"看过"的记账：服务端还没确认已读的那几条，未读点先压住（见 questReadMarks 的注释）
+    let pendingLocalReads = 0;
+    items.forEach((item) => {
+      const mark = questReadMarks.get(Number(item.number));
+      if (mark === undefined) return;
+      const messages = (Number(item.texts) || 0) + (Number(item.images) || 0);
+      if (messages <= mark) { if (item.unread) pendingLocalReads++; item.unread = false; }
+      else questReadMarks.delete(Number(item.number));       // 又来新消息了：按服务端算未读
+    });
+    [...questReadMarks.keys()].forEach((number) => { if (!numbers.has(number)) questReadMarks.delete(number); });
+    state.questList = items;
+    if (Number.isFinite(Number(data.unread))) state.quests.unread = Number(data.unread);
+    else state.quests.unread = items.filter((item) => item.unread).length;
+    if (Number.isFinite(Number(data.latest))) state.quests.latest = Number(data.latest);
+    if (Number.isFinite(Number(data.total))) state.quests.total = Number(data.total);
+    if (Number.isFinite(Number(data.retainedMinutes))) state.quests.retainedMinutes = Number(data.retainedMinutes);
+    state.questListError = '';
+    // 未读总数减掉"本地已读、服务端还没确认"的那几条：不然刚点开的行已读、徽标却又涨回去
+    if (pendingLocalReads) state.quests.unread = Math.max(0, (Number(state.quests.unread) || 0) - pendingLocalReads);
+    const added = [...numbers].filter((number) => !before.numbers.has(number));
+    renderQuestList();
+    const delta = questLastSync;
+    const hasNew = added.length > 0
+      || (Number(state.quests.total) || 0) > before.total
+      || (Number(state.quests.latest) || 0) > before.latest
+      || questUnreadCount() > before.unread
+      || delta.changed.length > 0;
+    return { added, changed: delta.changed.slice(), removed: delta.removed.slice(), hasNew };
   }
 
   /** 把整张列表刷成"已读"（本地），未读点立刻消失。 */
   function clearLocalUnread() {
     if (!Array.isArray(state.questList)) return;
-    state.questList.forEach((item) => { if (item) item.unread = false; });
+    state.questList.forEach((item) => { if (item) { item.unread = false; markQuestReadLocally(item.number); } });
     state.quests.unread = 0;
     renderQuestList();
+  }
+
+  /**
+   * 记下"用户看到的是这条回执当时的第几条消息"：列表每 2.5 秒被服务端快照覆盖一次，
+   * 后端确认已读慢半拍时靠这条记账把未读点压住（见 {@link questReadMarks}）。
+   */
+  function markQuestReadLocally(number) {
+    const value = Number(number);
+    if (!Number.isFinite(value) || value <= 0) return;
+    const item = Array.isArray(state.questList) ? state.questList.find((row) => row && Number(row.number) === value) : null;
+    questReadMarks.set(value, item ? (Number(item.texts) || 0) + (Number(item.images) || 0) : 0);
   }
 
   /** 单条标为已读：本地先落，再让后端确认；失败就把点补回来（列表与徽标同步）。 */
@@ -1589,6 +1901,7 @@
       payload.numbers.forEach((number) => {
         const item = state.questList.find((row) => row && row.number === number);
         if (item) item.unread = false;
+        markQuestReadLocally(number);
       });
       // 先把本地总数减一（徽标立刻掉一格），/api/quests/read 的返回值随后会覆盖成权威值。
       state.quests.unread = Math.max(0, (Number(state.quests.unread) || 0) - payload.numbers.length);
@@ -1610,22 +1923,14 @@
 
   /**
    * 拉全部回执列表（**只读，不隐式改已读** —— 一行在还没被点开之前必须是"未读"）。
+   * 合并与渲染都走 {@link mergeQuestList}（增量，不整块重建）。
    * 旧后端没有 /api/quests 时给出提示并优雅降级，其余功能照常。
    */
   async function loadQuestList() {
     if (!Array.isArray(state.questList)) questListState('正在读取回执列表…');
     const data = await api('/api/quests?limit=50');
     if (!data || !Array.isArray(data.quests)) throw new Error('bad payload');   // 旧后端返回 {} 时也走这里
-    state.questList = data.quests;
-    // unread 总数以服务端为准（列表里可能还有没带 unread 的条目），列表只用来画每行的点。
-    if (Number.isFinite(Number(data.unread))) state.quests.unread = Number(data.unread);
-    else state.quests.unread = state.questList.filter((item) => item && item.unread).length;
-    if (Number.isFinite(Number(data.latest))) state.quests.latest = Number(data.latest);
-    if (Number.isFinite(Number(data.retainedMinutes))) state.quests.retainedMinutes = Number(data.retainedMinutes);
-    state.questListError = '';
-    renderQuestList();
-    renderQuestTabBadge();
-    return data;
+    return mergeQuestList(data);
   }
 
   function questListFailed(error) {
@@ -1633,8 +1938,7 @@
     if (message === 'unauthorized') return;               // 401 由 api() 弹回登录页
     state.questList = null;
     state.questListError = '列表接口不可用（' + message + '）';
-    const box = $('quest-list');
-    if (box) box.innerHTML = '';                          // 先把上一次的行清掉，再画降级提示
+    questClearRows();                                     // 先把上一次的行清掉（并让增量状态表跟着干净），再画降级提示
     renderQuestList();
     renderQuestTabBadge();
     if (!state.questListWarned) {                          // 旧后端：只提示一次，别每 30 秒吵一遍
@@ -1643,24 +1947,11 @@
     }
   }
 
-  /** 末位刷新：列表里有"进行中"的条目就顺带更新一下状态（不重复标已读）。 */
-  /**
-   * 末位刷新：列表里有"进行中"的条目就顺带更新一下状态（不重复标已读）。
-   * `force` 给「发现新回执」用：那一刻列表里可能一条"进行中"都没有
-   * （新回执刚下达、还没跑起来），但**也必须**把左栏列表刷出来，否则用户要等 30 秒才看到。
-   */
-  async function refreshQuestListQuietly(force) {
-    if (!Array.isArray(state.questList)) return;
-    if (!(PAGE === 'quest' && document.visibilityState !== 'hidden')) return;
-    if (!force && !state.questList.some((item) => item && (item.busy || (item.done === false && !item.expired)))) return;
-    try { await loadQuestList(); } catch { /* 旧后端/断网：下一次动作再刷新 */ }
-  }
-
   /**
    * 回执未读数的轻量轮询：每 30 秒问一次 /api/status（**不拉列表**），
    * 有新回执时页签徽标就涨。标签页切回来立刻问一次；页面隐藏时完全不动。
-   * 跨页面保留：服务的是「在别的页面也能看到未读涨」。回执页上另有 5 秒一次的
-   * {@link pollQuestUnreadQuietly}（见 QUEST_UNREAD_INTERVAL），两者互不依赖。
+   * 跨页面保留：服务的是「在别的页面也能看到未读涨」。回执页上的列表刷新由
+   * {@link pollQuestListQuietly} 那条 2.5 秒的列表轮询负责，这里不再重复拉一次列表。
    */
   async function pollQuestStatusQuietly() {
     if (!state.token || document.visibilityState === 'hidden') return;
@@ -1671,46 +1962,49 @@
       if (Number.isFinite(Number(quests.unread))) state.quests.unread = Number(quests.unread);
       if (Number.isFinite(Number(quests.latest))) state.quests.latest = Number(quests.latest);
       renderQuestTabBadge();
-      if (PAGE === 'quest') await refreshQuestListQuietly();
     } catch { /* 旧后端/断网/未登录：静默，等下一次 */ }
   }
 
   /**
-   * 回执页专用：约 5 秒问一次 /api/status（很轻），只看 `quests.unread` / `quests.latest`。
-   * 一发现「有新回执」（latest 变大，或 unread 变大）就**立刻**刷新左栏列表并更新页签徽标。
+   * 回执页专用：**每 2.5 秒**（{@link QUEST_LIST_INTERVAL}）读一次只读的 `/api/quests?limit=50`，
+   * 合并成新的左栏列表；「有新任务」的判据见 {@link mergeQuestList}。
    *
-   * **不**把右栏详情切到最新那条：用户正在看哪条就继续看哪条（`renderQuest`/`loadQuest` 一概不碰）；
-   * 右栏跟的那条本身就是最新那条时，900ms 的回执轮询会继续把它更新。
-   * 页面隐藏时不发请求；离开回执页/页面隐藏时由 {@link stopQuestUnreadWatch} 清掉这个表。
+   * <p>为什么直接读列表、而不是只问 `/api/status` 的 `quests.latest/unread`：那四个"新回执"的形态里，
+   * 「既有行的状态推进」（正在生成的那条从 busy 变 done、消息条数 / 摘要变了）只有列表快照判得准。
+   * 这条**替代**了原来 5 秒一次的 /api/status 轮询（不是并列新增），间隔反而更短、请求更少一条。
+   *
+   * <p>**不打断用户**：刷新只动变化的那几行，右栏（`loadQuest` 那 900ms 的表）与用户选中的那条
+   * 一概不碰；用户没停在列表顶部时不动 `scrollTop`，只弹一个「有新回执 ↓」（见 {@link questListHint}）。
+   * 面板不可见 / 页面隐藏时一个请求都不发；切回可见由 visibilitychange 立刻补一次同一个函数。
    */
-  async function pollQuestUnreadQuietly() {
-    if (PAGE !== 'quest' || !state.token || document.visibilityState === 'hidden') return;
+  async function pollQuestListQuietly() {
+    if (!questPanelVisible()) return;
+    let delta;
     try {
-      const status = await api('/api/status');
-      const quests = status.quests || {};
-      const beforeLatest = Math.max(0, Number(state.quests.latest) || 0);
-      const beforeUnread = questUnreadCount();
-      const latest = Number(quests.latest);
-      const unread = Number(quests.unread);
-      if (Number.isFinite(unread)) state.quests.unread = unread;
-      if (Number.isFinite(latest)) state.quests.latest = latest;
-      renderQuestTabBadge();
-      const grew = (Number.isFinite(latest) && latest > beforeLatest)
-        || (Number.isFinite(unread) && unread > beforeUnread);
-      if (grew) await refreshQuestListQuietly(true);      // 有新回执：左栏列表立刻跟上（右栏一个字都不动）
-    } catch { /* 旧后端/断网/未登录：静默，等下一次 */ }
+      const data = await api('/api/quests?limit=50');
+      if (!data || !Array.isArray(data.quests)) return;
+      delta = mergeQuestList(data);
+    } catch { return; }   // 断网 / 旧后端 / 一条坏快照引起的渲染异常：一律静默，等下一次（不能让 2.5 秒的表把异常刷屏）
+    renderQuestTabBadge();
+    const box = $('quest-list');
+    const hint = questListHint();
+    if (box && hint) {
+      if (delta.added.length && box.scrollTop > 4) hint.hidden = false;    // 新行插在顶上：滚离顶部才提示
+      else if (box.scrollTop <= 4) hint.hidden = true;                     // 已经停在顶部：提示没必要
+    }
+    return delta;
   }
 
-  /** 起 5 秒那套「有没有新回执」的表：只有回执页才起；已经起着就复用，绝不叠加。 */
-  function startQuestUnreadWatch() {
+  /** 起 2.5 秒那套「检测到新任务就自动刷新回执」的表：只有回执页才起；已经起着就复用，绝不叠加。 */
+  function startQuestListWatch() {
     if (PAGE !== 'quest' || !state.token || document.visibilityState === 'hidden') return;
-    if (state.questUnreadTimer !== null) return;
-    state.questUnreadTimer = setInterval(() => { pollQuestUnreadQuietly(); }, QUEST_UNREAD_INTERVAL);
+    if (state.questListTimer !== null) return;
+    state.questListTimer = setInterval(() => { pollQuestListQuietly(); }, QUEST_LIST_INTERVAL);
   }
 
-  /** 停 5 秒那套表（离开回执页 / 页面隐藏时调；清干净不留悬挂的定时器）。 */
-  function stopQuestUnreadWatch() {
-    if (state.questUnreadTimer !== null) { clearInterval(state.questUnreadTimer); state.questUnreadTimer = null; }
+  /** 停那张表（离开回执页 / 页面隐藏时调；清干净不留悬挂的定时器）。 */
+  function stopQuestListWatch() {
+    if (state.questListTimer !== null) { clearInterval(state.questListTimer); state.questListTimer = null; }
   }
 
   /** 「回执」页签上的未读数徽标（所有栏目都会跟着 /api/status 更新）。 */
@@ -1719,19 +2013,32 @@
     const tab = $('tab-quest');
     if (!badge) return;
     const count = questUnreadCount();
-    badge.hidden = count <= 0;
-    badge.textContent = count > 99 ? '99+' : String(count);
-    badge.title = count > 0 ? count + ' 条未查看的回执' : '';
-    if (tab) tab.setAttribute('aria-label', '回执' + (count > 0 ? '（' + count + ' 条未查看）' : ''));
+    const text = count > 99 ? '99+' : String(count);
+    const title = count > 0 ? count + ' 条未查看的回执' : '';
+    // 值一样就不写：这条函数每轮轮询都会走一遍（未读数没变时不该动 DOM）
+    if (badge.hidden !== (count <= 0)) badge.hidden = count <= 0;
+    if (badge.textContent !== text) badge.textContent = text;
+    if (badge.title !== title) badge.title = title;
+    if (tab) {
+      const label = '回执' + (count > 0 ? '（' + count + ' 条未查看）' : '');
+      if (tab.getAttribute('aria-label') !== label) tab.setAttribute('aria-label', label);
+    }
   }
 
+  /**
+   * 画左栏列表：**增量**（新编号插一行、状态变了改那一行、消失的摘掉），不整块重建。
+   * 只有"空列表 / 接口降级"这两种整表替换才真的清空重画（见 {@link questClearRows}）。
+   */
   function renderQuestList() {
     const box = $('quest-list');
     if (!box) return;
-    box.innerHTML = '';
+    questListHint();
+    // 空态/降级提示是本函数按需重建的，先摘干净（它们是整表替换，不是日常刷新）
+    Array.from(box.querySelectorAll('.quest-empty')).forEach((node) => node.remove());
     const unread = questUnreadCount();
     if (state.questListError) {
       questListState(state.questListError);
+      questClearRows();
       const hint = el('div', 'quest-empty', '列表接口不可用：单条回执照样看（从右下角的回执云，或直接打开 /quest#编号）。');
       hint.setAttribute('data-quest', 'list-unavailable');
       box.appendChild(hint);
@@ -1744,53 +2051,15 @@
       ? '共 ' + state.questList.length + ' 条' + (unread ? ' · 未读 ' + unread : '') + (retained ? ' · 正文保留 ' + retained + ' 分钟' : '')
       : '还没有任何回执。');
     if (!state.questList.length) {
+      questClearRows();
       box.appendChild(el('div', 'quest-empty', '下达一条指令后，回执会出现在这里。'));
       renderQuestTabBadge();
       return;
     }
-    const current = questWatch.number || questNumberFromLocation();
-    state.questList.forEach((item) => {
-      if (!item) return;
-      const number = Number(item.number);
-      const running = !item.done || item.busy;
-      // 未读条目的消息条数（文字 + 图片）以纯数字呈现；0 条就不显示（后端只有 texts>0 才算未读）。
-      const unreadMessages = Math.max(0, (Number(item.texts) || 0) + (Number(item.images) || 0));
-      const showUnreadCount = !!item.unread && unreadMessages > 0;
-      // 「过期」不再是一个界面分支：后端马上会取消过期（正文落盘、expired 永远 false），
-      // 就算旧后端仍给 expired:true，这里也按普通行渲染，不再显示「已过期」。
-      const row = el('button', 'quest-row' + (item.unread ? ' unread' : '') + (running ? ' running' : '')
-        + (number === current ? ' current' : ''));
-      row.type = 'button';
-      row.setAttribute('role', 'listitem');
-      row.setAttribute('data-number', String(number));
-      row.setAttribute('aria-label', '回执 #' + number + '：' + (item.command || '（无指令）')
-        + '，' + (running ? '进行中' : relativeTime(item.ageMillis))
-        + (showUnreadCount ? '，未读 ' + unreadMessages + ' 条消息' : (item.unread ? '，未读' : '')));
-      if (number === current) row.setAttribute('aria-current', 'true');
-      row.appendChild(el('span', 'quest-dot', item.unread ? '' : null));   // 未读圆点（已读时保持占位，行高不跳）
-      const main = el('div', 'quest-row-main');
-      const line = el('div', 'quest-row-line');
-      line.appendChild(el('span', 'quest-row-num', '#' + number));
-      line.appendChild(el('span', 'quest-row-cmd', item.command || '（无指令）'));
-      line.appendChild(el('span', 'quest-row-state', running ? '进行中…' : relativeTime(item.ageMillis)));
-      if (running) line.appendChild(el('span', 'spin quest-row-spin'));
-      // 未读数徽标钉在行内最右侧（CSS 里 flex:0 0 auto + 白色空间不换行）：数字就是 texts + images。
-      if (showUnreadCount) {
-        const pill = el('span', 'quest-unread-count', String(unreadMessages));
-        pill.title = '未读 ' + unreadMessages + ' 条消息';
-        pill.setAttribute('aria-label', '未读 ' + unreadMessages + ' 条消息');
-        line.appendChild(pill);
-      }
-      main.appendChild(line);
-      main.appendChild(el('div', 'quest-row-summary', item.summary || (running ? '（还在跑，暂无摘要）' : '（没有摘要）')));
-      row.appendChild(main);
-      row.addEventListener('click', () => openQuest(number));
-      box.appendChild(row);
-    });
+    const delta = questSyncRows(state.questList);
     renderQuestTabBadge();
-    // 列表铺完再收敛一次两栏高度（见 fitQuestPanes）：列表行数会影响左栏高度，
-    // 早量拿到的是还没铺行的布局，两栏会比对话栏短一截（实测 11.83px）。
-    fitQuestPanes(0);
+    // 行数变了才重新收敛两栏高度（见 fitQuestPanes）：行数没变时布局没动，不必每 2.5 秒白量一遍。
+    if (delta.added.length || delta.removed.length) fitQuestPanes(0);
   }
 
   /** 点列表里的一行：换地址（可分享/可刷新）→ 打开那条 → 标为已读（点立刻消失）。 */
@@ -1803,16 +2072,20 @@
     readQuests({ numbers: [Math.floor(value)] });       // 前端不等后端：列表上的未读点立刻消失
   }
 
-  /** 列表卡头部的两个按钮。 */
+  /** 列表卡头部的两个按钮 + 列表的滚动（滚回顶部就把「有新回执 ↓」收掉）。 */
   function bindQuestListActions() {
+    const list = $('quest-list');
+    if (list) list.addEventListener('scroll', () => {
+      if (list.scrollTop <= 4 && questNewHint) questNewHint.hidden = true;
+    }, { passive: true });
     on('quest-list-refresh', 'click', () => {
       // 「刷新」一次刷两样：左栏列表 + 右栏当前打开的那条回执。
       // 还没打开过任何一条（questWatch.number 是 0）就只刷列表，不空跳也不报错。
       const current = Number(questWatch.number) || 0;
       if (current > 0) loadQuest(current).catch(() => {});   // loadQuest 自己会先清掉旧 timer，不会留下两条轮询
-      else clearInterval(questWatch.timer);                  // 没跟任何一条：只把可能残留的 timer 收干净
+      else stopQuestDetailWatch();                         // 没跟任何一条：只把可能残留的定时器收干净
       loadQuestList()
-        .then((data) => toast('回执列表已刷新，共 ' + data.quests.length + ' 条。'))
+        .then(() => toast('回执列表已刷新，共 ' + (Array.isArray(state.questList) ? state.questList.length : 0) + ' 条。'))
         .catch((error) => { questListFailed(error); toast('刷新失败：' + error.message); });
     });
     on('quest-list-all', 'click', () => {
@@ -5291,6 +5564,13 @@
     if (button) button.textContent = on ? '退出全屏' : '全屏';
     const input = $('terminal-input');
     if (input) input.focus();
+    // 进/出全屏都会把页头与导航栏**藏起来 / 放出来**：右栏顶边必须**当场重算**。
+    //
+    // <p>为什么不能"清掉 `--rail-top` 让它回落到 `--rail-stick-top`"：那个兜底量 = 页头高 + 导航栏高
+    // （`calc(var(--rail-bar) + var(--rail-tabs))`），贴左竖版导航下实测 62.25 + 734 = **796.25px**，
+    // 而右栏该对齐的是导航的**上边界**（74.25px）—— 差 722px。兜底量只在"什么都量不到"的第一帧有效，
+    // 一旦页头/导航已经有高度，它就是个错值。所以这里走 {@link syncRailSpacing} 现量现写。
+    syncRailSpacing();
   }
 
   /** 默认全屏：跟着页签进出（记得住用户手动退出过）。 */
@@ -5998,19 +6278,23 @@
     bindQuestListActions();
     // 列表里的「进行中」条目不靠高频轮询：页面重新可见时刷一次就够了。
     document.addEventListener('visibilitychange', () => {
-      // 页面隐藏：5 秒那套「有没有新回执」的表停掉（隐藏期间一个请求都不发），重新可见时再起。
-      if (document.hidden) { state.wasHidden = true; stopQuestUnreadWatch(); return; }
-      refreshQuestListQuietly();
+      // 页面隐藏：两条表都停掉（2.5 秒的列表表 + 右栏详情表）—— 隐藏期间一个请求都不发，重新可见时再起。
+      if (document.hidden) { state.wasHidden = true; stopQuestListWatch(); stopQuestDetailWatch(); return; }
       pollQuestStatusQuietly();            // 切回来顺手问一次未读数（新回执 → 徽标涨）
-      pollQuestUnreadQuietly();            // 回执页：切回来立刻查一次有没有新回执（不等那 5 秒）
-      startQuestUnreadWatch();
+      pollQuestListQuietly();              // 回执页：切回来**立刻补拉一次列表**（不等那 2.5 秒，页面上不能留过期列表）
+      startQuestListWatch();
+      resumeQuestDetailWatch();            // 右栏跟的那条也立刻补一次（还在跑就继续跟，已完成就收表）
       // **对话栏**：后台期间 follow 定时器被浏览器节流，切回来立刻补拉一次，别让"新消息"要等到下次定时器才出现。
       resumeCapturePoll('visibilitychange');
       syncChatArchive().catch(() => {});      // 对话栏读的是服务端存档：切回来立刻补一次（不等 2.5 秒那轮）
     });
+    // 离开页面（真导航 / 关标签页）：把右栏详情表收干净，不留孤儿定时器
+    window.addEventListener('pagehide', () => { stopQuestDetailWatch(); });
     // 窗口重新获得焦点也补一次（同窗口多标签、或者其他窗口盖住时，visibility 未必变化）
     window.addEventListener('focus', () => { resumeCapturePoll('focus'); });
-    window.addEventListener('pageshow', () => { resumeCapturePoll('pageshow'); });
+    // pageshow（含 bfcache 前进/后退回到本页）：右栏顶边**当场重算一次** ——
+    // 缓存期间不一定有 resize 事件，而页面被锁/解锁、页头出现与否都会改这条线。
+    window.addEventListener('pageshow', () => { resumeCapturePoll('pageshow'); syncRailSpacing(); });
 
     on('terminal-form', 'submit', async (event) => { event.preventDefault(); await submitTerminal(); });
     // 点终端任意位置都聚焦到提示符（真终端就是这样）
@@ -6163,13 +6447,20 @@
     // 变成**贴左竖栏**之后就是那一列的高（实测 744.25px）。它只喂 CSS 里 `--rail-stick-top` 这个**兜底**
     // （`--rail-top` 量到就不生效），不参与其它几何 —— 名字沿用旧称，语义以"导航容器的高度"为准。
     if (tabsH > 0) root.style.setProperty('--rail-tabs', Math.round(tabsH * 100) / 100 + 'px');
-    if (alignTop > 0) {
-      // 控制台全屏（body.console-full）没有页头也没有导航栏：右栏从视口顶开始，
-      // 与那条 `body.console-full { --rail-stick-top: 0px }` 同一个口径。
-      const fullscreen = document.body.classList.contains('console-full');
-      const top = fullscreen ? 0 : alignTop;
-      root.style.setProperty('--rail-top', Math.round(top * 100) / 100 + 'px');
+    const fullscreen = document.body.classList.contains('console-full');
+    if (fullscreen) {
+      // 控制台全屏：没有页头也没有导航栏，右栏**从视口顶开始**（与 CSS 的 `body.console-full { --rail-stick-top: 0px }` 同一口径）。
+      // **必须显式写 0**，不能"量不到就不写"：`--rail-top` 是写在 body 上的**内联**值，优先级高于任何样式表；
+      // 一旦在普通页面里被量成 74.25px，进了全屏它还压着 CSS 那条 0 → 右栏停在 74.25px；
+      // 而全屏下 `.tabs` 是 display:none、`railAlignTop()` 必然返回 0，原来那个 `alignTop > 0` 的守卫
+      // 正好把这一帧跳过 → 除非用户手动 resize 一次，错位就一直留着（导航代理实测到的 722px 就是这个族）。
+      root.style.setProperty('--rail-top', '0px');
+    } else if (alignTop > 0) {
+      // 普通页面：右栏顶边压在"导航栏上边界 / 内容列上边界"里更靠上的那条线上。
+      root.style.setProperty('--rail-top', Math.round(alignTop * 100) / 100 + 'px');
     }
+    // 非全屏又量不到（`#app` 还锁着、元素不在这一页、还没布局）：**什么都不写**，让上一次的值/CSS 兜底继续生效，
+    // 免得把 0 或垃圾值写进去（boot() 在 loadPage 之后还会再量两次，那时一定量得到）。
     // 回执页两栏的高度由 {@link fitQuestPanes} 收敛（不是在这里量一次就写）：
     // 那一刻右栏/左栏的几何还没落定，量出来会差 ~11.8px 且之后没人再量。
     if (split && rail) fitQuestPanes(0);
@@ -6240,16 +6531,17 @@
     syncConsoleFullscreen(PAGE);               // 控制台栏目默认全屏（跟着页面走）
     clearInterval(state.followTimer);
     clearInterval(state.questPollTimer);
-    stopQuestUnreadWatch();                    // 重新 boot（点刷新/重新登录）时把 5 秒那套也收干净，不叠加
+    stopQuestListWatch();                      // 重新 boot（点刷新/重新登录）时把 2.5 秒那套也收干净，不叠加
+    stopQuestDetailWatch();                    // 右栏详情表同理：收干净（loadPage 会按当前回执重新决定跟不跟）
     // 回执未读徽标：只问 /api/status（很轻），不用整页刷新；页面隐藏时不发请求。
     // **跨页面保留**：它服务的是「在别的页面也能看到未读涨」，别改成只在回执页跑。
     state.questPollTimer = setInterval(() => { pollQuestStatusQuietly(); }, 30000);
     state.followTimer = setInterval(() => {
       if ($('logs-follow') && $('logs-follow').checked && PAGE === 'logs') loadLogs().catch(() => {});
     }, 4000);
-    // 回执页：约 5 秒查一次「有没有新回执」（latest/unread 一涨就立刻刷左栏列表，右栏不动）。
+    // 回执页：每 2.5 秒读一次只读的回执列表（检测到新任务就地增量刷新左栏，右栏一动不动）。
     // 先起表再 loadPage：列表万一没读出来也不会把这条轮询一起丢掉（poll 里自己会判空跳过）。
-    startQuestUnreadWatch();
+    startQuestListWatch();
     startChatArchiveWatch();
     await loadPage();
     // 页面铺完再校正一次上下间距：字体/布局落定后的真实高度才是准的（见 syncRailSpacing）。

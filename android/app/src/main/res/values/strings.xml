@@ -58,4 +58,36 @@
     <string name="toast_login_cleared">登录状态已清除，网页会回到锁屏</string>
     <string name="no_browser">没有找到可用的浏览器</string>
     <string name="no_server">还没有配置服务器</string>
+
+    <!-- ================= 自动检查更新 / 自我更新 ================= -->
+    <!-- 主界面顶部横幅（有新版本时出现，不打断网页操作）。%1$s=新版本号 %2$s=当前版本号 -->
+    <string name="update_banner_title">发现新版本 %1$s（当前 %2$s）</string>
+    <string name="update_banner_action">下载更新</string>
+    <string name="update_banner_later">稍后</string>
+    <string name="update_banner_detail">详情</string>
+    <string name="update_banner_dismiss">忽略</string>
+
+    <!-- 设置页 -->
+    <string name="settings_update_title">应用更新</string>
+    <string name="settings_update_auto">自动检查更新（启动后检查一次）</string>
+    <string name="settings_update_check">检查更新</string>
+    <string name="settings_update_checking">正在检查更新…</string>
+    <string name="settings_update_badge">有新版本</string>
+    <string name="settings_update_current">当前版本 %1$s（versionCode %2$d）</string>
+    <!-- 这一句是**必须写清楚**的现实边界，不要删、不要改软。 -->
+    <string name="settings_update_boundary">现实边界：下载与 sha256 校验全自动，最后一步需要你在系统弹窗里点「安装」—— 这是 Android 的限制，静默替换需要 root 或系统签名（device-owner）。本 app 不会也不能替你点那一下。</string>
+    <string name="settings_update_unknown_sources">还没允许本 app「安装未知应用」，点这里去系统设置里打开。</string>
+    <string name="settings_update_download">下载并安装</string>
+    <string name="settings_update_retry">重试下载</string>
+    <string name="settings_update_install_now">立即安装</string>
+    <string name="settings_update_downloading">正在下载 %1$d%%（%2$s / %3$s）</string>
+    <string name="settings_update_downloading_unknown">正在下载 %1$s…</string>
+    <string name="settings_update_verifying">下载完成，正在校验 sha256…</string>
+    <string name="settings_update_verified">sha256 校验通过（%1$s），可以安装了。</string>
+    <string name="settings_update_hash_mismatch">sha256 校验不通过，已删除坏文件、拒绝安装。算出来 %1$s…，服务端说 %2$s…</string>
+    <string name="settings_update_up_to_date">已经是最新版本（%1$s）。</string>
+    <string name="settings_update_available">发现新版本 %1$s（当前 %2$s，%3$s）。</string>
+    <string name="settings_update_no_package">服务端说最新是 %1$s，但没给可下载的安装包（apkUrl 为空），本次只能先看更新说明。</string>
+    <string name="settings_update_notes_title">更新说明</string>
+    <string name="settings_update_release_page">打开发行页</string>
 </resources>

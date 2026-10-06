@@ -27,6 +27,17 @@
     <uses-permission
         android:name="android.permission.READ_EXTERNAL_STORAGE"
         android:maxSdkVersion="32" />
+    <!--
+      自我更新要用它：把下载好的 APK 交给系统安装器（Intent.ACTION_VIEW +
+      application/vnd.android.package-archive）。
+
+      说清楚它**不是**什么：它**不**等于「可以静默安装」。普通 app 无论有没有这个权限，
+      最后一步都必须由用户在系统弹窗里点「安装」；静默替换需要 root 或 device-owner/系统签名。
+      另外从 Android 8.0（API 26）起它还是个**按来源应用**授予的开关，用户没在本 app 上打开
+      「安装未知应用」时，安装 Intent 会被系统直接拒掉 —— 所以 UpdateInstaller 会先查
+      canRequestPackageInstalls()，没授权就引导用户去 ACTION_MANAGE_UNKNOWN_APP_SOURCES。
+    -->
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
 
     <application
         android:name=".PixikoApp"
@@ -59,7 +70,8 @@
             android:label="@string/settings_title"
             android:parentActivityName=".MainActivity" />
 
-        <!-- 只服务分享图片的 FileProvider（authority = 包名 + .fileprovider）。 -->
+        <!-- 服务分享图片与「自我更新」两件事的 FileProvider（authority = 包名 + .fileprovider）。
+             路径白名单见 res/xml/file_paths.xml：只放出 cacheDir/share 与 cacheDir/update 两个子目录。 -->
         <provider
             android:name="androidx.core.content.FileProvider"
             android:authorities="${applicationId}.fileprovider"

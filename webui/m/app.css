@@ -556,14 +556,25 @@ input[type=number] {
   gap: 6px; margin-top: 6px; align-items: start;
 }
 .bubble .bubble-imgs.one { grid-template-columns: 1fr; }
+/*
+ * 尺寸上限（用户报的「回执的图片预览不能过大」）：只按真实比例撑满列宽时，竖图（手机截图常见
+ * 9:19.5）高度会是宽度的两倍多，一张图就顶满整屏、把正文挤出视野。这里给**宽高比宿主**加一个
+ * 视口相关的上限，并让 `<img>` 在这个盒子里 `contain` 居中：
+ *   · 横图/方图通常够不到上限 → 行为与以前完全一样；
+ *   · 竖图被限制在 34vh，两侧留一点点底色，不再"一张图一屏"；
+ *   · 宽高比仍由 JS 按原图写进宿主（`aspect-ratio`），配合 max-height 自动按比例缩小 —— 不变形、不裁切。
+ * 点击进查看器仍看**原图**（查看器不受这里影响）。
+ */
 .bubble .bubble-imgs .bubble-img {
   aspect-ratio: 4 / 3;                  /* 中性初始比例：图片 load 后由 JS 换成真实比例 */
+  max-height: 34vh;
+  display: flex; align-items: center; justify-content: center;
   border-radius: 10px;
   overflow: hidden;
   background: #0e1727;
 }
 .bubble .bubble-imgs img {
-  width: 100%; height: auto; object-fit: fill; display: block;
+  width: 100%; height: auto; max-height: 100%; object-fit: contain; display: block;
 }
 .bubble .bubble-text + .bubble-imgs { margin-top: 8px; }
 

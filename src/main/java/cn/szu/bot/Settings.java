@@ -95,6 +95,107 @@ public final class Settings {
         return keys;
     }
     /**
+     * 「全局 infix」改造档位，按会话持久化（{@code infix_mode.modes.<会话键>}）。
+     *
+     * <p>实测 bug（logs/bot-20261006.log 15:30、data/quests/{78,252,255}.json）：用户一条复合语句
+     * （一段消息里同时含"改提示词"和"出图"）被拆成 **3 个 .infix 步骤 + 1 个 .gen**，每一步都拿**整份**
+     * 提示词去改写一次——前一步刚写进去的内容会被后一步"没提到它"而删掉，几步互相打架。
+     * 现在默认 {@link #GLOBAL}：一条指令里的所有改写诉求**合成一次**交给 DeepSeek，只改一次、只落地一次；
+     * {@link #PARTS} 保留旧的拆分/多步实现，供用户切回去。
+     */
+    public enum InfixMode {
+        GLOBAL("global", "全局"), PARTS("parts", "分组");
+        private final String key, label;
+        InfixMode(String key, String label) { this.key = key; this.label = label; }
+        /** 存进 config.json 的取值。 */
+        public String key() { return key; }
+        /** 回执里给用户看的中文说法。 */
+        public String label() { return label; }
+        /**
+         * 从 config.json 里读到的值：大小写不敏感，缺失/未知/类型不对一律当 global（默认档）。
+         * 手写的、被改坏的或旧版本的配置都不该让机器人读配置失败，更不该悄悄退回"多组各自改写"。
+         */
+        public static InfixMode stored(String value) {
+            if (value == null) return GLOBAL;
+            return switch (value.strip().toLowerCase(java.util.Locale.ROOT)) {
+                case "parts", "part", "split", "分组", "多组", "拆分" -> PARTS;
+                default -> GLOBAL;
+            };
+        }
+        /** 用户输入的参数（含中文别名）；认不出来返回 null，由调用方给出用法。 */
+        public static InfixMode parse(String value) {
+            if (value == null || value.isBlank()) return null;
+            return switch (value.strip().toLowerCase(java.util.Locale.ROOT)) {
+                case "global", "one", "once", "whole", "all", "全局", "整体", "一次" -> GLOBAL;
+                case "parts", "part", "split", "step", "steps", "分组", "多组", "拆分", "逐步" -> PARTS;
+                default -> null;
+            };
+        }
+    }
+    /** 一个会话的 infix 档位；没有设置过（含老配置）就是 global。 */
+    public synchronized InfixMode infixMode(String conversation) {
+        JsonElement modes = Json.obj(data, "infix_mode").get("modes");
+        if (modes == null || !modes.isJsonObject()) return InfixMode.GLOBAL;
+        JsonElement value = modes.getAsJsonObject().get(conversation);
+        if (value == null || !value.isJsonPrimitive() || !value.getAsJsonPrimitive().isString()) return InfixMode.GLOBAL;
+        return InfixMode.stored(value.getAsString());
+    }
+    /**
+     * 保存一个会话的 infix 档位；{@link InfixMode#GLOBAL} 是默认值，等于删掉这条设置
+     * （与 {@code qq_mode} / {@code image_send} 同一套写法：config.json 里只留显式设过 parts 的会话）。
+     * 返回保存后的值。
+     */
+    public synchronized InfixMode setInfixMode(String conversation, InfixMode mode) throws IOException {
+        if (mode == null) throw new IllegalArgumentException("infix 档位不能为空。");
+        if (conversation == null || conversation.isBlank()) throw new IllegalArgumentException("会话键不能为空。");
+        JsonObject next = freshSnapshot(), section = Json.obj(next, "infix_mode"), modes = Json.obj(section, "modes");
+        // 逐键写回：别的会话（以及别的代理写进同一段的键）都不会被这次保存抹掉。
+        java.util.LinkedHashMap<String, String> stored = new java.util.LinkedHashMap<>();
+        for (String key : modes.keySet()) {
+            JsonElement value = modes.get(key);
+            if (value != null && value.isJsonPrimitive() && value.getAsJsonPrimitive().isString()
+                    && InfixMode.stored(value.getAsString()) != InfixMode.GLOBAL) stored.put(key, value.getAsString());
+        }
+        if (mode == InfixMode.GLOBAL) stored.remove(conversation);
+        else stored.put(conversation, mode.key());
+        JsonObject updated = new JsonObject();
+        for (java.util.Map.Entry<String, String> entry : stored.entrySet()) updated.addProperty(entry.getKey(), entry.getValue());
+        section.add("modes", updated); next.add("infix_mode", section);
+        Json.atomicWrite(root.resolve("config.json"), next); data = next;
+        return mode;
+    }
+    /**
+     * 是否启用**传统正反义词排斥器**（本地互斥词表：姿势/视角/载具/室内外 + 反义词对）。
+     *
+     * <p>按会话持久化（{@code infix_mode.conflict_enabled.<会话键>}，存的是**打开**的会话）。
+     * <b>默认关闭</b>：用户实测 {@code cross-section view} 与 {@code front view} 被判成互斥而被删掉一个，
+     * 但剖面图与正面视角并不冲突——这类判断全权交给改写之后那次"整份提示词画面检查"（DeepSeek）。
+     * 打开时恢复旧的本地行为（秒杀同族词条，不问模型）。
+     */
+    public synchronized boolean infixConflictEnabled(String conversation) {
+        return enabledInfixConflict(Json.obj(data, "infix_mode")).contains(conversation);
+    }
+    /** 打开/关闭一个会话的传统正反义词排斥器；返回新状态。 */
+    public synchronized boolean setInfixConflictEnabled(String conversation, boolean enabled) throws IOException {
+        if (conversation == null || conversation.isBlank()) throw new IllegalArgumentException("会话键不能为空。");
+        JsonObject next = freshSnapshot(), section = Json.obj(next, "infix_mode");
+        java.util.TreeSet<String> keys = new java.util.TreeSet<>(enabledInfixConflict(section));
+        if (enabled) keys.add(conversation); else keys.remove(conversation);
+        JsonArray updated = new JsonArray();
+        for (String key : keys) updated.add(key);
+        section.add("conflict_enabled", updated); next.add("infix_mode", section);
+        Json.atomicWrite(root.resolve("config.json"), next); data = next;
+        return enabled;
+    }
+    private static java.util.List<String> enabledInfixConflict(JsonObject section) {
+        java.util.List<String> keys = new java.util.ArrayList<>();
+        JsonElement value = section.get("conflict_enabled");
+        if (value != null && value.isJsonArray())
+            for (JsonElement item : value.getAsJsonArray())
+                if (item.isJsonPrimitive() && item.getAsJsonPrimitive().isString()) keys.add(item.getAsString());
+        return keys;
+    }
+    /**
      * Whether "/prompt drop|keep" may fall back to the composite-phrase classification model
      * ({@link cn.szu.bot.prompt.CategoryModel}) for a phrase it cannot classify locally. On by default:
      * the model only ever removes the fragments belonging to the requested category, its answers are cached

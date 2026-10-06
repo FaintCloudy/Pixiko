@@ -7,6 +7,124 @@
 
 ---
 
+## 发行清单（每版必做）
+
+> **本节是规则，不是记录**：从 **v1.6.0 之后的下一次发行**起生效。历史上（v1.0.7–v1.6.0）每版都附了
+> 安卓 APK，但那只是当时的习惯、没有写成规则；**从这里开始，下面每一条都是发版的硬门槛——少一条就不许发**。
+
+### 0. 一句话口径
+
+**每一版发行都必须同时提供安卓版，不是可选项**（用户原话：「**以后每发行一版，安卓版也要跟着发行**」）。
+安卓版的**版本号＝本次发行号**（同一个发行号）：发行 `v1.7.0` → 客户端 `versionName "1.7.0"`、
+`versionCode` 按既有口径递增；**发行前必须核对 `android/app/build.gradle` 与发行号一致，不一致就不许发**。
+**控制台专属的改动（例如「控制台竖版导航」）不需要同步到安卓版 / `webui/m`**——但**版本号与发行节奏照样同步**：
+网页不在 APK 里，改网页不影响 app 功能，可是**这一版既然发行，就得有一份版本号＝本次发行号的 APK 一起发**。
+
+### 1. 发行产物清单（固定内容，一个都不能少）
+
+`<ver>` ＝ 不带 `v` 的发行号（`1.6.0`），`v<ver>` ＝ 带 `v` 的发行号（`v1.6.0`）。**zip 名里带 `v`，APK 名里不带。**
+
+| # | 内容 | 命名 | 上一版（v1.6.0）的实际样子 |
+|---|---|---|---|
+| 1 | 源码包 | `pixiko-v<ver>.zip` | `pixiko-v1.6.0.zip`，**11,833,406 B**，`git archive --format=zip --prefix=Pixiko-v1.6.0/ v1.6.0` |
+| 2 | 源码包校验 | `pixiko-v<ver>.zip.sha256` | **85 B**，内容是 `<64 位小写 hex><两个空格>pixiko-v1.6.0.zip<CRLF>` |
+| 3 | 开箱即用包 | `pixiko-v<ver>-runnable.zip` | `pixiko-v1.6.0-runnable.zip`，**24,726,688 B**（预编译 `build/pixiko.jar` + `lib/` + `webui/` + `android/` ＋空 `logs/`） |
+| 4 | 开箱包校验 | `pixiko-v<ver>-runnable.zip.sha256` | **94 B**，格式同上 |
+| 5 | **安卓 APK** | `pixiko-<ver>-debug.apk` | `pixiko-1.6.0-debug.apk`，**6,224,071 B**，`-NoDefaultHost` 构建 |
+| 6 | **安卓 APK 的 sha256** | 见下 | `a4226e8459e0146dcd2ae47b973b65a009dec00dc95e28093c45ad798f976ca4`（**必须在发行里给出**） |
+
+- **二进制大小必须写进发行正文**（上一版正文的「下载」表里每个附件一行「字节数（MiB）」）。
+- **APK 的 sha256「按上一版实际做法」**：v1.6.0 **没有**给 APK 附 `.sha256` 边车文件
+  （`verify-local.txt` 里那一行明写 `<apk>  6224071 B  a4226e84…  (no sidecar by design)`），
+  它的 sha256 落在**发布前的校验记录**（`verify-local.txt` / `verify-apk.txt` / `verify-remote.json`）里，
+  GitHub 资产本身也带 `digest=sha256:…`。**新口径更严**：APK 的 sha256 **必须出现在发行里**——
+  写进正文表格、或补一个 `pixiko-<ver>-debug.apk.sha256` 边车（两种都行，**但必须有**）。
+- 上一版实发 **5 个资产**（2 个 zip + 2 个 `.sha256` + 1 个 APK）；本清单把「APK 的 sha256」也算作
+  **必做内容**，所以是 **6 项内容**（资产文件 5 或 6 个，取决于 sha256 写成边车还是写进正文）。
+- 打包沿用 v1.6.0 踩出来的结论：用 **`git archive --format=zip`**（**绝不用 Windows 自带的 `tar.exe`**
+  解/打含中文名的包，它按 CP936 解码会出乱码）；条目名统一正斜杠 `/`；非 ASCII 条目名带 UTF-8（bit 11）标志。
+
+### 2. 安卓版版本号必须等于发行号（发行前核对，不一致就不许发）
+
+| 位置 | 必须等于 | 上一版（v1.6.0） |
+|---|---|---|
+| `android/app/build.gradle` → `versionName` | **本次发行号**（发行 `v1.7.0` → `"1.7.0"`） | `"1.6.0"` |
+| `android/app/build.gradle` → `versionCode` | 按既有口径**递增**（`1.4.0`→`140`、`1.5.3`→`153`、`1.6.0`→`160`，即 `major*100+minor*10+patch`；**只要求严格大于上一版**） | `160` |
+| APK 文件名 | `pixiko-<ver>-debug.apk`（版本号由脚本从 `build.gradle` 现读） | `pixiko-1.6.0-debug.apk` |
+| `RELEASE.md` / `README.md` 抬头 | 同一个发行号 | `v1.6.0` |
+
+只读核对（**不构建、不联网、不写文件**）：
+
+```powershell
+# ① 只看版本号对不对（版本号给错就非 0 退出）
+powershell -NoProfile -ExecutionPolicy Bypass -File android\build-apk.ps1 -CheckVersion 1.7.0
+# ② 发版前全量核对（版本号 + 产物齐全 + 两处 sha256 + APK 里没有局域网地址）
+powershell -NoProfile -ExecutionPolicy Bypass -File android\verify-release.ps1 -Version 1.7.0
+```
+
+**不许**为了让校验通过去糊弄版本号（改校验、改断言、改文件名都不行）：**是版本号跟着发行号走，不是反过来。**
+
+### 3. 安卓包必须用 `-NoDefaultHost` 构建（发布包绝不能烘焙本机局域网地址）
+
+v1.6.0 起 `android/build-apk.ps1` 每次构建都会**自动探测本机局域网地址**并烧进
+`BuildConfig.PIXIKO_DEFAULT_HOST`（只用于 app 首次运行预填地址框，方便本机测试）。
+
+```powershell
+# 发布包：明确关掉注入，BuildConfig.PIXIKO_DEFAULT_HOST 是空串
+powershell -NoProfile -ExecutionPolicy Bypass -File android\build-apk.ps1 -NoDefaultHost -OutDir F:\Bot\work\apk-lanip\release
+```
+
+- **发行的 APK 只能是 `-NoDefaultHost` 那份**，而且要在发行前**实测**：APK 里搜不到本机局域网地址
+  （`android/verify-release.ps1` 的第 ⑥ 条自动搜 `classes*.dex` / `assets/` / `res/raw/` / `AndroidManifest.xml`）；
+- **带局域网地址的那份包只用于本机测试，留在 `android/dist/`，绝不出现在发行里**。上一版的对照证据：
+  发布了 `F:\Bot\work\apk-lanip\release\pixiko-1.6.0-debug.apk`（**不含** `172.30.204.50`），
+  没发布 `android\dist\pixiko-1.6.0-debug.apk`（**含** `172.30.204.50:8787`，只作本机测试）；
+- 构建结束时脚本会打印**字节数 + 完整 sha256**，把它抄进发行正文（见第 1 节的第 6 项）。
+
+### 4. 发版前一键校验（`android/verify-release.ps1`）
+
+逐条打印 `PASS` / `FAIL` / `WARN`，**有 FAIL 就以退出码 1 结束**（全 PASS 退出 0）。
+**只读**：不构建、不下载、不写任何文件、不改任何东西。
+
+| 检查 | 内容 |
+|---|---|
+| ① | `android/app/build.gradle` 的 `versionName` ＝ 传入的发行号 |
+| ② | `versionCode` 与发行号口径一致（不一致是 WARN；`-Strict` 下升级为 FAIL） |
+| ③ | 发行目录里同时存在：**两个 zip、两个 `.sha256`、APK** |
+| ④ | 两个 `.sha256` 的内容与 zip 实测 sha256 一致（hex 与文件名都对） |
+| ⑤ | APK 的 sha256 与发行里给出的 sha256 一致（`-ExpectApkSha256`，或 `.sha256` 边车） |
+| ⑥ | **APK 里没有本机局域网地址**：搜 `classes*.dex` / `assets/` / `res/raw/` / `AndroidManifest.xml`，出现本机私网地址即 FAIL；dex 里出现**源码里没有**的私网字面量也 FAIL（那只能来自构建期烧入） |
+| ⑦ | 发行的 APK 与「本机测试包」（`F:\Bot\android\dist\` 与仓库里的 `android/dist/` 两处都看）**不是同一个文件**（sha256 相同即 FAIL） |
+
+```powershell
+# 默认发行目录 F:\Bot\work\release\v<发行号>
+powershell -NoProfile -ExecutionPolicy Bypass -File android\verify-release.ps1 -Version 1.7.0
+# 发行目录在别处
+powershell -NoProfile -ExecutionPolicy Bypass -File android\verify-release.ps1 -Version 1.7.0 -ReleaseDir D:\out\v1.7.0
+# 按新口径严查（APK 必须给出 sha256、versionCode 必须对）
+powershell -NoProfile -ExecutionPolicy Bypass -File android\verify-release.ps1 -Version 1.7.0 -Strict
+```
+
+### 5. 发行正文结构（按上一版 `body.md`，别自创格式）
+
+1. `## 下载`——一张表，**每个附件一行**：`| 文件名 | 用途 | 大小 |`（大小写实测字节数 + MiB）；
+   APK 那一行要写清**客户端版本号 / versionCode**，并写明「**这是不带局域网地址的发布包**」；
+2. `---`；
+3. `## 〇、本版新增（v<ver>）`——本版改动；
+4. 之后照抄 `RELEASE.md`：一、版权声明 → 二、运行环境要求 → 三、安装与启动（含 **Android 客户端**）→
+   四、常用脚本 → 五、已知限制 → 六、在 GitHub Releases 里发布。**正文＝整份 `RELEASE.md`**（v1.6.0 的实际做法）。
+
+### 6. 什么不需要跟着安卓版走
+
+- **控制台专属改动**（例如**控制台竖版导航**、桌面控制台的布局与样式）**不需要同步到安卓版或 `webui/m`**
+  ——用户口径：「**控制台竖版导航不需要同步安卓版**」；
+- **网页（含 `/m`）不在 APK 里**，app 每次从机器人加载页面，所以改网页**不影响 app 功能**；
+- 但**发行口径仍然同步**：**每发行一版就要跟着发一份版本号＝该发行号的 APK**（哪怕这一版只改了网页，
+  也要重新出一次包，把 `versionName` / `versionCode` 升到本次发行号）。v1.5.1 / v1.5.2 / v1.5.3 当时
+  「只改网页就不重出包」是**旧做法**，在新规则下不再允许。
+
+---
+
 ## 〇、本版新增（v1.6.0）
 
 **三件新功能 + 两个修复 + 构建工具**（按项目规则走**中间位进位**）：**`.style load` 真的切 Forge 预设与
@@ -1570,5 +1688,10 @@ copy config.example.json config.json
 3. **本版还补发了历史 Release**：**v1.0.7–v1.5.3**（18 个版本）此前只有 tag、没有 Release，
    本次一并补上（每版 2 个 zip + 2 个 `.sha256`，v1.4.0 起附 Android APK），**共 25 个 Release 在库**；
    打包与解包的坑见「本版新增」第 7 条。
+
+> **每版必做**：完整清单见上文 **[发行清单（每版必做）](#发行清单每版必做)** —— 那里写清了固定产物
+> （**每一版都必须同时发安卓版**）、命名、sha256 与「`-NoDefaultHost` 才许发」的口径。
+> 顺带如实说明：v1.6.0 **实发 5 个资产**（2 个 zip + 2 个 `.sha256` + APK），上面第 2 步里写的
+> 「一共三个附件」是旧口径，以本清单为准。
 
 > 建仓库时 License 请选 **None**（本项目保留所有权利，不使用开源许可证）。

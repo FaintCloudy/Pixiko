@@ -23,9 +23,17 @@ import java.util.concurrent.ConcurrentHashMap;
  * {@code ?token=}；失败次数过多会被短暂冷却。页面与静态资源不校验（登录页要能先打开，
  * Civitai 一次性登录页有自己的令牌）。
  *
- * <p>唯一的例外是<b>首次配置</b>：还没配好 DeepSeek 密钥时，{@code /api/config/**} 对本机（回环地址）
- * 免令牌。否则第一次运行会死锁在"要有令牌才能配置、要配置才有令牌"上；非本机访问仍然要令牌，
- * 避免局域网里有人替你把机器人配成他的。
+ * <p>例外只有三个，都写死在 {@link #shouldNotFilter} 里（**过滤器在路由匹配之前跑**，所以免令牌必须
+ * 在这里放行，控制器里再写也没用）：
+ * <ul>
+ *   <li><b>首次配置</b>：还没配好 DeepSeek 密钥时，{@code /api/config/**} 对本机（回环地址）免令牌。
+ *       否则第一次运行会死锁在"要有令牌才能配置、要配置才有令牌"上；非本机访问仍然要令牌，
+ *       避免局域网里有人替你把机器人配成他的。</li>
+ *   <li><b>安卓端自动更新</b>：{@code POST /api/app/update} 与 {@code GET /api/app/apk}
+ *       （见 {@link AppUpdate}）——手机里没有、也不该存网页令牌。这两个接口是只读的（不写文件、
+ *       不改 config），只允许局域网访问是既有前提。**别的 {@code /api/**} 一律照旧要令牌，
+ *       包括不存在的路径**（所以"未知接口不带令牌"仍然是 401，不是 404）。</li>
+ * </ul>
  */
 @Component
 public class WebAuthFilter extends OncePerRequestFilter {
@@ -35,10 +43,30 @@ public class WebAuthFilter extends OncePerRequestFilter {
 
     public WebAuthFilter(Settings settings) { this.settings = settings; }
 
-    /** 只有 /api 接口需要令牌。 */
+    /** 只有 /api 接口需要令牌；安卓端自动更新的两条接口在这里就放行（过滤器在路由之前）。 */
     @Override
     protected boolean shouldNotFilter(HttpServletRequest request) {
-        return !request.getRequestURI().startsWith("/api/");
+        String path = request.getRequestURI();
+        if (!path.startsWith("/api/")) return true;
+        // 只放行这两条：POST /api/app/update（问版本）与 GET /api/app/apk（下发布包）。
+        // 方法也要对上，免得有人拿它们当别的动词的口子。
+        return appUpdateBypass(path, request.getMethod());
+    }
+
+    /**
+     * 安卓端免令牌白名单：**两条接口都要 GET/POST 对上方法**才算（就这两条，别的 {@code /api/**} 一个字都不放宽）。
+     *
+     * <p>放行这两条的原因：手机端没有网页令牌。两条都是只读接口（{@link AppUpdate} 不写任何文件、
+     * 不改 config.json），而且只允许局域网访问是既有前提。
+     *
+     * <p>方法也要对上：{@code POST /api/app/apk} 拿不到字节流（契约里它只认 GET），所以它**照旧要令牌**——
+     * 少一个「不带令牌就能戳到的入口」。安卓端探测时误用过 POST，需要它返回 405 的话把 {@code "POST"}
+     * 加进下面就一行（那等于允许无凭据请求走到控制器拿 405），这里按「白名单越窄越好」从严。
+     */
+    private static boolean appUpdateBypass(String path, String method) {
+        if (path.equals("/api/app/update")) return "POST".equals(method);
+        if (path.equals("/api/app/apk")) return "GET".equals(method) || "HEAD".equals(method);
+        return false;
     }
 
     @Override

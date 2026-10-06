@@ -447,6 +447,23 @@ public final class PromptUsage {
             "女性", "男性", "女人", "男人", "女孩", "男孩", "少女", "少年", "孩子", "儿童", "人物", "人类", "大家",
             "背景", "场景", "画面");
     /** 内置中文词库总条数（0 表示词库文件不可用）。 */
+    /**
+     * 一个中文说法在**内置中文词库**里精确对应到哪些标准词条（别名整条相等才认，不做子串）。
+     *
+     * <p>给 {@code .prompt add 微笑} 这类"用户明确要加"的直通路径用：命中且唯一时可以直接照做、
+     * 不调 DeepSeek；命中多个（一词多义）就由调用方交回用户决定。空列表＝本机没有这个说法。
+     */
+    public List<String> exactAliases(String term) {
+        if (term == null || term.isBlank()) return List.of();
+        String wanted = term.strip();
+        List<String> found = new ArrayList<>();
+        for (Entry entry : library) {
+            if (entry.aliases().stream().noneMatch(alias -> alias.strip().equals(wanted))) continue;
+            if (!found.contains(entry.tag())) found.add(entry.tag());
+        }
+        return List.copyOf(found);
+    }
+    /** 内置中文词库的条目数（0＝该文件不可用，直通路径退化为只认人工同义词表）。 */
     public int librarySize() { return library.size(); }
     /**
      * 该词条"什么需求下才该用"：分类模板 + {@code data/prompt-zh-use-notes.txt} 里的人工说明。

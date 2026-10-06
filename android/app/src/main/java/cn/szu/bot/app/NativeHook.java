@@ -26,6 +26,15 @@ public final class NativeHook {
     /** localStorage 里存网页令牌的键，必须与 webui/app.js 的 TOKEN_KEY 完全一致。 */
     public static final String TOKEN_KEY = "kotori-webui-token";
 
+    /**
+     * localStorage 里存「本机设备 scope」镜像的键，必须与 webui/m/app.js 的 {@code DEVICE_SCOPE_KEY} 完全一致。
+     *
+     * <p>刻意<b>不</b>复用共享的 {@code pixiko-scope}：那个键是完整控制台（{@code /}）在用，
+     * 两套界面同源（同一台服务器的 localStorage 是同一个），共用键会让设备 scope 漏进控制台、
+     * 或者控制台手改的 scope 覆盖掉设备身份。
+     */
+    public static final String DEVICE_SCOPE_KEY = "pixiko-device-scope";
+
     /** 长按判定阈值：与需求一致，550ms。 */
     private static final int LONG_PRESS_MS = 550;
 
@@ -91,6 +100,31 @@ public final class NativeHook {
     public static String clearTokenScript() {
         return "(function(){try{window.localStorage.removeItem(" + jsString(TOKEN_KEY) + ");return 'cleared';}"
                 + "catch(e){return 'error:'+e;}})()";
+    }
+
+    /**
+     * 设备 scope 注入：把本机的 scope（{@code dev-xxxxxxxxxxxx}）写进 {@code window.__PIXIKO_SCOPE}。
+     *
+     * <p>这是<b>备用通道</b>：主通道是页面地址上的查询串（{@code /m?scope=…}，见
+     * {@link DeviceScope#pageUrl}），它在页面第一行脚本执行之前就已经在了，
+     * 刷新 / 重建 / 深链接都不会丢。注入这一份的用处是"外壳越过地址栏直接说话"：
+     * 万一页面被别的路径加载（或将来换成不便于改地址的加载方式），网页端仍拿得到设备 scope。
+     *
+     * <p>幂等、定向、不 reload：值已经一样就直接回 {@code 'same'}；
+     * 不一样时写进 {@code window.__PIXIKO_SCOPE} <b>并且</b>顺手落一份到 localStorage 的镜像键
+     * （键名必须与 {@code webui/m/app.js} 的 {@code DEVICE_SCOPE_KEY} 完全一致），
+     * 好让"外壳只说一句话"也能把网页端叫醒。刻意不去碰共享的 {@code pixiko-scope}：
+     * 那个键是完整控制台（{@code /}）的地盘，两边不能互相污染。
+     */
+    public static String deviceScopeScript(String scope) {
+        return "(function(){try{var want=" + jsString(scope) + ";"
+                + "var k=" + jsString(DEVICE_SCOPE_KEY) + ";"
+                + "var now=window.__PIXIKO_SCOPE;"
+                + "if(now===want){return 'same';}"
+                + "window.__PIXIKO_SCOPE=want;"
+                + "try{if(!window.localStorage.getItem(k)){window.localStorage.setItem(k,want);}}catch(e2){}"
+                + "return 'written';"
+                + "}catch(e){return 'error:'+e;}})()";
     }
 
     /** 判断「清空了没有」用的读值脚本。 */
