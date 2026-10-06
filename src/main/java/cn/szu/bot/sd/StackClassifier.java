@@ -330,11 +330,109 @@ public final class StackClassifier {
     /**
      * 通用底模名给人看的写法：{@code SD 1.5（原底模名 model.ckpt）}——面板/回执上要让人看得懂，
      * 而不是甩一个 {@code model-ckpt} 伪栈名；不是通用名返回空串。
+     *
+     * <p>**读时重判**（存量样式里抄来的 {@code model.ckpt}）与 LoRA 侧用同一句：同一个东西措辞必须
+     * 一样，否则界面上看起来像两码事；"这是存量记录里的通用名"这点写在 {@code evidence} 里（见
+     * {@link #ofStored}），标签不再区分。
      */
     public static String genericBaseModelLabel(String value) {
         String family = genericFamily(value);
         String raw = value == null ? "" : value.strip();
         return family.isEmpty() || raw.isEmpty() ? "" : family + "（原底模名 " + raw + "）";
+    }
+
+    /** 占位值（{@code model} / {@code unknown} …）当成"没有底模"：读存量数据时与 LoRA 侧同一个口径。 */
+    public static String usableName(String value) { return SdClient.usableBaseModel(value); }
+
+    /**
+     * 一条**存量记录**（样式/老存档里已经写死的 {@code baseModel} / {@code stack} / 来源 / 判据）
+     * 在出口处重判后的形态：
+     * <ul>
+     *   <li>{@code baseModel}：给人看的底模名——通用名写成「{@code SD 1.5（原底模名 model.ckpt）}」
+     *       （与 LoRA 侧**逐字相同**），具体名归一成规范名（{@code SDXL} / {@code Anima} …），
+     *       认不出来的名字照旧原样给，**绝不编**；</li>
+     *   <li>{@code stack}：归属栈（通用名归它指的家族栈，例如 {@code sd}）——**绝不再让
+     *       {@code model-ckpt} 这种伪栈名漏出去**；</li>
+     *   <li>{@code evidence}：判据原文（存量值没有时就按通用名现编一句，说清"这是按家族归的"）。</li>
+     * </ul>
+     * 与 LoRA 侧（{@code SdClient#resolveBaseModel}）共用 {@link #canonicalBaseModel(String)} /
+     * {@link #stackOfBaseModel(String)} / {@link #genericBaseModelLabel(String)} 同一套判据，两边显示一致。
+     */
+    public record Stored(String baseModel, String stack, String stackSource, String evidence, boolean generic) {
+    }
+
+    /**
+     * 把**存量**的底模/栈重判成出口形态（只读：不动数据文件，也不动判定表）。
+     *
+     * @param baseModel 存档里的底模名（可能是 {@code model.ckpt} 这种通用名，也可能是空）
+     * @param stack     存档里的栈名（可能是 {@code model-ckpt} 这种伪栈名）
+     * @param source    存档里的底模来源（没有就空串）
+     * @param evidence  存档里的底模判据（没有就空串）
+     * @param checkpoint 存档里的检查点名（只用来在底模/栈都空时兜底判一次栈，没有就空串）
+     * @param field     判据无实据时写进 evidence 的字段名（如 {@code baseModel}），空串表示不写
+     */
+    public static Stored ofStored(String baseModel, String stack, String source, String evidence, String checkpoint, String field) {
+        String storedStack = stack == null ? "" : stack.strip();
+        String storedEvidence = evidence == null ? "" : evidence.strip();
+        String name = usableName(baseModel);
+        if (name.isEmpty()) {
+            // 底模名是占位值/空：照旧只按检查点名判一次栈（老样式只有 checkpoint 的那种）；
+            // 存档里只留了一个 slug 伪栈名（model-ckpt）时也在这里按名字重判一次。
+            String fallback = stackOf("", checkpoint);
+            String kept = fallback.isEmpty() ? recoverPseudoStack(storedStack) : fallback;
+            return new Stored("", kept, source, storedEvidence, false);
+        }
+        String canonical = canonicalBaseModel(name);
+        if (canonical.isEmpty()) canonical = name;          // 认不出来的名字照旧原样给，不编
+        // 只有"通用名"才换成人话写法：具体名（SDXL / Anima / Illustrious …）一个字都不改。
+        String label = genericBaseModelLabel(name);
+        boolean generic = !label.isEmpty();
+        if (!generic) label = canonical;
+        // 通用名的栈必须按家族重判（model.ckpt → sd）；具体名沿用存档记着的栈，存档没记才补判一次
+        // （底模名非空就一定判得出栈，补上没有坏处，也与 LoRA 侧一致）。
+        String resolvedStack = storedStack.isEmpty() ? stackOfBaseModel(canonical)
+                : (generic ? firstKnown(stackOfBaseModel(canonical), storedStack) : storedStack);
+        // 底模名是空/占位、存档只留了一个 slug 栈（老数据里的 model-ckpt）时，照样按名字重判一次。
+        if (resolvedStack.isEmpty() || !knownStack(resolvedStack)) resolvedStack = recoverPseudoStack(resolvedStack);
+        String why = storedEvidence;
+        if (why.isEmpty() && generic)
+            why = "存量字段 " + (field == null || field.isBlank() ? "baseModel" : field) + "=" + name
+                    + " 是通用底模名（SD1.5 时代的常见命名），按它归入 " + canonical + " 栈";
+        return new Stored(label, resolvedStack, source, why, generic);
+    }
+
+    /** 通用的栈兜底：判出来的家族栈优先，其次存档里记着的那个。 */
+    private static String firstKnown(String derived, String stored) {
+        return derived == null || derived.isEmpty() ? (stored == null ? "" : stored) : derived;
+    }
+
+    /**
+     * 存档里的栈名/judge 不出来了，就按这个名字重判一次：认出来换成家族栈，认不出**原样保留**
+     * （"自成一族"的 slug 栈与真的没有栈都照旧）。
+     */
+    private static String recoverPseudoStack(String stack) {
+        String recovered = pseudoStackOf(stack);
+        return recovered.isEmpty() ? (stack == null ? "" : stack) : recovered;
+    }
+
+    /**
+     * 存档里记着的栈名是个 slug 出来的伪栈名（{@code model-ckpt} 就是 {@code model.ckpt} 的 slug）时，
+     * 拿它的原文重判一次，只认**通用底模名**这一种：判出来就换成它指的家族栈，认不出返回空串
+     * （{@code foo-barxl-v2} 这种"自成一族"的栈名照旧保留，别乱改）。
+     */
+    private static String pseudoStackOf(String stack) {
+        String value = stack == null ? "" : stack.strip();
+        if (value.isEmpty() || knownStack(value)) return "";
+        // 伪栈名是 slug 出来的：连字符当空格试一次，再把 {model/anything}-ckpt 这种写法还原成
+        // {model/anything}.ckpt（{@link #SD15_GENERIC} 认的那种"SD1.5 时代俗名"）试一次。
+        String dotted = value.replace("-ckpt", ".ckpt").replace("-safetensors", ".safetensors");
+        for (String candidate : List.of(value, value.replace('-', ' '), dotted, dotted.replace('-', ' '))) {
+            String canonical = canonicalBaseModel(candidate);
+            if (canonical.isEmpty() || canonical.equals(value)) continue;   // 认不出族的名字照旧不动
+            String derived = stackOfBaseModel(canonical);
+            if (knownStack(derived)) return derived;
+        }
+        return "";
     }
 
     /**

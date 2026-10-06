@@ -1184,19 +1184,23 @@
   };
 
   /**
-   * 可见时按 `ms` 轮询；页面隐藏时**不排下一拍**（省电 + 安卓后台节流），但回来必须**立刻**补。
+   * 按 `ms` 轮询。**页面隐藏时不再主动停表**：隐藏期间浏览器本来就会节流定时器（省电，正常、不对抗），
+   * 但主动停表就等于"服务端已经发好的图，要等我切回来才收" —— 用户看到的正是"失焦就不发图"。
    *
-   * <p>三重保底（任何一条生效就够）：
-   *   ① `visibilitychange` / `focus` / `pageshow` / `resume` / `online` 事件（见 {@link PixikoM.onWake}）；
-   *   ② **看门狗**：每 1.5 秒自查一次，只要 `document.hidden` 已经是 false 而定时器还没排上，就补排
-   *      —— 专治"事件没派发但状态已经变回来"；
-   *   ③ **用户交互**（touch/pointer/keydown）：即使 `document.hidden` 卡在 true，也给它 20 秒"当可见处理"
-   *      的宽限并立刻补一拍 —— 用户的手指就是最可靠的"我在前台"证据。
+   * <p>保住的三重保底（任何一条生效就够）：
+   *   ① `visibilitychange` / `focus` / `pageshow` / `resume` / `online` 事件（见 {@link PixikoM.onWake}）
+   *      —— 回到前台**立刻补一拍**，不必等下一轮；
+   *   ② **看门狗**：每 1.5 秒自查一次，只要定时器不在就补排 —— 专治"事件没派发"（安卓壳）；
+   *   ③ **用户交互**（touch/pointer/keydown）：看不见状态也能立刻补一拍。
+   *
+   * <p>去重照旧：补拍不会重复画（`seenText` / `seenImages` / 服务端存档的窗口差集）。
    */
   PixikoM.pollWhileVisible = function (fn, ms) {
     var interval = Math.max(200, Number(ms) || 1000);
-    var stopped = false, timer = null, running = false, forcedUntil = 0;
-    function canRun() { return !stopped && !!currentId && (!document.hidden || Date.now() < forcedUntil); }
+    var stopped = false, timer = null, running = false;
+    /* 只看"还有没有这一屏"：`document.hidden` 不再参与 —— 有的安卓壳里它一直停在 true，
+       拿它当闸门反而会把轮询永久掐死（那正是这套唤醒通道当初要绕开的坑）。 */
+    function canRun() { return !stopped && !!currentId; }
     async function tick() {
       timer = null;
       if (!canRun() || running) { schedule(); return; }
@@ -1209,27 +1213,22 @@
       if (stopped || timer || !canRun()) return;
       timer = setTimeout(tick, soon ? 120 : interval);
     }
-    /* 唤醒：只在**定时器已经没了**（之前被隐藏/暂停清掉）时才补一拍。
-       否则正常跑着的轮询会被手势插队多打一次请求 —— 那会让"下拉刷新恰好 1 次"变成 2 次。
-       用户交互额外给一段"当可见"的宽限（不怕 document.hidden 卡住）。 */
+    /* 唤醒：定时器已经没了才补一拍（正常跑着的轮询不被手势插队多打一次请求）。 */
     function wake(why) {
       if (stopped) return;
-      if (String(why).indexOf('user:') === 0) forcedUntil = Date.now() + 20000;
       if (timer) return;
       schedule(true);
     }
     function onVisibility() {
-      if (!document.hidden) forcedUntil = 0;
-      if (document.hidden) { if (timer) { clearTimeout(timer); timer = null; } return; }
-      if (timer) { clearTimeout(timer); timer = null; }
+      if (stopped) return;
+      if (timer) { clearTimeout(timer); timer = null; }   // 回到前台：立刻补一拍，不等下一轮
       schedule(true);
     }
     var stopWake = PixikoM.onWake(wake);
     document.addEventListener('visibilitychange', onVisibility);
-    /* 看门狗：事件没派发也不怕（安卓壳兜底）。 */
+    /* 看门狗：事件没派发也不怕（安卓壳兜底）—— 定时器不在就补排。 */
     var watchdog = setInterval(function () {
       if (stopped) return;
-      if (!document.hidden) forcedUntil = 0;
       if (!timer) schedule(true);
     }, 1500);
     timer = setTimeout(tick, Math.min(interval, 400));

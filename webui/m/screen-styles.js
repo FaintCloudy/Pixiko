@@ -188,6 +188,31 @@
     return Number.isFinite(n) ? n : (fallback === undefined ? 0 : fallback);
   }
   function shortName(file) { return text(file).replace(/^.*[\\/]/, '').split('?')[0]; }
+  /**
+   * 底模来源的人话括号注（`baseModelSource` 是**值**不是开关）。
+   *
+   * <p>`safetensors-header` = 读到了文件头部、`civitai` = 读到了 Civitai 记录、`inferred` = 按文件名/当前预设
+   * **推断**出来的。以前这里只判"字段非空"就一律写「（推断）」，于是本机 37 条样式里有 34 条（25 条
+   * `safetensors-header` + 9 条 `civitai`）明明有实据却被标成推断（面板上是「SDXL（推断）」，而来源
+   * 其实是 safetensors 头部元数据）。词表与后端
+   * `StackClassifier.sourceLabel`、桌面端 `app.js` 的 `baseModelSourceLabel`、本目录 `screen-loras.js`
+   * 的 `sourceLabel` 完全一致；认不出的来源**不写注**（与桌面端一致），不把原始英文键甩到界面上。
+   */
+  function sourceNote(source) {
+    var value = text(source);
+    if (!value) return '';
+    var table = {
+      'safetensors-header': 'safetensors 头部元数据',
+      'safetensors-keys': 'safetensors 张量结构',
+      'civitai': 'Civitai 记录',
+      'forge-metadata': 'Forge 元数据',
+      'forge-preset': 'Forge 预设配置',
+      'preset-inferred': '按当前预设推断',
+      'inferred': '按文件名/当前预设推断'
+    };
+    var label = table[value];
+    return label ? '（' + label + '）' : '';
+  }
   /* 这里原来有一个 truncate(value,max)：它只给底模说明用过一次，而用户要求「不许默认省略」，
      现在那一处改成完整显示，这个函数就没有调用方了，一并删掉（免得以后又被拿去截别的东西）。 */
   function coverUrlFor(name) {
@@ -402,7 +427,7 @@
     meta.appendChild(category);
     var base = text(item && item.baseModel);
     var stack = text(item && item.stackLabel);
-    if (base) meta.appendChild(el('span', 'st-tag', base + (text(item && item.baseModelSource) ? '（推断）' : '')));
+    if (base) meta.appendChild(el('span', 'st-tag', base + sourceNote(item && item.baseModelSource)));
     else if (stack) meta.appendChild(el('span', 'st-tag', stack));
     var width = num(item && item.width, 0);
     var height = num(item && item.height, 0);

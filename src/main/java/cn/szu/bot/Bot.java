@@ -9048,21 +9048,26 @@ public final class Bot implements AutoCloseable {
                     // 显示成 32 才正常（数值语义不变，Json.num 照旧读得出来）。
                     item.add("model", integerSteps(style.model().deepCopy()));
                     item.addProperty("modelSummary", style.modelSummary());
-                    // 样式属于哪一栈（样式里的 stack 字段；老样式没有就用底模名判一次）。
-                    String stack = Json.str(style.model(), "stack", "");
-                    if (stack.isBlank()) stack = cn.szu.bot.sd.StackClassifier.stackOf(
-                            Json.str(style.model(), "baseModel", ""), Json.str(style.model(), "checkpoint", ""));
-                    // 底模名：样式自己记着的优先；**老样式**只有检查点名、没有底模名时，按归属栈补该栈的规范
-                    // 底模名，好让「按底模分组」不漏项。只读回填，**不写回** data/local-styles.json；
-                    // 栈也判不出来（检查点名毫无线索）就照旧留空——那是"真的没有底模信息"，不填默认值。
-                    String baseModel = Json.str(style.model(), "baseModel", "");
+                    // 底模/栈一律走**读时重判**（与 /api/loras 同一套判据）：老样式里存的通用底模名
+                    // （model.ckpt）不能变成「model-ckpt 栈」这种伪栈名漏到面板与手机端。
+                    // 只读重判，**不回写** data/local-styles.json。
+                    cn.szu.bot.sd.StackClassifier.Stored stored =
+                            cn.szu.bot.sd.LocalStyles.storedBaseModel(style.model(), "baseModel");
+                    String stack = stored.stack();
+                    String baseModel = stored.baseModel();
                     String baseModelSource = Json.str(style.model(), "baseModelSource", "");
+                    // 老样式只有检查点名、没有底模名时按归属栈补该栈的规范底模名（好让「按底模分组」不漏项）；
+                    // 栈也判不出来（检查点名毫无线索）就照旧留空——那是"真的没有底模信息"，不填默认值。
                     if (baseModel.isBlank() && !stack.isBlank()) {
                         baseModel = cn.szu.bot.sd.StackClassifier.baseModelOfStack(stack);
                         if (!baseModel.isBlank()) baseModelSource = cn.szu.bot.sd.StackClassifier.INFERRED_SOURCE;
                     }
                     item.addProperty("baseModel", baseModel);
                     item.addProperty("baseModelSource", baseModelSource);
+                    // 与 /api/loras 同形的三个字段（界面直接用，不必各自再拼一遍）。
+                    item.addProperty("baseModelLabel", baseModelLabel(baseModel));
+                    item.addProperty("baseModelGroupKey", cn.szu.bot.sd.LocalStyles.baseModelGroupKey(baseModel));
+                    item.addProperty("evidence", stored.evidence());
                     item.addProperty("stack", stack);
                     item.addProperty("stackLabel", cn.szu.bot.sd.StackClassifier.stackLabel(stack));
                     String stackSource = Json.str(style.model(), "stackSource", "");
@@ -9083,6 +9088,14 @@ public final class Bot implements AutoCloseable {
             }
         } catch (Exception error) { /* 单条读不出来不影响列表 */ }
         return item;
+    }
+    /**
+     * 样式条目的底模标注（与 {@code /api/loras} 的 {@code baseModelLabel} 同一句形制：
+     * {@code 底模 SDXL} / {@code 底模 SD 1.5（原底模名 model.ckpt）} / {@code 底模未识别}）。
+     */
+    private static String baseModelLabel(String name) {
+        String value = name == null ? "" : name.strip();
+        return value.isEmpty() ? "底模未识别" : "底模 " + value;
     }
     /** 网页用的 SD 状态：是否在跑、自启动开关、启动入口与参数（不含任何密钥）。 */
     public JsonObject sdStatus() {

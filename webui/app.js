@@ -737,13 +737,18 @@
       let picture = null;
       const picturesOnce = () => { if (!picture) picture = questPictureArea(files, questLive.base); return picture; };
       let placed = false;
-      steps.forEach((pieces, index) => {
+      /* 卡号数的是**画出来的卡片**，不是 messages 的下标：`.gen 5` 这种回执里 5 条图片消息
+         被折进同一张图集卡，按下标编号就会看到「第 1 步 / 第 2 步 / 第 3 步 / 第 8 步」这种跳号
+         （用户报的「杂乱」）。正文一个字不改、只渲染一次，与手机端同一口径（那边的 `stepLabel`）。 */
+      let drawn = 0;
+      steps.forEach((pieces) => {
         const text = (pieces || []).filter((piece) => piece.type !== 'image' && piece.text).map((piece) => piece.text).join('\n');
         const hasPicture = !!groups && (pieces || []).some((piece) => piece.type === 'image' && piece.file);
         const galleryHere = hasPicture && !placed && files.length > 0;   // 图集放在第一处出现图片的位置
         if (!text && hasPicture && !galleryHere) return;                 // 图片已经被图集收走：这一步不再单独出一张空卡
+        drawn += 1;
         const step = el('div', 'quest-step');
-        step.appendChild(el('div', 'head', groups ? '第 ' + (index + 1) + ' 步' : '输出'));
+        step.appendChild(el('div', 'head', groups ? '第 ' + drawn + ' 步' : '输出'));
         if (text) {
           if (/(^|\n)[^\n]{0,16}(失败|错误|不正确|无效|超时|拒绝|找不到)[:：]/.test(text)) step.classList.add('err');
           step.appendChild(el('div', 'quest-text', text));
@@ -2453,8 +2458,10 @@
       const busy = capture.busy || (!capture.closed && capture.ageMillis < 1200 && attempt < 3);
       if (attempt % 4 === 0) await loadStatus().catch(() => {});
       const generating = !!state.status?.generation?.status;
-      const followOn = follow && (busy || generating || Date.now() < state.followUntil);
-      if ((busy || followOn) && attempt < 2400) {
+      // 续轮的判据里**服务端还在出图**单独成立：以前只有 `follow=true` 的指令（网页对话/生成）才续，
+      // 终端里的 `gen` 这类 follow=false 的路径会在出图完成前就把链条停掉 —— 那正是"图出好了却不见"的一半。
+      const followOn = follow && Date.now() < state.followUntil;
+      if ((busy || generating || followOn) && attempt < 2400) {
         state.pollTimer = setTimeout(() => pollCapture(id, attempt + 1, follow), busy ? 900 : 2500);
       }
     } catch (error) {
@@ -2472,12 +2479,16 @@
    *
    * <p>这里只**补拉一轮**（attempt=0）：已有的 `state.seenGroups` / `state.seenImages` 去重照旧生效，
    * 所以补拉不会重复画条目；`follow` 标记沿用调用方（网页对话/指令通道跟到底的那条）。
+   *
+   * <p>**不再看 `document.visibilityState`**：页面隐藏时浏览器本来就会节流定时器（那是不对抗的正常现象），
+   * 但**绝不主动**因为"看不见"就不发请求——否则"服务端已经发好了、页面却没接"就变成"失焦就不发图"。
+   * 补拉的判据改成"这条回执还有东西可等"：还在跟（follow）、本页正忙、或服务端仍在出图。
    */
   function resumeCapturePoll(source) {
     const id = state.activeCaptureId;
     if (!id || !state.token) return null;
-    if (document.visibilityState === 'hidden') return null;            // 还在后台就别发请求
-    if (!(state.activeCaptureFollow || state.busy > 0)) return null;   // 已经跟完的（不 follow、也不忙）不必再拉
+    const waiting = state.activeCaptureFollow || state.busy > 0 || !!state.status?.generation?.status;
+    if (!waiting) return null;                                        // 真的没在等（不 follow、不忙、服务端也没出图）才不必再拉
     // 节流：刚拉过就别重复拉（同一轮里 visibilitychange/focus/pageshow 可能一起来）。
     // **但从后台回来时不受节流限制**：那正是"定时器被节流、消息停在服务端"的场景，必须立刻补拉。
     // 用显式的 hidden 标记判断（`hiddenSince` 在 visibilitychange→hidden 时打点），
@@ -2488,7 +2499,9 @@
     state.followUntil = Date.now() + 20 * 60 * 1000;
     window.__captureResumeAt = Date.now();      // 探针用：确认"回前台确实补拉过"
     window.__captureResumeSource = String(source || '');
-    pollCapture(id, 0, state.activeCaptureFollow).catch(() => {});
+    // 从后台回来时**不受尝试次数/静默上限限制**：链条可能早就断了（follow=false 的指令、或
+    // 浏览器把定时器节流到分钟级），必须重新把它接上，不能只补一轮就让它再次断掉。
+    pollCapture(id, 0, state.activeCaptureFollow || !!state.status?.generation?.status).catch(() => {});
     return { id, source };
   }
 
@@ -2776,7 +2789,9 @@
   async function syncChatArchive() {
     const log = $('chat-log');
     if (!log || chatArchive.disabled || !state.token) return 0;
-    if (document.visibilityState === 'hidden') return 0;
+    // 这里**故意不看 `document.visibilityState`**：隐藏时浏览器会把 2.5 秒的表节流（正常、不对抗），
+    // 但主动停表就等于"服务端存档里的新条目要等我切回来才画"——那正是用户说的"失焦就不发图"。
+    // 补画是幂等的（窗口差集 + 本地快照去重），多跑几轮不会重复画。
     let list;
     try {
       const payload = await api('/api/chat/log', { body: { scope: scope() } });

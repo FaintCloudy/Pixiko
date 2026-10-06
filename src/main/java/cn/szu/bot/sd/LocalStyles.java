@@ -133,16 +133,20 @@ public final class LocalStyles {
         /** 一行摘要，给回执与网页显示用；没有模型参数时返回空串。 */
         public String modelSummary() {
             if (!hasModel()) return "";
+            // 底模/栈都按**读时重判**后的形态写：存量里的通用名（model.ckpt）不能变成「model-ckpt 栈」
+            // 这种伪栈名（数据文件依旧一字不改，见 StackClassifier.ofStored）。
+            StackClassifier.Stored stored = storedBaseModel(model, "model");
             List<String> parts = new ArrayList<>();
-            String baseModel = Json.str(model, "baseModel", "");
-            String checkpoint = Json.str(model, "checkpoint", "");
             // 底模是"这个样式属于哪个基础模型"的分类信息，来源也要写出来（推断的要显式标成推断）。
-            if (!baseModel.isBlank()) parts.add("底模 " + baseModel + sourceNote(Json.str(model, "baseModelSource", "")));
+            if (!stored.baseModel().isBlank())
+                parts.add("底模 " + stored.baseModel() + sourceNote(Json.str(model, "baseModelSource", "")));
             // 归属栈：载入样式时"栈对不对"比底模名字更关键（栈不对出全灰废图）。
-            String stack = Json.str(model, "stack", "");
-            if (stack.isBlank()) stack = StackClassifier.stackOf(baseModel, checkpoint);
+            String stack = stored.stack();
+            if (stack.isBlank()) stack = StackClassifier.stackOf(stored.baseModel(), Json.str(model, "checkpoint", ""));
             if (!stack.isBlank()) parts.add(StackClassifier.stackLabel(stack));
             // 检查点与底模是同一个东西时（按当前预设推断出来的那种）就不重复写一遍。
+            String baseModel = Json.str(model, "baseModel", "");
+            String checkpoint = Json.str(model, "checkpoint", "");
             if (!checkpoint.isBlank() && !checkpoint.equalsIgnoreCase(baseModel)
                     && !checkpoint.toLowerCase(java.util.Locale.ROOT).startsWith(baseModel.toLowerCase(java.util.Locale.ROOT) + "."))
                 parts.add("检查点 " + checkpoint);
@@ -180,6 +184,34 @@ public final class LocalStyles {
             return label.isBlank() ? "" : "（" + label + "）";
         }
     }
+
+    /**
+     * 一条样式**记着的**底模/栈在出口处的重判形态（只读：绝不回写 {@code data/local-styles.json}）。
+     *
+     * <p>老存档里 {@code baseModel=model.ckpt} 会把栈写成 {@code model-ckpt} 这种伪栈名，面板与手机端
+     * 照着显示就成了「model ckpt」。这里与 LoRA 侧共用 {@link StackClassifier#ofStored} 同一套判定：
+     * 通用名归它指的家族（{@code model.ckpt} → {@code SD 1.5} / {@code sd} 栈），具体名（{@code SDXL} /
+     * {@code Anima} …）一字不改。字段名/判据缺了就按"没有实据"处理，**不编**。
+     */
+    public static StackClassifier.Stored storedBaseModel(JsonObject model, String field) {
+        if (model == null) return StackClassifier.ofStored("", "", "", "", "", field);
+        return StackClassifier.ofStored(Json.str(model, "baseModel", ""), Json.str(model, "stack", ""),
+                Json.str(model, "baseModelSource", ""), Json.str(model, "evidence", ""),
+                Json.str(model, "checkpoint", ""), field);
+    }
+
+    /**
+     * 出口形态底模名 → **分组键**：同一个底模的不同写法算一组（{@code SDXL} / {@code SD 1.5} → 小写），
+     * 与 LoRA 侧 {@code SdClient.BaseModel.groupKey()} 同一个口径；未识别是空串（排最后）。
+     */
+    public static String baseModelGroupKey(String shown) {
+        String value = shown == null ? "" : shown.strip();
+        if (value.isEmpty()) return "";
+        String canonical = StackClassifier.canonicalBaseModel(value);
+        // 通用名的人话写法（「SD 1.5（原底模名 model.ckpt）」）归一到家族名，别把括号带进分组键。
+        return (canonical.isEmpty() ? value : canonical).toLowerCase(Locale.ROOT);
+    }
+
     /** 批量导入的结果：导入/覆盖了多少条、因为同名跳过多少条。 */
     public record ImportResult(int imported, int skipped) {}
 
@@ -325,12 +357,12 @@ public final class LocalStyles {
         return index != null && index.showcase(style == null ? "" : style.name());
     }
 
-    /** 这条样式记着的归属栈（没有就按底模/检查点名现判；判不出来是空串）。 */
+    /** 这条样式记着的归属栈（存量值出口重判；判不出来是空串）。 */
     public static String stackOf(Style style) {
         JsonObject model = style == null ? null : style.model();
         if (model == null) return "";
-        String stack = Json.str(model, "stack", "");
-        return stack.isBlank() ? StackClassifier.stackOf(Json.str(model, "baseModel", ""), Json.str(model, "checkpoint", "")) : stack;
+        // 存量里的 model-ckpt 这种伪栈名不能漏出去：与 LoRA 侧同一套判据重判（数据文件不动）。
+        return storedBaseModel(model, "baseModel").stack();
     }
 
     /** 归属栈 → 分类（{@code stack:xl} / {@code SDXL 栈}；栈为空就是「未分类」）。 */
