@@ -11,6 +11,7 @@ import java.nio.file.*;
 import java.util.*;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicInteger;
+import cn.szu.bot.sd.GenerationParameters;
 import cn.szu.bot.sd.SdClient;
 
 /** Catalogs, live state, migration and generation are tested only against disposable loopback servers. */
@@ -25,64 +26,74 @@ public final class SdSettingsTest {
         conflictsAndFailedWrites();
         validationBeforeMutation();
         parameterChangesAreLogged();
-        staleSnapshotNeverOverridesExplicitLocalSize();
+        parametersAreForgeIndependent();
         offlineAndTimeout();
         System.out.println("SdSettingsTest: " + assertions + " assertions passed.");
     }
 
     /**
-     * 「改了尺寸一生成又变回原尺寸」（2026-10-07 实测）：页面没实时连接时，桥接里那份旧快照会被
-     * 那个页面反复 PUT 回桥接（实测 0.6 秒后回来），机器人下一次 refresh 就把用户刚改的尺寸顶回去。
+     * 用户口径（最高优先级）：「机器人的参数与 Forge 独立」——桥接只有一个方向，
+     * 机器人 → Forge（出图前推送）；**禁止** Forge → 机器人（不再"跟随 WebUI 页面"采纳对方的值）。
      *
-     * <p>判据是**来源优先级**：实时页面（浏览器心跳认证过的快照）＞ 机器人这边的用户显式写入
-     * ＞ 页面未实时连接的桥接旧快照。载入样式/预设套用的尺寸同样受这条保护（它也走 setSize）。
+     * <p>事故（2026-10-07 真机日志）：04:07:00 用户改成 1600×1440 → 04:07:01 外部页面写回 960×1440
+     * → 04:07:03 {@code refresh()} 把它顶回 → 任务按 960×1440 出图。旧方案用"来源优先级 + 时刻标记"
+     * 只是缓解（页面实时连接时照样采纳）；现在改成**根本不读回来**，那套标记也一并删掉了。
+     *
+     * <p>规格里的 8 条定向断言就在这里，一条不多。
      */
-    private static void staleSnapshotNeverOverridesExplicitLocalSize() throws Exception {
+    private static void parametersAreForgeIndependent() throws Exception {
         try (Fixture f = new Fixture()) {
             SdClient client = f.client();
-            client.settings();
-            // 页面已断开，用户仍在机器人这边显式改尺寸（控制台/指令/手机端都走这条）。
-            f.live = false;
-            equal(960, client.setSize(960, 1440).width(), "explicit local size applied");
-            // 没通过心跳认证的旧页面把它自己那份旧尺寸 PUT 回桥接。
-            f.width = 832; f.height = 1152; f.revision++;
-            String kept = captureOutput(() -> {
-                SdClient.GenerationSettings after = client.settings();
-                equal(960, after.width(), "stale snapshot cannot override the explicit local width");
-                equal(1440, after.height(), "stale snapshot cannot override the explicit local height");
-                check(after.source().contains("本地显式参数"), "kept-local source is explicit: " + after.source());
-                equal(960, client.generationRequest().settings().width(), "generation submits the user's width");
-            });
-            check(kept.contains("保留本地显式值") && kept.contains("尺寸 960×1440 → 832×1152"),
-                    "ignored snapshot logged with old → new: " + kept);
-            equal(960, persistedWidth(f), "the user's size is what gets persisted for a restart");
-            equal(960, f.client().settings().width(), "restart keeps the explicit size against the stale snapshot");
-            // 载入样式套用尺寸（既有行为）也要活得过下一次未实时快照。
-            JsonObject styleModel = new JsonObject();
-            styleModel.addProperty("width", 768);
-            styleModel.addProperty("height", 512);
-            List<String> applied = client.applyModelParams(styleModel);
-            check(applied.stream().anyMatch(text -> text.contains("尺寸 768×512")), "style size applied: " + applied);
-            f.width = 832; f.height = 1152; f.revision++;
-            equal(768, client.settings().width(), "style-applied size survives a stale snapshot");
-            // 合法的变换照旧：展示图那种超限尺寸仍按 fitGenerationSize 同比例缩到合法值再套用。
-            JsonObject huge = new JsonObject();
-            huge.addProperty("width", 2400);
-            huge.addProperty("height", 3744);
-            List<String> fitted = client.applyModelParams(huge);
-            check(fitted.stream().anyMatch(text -> text.contains("尺寸 2400×3744 → 同比例缩到")),
-                    "out-of-range style size still fitted: " + fitted);
-            f.width = 832; f.height = 1152; f.revision++;
-            equal(SdClient.fitGenerationSize(2400, 3744)[0], client.settings().width(),
-                    "fitted style size survives a stale snapshot");
-            // 页面真在实时同步（心跳认证）时页面优先：既有行为一个字都不改。
+            SdClient.GenerationSettings sized = client.setSize(832, 1216);
+            SdClient.GenerationSettings picked = client.setSampler("DPM++ 2M");
+            client.setParameter("steps", "33");
+            client.setParameter("cfg", "7");
+            SdClient.GenerationRequest captured = client.generationRequest();
+            // ① 用户显式设的 832×1216，.size/.sampler 回执照旧，生成前解析就是它。
+            check(sized.width() == 832 && sized.height() == 1216 && "DPM++ 2M".equals(picked.samplerName())
+                            && captured.settings().width() == 832 && captured.settings().height() == 1216,
+                    "① .size/.sampler receipts and the generation snapshot use the user's values: "
+                            + captured.settings().width() + "×" + captured.settings().height());
+            // ② 页面没实时连接时把它自己那份旧尺寸 PUT 回桥接：机器人参数不变，生成仍用 832×1216。
+            f.live = false; f.width = 960; f.height = 1440; f.sampler = "DDIM"; f.revision++;
+            SdClient.GenerationSettings stale = client.settings();
+            SdClient.GenerationRequest afterStale = client.generationRequest();
+            check(stale.width() == 832 && stale.height() == 1216
+                            && afterStale.settings().width() == 832 && afterStale.settings().height() == 1216,
+                    "② a stale page write-back cannot change the size: " + stale.width() + "×" + stale.height());
+            // ③ 页面真在实时同步（心跳认证过）那份同样不采纳——比"来源优先级"那套彻底。
             f.live = true; f.width = 1216; f.height = 832; f.revision++;
-            SdClient.GenerationSettings followed = client.settings();
-            equal(1216, followed.width(), "a live page still wins");
-            check(followed.source().contains("实时同步"), "live page labelled: " + followed.source());
-            // 页面接管过之后本地那条"显式写入"记录作废：下一次未实时快照照旧跟随，不会永久粘住。
-            f.live = false; f.width = 512; f.height = 512; f.revision++;
-            equal(512, client.settings().width(), "after a live takeover the snapshot is followed again");
+            SdClient.GenerationSettings live = client.settings();
+            check(live.width() == 832 && live.height() == 1216,
+                    "③ a live page cannot change the size either: " + live.width() + "×" + live.height());
+            // ④ 采样方法也只认本地那份（页面写回的 DDIM 不算数）。
+            check("DPM++ 2M".equals(live.samplerName()), "④ the page cannot change the sampler: " + live.samplerName());
+            // ⑤ 步数 / CFG 存在机器人自己的记录里（data/sd-parameters.json），页面怎么写都不动。
+            GenerationParameters parameters = client.parameters();
+            check(parameters.steps() == 33 && parameters.cfgScale() == 7,
+                    "⑤ steps/CFG stay local: steps=" + parameters.steps() + " cfg=" + parameters.cfgScale());
+            // ⑥ 出图前参数仍然**推**给 WebUI：txt2img 请求体里就是机器人这一份（推送这条保留）。
+            client.generate(captured);
+            check(f.lastGeneration.get("width").getAsInt() == 832 && f.lastGeneration.get("height").getAsInt() == 1216
+                            && "DPM++ 2M".equals(f.lastGeneration.get("sampler_name").getAsString())
+                            && f.lastGeneration.get("steps").getAsInt() == 33
+                            && f.lastGeneration.get("cfg_scale").getAsDouble() == 7,
+                    "⑥ generation still pushes the bot's parameters to WebUI: " + f.lastGeneration);
+            // ⑦ 载入样式仍然套用样式尺寸（超限时按 fitGenerationSize 同比例缩）——机器人自己发起的行为。
+            JsonObject styleModel = new JsonObject();
+            styleModel.addProperty("width", 2400);
+            styleModel.addProperty("height", 3744);
+            List<String> applied = client.applyModelParams(styleModel);
+            int[] fitted = SdClient.fitGenerationSize(2400, 3744);
+            check(applied.stream().anyMatch(text -> text.contains("尺寸 2400×3744 → 同比例缩到"))
+                            && client.settings().width() == fitted[0] && client.settings().height() == fitted[1],
+                    "⑦ loading a style still applies its fitted size: " + applied);
+            // ⑧ 底模 / VAE 的**只读观测**仍在（VAE 冲突防呆要用它）：不回读参数 ≠ 不读模型信息。
+            f.optionsAvailable = true;
+            String checkpoint = client.parameters().checkpoint();
+            String vae = client.vae();
+            check("animaCatTower_v11.safetensors [aaaa]".equals(checkpoint) && "Automatic".equals(vae),
+                    "⑧ checkpoint/VAE remain read-only observable: " + checkpoint + " / " + vae);
         }
     }
 
@@ -109,11 +120,14 @@ public final class SdSettingsTest {
                     "checkpoint change logged from auto: " + model);
             String unchanged = captureOutput(() -> client.setSize(768, 512));
             check(unchanged.isBlank(), "same values leave no log line: " + unchanged);
-            // WebUI 页面把参数顶掉时同样留痕（这是"参数莫名其妙变了"最常见的一路）。
+            // 参数由机器人自己拥有：页面那份（DDIM/1024×1024）不采纳，也就不该留下"参数被改了"的日志。
             f.sampler = "DDIM"; f.width = 1024; f.height = 1024; f.revision++;
-            String followed = captureOutput(() -> client.settings());
-            check(followed.contains("跟随 WebUI 页面") && followed.contains("DDIM") && followed.contains("1024×1024"),
-                    "page override logged: " + followed);
+            SdClient.GenerationSettings[] held = new SdClient.GenerationSettings[1];
+            String followed = captureOutput(() -> held[0] = client.settings());
+            check(followed.isBlank() && held[0].width() == 768 && held[0].height() == 512
+                            && "DPM++ 2M".equals(held[0].samplerName()),
+                    "page-side parameter write-back is ignored silently: " + followed + " / "
+                            + held[0].samplerName() + " " + held[0].width() + "×" + held[0].height());
         }
     }
 
@@ -157,7 +171,8 @@ public final class SdSettingsTest {
             equal("DPM++ 2M", f.sampler, "legacy prompt edit preserves new parameters");
             equal(List.of(), client.setStyles(List.of()).styles(), "empty style list clears selection");
             f.live = false;
-            check(client.settings().source().contains("页面未实时连接"), "closed browser state labeled honestly");
+            // 参数不再跟随页面：来源标注只剩机器人本地那份（"页面未实时连接"只描述提示词那份）。
+            check(client.settings().source().contains("未同步"), "closed browser does not relabel the bot's own settings");
             equal(0, f.configReads.get(), "initialized bridge never uses startup defaults");
         }
     }
@@ -273,8 +288,8 @@ public final class SdSettingsTest {
             int before = f.puts.get();
             SdClient.GenerationSettings changed = client.setSize(640, 512);
             equal(2, f.puts.get() - before, "version conflict retries once");
-            equal("DPM++ 2M", changed.samplerName(), "retry preserves concurrent sampler edit");
-            equal(List.of("中文 风格"), changed.styles(), "retry preserves concurrent style edit");
+            equal("Euler a", changed.samplerName(), "concurrent page sampler edit is not adopted (the bot keeps its own)");
+            equal(List.of("Cinematic"), changed.styles(), "concurrent page style edit is not adopted (the bot keeps its own)");
             equal("concurrent positive", f.positive, "retry preserves concurrent prompt edit");
             f.alwaysConflict = true;
             before = f.puts.get();
@@ -374,6 +389,8 @@ public final class SdSettingsTest {
         volatile String positive = "live positive", negative = "live negative", sampler = "Euler a";
         volatile List<String> selectedStyles = List.of("Cinematic");
         volatile boolean oldBridge, initialized = true, live = true, conflictOnce, alwaysConflict, ambiguousAlias;
+        /** 只有 ⑧（底模/VAE 只读观测）那一条打开：其余用例里 /sdapi/v1/options 照旧 404。 */
+        volatile boolean optionsAvailable;
         volatile long delayMillis;
         volatile JsonObject lastPut, lastGeneration;
         volatile String startup = """
@@ -456,6 +473,11 @@ public final class SdSettingsTest {
                     ByteArrayOutputStream bytes = new ByteArrayOutputStream();
                     ImageIO.write(new BufferedImage(2, 3, BufferedImage.TYPE_INT_RGB), "png", bytes);
                     send(exchange, 200, "{\"images\":[\"" + Base64.getEncoder().encodeToString(bytes.toByteArray()) + "\"]}");
+                } else if (path.equals("/sdapi/v1/options") && optionsAvailable) {
+                    // 只读观测：机器人从这里读"当前加载的底模 / VAE"（VAE 冲突防呆与界面显示要用），
+                    // 但生成参数不从这里采纳（尺寸/采样方法/样式由机器人自己拥有）。
+                    send(exchange, 200, "{\"sd_model_checkpoint\":\"animaCatTower_v11.safetensors [aaaa]\","
+                            + "\"sd_vae\":\"Automatic\"}");
                 } else send(exchange, 404, "{}");
             } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
             finally { exchange.close(); }

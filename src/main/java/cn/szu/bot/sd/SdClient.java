@@ -166,18 +166,15 @@ public final class SdClient {
     private static final String LOCAL_SOURCE = "本地持久化（未同步 WebUI 当前页面）";
     private static final String DEFAULT_SOURCE = "WebUI 启动默认值（未同步当前页面）";
     /**
-     * 桥接快照的两种来源标注（与 {@link #bridgePrompts} 一一对应），也是**来源优先级**的判据：
+     * 桥接快照的两种来源标注（与 {@link #bridgePrompts} 一一对应），只描述**提示词**那一份的出处：
      * <ul>
-     *   <li>{@link #PAGE_LIVE_SOURCE}：浏览器心跳认证过的那一份——页面上的控件就等于这份值，所以**页面优先**；</li>
-     *   <li>{@link #PAGE_STATE_SOURCE}：页面没在实时连接时桥接服务端存着的那一份，可能是很旧的快照
-     *       （实测：一个没通过心跳认证的页面会把它自己那份旧尺寸反复 PUT 回桥接），
-     *       **不许**拿它覆盖机器人这边用户刚显式写入的值——见 {@link #adoptSnapshot}。</li>
+     *   <li>{@link #PAGE_LIVE_SOURCE}：浏览器心跳认证过的那一份（页面控件就等于这份值）；</li>
+     *   <li>{@link #PAGE_STATE_SOURCE}：页面没在实时连接时桥接服务端存着的那一份，可能是旧快照。</li>
      * </ul>
+     * 生成参数不再适用这两个标注：参数由机器人自己拥有，桥接回读一律不采纳（见 {@link #refresh}）。
      */
     private static final String PAGE_LIVE_SOURCE = "WebUI 当前页面（实时同步）";
     private static final String PAGE_STATE_SOURCE = "WebUI 桥接状态（页面未实时连接）";
-    /** 本地显式参数赢了未实时快照时的来源标注（回执里必须看得出来这份值是谁的）。 */
-    private static final String KEPT_LOCAL_SOURCE = "本地显式参数（未采用页面未实时连接的桥接旧快照）";
     private final Path root, stateFile, settingsFile, latestFile, generatedRoot, promptPreviousFile;
     private final JsonObject config;
     private final String baseUrl, authorization;
@@ -188,8 +185,8 @@ public final class SdClient {
     /**
      * Forge 的调度器与蒸馏 CFG（界面上的 Shift）。
      *
-     * <p>为什么要单独存一份：WebUI 的桥接扩展不认识这两个字段，每次 {@code refresh()} 从桥接重建
-     * {@code cachedSettings} 都会把它们冲掉。所以以这里的值为准，读设置与落盘时再合并回去。
+     * <p>为什么要单独存一份：WebUI 的桥接扩展不认识这两个字段，桥接里的参数实体也没有它们，
+     * 所以不混进桥接回读，读设置与落盘时再合并回去。
      */
     private volatile String activeScheduler = "";
     private volatile double activeDistilledCfg;
@@ -197,23 +194,10 @@ public final class SdClient {
      * 机器人自己记着的 VAE（{@code sd_vae}）。
      *
      * <p>为什么单独存一份、不放进 {@code cachedSettings}：{@code sd_vae} 是**WebUI 的全局选项**，
-     * 桥接扩展不认这个字段，每次 {@code refresh()} 从桥接重建 {@code cachedSettings} 都会把它冲掉
-     * （与调度器/蒸馏 CFG 完全同一个理由）。所以以这里的值为准，落盘时再合并回去。
+     * 桥接扩展不认这个字段（与调度器/蒸馏 CFG 完全同一个理由）。所以以这里的值为准，落盘时再合并回去；
+     * 读的时候以 WebUI 的 options 为准（见 {@link #vae()}），那是只读观测，不是采纳参数。
      */
     private volatile String activeVae = "";
-    /**
-     * 用户最后一次**显式写入**这份生成参数（采样方法/预设样式/尺寸）的时刻。
-     *
-     * <p>为什么需要它：这三项与 WebUI 页面同步，而桥接那边存着的那一份有可能是**页面没实时连接时**留下的旧值。
-     * 实测（2026-10-07）：一个没通过心跳认证的页面会把它自己那份旧尺寸反复 PUT 回桥接，机器人下一次
-     * {@code refresh()} 就把用户刚改的尺寸顶回去——表现就是「改了尺寸一生成又变回原尺寸」。
-     *
-     * <p>判据是**来源优先级 + 时刻**：实时页面（浏览器心跳认证过的快照）＞ 机器人这边的用户显式写入
-     * ＞ 页面未实时连接的桥接旧快照。只要本地有这条记录，未实时快照就休想覆盖它；页面真的在实时同步时
-     * 会认证并接管这几项（那时这条记录随之作废，见 {@link #adoptSnapshot}）。
-     * 载入样式/预设套用尺寸也走 {@link #changeSettings}，所以它们同样受这条保护。
-     */
-    private volatile Instant localSettingsAt;
     private JsonElement revision;
     private boolean bridgeAvailable;
     private boolean settingsBridgeAvailable, settingsInitialized;
@@ -267,20 +251,10 @@ public final class SdClient {
                 activeDistilledCfg = cachedSettings.distilledCfg();
                 // 老 sd-settings.json 没有 vae 字段：读回来是空串（＝没设过），完全照旧。
                 activeVae = cachedSettings.vae();
-                // 「这份是用户显式写的」这条记录也要活过重启：否则重启时桥接里的旧快照又把尺寸顶回去。
-                // 老文件没有这个字段（或格式不对）＝没有记录，不报错，行为与以前一样。
-                localSettingsAt = readInstant(saved, "local_settings_at");
             } catch (Exception e) {
                 throw new IOException("无法读取 data/sd-settings.json；请检查或恢复此配置文件。", e);
             }
         }
-    }
-
-    /** 读回一个 ISO-8601 时刻；没有这个字段或格式不对都当作"没有记录"，绝不因此报错。 */
-    private static Instant readInstant(JsonObject state, String key) {
-        String text = Json.str(state, key, "");
-        if (text.isBlank()) return null;
-        try { return Instant.parse(text); } catch (RuntimeException ignored) { return null; }
     }
 
     /** Refresh from the bridge, falling back only when the bridge is absent or the server is offline. */
@@ -1425,23 +1399,16 @@ public final class SdClient {
         try {
             JsonObject state = responseJson(request(BRIDGE, "GET", null, false, true), "读取 WebUI 提示词");
             Prompts value = bridgePrompts(state);
-            GenerationSettings snapshot = bridgeSettings(state, value.source());
-            if (needSettings && snapshot == null) snapshot = fallbackSettings();
+            // 桥接那份生成参数**只**用来判断"这次要不要一次写完四个字段"（settings_initialized），
+            // 参数值本身一律不采纳：机器人推送参数给 WebUI，绝不从 Forge/页面读回来。
+            boolean initialized = readSettingsInitialized(state);
             persist(value);
             cached = value;
-            if (snapshot != null) {
-                // WebUI 页面优先：这里覆盖掉机器人自己的记录时**必须留痕**，否则就成了"参数莫名其妙被改"。
-                GenerationSettings before = cachedSettings;
-                GenerationSettings adopted = adoptSnapshot(before, snapshot);
-                if (before == null) Log.info("生成参数初始化（" + adopted.source() + "）："
-                        + orBlank(adopted.samplerName()) + "，" + adopted.width() + "×" + adopted.height());
-                else if (needSettings) logSettingsChange(adopted == snapshot
-                        ? "跟随 WebUI 页面（" + snapshot.source() + "）"
-                        : "保留本地显式参数（未采用" + snapshot.source() + "）", before, adopted);
-                // 落盘的是**采纳后**的那一份：重启后读到的是用户显式写的值，而不是桥接里的旧快照。
-                persist(adopted);
-                cachedSettings = adopted;
-            }
+            // 唯一一次例外：机器人还没有任何本地参数记录（首次启动、且没有 data/sd-settings.json）时，
+            // 用桥接那份/本地兜底初始化一次；此后永远不再被页面回写的值顶掉。
+            // 事故（2026-10-07）：页面回写的旧尺寸（960×1440）曾把用户刚改的 1600×1440 顶回去。
+            if (needSettings && cachedSettings == null)
+                bootstrapSettings(initialized ? readSettings(state, value.source()) : fallbackSettings());
             revision = state.get("revision").deepCopy();
             bridgeAvailable = true;
         } catch (BridgeUnavailable e) {
@@ -1454,54 +1421,41 @@ public final class SdClient {
     }
 
     /**
-     * 采纳一份刚读回来的生成参数快照，判据是**来源优先级**：
-     * <ol>
-     *   <li>本地还没有记录（首次启动）：快照就是唯一来源，原样采纳；</li>
-     *   <li>快照来自**实时页面**（浏览器心跳认证过：那份值的每一项都等于页面控件）：页面优先，原样采纳——
-     *       用户在 WebUI 页面上改尺寸/采样方法必须跟着走，这是既有行为，一个字都不改。
-     *       页面认证过的值比本地新，本地那条"显式写入"记录随之作废；</li>
-     *   <li>快照是「页面未实时连接」时留下的旧值，而本地有用户的显式写入（{@link #localSettingsAt}）：
-     *       采样方法/预设样式/尺寸**保留本地那一份**。桥接那边没有时刻，只有"是否被浏览器认证过"这一条
-     *       可判：没认证过的快照证明不了它是更新的用户操作，就不许把用户刚改的值顶回去；</li>
-     *   <li>其余情况（本地没有显式写入）：照旧跟随快照。</li>
-     * </ol>
-     * 没有分歧时一律返回快照本身，来源标注照旧（这样"页面未实时连接"这类如实标注不会被我改掉）。
+     * 机器人还没有任何本地参数记录时的**唯一一次**参数初始化（首次启动 / 老版本升级上来）。
+     *
+     * <p>初始化之后，生成参数只由机器人自己写、自己读：桥接（页面）再回写什么都不采纳。
+     * 用户口径：「机器人的参数与 Forge 独立」——参数只能机器人 → Forge（出图前推送），不能 Forge → 机器人。
      */
-    private GenerationSettings adoptSnapshot(GenerationSettings before, GenerationSettings snapshot) {
-        if (snapshot.source().equals(PAGE_LIVE_SOURCE)) {
-            // 页面在实时同步：它现在就是权威，本地"显式写入"的记录不再是最新的那个动作。
-            if (before != null) localSettingsAt = null;
-            return snapshot;
-        }
-        if (before == null || localSettingsAt == null || sameSynced(before, snapshot)) return snapshot;
-        Log.info("生成参数保留本地显式值（" + localSettingsAt + " 写入，未采用" + snapshot.source() + "）："
-                + describeSettingsChange(before, snapshot));
-        return keepSynced(before, snapshot, SYNCED_FIELDS, KEPT_LOCAL_SOURCE);
-    }
-
-    /** 四项与 WebUI 页面同步的字段（采样方法/预设样式/尺寸）：桥接 PUT 只发改动的那几项。 */
-    private static final Set<String> SYNCED_FIELDS = Set.of("sampler_name", "styles", "width", "height");
-
-    /** 四项与 WebUI 页面同步的字段（采样方法/预设样式/尺寸）是否一致。 */
-    private static boolean sameSynced(GenerationSettings left, GenerationSettings right) {
-        return left.width() == right.width() && left.height() == right.height()
-                && left.samplerName().equals(right.samplerName()) && left.styles().equals(right.styles());
+    private void bootstrapSettings(GenerationSettings initial) throws Exception {
+        Log.info("生成参数初始化（" + initial.source() + "）："
+                + orBlank(initial.samplerName()) + "，" + initial.width() + "×" + initial.height());
+        persist(initial);
+        cachedSettings = initial;
     }
 
     /**
-     * 取 {@code preferred} 里 {@code keep} 指定的那几项同步字段 + {@code other} 的调度器/VAE 与来源标注。
-     * 桥接回读是"整个实体的状态"，而我们每次只写一部分字段——没写的那部分就该用本地这份。
+     * 读桥接响应里"参数桥接是否可用 / 参数是否已初始化"这两个标志，并写回
+     * {@link #settingsBridgeAvailable} 与 {@link #settingsInitialized}。
+     *
+     * <p>**不解析也不校验** sampler_name/width/height 那些值：参数不由桥接提供，旧页面回写的
+     * 那份旧值（甚至格式不对的值）不该让机器人报错。字段缺失＝老版本桥接（只同步提示词）。
      */
-    private static GenerationSettings keepSynced(GenerationSettings preferred, GenerationSettings other,
-            Set<String> keep, String source) {
-        return new GenerationSettings(
-                keep.contains("sampler_name") ? preferred.samplerName() : other.samplerName(),
-                other.scheduler(),
-                keep.contains("styles") ? preferred.styles() : other.styles(),
-                keep.contains("width") ? preferred.width() : other.width(),
-                keep.contains("height") ? preferred.height() : other.height(),
-                other.distilledCfg(), source, other.vae());
+    private boolean readSettingsInitialized(JsonObject state) throws IOException {
+        JsonElement initialized = state.get("settings_initialized");
+        if (initialized == null) {
+            settingsBridgeAvailable = false;
+            settingsInitialized = false;
+            return false; // Old prompt-only bridges remain usable with explicitly local settings.
+        }
+        if (!initialized.isJsonPrimitive() || !initialized.getAsJsonPrimitive().isBoolean())
+            throw new IOException("WebUI 桥接响应 settings_initialized 字段无效，请更新附带扩展。");
+        settingsBridgeAvailable = true;
+        settingsInitialized = initialized.getAsBoolean();
+        return settingsInitialized;
     }
+
+    /** 机器人推给 WebUI 的四项参数：桥接 PUT 只发改动的那几项（参数实体未初始化时一次写完四项）。 */
+    private static final Set<String> SYNCED_FIELDS = Set.of("sampler_name", "styles", "width", "height");
 
     public List<String> samplers() throws Exception {
         return samplerCatalog().stream().map(Sampler::name).toList();
@@ -1564,13 +1518,16 @@ public final class SdClient {
                 throw new IOException("导入样式需要在线的新版本 WebUI 桥接，请安装并重载附带扩展后重试；当前提示词未修改。");
             JsonObject state = responseJson(response, "读取 WebUI 状态以导入样式");
             Prompts current = bridgePrompts(state);
-            GenerationSettings parameters = bridgeSettings(state, current.source());
-            if (parameters == null || !settingsBridgeAvailable || !settingsInitialized)
+            if (!readSettingsInitialized(state))
                 throw new IOException("导入样式需要已同步生成参数的新版本 WebUI 桥接；请刷新并打开文生图页面后重试。");
+            // 机器人还没有自己的参数记录时先初始化一次；有了之后就只用本地那一份。
+            if (cachedSettings == null) bootstrapSettings(readSettings(state, current.source()));
             bridgeAvailable = true;
             String positive = append ? appendStyleText(current.positive(), positiveTemplate) : positiveTemplate;
             String negative = append ? appendStyleText(current.negative(), negativeTemplate) : negativeTemplate;
-            List<String> selected = parameters.styles().stream().filter(style -> !style.equals(template.name())).toList();
+            // 样式选择与提示词是同一个实体：按页面当前那份去掉刚导入的样式，一次 CAS 写下去。
+            List<String> selected = stringList(state.get("styles"), "styles").stream()
+                    .filter(style -> !style.equals(template.name())).toList();
             JsonObject payload = new JsonObject();
             payload.addProperty("positive", positive);
             payload.addProperty("negative", negative);
@@ -1580,19 +1537,18 @@ public final class SdClient {
             if (response.statusCode() == 409) continue;
             state = responseJson(response, "导入 WebUI 样式提示词");
             Prompts confirmed = bridgePrompts(state);
-            GenerationSettings confirmedSettings = bridgeSettings(state, confirmed.source());
-            if (confirmedSettings == null || !confirmed.positive().equals(positive) || !confirmed.negative().equals(negative)
-                    || !confirmedSettings.styles().equals(selected)
-                    || !confirmedSettings.samplerName().equals(parameters.samplerName())
-                    || confirmedSettings.width() != parameters.width() || confirmedSettings.height() != parameters.height())
+            // 只确认这次推送（提示词 + 样式选择）被受理：尺寸/采样方法等参数**不回读、不采纳**。
+            List<String> confirmedStyles = stringList(state.get("styles"), "styles");
+            if (!confirmed.positive().equals(positive) || !confirmed.negative().equals(negative)
+                    || !confirmedStyles.equals(selected))
                 throw new IOException("WebUI 未确认完整的样式导入结果，请检查当前正反向提示词与样式选择。");
             rememberPrevious(current,confirmed);
             persist(confirmed);
-            // 导入样式不碰尺寸：回读只用来确认提示词与样式选择，来源优先级同 adoptSnapshot。
-            GenerationSettings adopted = adoptSnapshot(cachedSettings, confirmedSettings);
-            persist(adopted);
             cached = confirmed;
-            cachedSettings = adopted;
+            // 写下去的就是机器人自己这份：本地样式选择跟着走，其余参数一个字都不动。
+            GenerationSettings imported = cachedSettings.withStyles(confirmedStyles).withSource(LOCAL_SOURCE);
+            persist(imported);
+            cachedSettings = imported;
             revision = state.get("revision").deepCopy();
             return confirmed;
         }
@@ -2175,10 +2131,7 @@ public final class SdClient {
             Prompts confirmed = bridgePrompts(state);
             if (!confirmed.positive().equals(positive) || !confirmed.negative().equals(current.negative()))
                 throw new IOException("WebUI 未确认完整的 LoRA 提示词更新，请检查当前提示词后重试。");
-            GenerationSettings parameters = bridgeSettings(state, confirmed.source());
-            // 这次只改了提示词：设置那边只采纳"确实更新了的"（来源优先级同 adoptSnapshot），
-            // 否则一次提示词编辑就会把用户刚改的尺寸换成桥接里的旧值。
-            if (parameters != null) { parameters = adoptSnapshot(cachedSettings, parameters); persist(parameters); cachedSettings = parameters; }
+            // 这次只改了提示词：生成参数是机器人自己那份，回读一个字都不碰它。
             rememberPrevious(current,confirmed);
             persist(confirmed);
             cached = confirmed;
@@ -2350,7 +2303,10 @@ public final class SdClient {
     }
 
     /**
-     * 改采样方法/尺寸/预设样式（这三项与 WebUI 页面同步）。
+     * 改采样方法/尺寸/预设样式/预设尺寸：**参数由机器人自己拥有**。这里只做两件事——
+     * 先改本地这一份并落盘，再把改动的字段**推**给 WebUI（出图时 generate 还会把完整参数再推一次）。
+     * 回读只用于确认"桥接受理了这次写入"（{@code settings_initialized}）与提示词/revision，
+     * **参数值一律不采纳**：旧页面回写的旧尺寸不能把用户刚改的值顶回去。
      *
      * @param where 入口名，只进日志——"谁改的"必须留痕
      */
@@ -2374,22 +2330,16 @@ public final class SdClient {
                 if (response.statusCode() == 409) continue;
                 JsonObject state = responseJson(response, "修改 WebUI 生成参数");
                 Prompts freshPrompts = bridgePrompts(state);
-                GenerationSettings confirmed = bridgeSettings(state, freshPrompts.source());
-                if (confirmed == null) throw new IOException("WebUI 未确认生成参数更新，请更新附带扩展并重试。");
-                // 回读是"整个实体的状态"，而这次只发了其中几个字段：**发出去的字段**一律以回读为准
-                // （那是写入确认），**没发的字段**保留本地这一份——桥接里那些字段可能是"页面未实时连接"
-                // 时留下的旧值，不能拿它把用户刚改的尺寸顶回去（来源优先级见 {@link #adoptSnapshot}）。
-                updated = keepSynced(updated, confirmed,
-                        settingsInitialized ? fields : SYNCED_FIELDS, confirmed.source());
+                // 只确认这次推送被受理（写完之后参数实体应当是已初始化的），**不回读、不采纳任何参数值**：
+                // 尺寸/采样方法/样式永远以本地这一份为准。
+                if (!readSettingsInitialized(state))
+                    throw new IOException("WebUI 未确认生成参数更新，请更新附带扩展并重试。");
                 persist(freshPrompts);
                 cached = freshPrompts;
                 revision = state.get("revision").deepCopy();
             }
-            // 这一次是用户显式写入（网页端/指令/预设/样式载入都走这里）：记下时刻，
-            // 之后"页面未实时连接"的桥接旧快照不许把这份采样方法/尺寸/预设样式顶回去。
-            localSettingsAt = Instant.now();
             persist(updated);
-            // 日志与"变更了什么"都用桥接那一份比较（before 也是桥接来的，两边都没有 vae 字段，
+            // 日志与"变更了什么"都用本地前后两份比较（两边都没有 vae 字段，
             // 不会因为合并 VAE 而每次改动都多报一行"VAE 变了"）。
             logSettingsChange(where, before, updated);
             // 桥接回读里没有 vae（它不在桥接的字段表里）：合并回机器人自己记的那一份，
@@ -2473,10 +2423,7 @@ public final class SdClient {
                 JsonObject state = responseJson(response, "修改提示词集"); confirmed = bridgePrompts(state);
                 if (!confirmed.positive().equals(proposed.positive()) || !confirmed.negative().equals(proposed.negative()))
                     throw new IOException("WebUI 未确认提示词集的完整更新，请检查当前提示词。");
-                GenerationSettings parameters = bridgeSettings(state, confirmed.source());
-                // 这次只改了提示词：设置那边只采纳"确实更新了的"（来源优先级同 adoptSnapshot），
-                // 否则一次提示词编辑就会把用户刚改的尺寸换成桥接里的旧值。
-                if (parameters != null) { parameters = adoptSnapshot(cachedSettings, parameters); persist(parameters); cachedSettings = parameters; }
+                // 这次只改了提示词：生成参数是机器人自己那份，回读一个字都不碰它。
                 revision = state.get("revision").deepCopy();
             }
             rememberPrevious(before,confirmed);
@@ -2531,13 +2478,7 @@ public final class SdClient {
                 if (!(negative ? updated.negative() : updated.positive()).equals(after)
                         || !(negative ? updated.positive() : updated.negative()).equals(negative ? current.positive() : current.negative()))
                     throw new IOException("WebUI 未确认提示词更新，未报告修改成功。");
-                GenerationSettings parameters = bridgeSettings(state, updated.source());
-                // 同上：提示词写入的回读不许顺手把用户显式改过的尺寸/采样方法换成桥接里的旧值。
-                if (parameters != null) {
-                    parameters = adoptSnapshot(cachedSettings, parameters);
-                    persist(parameters);
-                    cachedSettings = parameters;
-                }
+                // 同上：提示词写入的回读不碰生成参数（尺寸/采样方法始终是机器人自己那份）。
                 revision = state.get("revision").deepCopy();
             }
             rememberPrevious(current,updated);
@@ -2785,20 +2726,6 @@ public final class SdClient {
                 source.equals("webui-live") ? PAGE_LIVE_SOURCE : PAGE_STATE_SOURCE);
     }
 
-    private GenerationSettings bridgeSettings(JsonObject state, String source) throws IOException {
-        JsonElement initialized = state.get("settings_initialized");
-        if (initialized == null) {
-            settingsBridgeAvailable = false;
-            settingsInitialized = false;
-            return null; // Old prompt-only bridges remain usable with explicitly local settings.
-        }
-        if (!initialized.isJsonPrimitive() || !initialized.getAsJsonPrimitive().isBoolean())
-            throw new IOException("WebUI 桥接响应 settings_initialized 字段无效，请更新附带扩展。");
-        settingsBridgeAvailable = true;
-        settingsInitialized = initialized.getAsBoolean();
-        return settingsInitialized ? readSettings(state, source) : null;
-    }
-
     private static GenerationSettings readSettings(JsonObject state, String source) throws IOException {
         String sampler = requireString(state, "sampler_name");
         if (sampler.isBlank()) throw new IOException("WebUI 生成参数缺少有效采样方法 sampler_name。");
@@ -2929,9 +2856,6 @@ public final class SdClient {
     private void persist(GenerationSettings settings) throws IOException {
         JsonObject state = settingsJson(settings.withForge(activeScheduler, activeDistilledCfg).withVae(activeVae));
         state.addProperty("source", settings.source());
-        // 「这份是用户显式写的」也要落盘：重启后 refresh 才不会用桥接里的旧快照把它顶回去。
-        // 没有这条记录（没显式写过 / 已被实时页面接管）就不写字段，老文件读回来也照旧。
-        if (localSettingsAt != null) state.addProperty("local_settings_at", localSettingsAt.toString());
         state.addProperty("updated_at", Instant.now().toString());
         Json.atomicWrite(settingsFile, state);
     }
