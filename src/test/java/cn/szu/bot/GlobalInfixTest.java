@@ -8,6 +8,7 @@ import java.nio.file.*;
 import java.util.*;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicInteger;
+import cn.szu.bot.chat.ChatActions;
 import cn.szu.bot.chat.ChatService;
 import cn.szu.bot.chat.DeepSeekPrompts;
 import cn.szu.bot.sd.SdClient;
@@ -46,8 +47,10 @@ public final class GlobalInfixTest {
         try {
             settingsAndPersistence(root);
             callCapAndMerging(root);
+            targetSideStaysApart(root);
             conflictResolverDefaultOff(root);
             deepSeekScreen(root);
+            screenReceiptKeepsOnlyProblems(root);
             partModeKeepsOldBehaviour(root);
             modeCommandAndUndo(root);
             webInterfaces(root);
@@ -81,6 +84,8 @@ public final class GlobalInfixTest {
         final List<String> rewrites = new ArrayList<>();
         /** 每一次画面检查的假响应：JSON 文本；{@code "@fail"} 表示这次调用直接失败。 */
         final List<String> reviews = new ArrayList<>();
+        /** 实际发给检查模型的系统提示词（钉住"同义堆叠不算问题""已有的词不许重复补"这些写死的口径）。 */
+        final List<String> reviewSystems = new CopyOnWriteArrayList<>();
         final boolean strictDictionaryListMode;
         HttpServer web;
         int webPort;
@@ -121,21 +126,22 @@ public final class GlobalInfixTest {
             return DeepSeekPrompts.of(settings, DeepSeekPrompts.Channel.IMAGE, (body, key, timeout) -> {
                 String system = systemOf(body);
                 if (system.contains("You review one final Stable Diffusion")) {
+                    reviewSystems.add(system);
                     // 改写/检查都有"同一次请求失败后重试"的容错：同一个用例里的重试必须拿到**同一个**
                     // 假响应（否则第二次会掉进"没有脚本 → 默认通过"，用例就假绿/假红了）。
                     // 所以按**调用次数对脚本条数取模**给响应，"@fail"永远失败。
-                    String prompt = Json.str(Json.parse(userOf(body)), "positive", "");
+                    String prompt = Json.str(Json.parse(firstUserOf(body)), "positive", "");
                     int call = count("review");
                     int index = reviews.isEmpty() ? -1 : call % reviews.size();
                     calls.add("review");
                     promptAtCall.add(prompt);
                     if (index >= 0 && "@fail".equals(reviews.get(index))) throw new java.io.IOException("假检查调用失败");
                     if (index >= 0) return completion(reviews.get(index));
-                    return completion("{\"ok\":true,\"issues\":\"\"}");
+                    return completion("{\"ok\":true,\"conflicts\":[]}");
                 }
                 int index = count("rewrite");
                 calls.add("rewrite");
-                JsonObject input = Json.parse(userOf(body));
+                JsonObject input = Json.parse(firstUserOf(body));
                 // 记录"实际交给模型的指令文本"：显式 .infix + 中文要求时这里必须非空。
                 rewriteInstructionsSeen.add(Json.str(input, "instruction", ""));
                 promptAtCall.add(Json.str(input, "positive", ""));
@@ -170,6 +176,18 @@ public final class GlobalInfixTest {
         private static String userOf(JsonObject body) {
             JsonArray messages = body.getAsJsonArray("messages");
             return messages.get(messages.size() - 1).getAsJsonObject().get("content").getAsString();
+        }
+
+        /**
+         * 第一条 user 消息（真正的输入）。改写/检查都有"返回不合法就带上前一次原文再问一次"的容错，
+         * 重试时最后一条消息是那句"你上次不是 JSON"的提示、不是原始输入——取最后一条会让桩自己解析失败。
+         */
+        private static String firstUserOf(JsonObject body) {
+            for (JsonElement item : body.getAsJsonArray("messages")) {
+                JsonObject message = item.getAsJsonObject();
+                if ("user".equals(Json.str(message, "role", ""))) return Json.str(message, "content", "");
+            }
+            return "";
         }
 
         private static DeepSeekPrompts.Response completion(String content) {
@@ -381,6 +399,79 @@ public final class GlobalInfixTest {
         }
     }
 
+    // ------------------------------------------------------------------ ②b 目标（正/反向）不许串味
+
+    /**
+     * 实测 bug（data/quests/370.json、logs/bot-20261006.log 20:16:40）：用户说「男性蹲在女性后面脱下内裤」
+     * （他要的正是这个画面），模型却计划成 {@code /promptR add "1boy, male蹲下脱内裤"}，中文兜底把它写成
+     * {@code .infix 反向提示词里加上：…}；这条又与用户那句正向要求**合并成一条**，句首的"反向"支配了整句，
+     * 画面被排除——与用户诉求正好相反。这里钉住两处修复：合并按目标分组 + 用户没要求排除时反向改回正向。
+     */
+    private static void targetSideStaysApart(Path root) throws Exception {
+        JsonObject event = new JsonObject();
+        event.addProperty("message_type", "private"); event.addProperty("user_id", "456");
+        Path sideRoot = Files.createTempDirectory(root, "targets-");
+        Json.atomicWrite(sideRoot.resolve("config.json"), new JsonObject());
+        Settings settings = new Settings(sideRoot);
+        String reported = "男性蹲在女性后面脱下内裤";
+
+        // ① 实测的两步形态：一条明确"反向提示词里加上"、一条没说侧别 → 绝不合并（合并后"反向"支配整句）。
+        List<String> split = Bot.mergeInfixSteps(List.of(
+                ".infix 反向提示词里加上：\"1boy, male蹲下脱内裤\"",
+                "/infix 男性蹲在女性后面脱下内裤", "/gen"), event, settings);
+        check(split.size() == 3 && split.get(0).equals(".infix 反向提示词里加上：\"1boy, male蹲下脱内裤\"")
+                        && split.get(1).equals("/infix 男性蹲在女性后面脱下内裤"),
+                "目标不同的两条 infix 不得合并（各自原样、顺序不变）：" + split);
+
+        // ② 同侧（都没指定＝正向）照旧合成一条 —— 既有合并行为不许坏。
+        List<String> sameSide = Bot.mergeInfixSteps(List.of(".infix 加入 a", ".infix 加入 b"), event, settings);
+        check(sameSide.size() == 1 && sameSide.get(0).equals("/infix 加入 a；加入 b"),
+                "同侧的两条 infix 照旧合成一条：" + sameSide);
+
+        // ③ 一条里正反两侧都点名的：自己就说不清，单独成步（绝不与别的 infix 串成一条）。
+        List<String> mixedOne = Bot.mergeInfixSteps(List.of(".infix 正向加上 a，反向删掉 b", ".infix 加入 c"), event, settings);
+        check(mixedOne.size() == 2, "一条里正反混用的 infix 不参与合并：" + mixedOne);
+
+        // ④ 规划层：用户描述想要的画面，模型却计划成 .promptR → 中文兜底 + 侧别守卫后必须落到正向（取值一字不动）。
+        ChatActions.Plan raw = new ChatActions.Plan("明白，兄弟！Male 蹲在后面动手脱内裤——这回没那三样了啊。",
+                List.of("/promptR add \"1boy, male蹲下脱内裤\"", "/infix 男性蹲在女性后面脱下内裤", "/gen"), "", 90, false, true);
+        ChatActions.Plan fixed = DeepSeekPrompts.withRequestedSide(DeepSeekPrompts.withChineseTagGuard(raw), reported);
+        check(!fixed.commands().stream().anyMatch(text -> text.contains("反向") || text.contains("promptR"))
+                        && fixed.commands().get(0).equals(".infix 正向提示词里加上：\"1boy, male蹲下脱内裤\""),
+                "用户描述想要的画面：计划里不得留下反向指令，promptR 改回正向：" + fixed.commands());
+
+        // ⑤ 用户明确说了"不要/排除"时，反向指令原样保留（既有行为，不许被上面的守卫误翻）。
+        ChatActions.Plan kept = DeepSeekPrompts.withRequestedSide(DeepSeekPrompts.withChineseTagGuard(raw),
+                "反向提示词里加上不存在的手，不要出现多余的手");
+        check(kept.commands().get(0).equals(".infix 反向提示词里加上：\"1boy, male蹲下脱内裤\""),
+                "用户明确要求排除时反向指令原样保留：" + kept.commands());
+
+        // ⑥ 端到端（默认档）：这条链交给改写模型的指令里只有正向语义，反向提示词一个字符都不动。
+        try (Fixture f = new Fixture("target-side-", false)) {
+            String scope = "456";
+            f.seed(scope, "1girl, a girl standing, <lora:sora:1>", "bad_hands");
+            f.rewrites.add("@add:a boy squatting behind the girl pulling down her panties");
+            f.steps(fixed.commands(), scope);
+            check(f.rewriteInstructionsSeen.stream().anyMatch(text -> text.contains("正向提示词里加上"))
+                            && f.rewriteInstructionsSeen.stream().noneMatch(text -> text.contains("反向")
+                                    || text.toLowerCase(Locale.ROOT).contains("negative")),
+                    "交给改写模型的指令里只有正向语义：" + f.rewriteInstructionsSeen);
+            check(new UserPromptStore(f.root).prompts(scope).negative().equals("bad_hands")
+                            && new UserPromptStore(f.root).prompts(scope).positive().contains("a boy squatting behind the girl"),
+                    "用户要的画面只进了正向，反向提示词原样：" + new UserPromptStore(f.root).prompts(scope));
+        }
+
+        // ⑦ 显式 `.infix 反向提示词里加上：X` 仍然只动反向（既有行为不许坏）。
+        try (Fixture f = new Fixture("explicit-negative-", false)) {
+            String scope = "456";
+            f.seed(scope, "1girl, <lora:sora:1>", "bad_hands");
+            f.rewrites.add("{\"positive\":\"1girl, <lora:sora:1>\",\"negative\":\"bad_hands, blur\"}");
+            Run run = f.run(".infix 反向提示词里加上：blur", scope, true);
+            check(run.prompts().negative().contains("blur") && run.prompts().positive().equals("1girl, <lora:sora:1>"),
+                    "显式反向 infix 只动反向：" + run.prompts());
+        }
+    }
+
     // ------------------------------------------------------------------ ③ 传统反义词排斥器
 
     private static void conflictResolverDefaultOff(Path root) throws Exception {
@@ -406,7 +497,7 @@ public final class GlobalInfixTest {
             String scope = "456";
             f.seed(scope, "1girl, cross-section view, front view, <lora:kotori:1>", "bad_hands");
             f.rewrites.add("@add:smile");
-            f.reviews.add("{\"ok\":true,\"issues\":\"\"}");
+            f.reviews.add("{\"ok\":true,\"conflicts\":[]}");
             Run run = f.run(".infix 加入微笑", scope, true);
             check(!run.prompts().positive().contains("删除冲突词条"), "回执里没有'删除冲突词条'这类本地互斥动静");
             check(run.prompts().positive().contains("cross-section view") && run.prompts().positive().contains("front view"),
@@ -425,7 +516,7 @@ public final class GlobalInfixTest {
             check(new Settings(f.root).infixConflictEnabled("1:private:456"), "conflict on 已落盘");
             f.seed(scope, "1girl, standing, lying, <lora:kotori:1>", "bad_hands");
             f.rewrites.add("@add:smile");
-            f.reviews.add("{\"ok\":true,\"issues\":\"\"}");
+            f.reviews.add("{\"ok\":true,\"conflicts\":[]}");
             Run run = f.run(".infix 加入微笑", scope, true);
             boolean one = !(run.prompts().positive().contains("standing") && run.prompts().positive().contains("lying"));
             check(one, "打开开关后本地互斥整理恢复（同族只留一个）：" + run.prompts().positive());
@@ -460,8 +551,8 @@ public final class GlobalInfixTest {
             String scope = "456";
             f.seed(scope, "1girl, standing, <lora:kotori:1>", "bad_hands");
             f.rewrites.add("{\"positive\":\"1girl, standing, lying on back, <lora:kotori:1>\",\"negative\":\"bad_hands\"}");
-            f.reviews.add("{\"ok\":false,\"issues\":\"standing 与 lying on back 同时存在\","
-                    + "\"positive\":\"1girl, lying on back, <lora:kotori:1>\",\"negative\":\"bad_hands\"}");
+            f.reviews.add("{\"ok\":false,\"conflicts\":[{\"what\":\"standing 与 lying on back 同时存在\",\"why\":\"站姿与躺姿不能同时成立\"}],"
+                    + "\"fixed_positive\":\"1girl, lying on back, <lora:kotori:1>\",\"fixed_negative\":\"bad_hands\"}");
             Run run = f.run(".infix 让人物躺下", scope, true);
             check(run.prompts().positive().contains("lying on back"), "修正稿已落地：" + run.prompts().positive());
             check(!run.prompts().positive().contains("standing"), "矛盾要素消失：" + run.prompts().positive());
@@ -475,10 +566,10 @@ public final class GlobalInfixTest {
             String scope = "456";
             f.seed(scope, "1girl, <lora:kotori:1>", "bad_hands");
             f.rewrites.add("@add:grass");
-            f.reviews.add("{\"ok\":true,\"issues\":\"\"}");
+            f.reviews.add("{\"ok\":true,\"conflicts\":[]}");
             Run run = f.run(".infix 加入草地", scope, true);
             check(run.prompts().positive().contains("grass"), "改写已落地：" + run.prompts().positive());
-            check(run.last().contains("已通过"), "回执写明检查通过：" + run.last());
+            check(run.last().contains("画面检查：通过"), "回执写明检查通过：" + run.last());
             check(run.rewrites() == 1 && run.reviews() == 1, "1 改写 + 1 检查：" + run.calls);
         }
         // 检查失败/超时 → 按改写后的版本落地，且明确说明未通过检查（绝不静默）。
@@ -490,8 +581,9 @@ public final class GlobalInfixTest {
             Run run = f.run(".infix 加入草地", scope, true);
             check(run.prompts().positive().contains("grass"), "检查失败时仍按改写后的版本落地：" + run.prompts().positive());
             check(run.prompts().positive().contains("<lora:kotori:1>"), "LoRA 标签没丢");
-            check(run.last().contains("未通过画面检查"), "回执里明确写了未通过检查：" + run.last());
-            check(run.last().contains("落地"), "并说明已经按改写后的版本落地：" + run.last());
+            check(run.last().contains("画面检查：未通过（检查调用失败）"), "回执里明确写了未通过检查：" + run.last());
+            check(!run.last().contains("检查调用失败：") && !run.last().contains("Exception"),
+                    "失败回执只写结论、不带一大段异常文本：" + run.last());
             check(run.rewrites() == 1, "改写只调一次（检查失败不重试）：" + run.calls);
         }
         // 检查乱返回（不是 JSON）→ 同样如实说明、按改写后的版本落地。
@@ -502,7 +594,7 @@ public final class GlobalInfixTest {
             f.reviews.add("我觉得没问题呀");
             Run run = f.run(".infix 加入草地", scope, true);
             check(run.prompts().positive().contains("grass"), "乱返回时按改写后的版本落地：" + run.prompts().positive());
-            check(run.last().contains("未通过画面检查"), "乱返回也明确说明未通过检查：" + run.last());
+            check(run.last().contains("画面检查：未通过（检查返回不可用）"), "乱返回也明确说明未通过检查：" + run.last());
             check(run.reviews() >= 1, "乱返回会按既有容错重试（最多 3 次）：" + run.calls);
         }
         // 落地前校验：修正稿空 / 含中文 / 丢 LoRA → 回滚到改写后的版本（不是空、不是坏）。
@@ -516,7 +608,7 @@ public final class GlobalInfixTest {
             Run run = f.run(".infix 加入草地", scope, true);
             check(!run.prompts().positive().isBlank(), "提示词不是空的");
             check(run.prompts().positive().contains("1girl"), "原有内容没被丢掉");
-            check(run.last().contains("未通过画面检查"), "如实说明：" + run.last());
+            check(run.last().contains("画面检查：未通过"), "如实说明：" + run.last());
         }
         // 改写调用失败 → 一个字都不改（不是"检查失败"那条路径）。
         try (Fixture f = new Fixture("rewrite-fail-", false)) {
@@ -546,11 +638,12 @@ public final class GlobalInfixTest {
             String scope = "456";
             f.seed(scope, "1girl, <lora:kotori:1>", "bad_hands");
             f.rewrites.add("@add:grass");
-            f.reviews.add("{\"ok\":false,\"issues\":\"清空\",\"positive\":\"\",\"negative\":\"\"}");
+            f.reviews.add("{\"ok\":false,\"conflicts\":[{\"what\":\"正向提示词被清空\",\"why\":\"修正稿把正向清成了空串\"}],"
+                    + "\"fixed_positive\":\"\",\"fixed_negative\":\"\"}");
             Run run = f.run(".infix 加入草地", scope, true);
             check(run.prompts().positive().contains("grass"), "修正稿为空 → 回滚到改写后的版本：" + run.prompts().positive());
             check(!run.prompts().positive().isBlank(), "不是空的");
-            check(run.last().contains("画面检查：未通过") && run.last().contains("修正稿被丢弃")
+            check(run.last().contains("画面检查：发现 1 处问题") && run.last().contains("修正稿被丢弃")
                             && run.last().contains("正向提示词被清空"),
                     "回执说明修正稿被丢弃的原因：" + run.last());
         }
@@ -559,7 +652,8 @@ public final class GlobalInfixTest {
             String scope = "456";
             f.seed(scope, "1girl, <lora:kotori:1>", "bad_hands");
             f.rewrites.add("@add:grass");
-            f.reviews.add("{\"ok\":false,\"issues\":\"改了\",\"positive\":\"1girl, 草地, <lora:kotori:1>\",\"negative\":\"bad_hands\"}");
+            f.reviews.add("{\"ok\":false,\"conflicts\":[{\"what\":\"残留中文\",\"why\":\"修正稿把中文写进了提示词\"}],"
+                    + "\"fixed_positive\":\"1girl, 草地, <lora:kotori:1>\",\"fixed_negative\":\"bad_hands\"}");
             Run run = f.run(".infix 加入草地", scope, true);
             check(!run.prompts().positive().contains("草地"), "修正稿含中文 → 不回滚以外的内容也不落地中文：" + run.prompts().positive());
             check(run.prompts().positive().contains("grass"), "回滚到改写后的版本：" + run.prompts().positive());
@@ -570,12 +664,126 @@ public final class GlobalInfixTest {
             String scope = "456";
             f.seed(scope, "1girl, <lora:kotori:1>", "bad_hands");
             f.rewrites.add("@add:grass");
-            f.reviews.add("{\"ok\":false,\"issues\":\"重写\",\"positive\":\"1girl, grass, smile\",\"negative\":\"bad_hands\"}");
+            f.reviews.add("{\"ok\":false,\"conflicts\":[{\"what\":\"LoRA 标签要重写\",\"why\":\"模型想改标签\"}],"
+                    + "\"fixed_positive\":\"1girl, grass, smile\",\"fixed_negative\":\"bad_hands\"}");
             Run run = f.run(".infix 加入草地", scope, true);
             check(run.prompts().positive().contains("<lora:kotori:1>"), "修正稿丢 LoRA → 回滚到带标签的版本：" + run.prompts().positive());
-            check(!run.last().contains("修正稿已落地"), "没有落地修正稿");
-            check(run.last().contains("画面检查：未通过") && run.last().contains("丢了 LoRA/嵌入标签"),
+            check(!run.last().contains("已按修正稿修正") && !run.last().contains("已修正"),
+                    "没有落地修正稿：" + run.last());
+            check(run.last().contains("丢了 LoRA/嵌入标签") && run.last().contains("已按改写后的版本落地"),
                     "如实说明修正稿丢了 LoRA 标签：" + run.last());
+        }
+    }
+
+    // ------------------------------- ④b 检查：同义堆叠不算问题、缺词要补、原文只进日志
+
+    /**
+     * 用户贴的那段"整段自言自语"（上千字、反复自我推翻）。它只允许落在日志存档里，
+     * 一个片段都不许进回执。
+     */
+    private static final String REVIEW_MONOLOGUE = """
+            等等，"stuffed toy" 与 "stuffed animal" 兼容，所以应该 ok=true？但用户要求"报告问题仅当图片会破坏"……
+            那为何我最初认为有问题？重新审视：这只是一个称呼差异，stuffed bunny 也是同一类玩具……
+            可是构图 cowboy shot 与 ass focus 到底算不算冲突？我需要逐条列举再逐条反驳自己……
+            最终结论：也许 ok=false，也许 ok=true，取决于怎么理解"同一道具"。再重新审视一次……
+            """;
+
+    private static void screenReceiptKeepsOnlyProblems(Path root) throws Exception {
+        // ① 同义/冗余堆叠**不算问题**：模型就算报了，回执也不许出现"发现问题"（解析侧就该丢掉）。
+        try (Fixture f = new Fixture("screen-stack-", false)) {
+            String scope = "456";
+            f.seed(scope, "1girl, stuffed toy, stuffed animal, stuffed bunny, <lora:kotori:1>", "bad_hands");
+            f.rewrites.add("@add:grass");
+            f.reviews.add("{\"ok\":false,\"conflicts\":["
+                    + "{\"what\":\"stuffed toy / stuffed animal / stuffed bunny 同义标签堆叠\",\"why\":\"同一个道具被描述了三遍\"},"
+                    + "{\"what\":\"坐姿与屁股压在他身上语义重复\",\"why\":\"两句话意思一样\"}]}");
+            Run run = f.run(".infix 加入草地", scope, true);
+            check(run.last().contains("画面检查：通过") && !run.last().contains("处问题") && !run.last().contains("stuffed"),
+                    "同义堆叠不算问题、回执只写通过：" + run.last());
+        }
+        // ② 长句里有男性描述（male crouching behind girl）而正向没有 1boy → 补上 1boy 并在回执里列出。
+        try (Fixture f = new Fixture("screen-add-boy-", false)) {
+            String scope = "456";
+            f.seed(scope, "1girl, male crouching behind girl, <lora:kotori:1>", "bad_hands");
+            f.rewrites.add("@add:grass");
+            f.reviews.add("{\"ok\":false,\"conflicts\":[],\"added\":[{\"tag\":\"1boy\",\"why\":\"描述里有 male crouching\"}],"
+                    + "\"fixed_positive\":\"1girl, 1boy, male crouching behind girl, grass, <lora:kotori:1>\","
+                    + "\"fixed_negative\":\"bad_hands\"}");
+            Run run = f.run(".infix 加入草地", scope, true);
+            check(run.prompts().positive().contains("1boy") && run.last().contains("画面检查：发现 1 处问题")
+                            && run.last().contains("1) 补词：描述里有 male crouching → 已补 1boy"),
+                    "缺 1boy 时补上并如实列出：" + run.last());
+        }
+        // ③ 有插入场景描写而没有 sex → 补上恰当的那个词，并在回执里列出。
+        try (Fixture f = new Fixture("screen-add-sex-", false)) {
+            String scope = "456";
+            f.seed(scope, "1girl, penetration close-up, joined crotch, <lora:kotori:1>", "bad_hands");
+            f.rewrites.add("@add:grass");
+            f.reviews.add("{\"ok\":false,\"conflicts\":[],\"added\":[{\"tag\":\"sex\",\"why\":\"插入了但缺 sex\"}],"
+                    + "\"fixed_positive\":\"1girl, sex, penetration close-up, joined crotch, grass, <lora:kotori:1>\","
+                    + "\"fixed_negative\":\"bad_hands\"}");
+            Run run = f.run(".infix 加入草地", scope, true);
+            check(run.prompts().positive().contains("sex") && run.last().contains("补词：插入了但缺 sex → 已补 sex"),
+                    "插入场景缺词时补上并如实列出：" + run.last());
+        }
+        // ④ 已经有 1boy → 不重复补、也不谎报"已补"（我们的回执只认修正稿里**新出现**的标签）。
+        try (Fixture f = new Fixture("screen-no-dup-", false)) {
+            String scope = "456";
+            f.seed(scope, "1girl, 1boy, male crouching behind girl, <lora:kotori:1>", "bad_hands");
+            f.rewrites.add("@add:grass");
+            f.reviews.add("{\"ok\":false,\"conflicts\":[],\"added\":[{\"tag\":\"1boy\",\"why\":\"male crouching behind girl\"}],"
+                    + "\"fixed_positive\":\"1girl, 1boy, male crouching behind girl, grass, <lora:kotori:1>\","
+                    + "\"fixed_negative\":\"bad_hands\"}");
+            Run run = f.run(".infix 加入草地", scope, true);
+            String landed = run.prompts().positive();
+            check(landed.split("1boy", -1).length == 2 && !run.last().contains("补词"),
+                    "已有 1boy 就不再补、也不谎报补词：" + landed + " / " + run.last());
+            check(!f.reviewSystems.isEmpty() && f.reviewSystems.get(0).contains("never a tag that is already present"),
+                    "检查提示词里写死了：已有的词不许重复补");
+        }
+        // ⑤ 真冲突（standing + lying on back）→ 进 conflicts，回执带"冲突："前缀。
+        try (Fixture f = new Fixture("screen-real-conflict-", false)) {
+            String scope = "456";
+            f.seed(scope, "1girl, standing, lying on back, <lora:kotori:1>", "bad_hands");
+            f.rewrites.add("@add:grass");
+            f.reviews.add("{\"ok\":false,\"conflicts\":[{\"what\":\"standing 与 lying on back 同时存在\","
+                    + "\"why\":\"站姿与躺姿不能同时成立\"}],"
+                    + "\"fixed_positive\":\"1girl, lying on back, grass, <lora:kotori:1>\",\"fixed_negative\":\"bad_hands\"}");
+            Run run = f.run(".infix 加入草地", scope, true);
+            check(run.last().contains("画面检查：发现 1 处问题")
+                            && run.last().contains("1) 冲突：standing 与 lying on back 同时存在"),
+                    "真冲突逐条列出：" + run.last());
+        }
+        // ⑥ 超长自言自语写在 reasoning 字段里 → 回执只含冲突/补词，原文只落日志。
+        try (Fixture f = new Fixture("screen-mono-", false)) {
+            String scope = "456";
+            f.seed(scope, "1girl, <lora:kotori:1>", "bad_hands");
+            f.rewrites.add("@add:grass");
+            f.reviews.add("{\"ok\":false,\"conflicts\":[{\"what\":\"取景范围冲突\",\"why\":\"两种构图不能同时成立\"}],"
+                    + "\"added\":[{\"tag\":\"1boy\",\"why\":\"male crouching\"}],"
+                    + "\"fixed_positive\":\"1girl, 1boy, grass, <lora:kotori:1>\",\"fixed_negative\":\"bad_hands\","
+                    + "\"reasoning\":" + Json.GSON.toJson(REVIEW_MONOLOGUE) + "}");
+            Run run = f.run(".infix 加入草地", scope, true);
+            String receipt = run.last();
+            check(!receipt.contains("重新审视") && !receipt.contains("stuffed toy") && !receipt.contains("stuffed bunny")
+                            && receipt.contains("1) 冲突：取景范围冲突") && receipt.contains("2) 补词：male crouching → 已补 1boy"),
+                    "回执只有冲突与补词、没有原文片段：" + receipt);
+            Path archive = f.root.resolve("logs/prompt-review.log");
+            String stored = Files.exists(archive) ? Files.readString(archive) : "";
+            check(stored.contains("画面检查原文") && stored.contains("重新审视") && stored.contains("stuffed bunny"),
+                    "整段原文落进 logs/prompt-review.log：" + (stored.length() > 200 ? stored.substring(0, 200) : stored));
+        }
+        // ⑦ 补词后的修正稿过不了落地前校验 → 回滚到改写后的版本并如实说明。
+        try (Fixture f = new Fixture("screen-add-rollback-", false)) {
+            String scope = "456";
+            f.seed(scope, "1girl, <lora:kotori:1>", "bad_hands");
+            f.rewrites.add("@add:grass");
+            f.reviews.add("{\"ok\":false,\"conflicts\":[],\"added\":[{\"tag\":\"1boy\",\"why\":\"male crouching\"}],"
+                    + "\"fixed_positive\":\"1girl, 1boy, grass\",\"fixed_negative\":\"bad_hands\"}");
+            Run run = f.run(".infix 加入草地", scope, true);
+            check(run.prompts().positive().contains("<lora:kotori:1>") && !run.prompts().positive().contains("1boy")
+                            && run.last().contains("修正稿被丢弃") && run.last().contains("已按改写后的版本落地"),
+                    "补词稿丢了 LoRA → 回滚：" + run.last());
         }
     }
 
@@ -693,7 +901,7 @@ public final class GlobalInfixTest {
             String scope = "456";
             f.seed(scope, "1girl, <lora:kotori:1>", "bad_hands");
             f.rewrites.add("@add:grass");
-            f.reviews.add("{\"ok\":true,\"issues\":\"\"}");
+            f.reviews.add("{\"ok\":true,\"conflicts\":[]}");
             f.run(".infix 加入草地", scope, true);
             check(new UserPromptStore(f.root).prompts(scope).positive().contains("grass"), "改写已落地");
             f.command(".prompt undo", scope);
@@ -706,7 +914,7 @@ public final class GlobalInfixTest {
             String scope = "456";
             f.seed(scope, "1girl, <lora:kotori:1>", "bad_hands");
             f.rewrites.add("@add:grass");
-            f.reviews.add("{\"ok\":true,\"issues\":\"\"}");
+            f.reviews.add("{\"ok\":true,\"conflicts\":[]}");
             f.calls.clear();
             // 变体 1：多行链路（infix 换行 gen）
             f.command(".infix 加入草地\n.gen 1", scope);

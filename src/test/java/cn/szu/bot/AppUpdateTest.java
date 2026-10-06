@@ -435,11 +435,11 @@ public final class AppUpdateTest {
                     Files.write(gradleRoot.resolve("android/app/build.gradle"), new byte[]{(byte) 0xFF, 0, 1, 2});
                     equal(1005030, cn.szu.bot.web.AppUpdateFixture.versionCodeViaGradle(gradleRoot, "1.5.3", candidates),
                             "build.gradle 读坏了也不抛，退回兜底（1.5.3 → 1005030）");
-                    // 真机那份 build.gradle（versionCode 160）优先：与真机 android/app/build.gradle 对齐
-                    equal(160, cn.szu.bot.web.AppUpdateFixture.versionCodeViaGradle(
+                    // 真机那份 build.gradle（versionCode 161）优先：与真机 android/app/build.gradle 对齐
+                    equal(161, cn.szu.bot.web.AppUpdateFixture.versionCodeViaGradle(
                                     Path.of("F:\\Bot"), "1.6.0",
                                     List.of(Path.of("F:\\Bot\\work\\apk-lanip\\release\\pixiko-1.6.0-debug.apk"))),
-                            "真机 build.gradle 的 versionCode 160 被读到（gradle 永远优先）");
+                            "真机 build.gradle 的 versionCode 161 被读到（gradle 永远优先）");
                 } finally {
                     try (var walk = Files.walk(gradleRoot)) {
                         walk.sorted(Comparator.reverseOrder()).forEach(path -> {

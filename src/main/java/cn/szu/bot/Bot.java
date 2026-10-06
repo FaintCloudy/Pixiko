@@ -2009,11 +2009,12 @@ public final class Bot implements AutoCloseable {
                     return;
                 }
                 SdClient.Prompts landed = userPrompts.prompts(scope);
-                ScreenOutcome screen = screenPrompt(client, scope, landed);
+                ScreenOutcome screen = screenPrompt(client, scope, conversation, landed);
+                // 画面检查的结论（冲突点逐条列表）拼在同一份回执里，不再多发一条文本（normal 档 ≤1 条文本的不变量）。
                 String result = "智能修改已应用，本次变化：\n" + formatPromptDiff(original, userPrompts.prompts(scope))
                         + formatRejected(filter.rejected())
-                        + screen.suffix()
-                        + "（用 .prompt 查看完整提示词）";
+                        + "（用 .prompt 查看完整提示词）"
+                        + screen.suffix();
                 Log.info("整份提示词画面检查（" + conversation + "）：" + screen.log());
                 Log.info(result);
                 message = result; succeeded = true;
@@ -2028,40 +2029,116 @@ public final class Bot implements AutoCloseable {
     private record ScreenOutcome(String suffix, String log) { }
     /**
      * 改写落地之前对整份提示词做一次检查（DeepSeek）：正反向是否自相矛盾、有没有明显会让画面崩坏的组合、
-     * 是否残留中文或坏标签、LoRA 标签是否完好。
+     * 是否残留中文或坏标签、LoRA 标签是否完好；**并按描述补齐隐含词条**（有男性描述就要 {@code 1boy}、
+     * 有插入场景就要 {@code sex}/{@code vaginal}/{@code hetero} 里恰当的那个……）。
      *
-     * <p>检查给出修正稿时先过落地前校验，通过才落地（回执写明修正了什么）；检查失败/超时/返回不可用，
-     * 或者修正稿没通过校验，都**按改写后的版本原样落地**，并在回执里明确说明"未通过画面检查"。
+     * <p>检查给出修正稿时先过落地前校验，通过才落地（回执写明修了什么）；检查失败/超时/返回不可用，
+     * 或者修正稿没通过校验，都**按改写后的版本原样落地**，并在回执里明确说明。
      * 这一步只可能发生在这一个方法里，一条指令最多再多一次 DeepSeek 调用。
+     *
+     * <p><b>回执里只出现"问题"</b>：冲突点与补词可能真的有很多条，所以逐条列出（一行一条、
+     * **不做省略号截断**），形态是 {@code 画面检查：发现 N 处问题} + {@code 1) 冲突：…} / {@code 2) 补词：…}，
+     * 或者 {@code 画面检查：通过}，或者 {@code 画面检查：未通过（…）}。同义/冗余堆叠**不算问题**
+     * （解析侧已丢弃，见 DeepSeekPrompts.Review）。模型的**完整原文**（含自言自语/推理）由
+     * {@link #archiveReviewRaw} 只落日志存档（logs/prompt-review.log），一个字都不进回执。
      */
-    private ScreenOutcome screenPrompt(DeepSeekPrompts client, String scope, SdClient.Prompts current) {
+    private ScreenOutcome screenPrompt(DeepSeekPrompts client, String scope, String conversation, SdClient.Prompts current) {
         DeepSeekPrompts.Review review;
         try { review = client.review(current); }
         catch (Exception failed) {
             Log.warn("整份提示词画面检查没有完成：" + error(failed));
-            return new ScreenOutcome("\n画面检查：未通过画面检查（检查调用失败：" + error(failed) + "），已按改写后的版本落地，"
-                    + "如需再试可以再说一次要求或 .prompt undo。", "未通过（调用失败：" + error(failed) + "），按改写后版本落地");
+            return new ScreenOutcome("\n画面检查：未通过（检查调用失败）", "未通过（检查调用失败）");
         }
-        if (review.ok())
-            return new ScreenOutcome("\n画面检查：已通过（正反向无自相矛盾、无明显崩坏组合、无残留中文、LoRA 标签完好）", "已通过");
+        // 不管这一次结论可不可用、通不通过，模型原文一律先存档：用户要能事后查询归因。
+        archiveReviewRaw(scope, conversation, review.raw());
+        if (!review.usable())
+            return new ScreenOutcome("\n画面检查：未通过（检查返回不可用）", "未通过（检查返回不可用）");
+        if (review.ok()) return new ScreenOutcome("\n画面检查：通过", "通过");
+        // 冲突点：解析侧已经丢掉"同义/冗余堆叠"这类不算问题的条项。
+        List<String> problems = new ArrayList<>();
+        for (DeepSeekPrompts.Conflict item : review.conflicts()) problems.add(conflictLine(item));
         if (review.corrected() == null)
-            return new ScreenOutcome("\n画面检查：未通过（检查未给出可用的修正稿），已按改写后的版本落地。"
-                    + (review.issues().isBlank() ? "" : "检查说明：" + review.issues()), "未通过（无修正稿），按改写后版本落地");
-        String why = promptRejection(new SdClient.Prompts(review.corrected().positive(), review.corrected().negative(),
-                UserPromptStore.PERSONAL_SOURCE), scope);
+            return new ScreenOutcome(
+                    problems.isEmpty() ? "\n画面检查：通过" : "\n" + problemHead(problems) + numbered(problems)
+                            + "\n未给出可用的修正稿，已按改写后的版本落地。",
+                    problems.isEmpty() ? "通过（只有不算问题的堆叠）" : "未通过（无修正稿），按改写后版本落地");
+        SdClient.Prompts corrected = new SdClient.Prompts(review.corrected().positive(), review.corrected().negative(),
+                UserPromptStore.PERSONAL_SOURCE);
+        String why = promptRejection(corrected, scope);
         if (why != null)
-            return new ScreenOutcome("\n画面检查：未通过（修正稿被丢弃：" + why + "），已按改写后的版本落地。"
-                    + (review.issues().isBlank() ? "" : "检查说明：" + review.issues()), "未通过（修正稿 " + why + "），按改写后版本落地");
+            return new ScreenOutcome("\n" + problemHead(problems) + numbered(problems)
+                    + "\n修正稿被丢弃（" + why + "），已按改写后的版本落地。",
+                    "未通过（修正稿被丢弃：" + why + "）");
         try {
-            userPrompts.replace(scope, new SdClient.Prompts(review.corrected().positive(), review.corrected().negative(),
-                    UserPromptStore.PERSONAL_SOURCE));
+            userPrompts.replace(scope, corrected);
         } catch (Exception failed) {
             Log.warn("画面检查的修正稿没能落地：" + error(failed));
-            return new ScreenOutcome("\n画面检查：未通过（修正稿落地失败：" + error(failed) + "），已按改写后的版本落地。",
-                    "未通过（修正稿落地失败：" + error(failed) + "）");
+            return new ScreenOutcome("\n" + problemHead(problems) + numbered(problems)
+                    + "\n修正稿落地失败，已按改写后的版本落地。", "未通过（修正稿落地失败）");
         }
-        return new ScreenOutcome("\n画面检查：发现矛盾/坏组合并已修正 —— "
-                + (review.issues().isBlank() ? "检查给出的问题已修正" : review.issues()), "发现矛盾，已用修正稿落地：" + review.issues());
+        // 补词：只认**真的补上了**的那些（修正稿里有、改写稿里没有），绝不按模型的措辞谎报。
+        for (DeepSeekPrompts.Added item : review.added()) {
+            if (promptHasTag(corrected.positive(), item.tag()) || promptHasTag(corrected.negative(), item.tag())) {
+                if (promptHasTag(current.positive(), item.tag()) || promptHasTag(current.negative(), item.tag())) continue;
+                problems.add(addedLine(item));
+            }
+        }
+        // "改了 N 处"按**实际被改动的提示词字段**数（正向/反向各算一处），避免把模型的措辞当成数字。
+        int fixed = 0;
+        if (!corrected.positive().equals(current.positive())) fixed++;
+        if (!corrected.negative().equals(current.negative())) fixed++;
+        String tail = fixed == 0 ? "已按修正稿修正" : "已修正 " + fixed + " 处";
+        if (problems.isEmpty()) return new ScreenOutcome("\n画面检查：" + tail, tail);
+        return new ScreenOutcome("\n" + problemHead(problems) + numbered(problems) + "\n" + tail,
+                "发现 " + problems.size() + " 处问题，" + tail);
+    }
+    /** 问题清单的小标题；没有问题时不写标题（只用"未通过/已修正"那几种固定形态）。 */
+    private static String problemHead(List<String> problems) {
+        return problems.isEmpty() ? "画面检查：未通过" : "画面检查：发现 " + problems.size() + " 处问题";
+    }
+    /** 问题清单正文：一行一条、按模型给的顺序、**不做省略号截断**（冲突可能真的有很多条）。 */
+    private static String numbered(List<String> problems) {
+        StringBuilder text = new StringBuilder();
+        for (int index = 0; index < problems.size(); index++) text.append('\n').append(index + 1).append(") ").append(problems.get(index));
+        return text.toString();
+    }
+    /** 一条冲突：{@code 冲突：what（why）}；why 与 what 重复或为空时只写 what。 */
+    private static String conflictLine(DeepSeekPrompts.Conflict item) {
+        String what = item.what().isBlank() ? item.why() : item.what();
+        String why = item.what().isBlank() || item.why().isBlank() || item.why().equals(item.what()) ? "" : "（" + item.why() + "）";
+        return "冲突：" + what + why;
+    }
+    /** 一条补词：{@code 补词：why → 已补 tag}。 */
+    private static String addedLine(DeepSeekPrompts.Added item) {
+        return "补词：" + (item.why().isBlank() ? "" : item.why() + " → ") + "已补 " + item.tag();
+    }
+    /** 提示词里是否已有这个标签（按词边界比对，避免 "1boy" 命中 "1boys" 这类误判）。 */
+    private static boolean promptHasTag(String prompt, String tag) {
+        if (prompt == null || tag == null || tag.isBlank()) return false;
+        return Pattern.compile("(?i)(?<![a-z0-9_])" + Pattern.quote(tag.strip()) + "(?![a-z0-9_])").matcher(prompt).find();
+    }
+    /** 画面检查原文的存档序号（只用于日志定位，不参与任何判定）。 */
+    private final java.util.concurrent.atomic.AtomicInteger reviewArchiveSeq = new java.util.concurrent.atomic.AtomicInteger();
+    /**
+     * 把检查模型的**完整原文**（含自言自语/推理）追加进 {@code logs/prompt-review.log}（UTF-8、带时间戳与
+     * 会话/scope/检查序号，便于事后检索归因）；常规日志里只留一条"已记录，见 prompt-review.log"的指针，
+     * 回执里一个字都不带。存档失败只记日志，绝不影响这次指令。
+     */
+    private void archiveReviewRaw(String scope, String conversation, String raw) {
+        if (raw == null || raw.isBlank()) return;
+        int number = reviewArchiveSeq.incrementAndGet();
+        String stamp = java.time.LocalDateTime.now().truncatedTo(java.time.temporal.ChronoUnit.SECONDS).toString();
+        Path file = settings.root.resolve("logs/prompt-review.log");
+        try {
+            Files.createDirectories(file.getParent());
+            Files.writeString(file, "[" + stamp + "] 画面检查原文（scope=" + scope + "，会话=" + conversation
+                    + "，检查 #" + number + "）：" + raw + System.lineSeparator(), StandardCharsets.UTF_8,
+                    java.nio.file.StandardOpenOption.CREATE, java.nio.file.StandardOpenOption.APPEND);
+            Log.info("画面检查原文已记录，见 logs/prompt-review.log（scope=" + scope + "，检查 #" + number
+                    + "，" + raw.length() + " 字）");
+        } catch (Exception failed) {
+            Log.warn("画面检查原文没能存档（不影响这次指令）：" + error(failed));
+        }
     }
     /**
      * 落地前校验：任一不满足就返回一句"为什么不能落地"（调用方据此回滚到改写后的版本），全部满足返回 null。
@@ -2205,6 +2282,11 @@ public final class Bot implements AutoCloseable {
      *       因为它们的诉求都落在同一份提示词上，分开改必然互相覆盖；</li>
      *   <li>用户显式写 {@code .infix #keep <要求>}（或 {@code !keep}）→ 这一条不参与合并，
      *       多条 {@code #keep} 就是用户明确要的"多条独立指令"，各改各的（给需要逐步微调的场合留出口）。</li>
+     *   <li><b>目标（正/反向）不同的 {@code .infix} 绝不合成一条</b>：合并只是把几条要求用「；」串起来，
+     *       串起来之后句首那个"反向提示词里加上"会**支配整句**，把用户要的正向画面写进反向提示词
+     *       （实测 bug：data/quests/370.json 的「反向提示词里加上…；男性蹲在女性后面脱下内裤」）。
+     *       所以先按目标分组，只有目标一致（都没指定＝正向，或都显式正向，或都显式反向）才合并；
+     *       一条里正反两侧都点名的，自己就说不清，单独成步、不参与合并。</li>
      * </ul>
      * 控制指令（{@code .infix mode} / {@code .infix filter} / {@code .infix conflict}）永远不参与合并。
      * 非 infix 的步骤（{@code .gen}、{@code .style load}…）顺序与数量都不变。
@@ -2217,12 +2299,15 @@ public final class Bot implements AutoCloseable {
         List<String> instructions = new ArrayList<>();
         List<String> originals = new ArrayList<>();
         int slot = -1;
+        InfixTarget target = null;
         for (String command : commands) {
             // 切档位的指令本身不合并；它后面的 .infix 按切换后的档位判断（顺序执行，语义不变）。
             Settings.InfixMode switched = modeSwitchOf(command);
             if (switched != null) {
                 mode = switched;
-                if (mode == Settings.InfixMode.PARTS) { flushInfix(kept, instructions, originals, slot); instructions.clear(); originals.clear(); slot = -1; }
+                if (mode == Settings.InfixMode.PARTS) {
+                    flushInfix(kept, instructions, originals, slot); instructions.clear(); originals.clear(); slot = -1; target = null;
+                }
                 kept.add(command);
                 continue;
             }
@@ -2232,12 +2317,38 @@ public final class Bot implements AutoCloseable {
             String raw = step.group(1).strip();
             // 显式出口：.infix #keep <要求>（也认 !keep）表示"这一条不要和别的 infix 合并"，各改各的。
             if (raw.matches("(?is)^[#!]keep(\\s.*)?$")) { kept.add(command); continue; }
+            InfixTarget side = infixTargetOf(raw);
+            if (side == InfixTarget.MIXED) {
+                // 一条里同时点名正反两侧：它自己说不清该动哪边，绝不和别的 infix 串成一条。
+                flushInfix(kept, instructions, originals, slot); instructions.clear(); originals.clear(); slot = -1; target = null;
+                kept.add(command);
+                Log.info("这条 .infix 同时点名了正反两侧，保持独立步骤（不与别的 infix 合并）：" + Log.text(command));
+                continue;
+            }
+            if (slot >= 0 && side != target) {
+                // 目标不同（例如"反向提示词里加上 X"与一句没指定侧别的画面要求）：分组断开，各成一步。
+                flushInfix(kept, instructions, originals, slot); instructions.clear(); originals.clear(); slot = -1; target = null;
+            }
             instructions.add(raw);
             originals.add(command);
-            if (slot < 0) { slot = kept.size(); kept.add(null); }
+            if (slot < 0) { slot = kept.size(); kept.add(null); target = side; }
         }
         flushInfix(kept, instructions, originals, slot);
         return List.copyOf(kept);
+    }
+    /** 一条 {@code .infix} 的要求落在哪一侧：没指定按正向（用户描述想要的画面 → 正向）。 */
+    enum InfixTarget { POSITIVE, NEGATIVE, MIXED }
+    /**
+     * 认这条改写要求点名的侧别：只有**明确写了**"反向/负向/负面/negative"才算反向；
+     * 明确写"正向/positive"或什么都不说都算正向（不确定的一律按正向）。
+     * 两侧都点名的返回 {@link InfixTarget#MIXED}（调用方据此拒绝合并）。
+     */
+    static InfixTarget infixTargetOf(String instruction) {
+        String text = instruction == null ? "" : instruction;
+        boolean negative = text.matches("(?is).*(反向|负向|负面|negative).*");
+        boolean positive = text.matches("(?is).*(正向|positive).*");
+        if (negative && positive) return InfixTarget.MIXED;
+        return negative ? InfixTarget.NEGATIVE : InfixTarget.POSITIVE;
     }
     /**
      * 把收集到的改写要求合成一条 .infix 放回它原来的位置。只有一条（或没有）时不合并：

@@ -189,6 +189,15 @@
     if (cut >= 6) head = head.slice(0, cut);
     return head + '…';
   }
+  /**
+   * 任意值 → 字符串（`null`/`undefined` 变空串）。
+   *
+   * <p><b>必须在本文件里定义</b>：`screen-quest.js` 有 15 处 `text(...)`（步骤标题、正文、
+   * 摘要、错误文案都靠它），而 `text()` 只定义在 **screen-styles.js 自己的 IIFE 里、不是全局**。
+   * 缺了它，`stepTitle()` 与 `fillRow()` 一调用就抛 `ReferenceError: text is not defined` ——
+   * 于是列表卡在骨架屏、详情屏直接变成"这一屏加载失败"，用户看到的就是**回执条目正文错乱/不出来**。
+   */
+  function text(value) { return value === undefined || value === null ? '' : String(value); }
   function num(value, fallback) {
     var n = Number(value);
     return Number.isFinite(n) ? n : (fallback === undefined ? 0 : fallback);
@@ -1226,10 +1235,23 @@
     syncRunningLine(payload);
   }
 
-  /** 步骤行增量化：只补新出现的行，已在位的只改文本。 */
+  /**
+   * 步骤行增量化：只补新出现的行，已在位的只改文本。
+   *
+   * <p><b>「DOM 里已有的 `.q-step`」是唯一账本</b>，不是 `detail.stepNodes.length`。
+   * `renderDetail()` 在一次打开里会跑两遍（路由进入 + `/api/quest` 回来各一次），用数组长度当
+   * 起始下标就会**第二次把同样 4 条消息又追加 4 张卡**：打开 #361 看到 8 张卡、打开 #360 看到
+   * 14 张、而且上一条回执留下的孤儿卡也永远清不掉 —— 用户报的「手机端回执条目正文混乱」正是这个。
+   * 现在每次进来先把还挂在 `detail.body` 上的 `.q-step` 按 DOM 顺序收回本数组、**按位复用**，
+   * 收尾再把超出 `used` 的多余卡片全部摘掉，于是「卡片数 = 消息条数」恒成立。
+   */
   function syncSteps(payload, isMessages, steps, hasTiles) {
-    var count = detail.stepCount || 0;
+    var live = detail.body.querySelectorAll('.q-step');
+    detail.stepNodes.length = 0;
+    for (var j = 0; j < live.length; j++) detail.stepNodes[j] = live[j];
+    var used = 0;              // 真正用到的卡片数（纯图片片段不占卡片）
     var placed = false;
+    var lastNew = null;        // 本轮新插进去的最后一张卡（新卡都排它后面，保持正序）
     for (var index = 0; index < steps.length; index++) {
       var group = steps[index] || [];
       var stepText = group.filter(function (piece) { return piece && piece.type !== 'image' && piece.text; })
@@ -1237,18 +1259,22 @@
       var hasPic = !!(isMessages && group.some(function (piece) { return piece && piece.type === 'image' && piece.file; }));
       var here = hasPic && !placed && hasTiles;
       var skip = !stepText && hasPic && !here;   // 纯图片片段：内容已经由图集负责，不再单开一行
-      if (skip) {
-        // 这一行不占位：它原来的节点（如果建过）留着不用，收尾时按数量清掉
-        continue;
-      }
-      var node = detail.stepNodes[count];
+      if (skip) continue;                        // 这一条不占卡片：收尾按 used 清掉多余节点
+      var node = detail.stepNodes[used];
       if (!node) {
         node = el('div', 'q-step');
         node.appendChild(el('div', 'q-step-head', ''));
         node.appendChild(el('div', 'q-text', ''));
-        detail.stepNodes[count] = node;
       }
-      if (node.parentNode !== detail.body) detail.body.insertBefore(node, bodyAnchor());
+      detail.stepNodes[used] = node;
+      /* 新卡片插在**上一张新卡片之后**：都往 `bodyAnchor()`（第一张卡）前面塞的话，
+         同一轮里建出来的多张卡会**倒序**（第一次渲染出来是"本次领取完成…"在最上面，
+         第二遍才被摆正）。没有前一张时（本回执的第一张卡）才用锚点。 */
+      if (node.parentNode !== detail.body) {
+        if (lastNew && lastNew.parentNode === detail.body) detail.body.insertBefore(node, lastNew.nextSibling);
+        else detail.body.insertBefore(node, bodyAnchor());
+      }
+      lastNew = node;
       if (here) placed = true;
       node.classList.toggle('q-err', /(^|\n)[^\n]{0,16}(失败|错误|不正确|无效|超时|拒绝|找不到)[:：]/.test(stepText));
       var head = node.firstChild;
@@ -1257,15 +1283,16 @@
       if (head && head.textContent !== title) head.textContent = title;
       if (body && body.textContent !== stepText) body.textContent = stepText;
       if (body) body.style.display = stepText ? '' : 'none';
-      count++;
+      used++;
     }
-    // 行数变少（换了条目/回执重读）：把多出来的节点摘掉；行数变多则**只补不重画**
-    for (var k = count; k < detail.stepNodes.length; k++) {
-      var stale = detail.stepNodes[k];
+    /* 收尾：只保留用到的前 `used` 张卡，其余（本回执多余的 / 上一条回执留下的孤儿）一并摘掉。
+       倒着遍历是因为 `live` 是活的 HTMLCollection。 */
+    for (var k = live.length - 1; k >= used; k--) {
+      var stale = live[k];
       if (stale && stale.parentNode) stale.remove();
     }
-    detail.stepNodes.length = count;
-    detail.stepCount = count;
+    detail.stepNodes.length = used;
+    detail.stepCount = used;
   }
 
   /**

@@ -84,7 +84,7 @@ public final class AppUpdateEvidenceTest {
                 equal(devSize, dev.get("sizeBytes").getAsLong(), "dev 的 sizeBytes == 真机 dist APK 实测字节数");
                 equal(devSha, str(dev, "sha256"), "dev 的 sha256 == 真机 dist APK 实测哈希");
                 equal(base + "/api/app/apk", str(dev, "apkUrl"), "apkUrl 用请求的 Host 拼");
-                equal(160, dev.get("versionCode").getAsInt(), "versionCode 读真机 build.gradle（160）");
+                equal(161, dev.get("versionCode").getAsInt(), "versionCode 读真机 build.gradle（当前 1.6.1/161；发版升号时同步这里）");
                 check(str(dev, "notes").contains("本机测试包"), "dev 的 notes 说明是测试包");
                 check(str(dev, "notes").matches("(?s).*\\d+\\.\\d+\\.\\d+\\.\\d+:\\d+.*"),
                         "dev 的 notes 带上了真实地址：" + str(dev, "notes"));
