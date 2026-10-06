@@ -170,6 +170,8 @@
         if ((applying || (catalogRefresh && field === "styles")) && (!event || event.isTrusted !== true)) return;
         dirty = true;
         if (field) pendingFields.add(field);
+        // 宽高是一个整体（换宽高按钮点哪一边都算动了尺寸）：只发其中一边会把另一边留在旧值上。
+        if (field === "width" || field === "height") { pendingFields.add("width"); pendingFields.add("height"); }
         epoch += 1;
         lastInputAt = Date.now();
         if (catalogRefresh && field === "styles") {
@@ -308,15 +310,37 @@
             if (Date.now() - lastInputAt < 200) return;
             const local = controls.read();
             const merged = {expected_revision: remote.revision};
-            for (const key of fields) merged[key] = bootstrapFields.has(key) || !equal(local[key], base[key]) ? local[key] : remote[key];
-            const beforeWrite = epoch;
-            const written = await request("/prompts", "PUT", merged);
-            if (written.conflict || composing || epoch !== beforeWrite || !same(controls.read(), local)) return;
-            await apply(written.state);
-            base = written.state;
-            dirty = false;
-            bootstrapFields.clear();
-            pendingFields.clear();
+            for (const key of fields) {
+                // **谁的值能上传**：生成参数（采样方法/预设样式/尺寸）只认「用户真的动过这一项」
+                // （受信任的事件记进 pendingFields，见 touched），或者这一份还没初始化过（bootstrap）。
+                // 控件自己漂回旧值（Gradio 重新渲染把输入框改回去、别的扩展改它）不算用户操作：
+                // 旧版把这种漂移也当成本地编辑推上去，就成了"机器人刚写的尺寸又被顶回旧值"——
+                // 用户报的「改了尺寸一生成又变回原尺寸」里，桥接这一侧就是它干的。
+                // 提示词沿用旧判据：页面上可能有别的脚本直接写提示词，那种漂移确实该同步出去。
+                const userEdit = bootstrapFields.has(key) || pendingFields.has(key);
+                const drifted = !equal(local[key], base[key]);
+                if (settingFields.includes(key)) merged[key] = userEdit ? local[key] : remote[key];
+                else merged[key] = userEdit || drifted ? local[key] : remote[key];
+            }
+            // 合并结果与桥接现状一模一样＝没有用户操作要上传：只把远端值应用到页面，**不发这趟 PUT**
+            // （没初始化过的那一份必须发，见桥接的"首次写齐四个字段"约定）。
+            const complete = remote.initialized && remote.settings_initialized;
+            if (complete && fields.every(key => equal(merged[key], remote[key]))) {
+                await apply(remote);
+                base = remote;
+                dirty = false;
+                bootstrapFields.clear();
+                pendingFields.clear();
+            } else {
+                const beforeWrite = epoch;
+                const written = await request("/prompts", "PUT", merged);
+                if (written.conflict || composing || epoch !== beforeWrite || !same(controls.read(), local)) return;
+                await apply(written.state);
+                base = written.state;
+                dirty = false;
+                bootstrapFields.clear();
+                pendingFields.clear();
+            }
         } else if (epoch === beforeFetch && !composing) {
             await apply(remote);
             base = remote;

@@ -62,7 +62,13 @@
    * 落盘之后，重建立刻能从服务端把这条回执补回来，并把跟单续上（见 {@link catchUpReceipts}）。
    */
   var FOLLOW_KEY = 'pixiko-follow-capture';
-  /** 补拉窗口：只补最近这么久的回执；更老的留在回执屏里看，不往对话正文里灌历史。 */
+  /**
+   * **跟单那条**回执的补拉窗口：只补最近这么久的；更老的留在回执屏里看，不往对话正文里灌历史。
+   *
+   * <p>注意它**只**管"正在跟的那条"（跟单本身另有 {@link CAPTURE_FOLLOW_MAX_MS} 兜底）。
+   * "这次页面会话错过的那些"由 {@link catchUpCutoff} 那个闸门管，**不能**用这个 6 小时窗口 ——
+   * 6 小时内的老回执全都会满足它，那正是「对话框莫名其妙插入历史对话」的来源。
+   */
   var CATCHUP_WINDOW_MS = 6 * 60 * 60 * 1000;
   /** 一次补拉最多补几条（"正在跟的那条"另算）。防止冷启动把历史回执整片灌进对话。 */
   var CATCHUP_MAX_QUESTS = 3;
@@ -2648,16 +2654,22 @@
     }
     if (!parts.length && !images.length) return 0;
 
-    /* 先把"这一段正文已经在哪个气泡里"对出来。对账只看**存在的条目**：
-       ① 正文完全相同 → 同一条消息（本地那份可能缺图或短了一截）；
-       ② 本地那条是它**严格前缀**且它是本地那条长出来的 → 同一条消息的成长版。
-       都不成立就新开一个气泡：没有稳定 id 时宁可各占一个，也不拿前缀去猜。 */
+    /* 先把"这一段正文已经在哪个气泡里"对出来。对账只看**存在的条目**，且只认**正文逐字相同**
+       （本地那条可能只是缺图）。
+
+       为什么不认"本地那条是它的前缀"（这里曾经就是 `text.indexOf(entry.text) === 0`）：
+       共享前缀的不同消息太多了 ——「任务 #12 已受理」「任务 #12 已完成」「任务 #12 已完成：1/1」
+       在服务端是**三条不同消息（条内序号 1/2/3）**，前缀判定却会把它们串成一个气泡。
+       更要命的是它**跨历史**：补拉一条老回执时，本地那条几小时前的短正文会被当成"它长出来的"，
+       于是图/新正文被并进一条与本次会话无关的老气泡里。
+       对不上就新开一个气泡：没有稳定身份时宁可各占一个，也不拿前缀去猜
+       （稳定的那一半在服务端落盘时用"回执号 + 条内序号"钉住，见 {@link alignmentHit}）。 */
     var used = Object.create(null);      // 这个气泡已经被本回执的哪一段认领了（含本轮新建的）
     var targets = [];
     var adopted = 0;
-    /** 这个气泡是不是这一段正文的「同一条消息」：正文相同，或本地那条是它长出来的前缀。 */
+    /** 这个气泡是不是这一段正文的「同一条消息」：**正文逐字相同**（服务端就地更新过的版本也相同）。 */
     function sameMessage(entry, text) {
-      return !!entry.text && (entry.text === text || text.indexOf(entry.text) === 0);
+      return !!entry.text && entry.text === text;
     }
     for (var t = 0; t < parts.length; t++) {
       var text = parts[t];
@@ -2745,15 +2757,22 @@
   }
 
   /**
-   * 补拉链：从服务端把「正在跟的那条回执」与「这台设备还没领到的回执」补齐（幂等）。
+   * 补拉链：从服务端把「正在跟的那条回执」与「这一趟页面会话**真的错过**的回执」补齐（幂等）。
    *
-   * <p>三条来源，合起来覆盖"页面被重建"的各种成因：
+   * <p><b>只补该补的，绝不动用户在看的这段历史。</b>两条来源，一条都不许放宽：
    *   <ol>
-   *     <li>{@link readFollow} 里那条正在跟的回执（挂起时被系统收掉的现场）—— 顺带把跟单**续上**；</li>
-   *     <li>这个 scope 的服务端回执列表里**有图**、且「未读 / 还在跑 / 比跟单那条更新」的几条
-   *         —— 覆盖挂起期间新到的回执（挑有图的：用户报的是收不到图）；</li>
-   *     <li>太老（超过 {@link CATCHUP_WINDOW_MS}）的一律不补 —— 历史回执留在回执屏里看。</li>
+   *     <li>{@link readFollow} 里那条正在跟的回执（挂起时被系统收掉的现场）—— 顺带把跟单**续上**；
+   *         且仍然受 {@link CATCHUP_WINDOW_MS} 约束（跟单本身有 {@code CAPTURE_FOLLOW_MAX_MS} 兜底）；</li>
+   *     <li>**本条页面会话开始之后才发生**的回执 —— 覆盖挂起/被回收期间新到的那几条。
+   *         判据是"开始时间晚于这次页面加载"，见 {@link catchUpCutoff}。</li>
    *   </ol>
+   *
+   * <p><b>为什么不能靠"未读 / 有图 / 比跟单新 / 6 小时内"</b>（这里曾经就是这么写的，是
+   * 「对话框莫名其妙插入历史对话」的元凶）：`unread` 只会被用户在**回执屏**手动标记才清零，
+   * 手机上几乎永远是 true；`busy` 在"受理后立刻 done"的指令上也是 false；于是几小时前那几条
+   * 老回执条条都满足条件，被当成"这次错过的"重新 {@link mergeReceiptIntoChat} 进来 ——
+   * 用户删掉（或清掉）的老回执正文就这样**又冒出来，而且是追加到对话末尾**。
+   * 现在窗口按"这次页面会话"收死：老回执一条都不补（要看在回执屏里看）。
    *
    * <p>只在对话屏挂好之后跑：正文还没读回来时补进去的条目会被 {@link chatLoad} 整屏重读冲掉。
    *
@@ -2761,6 +2780,33 @@
    */
   var catchUpAt = 0;
   var catchUpInFlight = null;
+  /**
+   * 「这条回执算不算这一次页面会话里发生的」的时间闸门（见 {@link catchUpReceipts}）。
+   *
+   * <p>取"这次页面加载那一刻"，再往前留 {@link CATCHUP_CLOCK_SLACK_MS} 的余量（只为了让
+   * 页面加载与回执受理之间正常的先后抖动不至于把**刚发生**的那条挡在外面）。老回执动辄
+   * 几小时前，余量多大都不影响判据；真正错过的那条一定是"页面加载之后才受理"的
+   * （受理在先、页面加载在后 = 它早就在正文存档里了）。
+   *
+   * <p>重算时机见 {@link catchUpCutoff}：每次"整页重建/首次进对话屏"都会重算，
+   * 所以下拉刷新之后仍然只补刷新之后发生的那几条。
+   */
+  var CATCHUP_CLOCK_SLACK_MS = 10000;
+  var catchUpCutoffAt = 0;
+
+  /** 本条页面会话的补拉时间闸门（毫秒墙钟）；没定过就现在定，页面重建后会重新定。 */
+  function catchUpCutoff() {
+    if (!catchUpCutoffAt) catchUpCutoffAt = Date.now() - CATCHUP_CLOCK_SLACK_MS;
+    return catchUpCutoffAt;
+  }
+
+  /** 服务端那条回执的受理时刻（毫秒墙钟）；解析不出来给 0（= 认不出新旧，按"老"处理）。 */
+  function questStartedAt(row) {
+    var raw = row && (row.startedAt === null || row.startedAt === undefined ? '' : String(row.startedAt).trim());
+    if (!raw) return 0;
+    var at = Date.parse(raw);
+    return isNaN(at) ? 0 : at;
+  }
 
   function catchUpReceipts(force) {
     if (catchUpInFlight) return catchUpInFlight;
@@ -2770,7 +2816,10 @@
     catchUpAt = now;
 
     var scope = PixikoM.scope();
+    var cutoff = catchUpCutoff();
     var follow = readFollow(scope);
+    /* 跟单现场太老（超过补拉窗口）就不认它 —— 与下面的时间闸门同一个口径：补拉只服务"眼下的这一趟"。 */
+    if (follow && follow.at && Date.now() - Number(follow.at) > CATCHUP_WINDOW_MS) follow = null;
     var followQuest = follow ? Number(follow.quest) || 0 : 0;
     var wanted = followQuest > 0 ? [followQuest] : [];
     var followed = null;
@@ -2783,10 +2832,12 @@
         var row = rows[i] || {};
         var number = Number(row.number) || 0;
         if (number <= 0 || wanted.indexOf(number) >= 0) continue;
-        if (!(Number(row.images) > 0)) continue;                             // 只补有图的（用户报的是收不到图）
-        if (!(Number(row.ageMillis) <= CATCHUP_WINDOW_MS)) continue;          // 太老的留在回执屏
-        var missed = row.unread === true || row.busy === true || (followQuest > 0 && number > followQuest);
-        if (!missed) continue;
+        /* 闸门①：**这次页面会话之后**才受理的才算"我错过的"。老回执一条都不补 ——
+           它就是靠这一条被挡在门外的（不看 unread / busy / 有没有图，那些都会漏）。 */
+        if (questStartedAt(row) < cutoff) continue;
+        /* 闸门②：还在跑 / 有新正文 / 有新图 —— 三种都算"有新东西"，避免把一条空回执补进来。
+           注意这里不再用"比跟单那条新"当宽松条件：那对新会话是恒真的（followQuest=0 时谁都比它新）。 */
+        if (!(row.unread === true || row.busy === true || Number(row.texts) > 0 || Number(row.images) > 0)) continue;
         wanted.push(number);
         extra++;
       }
@@ -2820,6 +2871,9 @@
 
   /** 调试/自动化用：手动触发一次补拉（`force` 默认为 true）。 */
   PixikoM.catchUpReceipts = function (force) { return catchUpReceipts(force !== false); };
+
+  /** 调试/自动化用：看一眼本次页面会话的补拉闸门（= 只补这个时刻之后受理的回执）。 */
+  PixikoM.catchUpCutoff = function () { return catchUpCutoff(); };
 
   /** 清空对话：POST /api/chat/reset {scope} 之后再清本地。 */
   async function clearChat() {
@@ -2859,6 +2913,9 @@
 
   function chatMount(root) {
     root.classList.add('chat');
+    /* 整页重建（挂起被回收 / 下拉刷新）之后重新起算补拉闸门：这次页面会话之前受理的回执一律不补。
+       放在 mount 里而不是 boot 里 —— mount 才是"用户的对话屏从这一刻起"的那个时刻。 */
+    catchUpCutoffAt = 0;
     var log = el('div', 'chat-log');
     log.setAttribute('data-chat-log', '1');
     root.appendChild(log);

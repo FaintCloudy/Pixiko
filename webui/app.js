@@ -3155,6 +3155,15 @@
   }
   const setText = (id, value) => setNode(id, (node) => { node.textContent = value; });
   const setValue = (id, value) => setNode(id, (node) => { node.value = value; });
+  /**
+   * 生成参数输入框专用赋值：**用户正在这个框里编辑时一个字都不写**。
+   * 轮询（30 秒一次的 /api/status）会把还没失焦的新尺寸/新步数换成服务端那份旧值，
+   * 用户失焦时 change 再发上去的还是换回来的旧值 —— 那次修改就被悄悄吞掉了。
+   */
+  const setGenValue = (id, value) => setNode(id, (node) => {
+    if (document.activeElement === node) return;
+    node.value = value;
+  });
   const setChecked = (id, value) => setNode(id, (node) => { node.checked = value; });
 
   async function loadStatus() {
@@ -3216,18 +3225,23 @@
     renderEndpoints(status.endpoints);
 
     const gen = status.generation || {};
-    setValue('set-width', gen.width ?? '');
-    setValue('set-height', gen.height ?? '');
-    setValue('set-steps', gen.steps ?? '');
-    setValue('set-cfg', gen.cfg ?? '');
-    setValue('set-seed', gen.seed ?? '');
-    setValue('set-imgcnt', status.imageCount ?? '');
+    // 生成参数的输入框：**正在编辑的那一个不写**。轮询（30 秒一次的 /api/status）会把用户刚输入、
+    // 还没失焦的新尺寸/新步数换成服务端那份旧值——"改完即生效"就变成了"改完被旧值覆盖"
+    // （失焦时 change 再发上去的还是被换回来的旧值，等于这次修改被悄悄吞掉）。
+    setGenValue('set-width', gen.width ?? '');
+    setGenValue('set-height', gen.height ?? '');
+    setGenValue('set-steps', gen.steps ?? '');
+    setGenValue('set-cfg', gen.cfg ?? '');
+    setGenValue('set-seed', gen.seed ?? '');
+    setGenValue('set-imgcnt', status.imageCount ?? '');
     setChecked('gen-autoget', !!status.autoGet);
     setChecked('lora-auto-get', !!status.autoGet);
     setChecked('set-notice', !!status.noticeEnabled);
     setChecked('set-logmirror', !!status.logMirror);
     // 面板显示的就是机器人里当前生效的值：同步后不该再重复提交一次。
-    appliedGeneration = JSON.stringify(generationPayload());
+    // 签名按**服务端那份值**算，不按面板里的值：面板里可能有用户正在编辑、还没发出去的内容
+    // （见 setGenValue 的焦点保护），把它当成"已生效"会让那次 change 被签名判重直接丢掉。
+    appliedGeneration = appliedSignature(gen, status.imageCount);
     applyGenerationSummary(status);
     // 队列里有任务就在生成中：开始/继续轮询 SD 进度；空闲就停掉。
     if (status.generation?.status) startProgressPolling(); else loadProgress().catch(() => {});
@@ -3342,7 +3356,8 @@
     state.options = options;
     fillSelect('set-sampler', options.samplers, (state.status?.generation?.sampler) || '');
     fillModelSelect('set-model', options, (state.status?.generation?.model) || '');
-    appliedGeneration = JSON.stringify(generationPayload());
+    // 签名同样按服务端那份值算（见 appliedSignature）：面板里可能正有用户没发出去的编辑。
+    appliedGeneration = appliedSignature(state.status?.generation || {}, state.status?.imageCount);
     applyGenerationSummary(state.status);
   }
 
@@ -3422,18 +3437,31 @@
   /**
    * 提示词面板的增删改：直接调 `/api/prompt/edit`（个人 prompt 是本机 JSON，和 SD 桥接无关）。
    * 接口返回刷新后的整份面板数据，一次往返就够，不用再 loadPrompt()，也没有回执要轮询。
+   *
+   * <p><b>不加右下角提示</b>：`add` / `remove` / `set` / `clear` / `undo` 都是"改提示词"这一类操作，
+   * 面板自己已经把结果就地更新了（词条、两段原文、可回退步数），再弹一下就只是打扰（用户 2026-10-07 口径：
+   * 「对话可以有，但是右下角不要弹出回执提示」）。**只静默成功那一下**：失败仍然弹（见 catch），
+   * 别的操作（`.gen`、`.help`、LoRA、样式…）与提示词面板里的其它反馈一个字都不改。
    */
   async function editPrompt(side, action, value) {
     try {
       const data = await api('/api/prompt/edit', { body: { side, action, value: value == null ? '' : String(value), scope: scope() } });
       renderPrompt(data);
-      if (data.message) toast(data.message);
+      if (data.message && !quietPromptEditToast(action)) toast(data.message);
       return data;
     } catch (error) {
       if (String(error.message) !== 'unauthorized') toast(error.message);
       await loadPrompt().catch(() => {});
       return null;
     }
+  }
+
+  /**
+   * 提示词面板这个动作要不要弹右下角提示：`add` / `remove` / `set` / `clear` / `undo`
+   * 一律不弹（面板已就地更新），其余（认不出的动作）照旧弹，宁可多弹也不静默掉意外情况。
+   */
+  function quietPromptEditToast(action) {
+    return ['add', 'remove', 'set', 'clear', 'undo'].includes(String(action == null ? '' : action).trim().toLowerCase());
   }
 
   /**
@@ -4959,6 +4987,23 @@
       payload[key] = (key === 'sampler' || key === 'model') ? value : Number(value);
     });
     return payload;
+  }
+
+  /**
+   * 机器人当前生效值对应的提交外形（键与类型跟 {@link generationPayload} 完全一样）。
+   * 用它算"这份已经生效"的签名，而不是拿面板里的值算：面板里可能有用户正在编辑、
+   * 还没发出去的内容（见 `setGenValue` 的焦点保护），当成已生效会把那次 change 判重丢掉。
+   */
+  function appliedSignature(gen, imageCount) {
+    const values = { width: gen.width, height: gen.height, sampler: gen.sampler, model: gen.model,
+      steps: gen.steps, cfg: gen.cfg, seed: gen.seed, imageCount };
+    const payload = {};
+    GEN_FIELDS.forEach(([, key]) => {
+      const value = values[key];
+      if (value === undefined || value === null || String(value).trim() === '') return;
+      payload[key] = (key === 'sampler' || key === 'model') ? String(value) : Number(value);
+    });
+    return JSON.stringify(payload);
   }
 
   /** 把面板里的值立刻发回机器人生效；同一份值不重复发。 */

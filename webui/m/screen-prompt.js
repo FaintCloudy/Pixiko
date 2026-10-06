@@ -594,10 +594,21 @@
 
     /* ---------- 写操作（/api/prompt/edit） ---------- */
 
+    /**
+     * 这个动作要不要弹右下角提示：`add` / `remove` / `set` / `clear` / `undo` 一律不弹 ——
+     * 提示词屏自己已经就地更新（词条、两段原文、可撤销步数），再弹一下只是打扰
+     * （用户 2026-10-07 口径：「对话可以有，但是右下角不要弹出回执提示」）。
+     * 认不出的动作照旧弹：宁可多弹，也不静默掉意外情况。
+     */
+    function quietEditToast(action) {
+      var value = String(action == null ? '' : action).trim().toLowerCase();
+      return value === 'add' || value === 'remove' || value === 'set' || value === 'clear' || value === 'undo';
+    }
+
     function edit(side, action, value) {
       var body = { side: side, action: action, value: value == null ? '' : String(value), scope: P.scope() };
       return P.api('/api/prompt/edit', { body: body }).then(function (data) {
-        if (data && data.message) P.toast(data.message);
+        if (data && data.message && !quietEditToast(action)) P.toast(data.message);
         // 局部刷新：重取 /api/prompt，只重画这两块，不动整页。
         return load();
       }, function (error) {

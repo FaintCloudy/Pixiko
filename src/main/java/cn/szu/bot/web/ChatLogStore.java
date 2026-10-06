@@ -166,13 +166,27 @@ public final class ChatLogStore {
     }
 
     /**
-     * 页面整组 push 之后的补救：**把服务端自己 append 过、却被这一份 push 覆盖掉的条目补回来**。
+     * 页面整组 push 之后的补救：**只把"日志末尾之后缺的那几条"补回来**（{@code /api/chat/log/save} 是整组覆盖写）。
      *
-     * <p>为什么需要：{@code /api/chat/log/save} 是"整组覆盖写"，而服务端在两次 push 之间也可能
-     * append（回执消息、图片）。页面那一份是"上一次读到之后"的快照时，覆盖回去就会把服务端刚 append
-     * 的那条抹掉。页面侧已经做了并集合并（见 {@code app.js} 的 {@code chatArchiveSend}），这里是
-     * **服务端自己的第二道**，而且是**逐字节确定**的一对一比对，不靠下标、不靠正文前缀：
-     * 账本里记着每条追加条目的完整形状，只要刚写进去的正文里没有一模一样的一条，就按追加顺序补回末尾。
+     * <p>为什么需要：服务端在两次 push 之间也会 append（回执消息、图片）。页面那一份是"上一次读到之后"的
+     * 快照时，覆盖回去就会把服务端刚 append 的那几条抹掉。页面侧已经做了并集合并（见 {@code app.js} 的
+     * {@code chatSaveLog}），这里是**服务端自己的第二道**，而且是**逐字节确定**的一对一比对，
+     * 不靠下标、不靠正文前缀。
+     *
+     * <p><b>判据（关键，收紧过一次）</b>：账本（= 服务端追加顺序）里**最后一条还在推上来的正文里的**
+     * 条目的下标记作 {@code lastMatchedAt}；只有它**之后**的账本条目才算"这次 push 抹掉的"，
+     * 按追加顺序补回末尾。一条都对不上（{@code lastMatchedAt < 0}，页面把服务端追加过的条目全删了）
+     * → 一条都不补。比对逐条用 {@link #hasSame}（完整形状、字段顺序统一，不靠下标、不靠前缀）。
+     *
+     * <p>这一条判据同时满足两个硬要求（它们是互相拉扯的，别只往一边收）：
+     * <ul>
+     *   <li><b>用户删掉的不复活</b>：页面删的是"中间/全部"。删中间时末尾那条追加条目还在，
+     *       删掉的那些下标落在 {@code lastMatchedAt} 之前，一律不补；全删时一条都对不上
+     *       （{@code lastMatchedAt < 0}），直接一条不补。老写法"正文里没有就补回末尾"正是把
+     *       用户删掉的历史塞回对话末尾的元凶；</li>
+     *   <li><b>真丢的补得回来</b>：页面读到服务端那份之后又 append 了新条目（并集之后、push 之前
+     *       那一瞬间），页面手里那份就是"少了末尾 N 条"—— 末尾之前那条对得上，于是这 N 条被补回。</li>
+     * </ul>
      *
      * <p>只补不删：页面自己的增删语义一个字没变（用户清空整段对话走 {@code /api/chat/reset}，
      * 那时账本也一起重来）。
@@ -182,16 +196,48 @@ public final class ChatLogStore {
         Map<String, Saved> keys = loadLedger(safe);
         if (keys.isEmpty()) return;
         JsonArray entries = load(safe);
-        List<JsonObject> lost = new ArrayList<>();
+
+        List<JsonObject> ledger = new ArrayList<>();          // 账本 = 服务端追加顺序（重复正文按出现次数各算一条）
         for (Saved saved : keys.values()) {
             JsonObject want = parseEntry(saved.entry());
-            if (want == null || containsSame(entries, want)) continue;   // 正文里已经有了：没丢
+            if (want != null) ledger.add(want);
+        }
+        if (ledger.isEmpty()) return;
+
+        /* 账本里"最后一条还在推上来的正文里的"下标：它之后的账本条目才是"被这次 push 抹掉的尾巴"。
+           一条都对不上 = 页面把服务端追加过的条目**全删了**（或整份换成了别的内容）→ 一条都不补。 */
+        int lastMatchedAt = -1;
+        for (int index = 0; index < ledger.size(); index++) {
+            if (hasSame(entries, ledger.get(index))) lastMatchedAt = index;
+        }
+        if (lastMatchedAt < 0) return;
+        List<JsonObject> lost = new ArrayList<>();
+        for (int index = lastMatchedAt + 1; index < ledger.size(); index++) {
+            JsonObject want = ledger.get(index);
+            if (hasSame(entries, want)) continue;             // 正文别处已经有了这一条（窗口里还在）：不补
             lost.add(want);
         }
         if (lost.isEmpty()) return;
-        for (JsonObject entry : lost) entries.add(entry);          // 按账本（= 追加）顺序补回末尾
+        for (JsonObject entry : lost) entries.add(entry);      // 按账本（= 追加）顺序补回末尾
         write(safe, entries);
-        Log.info("WebUI 对话正文：页面整组 push 少了 " + lost.size() + " 条服务端追加过的条目，已按序补回（" + safe + "）。");
+        Log.info("WebUI 对话正文：页面整组 push 抹掉了末尾 " + lost.size() + " 条服务端追加过的条目，已按序补回（" + safe + "）。");
+    }
+
+    /** 这一条正文条目与账本里那一条是不是**同一形状**（role + 文字 + 图片，逐字节）。 */
+    private static boolean sameShape(JsonElement entry, JsonObject wanted) {
+        if (entry == null || !entry.isJsonObject()) return false;
+        return Json.GSON.toJson(normalizeEntry(entry)).equals(Json.GSON.toJson(normalizeEntry(wanted)));
+    }
+
+    /**
+     * 正文里还有没有"这一形状"的条目（{@link #sameShape} 的数组版）——形状比对只看
+     * role + 文字 + 图片，字段顺序与裁剪口径先统一，所以"同一形状"就是"逐字节一样的那一条"。
+     */
+    private static boolean hasSame(JsonArray entries, JsonObject wanted) {
+        for (int index = 0; index < entries.size(); index++) {
+            if (sameShape(entries.get(index), wanted)) return true;
+        }
+        return false;
     }
 
     // ---------------------------------------------------------------- 追加（服务端权威写入之一）
@@ -510,11 +556,6 @@ public final class ChatLogStore {
             if (images.size() == 0) return index;
         }
         return -1;
-    }
-
-    /** 正文里已经有"逐字节一样"的这一条吗（比较会顺手规范化：字段顺序与裁剪口径都统一）。 */
-    private static boolean containsSame(JsonArray entries, JsonObject wanted) {
-        return indexOfSame(entries, wanted) >= 0;
     }
 
     /** 正文里"逐字节一样"的那一条的下标（先规范化再比，字段顺序/裁剪口径都统一）。 */

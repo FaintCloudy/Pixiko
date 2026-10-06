@@ -25,8 +25,65 @@ public final class SdSettingsTest {
         conflictsAndFailedWrites();
         validationBeforeMutation();
         parameterChangesAreLogged();
+        staleSnapshotNeverOverridesExplicitLocalSize();
         offlineAndTimeout();
         System.out.println("SdSettingsTest: " + assertions + " assertions passed.");
+    }
+
+    /**
+     * 「改了尺寸一生成又变回原尺寸」（2026-10-07 实测）：页面没实时连接时，桥接里那份旧快照会被
+     * 那个页面反复 PUT 回桥接（实测 0.6 秒后回来），机器人下一次 refresh 就把用户刚改的尺寸顶回去。
+     *
+     * <p>判据是**来源优先级**：实时页面（浏览器心跳认证过的快照）＞ 机器人这边的用户显式写入
+     * ＞ 页面未实时连接的桥接旧快照。载入样式/预设套用的尺寸同样受这条保护（它也走 setSize）。
+     */
+    private static void staleSnapshotNeverOverridesExplicitLocalSize() throws Exception {
+        try (Fixture f = new Fixture()) {
+            SdClient client = f.client();
+            client.settings();
+            // 页面已断开，用户仍在机器人这边显式改尺寸（控制台/指令/手机端都走这条）。
+            f.live = false;
+            equal(960, client.setSize(960, 1440).width(), "explicit local size applied");
+            // 没通过心跳认证的旧页面把它自己那份旧尺寸 PUT 回桥接。
+            f.width = 832; f.height = 1152; f.revision++;
+            String kept = captureOutput(() -> {
+                SdClient.GenerationSettings after = client.settings();
+                equal(960, after.width(), "stale snapshot cannot override the explicit local width");
+                equal(1440, after.height(), "stale snapshot cannot override the explicit local height");
+                check(after.source().contains("本地显式参数"), "kept-local source is explicit: " + after.source());
+                equal(960, client.generationRequest().settings().width(), "generation submits the user's width");
+            });
+            check(kept.contains("保留本地显式值") && kept.contains("尺寸 960×1440 → 832×1152"),
+                    "ignored snapshot logged with old → new: " + kept);
+            equal(960, persistedWidth(f), "the user's size is what gets persisted for a restart");
+            equal(960, f.client().settings().width(), "restart keeps the explicit size against the stale snapshot");
+            // 载入样式套用尺寸（既有行为）也要活得过下一次未实时快照。
+            JsonObject styleModel = new JsonObject();
+            styleModel.addProperty("width", 768);
+            styleModel.addProperty("height", 512);
+            List<String> applied = client.applyModelParams(styleModel);
+            check(applied.stream().anyMatch(text -> text.contains("尺寸 768×512")), "style size applied: " + applied);
+            f.width = 832; f.height = 1152; f.revision++;
+            equal(768, client.settings().width(), "style-applied size survives a stale snapshot");
+            // 合法的变换照旧：展示图那种超限尺寸仍按 fitGenerationSize 同比例缩到合法值再套用。
+            JsonObject huge = new JsonObject();
+            huge.addProperty("width", 2400);
+            huge.addProperty("height", 3744);
+            List<String> fitted = client.applyModelParams(huge);
+            check(fitted.stream().anyMatch(text -> text.contains("尺寸 2400×3744 → 同比例缩到")),
+                    "out-of-range style size still fitted: " + fitted);
+            f.width = 832; f.height = 1152; f.revision++;
+            equal(SdClient.fitGenerationSize(2400, 3744)[0], client.settings().width(),
+                    "fitted style size survives a stale snapshot");
+            // 页面真在实时同步（心跳认证）时页面优先：既有行为一个字都不改。
+            f.live = true; f.width = 1216; f.height = 832; f.revision++;
+            SdClient.GenerationSettings followed = client.settings();
+            equal(1216, followed.width(), "a live page still wins");
+            check(followed.source().contains("实时同步"), "live page labelled: " + followed.source());
+            // 页面接管过之后本地那条"显式写入"记录作废：下一次未实时快照照旧跟随，不会永久粘住。
+            f.live = false; f.width = 512; f.height = 512; f.revision++;
+            equal(512, client.settings().width(), "after a live takeover the snapshot is followed again");
+        }
     }
 
     /**

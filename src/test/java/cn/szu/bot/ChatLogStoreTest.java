@@ -48,6 +48,7 @@ public final class ChatLogStoreTest {
             appendIdempotent(root);
             appendReceiptFold(root);
             appendVersusPush(root);
+            recoverWindow(root);
         } finally {
             TestCleanup.deleteQuietly(root);
         }
@@ -56,7 +57,71 @@ public final class ChatLogStoreTest {
                 + "缺文件静默与坏数据才 warn、超长文字截断、只留最后 200 条、512KB 裁剪、scope 净化不逃逸、"
                 + "无 BOM 与纯 LF、8 线程并发不半截、空输入不抛、"
                 + "服务端追加按「回执号 + 条内序号」幂等、多步回执逐条对齐且图并进上一条正文、"
-                + "页面整组 push 与服务端 append 交替不丢不重。");
+                + "页面整组 push 与服务端 append 交替不丢不重、"
+                + "recoverAppended 只补末尾缺的那几条（用户删掉的历史绝不复活）。");
+    }
+
+    /**
+     * {@code recoverAppended} 的窗口判据（「对话框莫名其妙插入历史对话」的服务端那一半）：
+     *
+     * <ol>
+     *   <li>页面这份**少了末尾几条**（读完之后服务端又 append 了）→ 只补末尾缺的，一条不重；</li>
+     *   <li>页面这份**把 append 过的条目全删了**（只留自己的话）→ 一条都不补（不许复活历史）；</li>
+     *   <li>页面这份**删掉了中间那几条、末尾那条还在** → 删掉的不复活、末尾的也不重复；</li>
+     *   <li>被删掉之后再 append 的一条新回执 → 只补这一条新的（幂等键是"回执号 + 条内序号"）。</li>
+     * </ol>
+     */
+    static void recoverWindow(Path root) {
+        ChatLogStore store = new ChatLogStore(root);
+        JsonArray page = new JsonArray();
+        page.add(entry("user", "帮我生成一张"));
+        store.save("recover", page);
+        check(store.append("recover", List.of(
+                new ChatLogStore.Append("quest:71:1", "回执一", List.of()),
+                new ChatLogStore.Append("quest:71:2", "回执二", List.of("data/generated/a.png")),
+                new ChatLogStore.Append("quest:71:3", "回执三", List.of()))) == 3,
+                "预置：服务端追加 3 条回执，现在共 " + store.load("recover").size() + " 条");
+
+        // ① 少末尾一条：页面读到"回执一/二"之后服务端又追加了"回执三"
+        JsonArray stale = new JsonArray();
+        stale.add(entry("user", "帮我生成一张"));
+        stale.add(entry("bot", "回执一"));
+        JsonObject second = entry("bot", "回执二");
+        JsonArray images = new JsonArray();
+        images.add("data/generated/a.png");
+        second.add("images", images);
+        stale.add(second);
+        store.save("recover", stale);
+        JsonArray afterTail = store.load("recover");
+        check(afterTail.size() == 4 && "回执三".equals(afterTail.get(3).getAsJsonObject().get("text").getAsString()),
+                "① 只补末尾缺的那 1 条，落在末尾：" + afterTail);
+
+        // ② 全删（页面只剩自己那句话）：一条都不许复活
+        JsonArray onlyUser = new JsonArray();
+        onlyUser.add(entry("user", "都删了"));
+        store.save("recover", onlyUser);
+        JsonArray afterWipe = store.load("recover");
+        check(afterWipe.size() == 1 && "都删了".equals(afterWipe.get(0).getAsJsonObject().get("text").getAsString()),
+                "② 页面把服务端追加过的条目全删了：一条都不补回来（" + afterWipe.size() + " 条）");
+
+        // ③ 删中间、留末尾：末尾那条还在 → 删掉的不复活、末尾的也不重复
+        store.append("recover", List.of(
+                new ChatLogStore.Append("quest:72:1", "新回执甲", List.of()),
+                new ChatLogStore.Append("quest:72:2", "新回执乙", List.of())));
+        JsonArray keepTail = new JsonArray();
+        keepTail.add(entry("user", "删掉中间那两条"));
+        keepTail.add(entry("bot", "新回执乙"));
+        store.save("recover", keepTail);
+        JsonArray afterMiddle = store.load("recover");
+        check(afterMiddle.size() == 2 && "新回执乙".equals(afterMiddle.get(1).getAsJsonObject().get("text").getAsString()),
+                "③ 删掉中间那几条、末尾那条还在：一条都不复活（" + afterMiddle.size() + " 条：" + afterMiddle + "）");
+
+        // ④ 删掉之后再 append 一条新的 → 只补这一条新的
+        check(store.append("recover", List.of(new ChatLogStore.Append("quest:73:1", "删掉之后的新回执", List.of()))) == 1,
+                "④ 删掉之后再 append 一条新回执：真的写了 1 条");
+        JsonArray afterNew = store.load("recover");
+        check(afterNew.size() == 3 && "删掉之后的新回执".equals(afterNew.get(2).getAsJsonObject().get("text").getAsString()),
+                "④ 新回执落在末尾，被删掉的历史仍然没有复活：" + afterNew);
     }
 
     // ---------------------------------------------------------------- 12) 服务端追加：幂等
@@ -170,18 +235,19 @@ public final class ChatLogStoreTest {
         check(store.append("race2", receipt) == 2, "服务端追加 2 条");
         check(store.load("race2").size() == 3, "现在 1 条用户 + 2 条回执：" + store.load("race2").size());
 
-        // ① 页面拿着一份旧快照（只有用户那条）整组 push → 服务端的两条必须找回来
+        /* ① 页面拿着一份旧快照（只有用户那条）整组 push —— 这份里**一条服务端追加过的条目都没有**。
+              按收紧后的判据（见 {@link ChatLogStore#save} 的 recoverAppended 说明）这是"页面把回执条目
+              全删了"的形状，**一条都不补**：账本比正文活得久（1024 键 vs 200 条窗口），只要"正文里没有就补"
+              就等于"用户删掉的历史一律复活"，那正是用户报的「对话框莫名其妙插入历史对话」。
+              真丢的尾巴（页面这份里**还留着**末尾之前那条，只是少了后面几条）由 ③b 覆盖。 */
         JsonArray stalePage = new JsonArray();
         stalePage.add(entry("user", "帮我生成一张"));
         store.save("race2", stalePage);
         JsonArray afterPush = store.load("race2");
-        check(afterPush.size() == 3, "页面整组 push 之后服务端追加的 2 条被补回来（不丢）：" + afterPush.size());
-        check("已加入生成队列".equals(afterPush.get(1).getAsJsonObject().get("text").getAsString()),
-                "补回来的是那两条回执，顺序不变");
-        check(afterPush.get(2).getAsJsonObject().getAsJsonArray("images").size() == 1,
-                "带图那条也原样回来：" + afterPush.get(2));
+        check(afterPush.size() == 1 && "帮我生成一张".equals(afterPush.get(0).getAsJsonObject().get("text").getAsString()),
+                "① 页面这份一条服务端条目都没留（= 全删了）：一条都不补回来（" + afterPush.size() + " 条）");
 
-        // ② 页面这次读到了服务端那一份（整组 push 里已经包含它们）→ 不许再写第二遍
+        // ② 页面这次读到了服务端那一份（整组 push 里已经包含它们）→ 一条都不重复
         JsonArray fresh = new JsonArray();
         fresh.add(entry("user", "帮我生成一张"));
         fresh.add(entry("bot", "已加入生成队列"));

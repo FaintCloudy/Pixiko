@@ -180,16 +180,34 @@ public final class ReceiptChatLogTest {
         ChatLogStore store = new ChatLogStore(root);
         int baseline = store.load(SCOPE).size();
 
-        // ① 页面拿着一份**旧快照**（只有用户那条）整组 push：服务端 append 过的条目必须找回来
-        JsonArray page = new JsonArray();
+        // ① 页面拿着一份**少了末尾一条**的旧快照整组 push：少的那条服务端 append 过的条目必须找回来。
+        //    判据见 ChatLogStore#save 的 recoverAppended：只有"页面这份里留住了末尾之前那条、
+        //    少了它后面几条"才补；一份服务端条目都没留 = 用户删了，绝不复活（下面 ①b 断言）。
+        JsonArray page = store.load(SCOPE).deepCopy();
+        check(page.size() == baseline && baseline > 1, "预置：服务端正文 " + page.size() + " 条（用例 1、2 留下的）");
+        page.remove(page.size() - 1);                    // 模拟"读完之后服务端又追加了一条"的旧快照
         JsonObject user = new JsonObject();
         user.addProperty("role", "user");
         user.addProperty("text", "页面自己的话");
         page.add(user);
         store.save(SCOPE, page);
         JsonArray afterPush = store.load(SCOPE);
-        check(afterPush.size() == baseline + 1, "页面整组覆盖写之后：服务端 append 的条目一条没丢，另加了页面那条（"
+        check(afterPush.size() == baseline + 1, "页面整组覆盖写之后：少了的那条服务端 append 条目找回来了，另加了页面那条（"
                 + afterPush.size() + "）：" + afterPush.size());
+
+        // ①b 页面这份**一条服务端追加过的条目都没留**（用户把回执条目全删了）→ 一条都不许复活
+        JsonArray wipe = new JsonArray();
+        JsonObject mine = new JsonObject();
+        mine.addProperty("role", "user");
+        mine.addProperty("text", "全删了只剩这句");
+        wipe.add(mine);
+        store.save(SCOPE, wipe);
+        JsonArray afterWipe = store.load(SCOPE);
+        check(afterWipe.size() == 1 && "全删了只剩这句".equals(afterWipe.get(0).getAsJsonObject().get("text").getAsString()),
+                "页面把服务端追加过的条目全删了：一条都不补回来（" + afterWipe.size() + " 条）");
+        JsonArray restore = new JsonArray();             // 后面 ② 的交替并发要有内容可推
+        restore.add(mine);
+        store.save(SCOPE, restore);
 
         // ② 交替并发：一个线程整组 push、另一个线程 append
         ExecutorService pool = Executors.newFixedThreadPool(2);

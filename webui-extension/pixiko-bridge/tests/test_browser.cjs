@@ -450,6 +450,41 @@ test("a stalled native refresh times out clearly and does not loop clicks or ack
         "a late genuine model update can recover safely");
 });
 
+test("a control reverted by the page never pushes the old size back over the bot's value", async () => {
+    // 用户报的场景：机器人把尺寸改成 832×1216 之后，Gradio 把宽高控件自己渲染回旧值（没有受信任的
+    // 用户事件）。旧版把这种漂移当成本地编辑，于是 960×1440 又被推回桥接，机器人下一次读就把用户的
+    // 尺寸顶回去——"改了尺寸一生成又变回原尺寸"。
+    const h = await harness({stored: {positive: "", negative: "", revision: 3, initialized: true,
+        settings_initialized: true, sampler_name: "Euler a", styles: [], width: 960, height: 1440}});
+    await h.tick();
+    h.state.width = 832;
+    h.state.height = 1216;
+    h.state.revision += 1;
+    await h.tick();
+    assert.equal(h.ui.width.number.value, "832");
+    h.ui.width.number.value = "960";
+    h.ui.width.range.value = "1440";
+    h.ui.height.number.value = "1440";
+    h.ui.height.range.value = "1440";
+    const puts = h.puts().length;
+    await h.tick();      // 漂移这一拍先被 200ms 防抖挡下（与真实页面一致）
+    await h.tick();
+    assert.equal(h.state.width, 832, "the bot's width must survive a cosmetic control revert");
+    assert.equal(h.state.height, 1216, "the bot's height must survive a cosmetic control revert");
+    assert.equal(h.puts().length, puts, "no PUT while the user has not touched anything");
+    assert.equal(h.ui.width.number.value, "832", "the page adopts the bot's value again");
+});
+
+test("a real width edit still publishes both dimensions", async () => {
+    const h = await harness({stored: {positive: "", negative: "", revision: 3, initialized: true,
+        settings_initialized: true, sampler_name: "Euler a", styles: [], width: 960, height: 1440}});
+    await h.tick();
+    h.edit("width", 1024);
+    await h.tick();
+    assert.equal(h.state.width, 1024, "user width edit is published");
+    assert.equal(h.state.height, 1440, "the untouched height travels with it unchanged");
+});
+
 test("legacy bridge without catalog revision neither needs a refresh button nor probes catalog", async () => {
     const h = await harness({refreshButton: false});
     await h.tick();
