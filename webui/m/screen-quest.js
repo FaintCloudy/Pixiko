@@ -1435,6 +1435,21 @@
   }
 
   /**
+   * 回前台 / 页面重建 / 被冻过之后：**立刻补一拍事件队列**，再补一次 `/api/quest`。
+   *
+   * <p>两条都要，缺一条就有一档会慢：
+   *   · 平台把定时器冻住时，队列那一拍的到期时刻是不确定的 —— 只等队列自己的节拍，恢复后最坏
+   *     要等一整个 `EVENT_DRAIN_MS`（实测同一份代码量到 113ms 与 1849ms 两种）；
+   *   · 只补 `/api/quest` 也不行：`patch` 是事件队列的东西，队列不取就画不出来。
+   * 这一下是"真的回来了"，与队列的最小间隔无关（`drainNow` 立即取一拍）。
+   */
+  function onDetailWake() {
+    if (typeof P.current === 'function' && P.current() !== 'quest-detail') return;
+    if (typeof P.drainEvents === 'function') P.drainEvents().catch(function () { });
+    if (detail.number) loadDetail(detail.number, true);
+  }
+
+  /**
    * 事件队列的 `patch`：图片晚到 ⇒ 并进**它那条**回执的图集。
    *
    * <p>手机上各屏懒挂载：用户直接进「回执详情」时对话屏从没建过，`chatEventEntry` 认不出这条
@@ -1544,6 +1559,8 @@
     if (!detail.eventBound) {
       detail.eventBound = true;
       if (typeof P.onEvent === 'function') P.onEvent(onQueueEvent);
+      // 回前台/解冻：立刻补一拍队列 + 补一次 /api/quest（见 onDetailWake 的注释）
+      if (typeof P.onWake === 'function') P.onWake(onDetailWake);
     }
     if (typeof P.setQuestEventTarget === 'function') {
       P.setQuestEventTarget(function (number) {

@@ -348,7 +348,7 @@ public final class WebUiTest {
                 "面板底部不再渲染回执卡（对话仍按出站消息分条渲染）");
         check(script.body().contains("function chatAppendImages")
                         && script.body().substring(script.body().indexOf("async function pollCapture"),
-                                script.body().indexOf("async function runCommands")).length() > 0,
+                                script.body().indexOf("async function runCommands")).contains("chatAppendImages("),
                 "对话里一次发送的多张图合成一条图集（连续图片组攒起来交给 chatAppendImages，含文字的组仍各自成条）");
         check(script.body().contains("chatImageRun: null")
                         && countOf(script.body(), "state.chatImageRun = null") >= 2
@@ -362,9 +362,12 @@ public final class WebUiTest {
         // （/api/events 取件 → 渲染 → ack）。服务端历史（/api/chat/log）那条读路径**必须不存在** ——
         // 历史条目只有 role/text/images、没有幂等 id，队列再送一次同内容的事件时按 id 去重必然不命中，
         // 同一段对话就会被画两遍（用户报的「控制台对话还是有大量重复」）。客户端也不再推存档。
-        check(countOf(script.body(), "['\"]/api/chat/log") == 0 && countOf(script.body(), "['\"]/api/chat/log/save") == 0
-                        && countOf(script.body(), "chatArchiveMerge(") == 0,
-                "对话不再读/写服务端正文存档（/api/chat/log 与 /api/chat/log/save 一个都不调）");
+        // 注意：`countOf` 是**字面量子串**计数，所以这里写的是带引号的那个字面量 `'/api/chat/log'`
+        // （写正则形的 `['"]/api/chat/log` 会永远数到 0，等于没有断言 —— 那条路是"读历史"的回归闸门）。
+        check(countOf(script.body(), "'/api/chat/log'") == 0 && countOf(script.body(), "'/api/chat/log/save'") == 0
+                        && countOf(script.body(), "chatArchiveMerge(") == 0
+                        && script.body().contains("'/api/events'") && script.body().contains("'/api/events/ack'"),
+                "对话不再读/写服务端正文存档（/api/chat/log 与 /api/chat/log/save 一个都不调），只走 /api/events + ack");
         check(script.body().contains("const PAGE = window.PIXIKO_PAGE || 'gen';")
                         && !script.body().contains("PAGE === 'chat'")
                         && countOf(script.body(), "await loadChatFromQueue()") == 1

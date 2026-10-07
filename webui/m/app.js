@@ -2227,8 +2227,11 @@
    *
    * 以前是三四个源各来一次（`/api/chat/log` 轮询 + `/api/capture` 跟单 + `/api/quests` 补拉），
    * 前端必须自己"缝"；缝错就是「回执重复 / 图片重复 / 回执时不时少一条」。现在只有这一条路。
+   *
+   * <p>节拍定 **1000ms**（原来是 2000ms）：被冻过之后"那一拍"的到期时刻是不确定的，恢复后最坏
+   * 要等一整个节拍才把图补上；1000ms 把这一档的上界压到 1 秒内（唤醒时另有立即补拍，见 onWake）。
    */
-  var EVENT_DRAIN_MS = 2000;
+  var EVENT_DRAIN_MS = 1000;
 
   /** 当前 scope 的 `lastSeq` 键（每设备一份，localStorage）。 */
   function eventsCursorKey() { return 'pixiko-events-last-seq:' + PixikoM.scope(); }
