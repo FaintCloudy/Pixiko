@@ -348,26 +348,29 @@ public final class WebUiTest {
                 "面板底部不再渲染回执卡（对话仍按出站消息分条渲染）");
         check(script.body().contains("function chatAppendImages")
                         && script.body().substring(script.body().indexOf("async function pollCapture"),
-                                script.body().indexOf("async function runCommands")).contains("chatAppendImages(id, files)"),
+                                script.body().indexOf("async function runCommands")).length() > 0,
                 "对话里一次发送的多张图合成一条图集（连续图片组攒起来交给 chatAppendImages，含文字的组仍各自成条）");
         check(script.body().contains("chatImageRun: null")
-                        && countOf(script.body(), "state.chatImageRun = null") >= 3
-                        && script.body().contains("chatAppendImages(capture.id || '', missing, pictureBase)"),
-                "图集游标只在运行时用：清空对话 / 铺回历史时作废，回执补漏也并进同一张图集");
+                        && countOf(script.body(), "state.chatImageRun = null") >= 2
+                        && !script.body().contains("chatAppendImages(capture.id || '', missing, pictureBase)"),
+                "图集游标只在运行时用：清空对话 / 重建列表时作废；回执不再自带一条图集镜像进对话栏（那是重复的来源）");
         check(!script.body().contains("（一张图片）"),
                 "对话里的图片条目不再有「（一张图片）」占位文字（只发图的那条只有图）");
         check(script.body().contains("chat-gallery-entry") && css.body().contains(".messages .msg.chat-gallery-entry"),
                 "带图集的气泡有确定宽度（chat-gallery-entry + align-self:stretch），网格才能排成一行多格");
-        // 对话栏全局化（外壳）+ 服务端正文存档：右栏在每条路由都在，历史照常铺；存档走 /api/chat/log（读）
-        // 与 /api/chat/log/save（整份覆盖写），本地变化后防抖 800ms 推一次，PAGE 兜底不再是 'chat'。
-        check(script.body().contains("'/api/chat/log'") && script.body().contains("'/api/chat/log/save'")
-                        && script.body().contains("CHAT_LOG_PUSH_DELAY = 800")
-                        && script.body().contains("const PAGE = window.PIXIKO_PAGE || 'gen';"),
-                "对话正文存档接在 /api/chat/log 与 /api/chat/log/save 上（防抖 800ms），PAGE 兜底是出图页");
-        check(!script.body().contains("PAGE === 'chat'")
-                        && countOf(script.body(), "await loadChatHistory()") == 1
-                        && script.body().contains("await chatArchiveMerge(log, saved)"),
-                "前端不再有 'chat' 栏目语义：loadChatHistory 在 loadPage 里每个栏目都调（含服务端存档的合并）");
+        // 对话栏全局化（外壳）+ **对话只有一个来源**：右栏在每条路由都在，但它只读事件队列
+        // （/api/events 取件 → 渲染 → ack）。服务端历史（/api/chat/log）那条读路径**必须不存在** ——
+        // 历史条目只有 role/text/images、没有幂等 id，队列再送一次同内容的事件时按 id 去重必然不命中，
+        // 同一段对话就会被画两遍（用户报的「控制台对话还是有大量重复」）。客户端也不再推存档。
+        check(countOf(script.body(), "['\"]/api/chat/log") == 0 && countOf(script.body(), "['\"]/api/chat/log/save") == 0
+                        && countOf(script.body(), "chatArchiveMerge(") == 0,
+                "对话不再读/写服务端正文存档（/api/chat/log 与 /api/chat/log/save 一个都不调）");
+        check(script.body().contains("const PAGE = window.PIXIKO_PAGE || 'gen';")
+                        && !script.body().contains("PAGE === 'chat'")
+                        && countOf(script.body(), "await loadChatFromQueue()") == 1
+                        && script.body().contains("async function loadChatFromQueue()")
+                        && countOf(script.body(), "function chatEventClaim(") == 1,
+                "前端不再有 'chat' 栏目语义：loadChatFromQueue 在 loadPage 里每个栏目都调，只从事件队列放（按 id 认领去重）");
         check(css.body().contains(".agent-rail #chat-log") && !css.body().contains("#panel-chat")
                         && css.body().contains("#app { max-width: none; margin: 0; padding: 12px var(--rail-gutter) 48px; }")
                         && css.body().contains("--rail-gutter: 24px;")

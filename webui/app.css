@@ -221,6 +221,14 @@ code { background: rgba(120, 160, 220, .14); padding: 1px 5px; border-radius: 6p
 @keyframes fade-in { from { opacity: 0; } to { opacity: 1; } }
 
 .messages { display: flex; flex-direction: column; gap: 10px; min-height: 40vh; }
+/* 事件队列把太旧的已 ack 前缀裁掉时的提示（**不是**一条对话气泡，`.msg` 都不带，
+   免得被"气泡数 == 队列 message 事件数"这类对账把它算进去）。只在取件回包的 `trimmedUpTo` > 0
+   且本地游标还在它下面时挂一条（见 app.js 的 chatTrimNotice）。 */
+.chat-trim-notice { align-self: center; color: var(--muted); font-size: 12px; text-align: center;
+  padding: 4px 10px; opacity: .85; }
+/* 发消息到服务端回来的这段时间的状态提示：**不放进 #chat-log**（它不是一条对话），
+   挂在输入框上方，免得和队列渲染出来的那两条打架。 */
+.chat-typing { color: var(--muted); font-size: 12px; padding: 2px 4px 6px; animation: fade-in .2s var(--ease) both; }
 .msg { max-width: 88%; padding: 10px 13px; border-radius: 15px; white-space: pre-wrap; word-break: break-word;
   animation: bubble-in .3s var(--ease) both; }
 .msg.user { align-self: flex-end; background: linear-gradient(135deg, var(--accent), #3f7fe0); color: #04101f; border-bottom-right-radius: 5px; box-shadow: 0 8px 20px rgba(90, 162, 255, .2); }

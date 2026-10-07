@@ -2137,6 +2137,12 @@
    * 只追加新到的内容，不清空重建，否则整块会一直闪。state.receipt 记住当前回执 id 与已渲染条数。
    */
   function renderCapture(capture) {
+    // **回执栏的绘制已整体搬到事件队列那一段**（见 `receiptRail*` 函数群）：正文、图片、
+    // "还在跑吗"全从同一条队列来。这里若还照旧往 `*-receipts` 里写，就会和那条路抢同一个 DOM
+    // （同一 tick 两条路各 append 一次 = 重复卡片 / 图并进"最后那条图集"）。
+    // **所有调用点统一走 rail**：`runCommands` 用 {@link receiptRailFollow} 写"跟哪条 + 表头"，
+    // 正文与图片由事件队列归位。函数名与入参形状保留，只是不再由它画回执栏。
+    if (capture) { receiptRailFollow(capture); return; }
     const key = String(capture.id || capture.command || '');
     const texts = capture.texts || [], images = capture.images || [];
     // 图片卡的标题（面板回执栏与对话页共用同一句）。
@@ -2215,17 +2221,250 @@
         toast(texts[texts.length - 1].split('\n')[0]);
       }
     }
-    // 图片还必须落进 #chat-log（右栏）：对话栏现在是外壳的一部分，**每条路由的页面都带着它**，
-    // 所以这里不再判栏目，只看右栏在不在。当前页面轮询到的回执**都镜像进对话栏** ——
-    // /gen 点开始生成、/loras 搜 LoRA 都会在右栏出现一条，右栏因此是「与机器人的对话」完整的一条线。
-    // 面板自己的回执栏（上面的循环）与右栏是两个区域，同一条回执在两边各出现一次是**有意**的，不算重复；
-    // 右栏内部按**图片路径**去重（共用模块 `Sync.unpaintedImages`），同一张图在对话栏里绝不会画两遍。
-    if (images.length && $('chat-log')) {
-      const files = images.map((image) => (image && image.file ? String(image.file) : '')).filter(Boolean);
-      const missing = Sync.unpaintedImages(chatSnapshot.entries, files);
-      // 同一回执里后到的图并进**同一张图集**（那条条目还在就并进去），不再叠一条新气泡。
-      if (missing.length) chatAppendImages(capture.id || '', missing, pictureBase);
+    // **不再把图片镜像进 #chat-log**：以前这里按"当前页面轮询到的回执照样画一条图集"，
+    // 而同一张图服务端**也已经入队**（`message` 的 images 或晚到的 `patch`，带稳定 id）——
+    // 两条路各画一次，图就在对话里出现两遍（用户报的「图片回执重复」）。对话栏的正文与图片
+    // 一律只从事件队列进（见 {@link renderChatEvent}）。面板自己的回执栏（上面的循环）与右栏
+    // 是两个区域，不归这条管。
+  }
+
+  // ---------------------------------------------------------------- 回执栏（出图页右栏下方）
+  //
+  // 用户报的「回执不更新生成的图片的状态」：生成页的 `#gen-receipts` 会先冒一张
+  // `receipt pending`＋「执行中…」的占位卡，而这条卡以前靠 `/api/capture` 轮询往里补内容 ——
+  // 那条轮询已经停用（正文与图片的唯一来源是事件队列），于是卡**永远卡在那里**。
+  //
+  // 现在回执栏挂到**同一条事件队列**上：`message` 按 `quest` 归位（正文 + 命令头）、
+  // `patch` 按 `target = quest:<号>:<序号>` 就地补图（张数/缩略图/占位随之更新）；
+  // 有没有跑完看**服务端状态**（`/api/progress` 的 `running` / 队列文字里的「运行中」），
+  // 不再有第二个数据源，也不再有多源合并。
+
+  // ---------------------------------------------------------------- 回执栏（七个 *-receipts 容器）
+  //
+  // 用户报的「回执不更新生成的图片的状态」：回执栏会先冒一张 `receipt pending`＋「执行中…」的占位卡，
+  // 而这张卡以前靠 `/api/capture` 轮询往里补内容 —— 那条轮询随"对话只吃事件队列"一起停用了
+  // （正文与图片的唯一来源是事件队列），于是卡**永远卡在那里**，图到了也不更新。
+  //
+  // 现在每个回执栏都挂到**同一条事件队列**上，且**只有一份通用实现**（不是每个容器一份特例）：
+  //   · `message`（带 `quest`）→ 按任务号归位正文；
+  //   · `patch`（`target = quest:<号>:<序号>`）→ **按到达顺序**就地补图（张数随之上来）；
+  //   · "还在跑吗"看**服务端状态**（`/api/progress.running` / 队列文字里的「运行中」/ `/api/tasks`），
+  //     不再有第二个数据源，也不再有多源合并。
+  //
+  // 每个容器跟"自己那条任务"：`state.receiptRail.quest[容器 id]`，由 {@link runCommands}
+  // （有任务号的写操作）写入 —— 它是**纯 state**，不从 DOM 反推（从 DOM 读就永远读不到：
+  // 建卡才知道号、知道号才建卡，那是死循环）。
+
+  /** 回执栏的通用状态：`quest[容器 id] = 任务号`、`command` 表头、`gallery` 图集游标。 */
+  const receiptRail = { quest: Object.create(null), command: Object.create(null), gallery: Object.create(null) };
+
+  /** 按任务号归位的正文与图片：`Map<号, {number, texts, images}>`。 */
+  const receiptQuests = new Map();
+
+  /** 取（必要时新建）某个任务号的归位记录。 */
+  function receiptQuestOf(number) {
+    const key = String(Number(number) || 0);
+    if (!receiptQuests.has(key)) receiptQuests.set(key, { number: Number(number) || 0, texts: [], images: [] });
+    return receiptQuests.get(key);
+  }
+
+  /** 清空回执栏（重建对话栏 / 清空对话时调）：归位记录、图集游标、"跟哪条"一起作废。 */
+  function receiptRailReset() {
+    receiptQuests.clear();
+    receiptRail.quest = Object.create(null);
+    receiptRail.command = Object.create(null);
+    receiptRail.gallery = Object.create(null);
+    for (const id of RECEIPT_BOXES) {
+      const box = $(id);
+      if (box) box.innerHTML = '';
     }
+  }
+
+  /**
+   * 让**当前打开的那些回执栏**跟一条任务（`/api/command` 与 `/api/chat` 那条路都走它）。
+   *
+   * <p>为什么号要放在 state 而不是从 DOM 读：卡片上的 `data-receipt-quest` 是**本函数这一路**
+   * 写上去的 —— 从 DOM 反推"当前跟哪条"就是"建卡才知道号、知道号才建卡"的死循环（实测卡死：
+   * 一个节点都不建）。号来自服务端响应（`capture.quest`），这才是权威。
+   *
+   * @param {object} capture `{quest, command, id}`（`quest` 就是任务号）
+   */
+  function receiptRailFollow(capture) {
+    const number = Number(capture && (capture.quest || /^quest:(\d+)/.exec(String(capture.id || ''))?.[1])) || 0;
+    if (!number) return;
+    const command = String((capture && capture.command) || '');
+    for (const id of RECEIPT_BOXES) {
+      const box = $(id);
+      if (!box) continue;
+      const panel = box.closest ? box.closest('.panel') : null;
+      if (!panel || !panel.classList.contains('active')) continue;    // 只跟当前这一栏的（别的栏没有它就跳过）
+      if (Number(receiptRail.quest[id]) !== number) {
+        receiptRail.quest[id] = number;
+        receiptRail.gallery[id] = null;
+      }
+      if (command) receiptRail.command[id] = command;
+    }
+    receiptRailSync(true);                       // 受理当场：卡片 + 「执行中…」（完成由服务端状态决定）
+  }
+
+  /**
+   * 服务端**现在**还有没有在跑（完成判据的"未完成"那一半），权威度从高到低：
+   *   · `/api/progress.running`（SD 正在采样）；
+   *   · `/api/tasks` 里任何一条的 `running`（队列里还有活）；
+   *   · `/api/status` 队列文字里的「运行中」——**只在上面两份都还没到手时**才当依据
+   *     （它是随 `/api/status` 30 秒一拍来的，可能停在旧值上；两份拿到了就以它们为准）。
+   * 再加上"我们还在等某一条回执"（`state.busy` / `state.wantsCaptureState`）。
+   * **`patch` 到齐不算完成**：服务端说没在跑才算（`patch` 只说明"图到了"）。
+   */
+  function receiptBusy() {
+    if (Number(state.busy) > 0 || state.wantsCaptureState) return true;
+    if (state.progress && state.progress.running) return true;
+    if (Array.isArray(state.tasks)) { if (state.tasks.some((task) => task && task.running)) return true; }
+    // 两份权威接口都拿到过就到此为止（不再看 `/api/status` 的队列文字：那是 30 秒一拍的旧值，
+    // 服务端刚收工它还会写着「运行中」，照它判就会把「执行中…」多留半分钟）。
+    if (state.tasksSeen || state.progressSeen) return false;
+    const queueText = String((state.status && state.status.generation && state.status.generation.status) || '');
+    return /运行中/.test(queueText);
+  }
+
+  /**
+   * 事件队列：一条 `message`（带 `quest`）→ 回执栏里那条任务的正文。
+   * @param {object} item 原始事件（`quest` / `index` 都在它上面）
+   */
+  function receiptRailMessage(item) {
+    const number = Number((item && item.quest) || 0);
+    if (!number) return;
+    const text = String((item && item.text) || '');
+    const record = receiptQuestOf(number);
+    if (text && record.texts.indexOf(text) < 0) record.texts.push(text);
+    for (const file of ((item && item.images) || []).map(chatImageFile).filter(Boolean)) {
+      if (record.images.indexOf(file) < 0) record.images.push(file);
+    }
+    // 任务号第一次见到：从下方冒一条带跳转的信息云（和以前"新回执提示一次"同一个观感，
+    // 只是判据换成"这件事件第一次到" —— 队列重放同一条不会重复提示）。
+    if (!record.toasted) {
+      record.toasted = true;
+      if (text) questCloud('任务 #' + number + '：' + text.split('\n')[0], number);
+    }
+    receiptRailSync(receiptBusy());
+  }
+
+  /** 事件队列：一条 `patch`（`target = quest:<号>:<序号>`）→ 回执栏里那条任务的图（按到达顺序 append）。 */
+  function receiptRailPatch(action) {
+    const match = /^quest:(\d+):/.exec(String((action && action.target) || ''));
+    if (!match) return;
+    const record = receiptQuestOf(Number(match[1]));
+    for (const file of Sync.dedupeImages(action.images || [])) {
+      if (record.images.indexOf(file) < 0) record.images.push(file);
+    }
+    receiptRailSync(receiptBusy());
+  }
+
+  /**
+   * 把**每个**回执栏同步成"它自己那条任务"的样子。
+   *
+   * @param {boolean} pending 还要不要保留那张「执行中…」占位卡（判定见 {@link receiptBusy}）
+   */
+  function receiptRailSync(pending) {
+    for (const id of RECEIPT_BOXES) {
+      const box = $(id);
+      if (!box) continue;
+      const number = Number(receiptRail.quest[id]) || 0;
+      const record = number && receiptQuests.get(String(number));
+      if (!record) {
+        // 还没跟任何任务：清掉旧卡与占位（不是把别的东西抹掉 —— 这里只有本函数写的卡）。
+        if (box.children.length) box.innerHTML = '';
+        if (pending) receiptSpinner(box, true);
+        continue;
+      }
+      receiptRailCard(box, id, record);
+      receiptSpinner(box, pending);
+    }
+  }
+
+  /** 「执行中…」占位卡：`on` 为真时确保它在（并永远排在最后），否则摘掉。 */
+  function receiptSpinner(box, on) {
+    let card = box.querySelector('.receipt.pending');
+    if (!on) { if (card) card.remove(); return; }
+    if (!card) {
+      card = el('div', 'receipt pending');
+      card.appendChild(el('span', 'spin'));
+      card.appendChild(document.createTextNode(' 执行中…'));
+    }
+    box.appendChild(card);                       // 排到最后（图与正文都在它上面）
+  }
+
+  /**
+   * 一条任务的回执卡：**就地更新**（正文一行行加、图一格一格加，"先文字后图"不闪）。
+   * 图集用 `createGallery`（和其它出图位置同一套节点与查看器），`receiptRail.gallery[容器]`
+   * 记住那个 gallery 对象，后到的图调 `gallery.add(file)` 继续往同一张卡的同一个网格里加。
+   */
+  function receiptRailCard(box, boxId, record) {
+    let card = box.querySelector('[data-receipt-quest="' + record.number + '"]');
+    if (!card) {
+      // 换了一条任务（或者这张卡还没建）：只换**本函数自己那张卡**，不整块清（占位卡由 receiptSpinner 管）。
+      const stale = box.querySelector('[data-receipt-quest]');
+      if (stale) stale.remove();
+      receiptRail.gallery[boxId] = null;
+      card = el('div', 'receipt ok image-receipt');
+      card.setAttribute('data-receipt-quest', String(record.number));
+      card.setAttribute('data-receipt-signature', '');
+      card.appendChild(el('div', 'head', '任务 #' + record.number));
+      const lines = el('div', 'receipt-lines');
+      lines.setAttribute('data-receipt-lines', '1');
+      card.appendChild(lines);
+      const images = el('div', 'receipt-images');
+      images.setAttribute('data-receipt-images', '1');
+      card.appendChild(images);
+      box.appendChild(card);
+    }
+    const head = card.querySelector('.head');
+    const lines = card.querySelector('[data-receipt-lines]');
+    const images = card.querySelector('[data-receipt-images]');
+    const files = record.images.slice();
+    // 签名 = 正文条数 + 图片路径：一样就一个字都不动（事件重放时不会闪、不会重下图片）。
+    const signature = record.texts.length + '|' + files.join('\u0000');
+    if (signature === card.getAttribute('data-receipt-signature')) return;
+    card.setAttribute('data-receipt-signature', signature);
+    const command = String(receiptRail.command[boxId] || '');
+    if (head) head.textContent = '任务 #' + record.number + (command ? ' · ' + command : '') + ' · 图 ' + files.length + ' 张';
+    if (lines) {
+      record.texts.forEach((text, index) => {
+        let node = lines.children[index];
+        if (!node) { node = el('div', 'receipt-line'); lines.appendChild(node); }
+        if (node.textContent !== text) node.textContent = text;
+      });
+      while (lines.children.length > record.texts.length) lines.lastChild.remove();
+      lines.hidden = !record.texts.length && !!files.length;
+    }
+    if (!images) return;
+    images.hidden = !files.length;
+    if (!files.length) {
+      images.innerHTML = '';
+      receiptRail.gallery[boxId] = null;
+      return;
+    }
+    if (files.length === 1) {
+      const reuse = images.querySelector('a.image-link');
+      if (reuse && reuse.href === imageUrl(files[0])) return;    // 这一张已经画好了：不动
+      images.innerHTML = '';
+      receiptRail.gallery[boxId] = null;
+      images.appendChild(imageNode(imageUrl(files[0], THUMB_LARGE), shortName(files[0]), 'receipt-image', null, 0,
+        { eager: true, full: imageUrl(files[0]) }));
+      return;
+    }
+    // 2 张以上：同一个 gallery 一张张往里加（`gallery.add` 自己会更新表头「共 N 张」）。
+    if (!receiptRail.gallery[boxId] || receiptRail.gallery[boxId].card.parentNode !== images) {
+      images.innerHTML = '';
+      receiptRail.gallery[boxId] = createGallery({ base: '任务 #' + record.number + ' 的图',
+        cardClass: 'receipt ok image-receipt gallery-receipt', gridClass: 'gallery-grid', firstFile: files[0] });
+      images.appendChild(receiptRail.gallery[boxId].card);
+      receiptRail.gallery[boxId].__files = 1;
+    }
+    const gallery = receiptRail.gallery[boxId];
+    const have = Number(gallery.__files) || 0;
+    for (let index = have; index < files.length; index++) gallery.add(files[index]);
+    gallery.__files = files.length;
   }
 
   /**
@@ -2410,7 +2649,7 @@
     });
     if (!texts.length && !images.length) return;
     // 没有文字但有图：文字给空串（只发图的那条不该多出「一张图片」这种占位文字）。
-    appendMessage('bot', texts.join('\n') || '', images);
+    appendLocalNote('bot', texts.join('\n') || '');
   }
 
   /**
@@ -2517,36 +2756,39 @@
 
 
   /**
-   * 一条回执的**当前状态**（`/api/capture`，只读、不进队列）。
+   * 「出图完成」的信息云：以前靠 `/api/capture` 的 `images` 计数推，现在**图片张数从事件队列来**
+   * （`receiptRail` 那条路），这里只负责"服务端说没在跑了"时冒一条 done 云。
    *
-   * <p>它现在只服务两件事：信息云（「任务 #N 出图完成」）与"这条还在跑吗"的即时判断。
-   * **正文与图片一律不再从这里进对话** —— 那是事件队列（`/api/events`）的唯一职责
-   * （用户定的新契约：不要把同一个信息从多个源各画一次）。
+   * <p>也就是说：这条路径**一个 `/api/capture` 都不打**了（用户定的口径：不要再有第二个数据源）。
+   *
+   * @param {string} id 跟单 id（信息云去重按它）
+   * @param {number} quest 任务号（省略时取"当前回执栏跟的那条"）
    */
-  async function refreshCaptureState(id, quest) {
-    if (!id) return null;
-    try {
-      const capture = await api('/api/capture', { body: { id } });
-      const imageCount = (capture.images || []).length;
-      const seenImages = questCloudSeen.get(id) || 0;
-      if (capture.quest && imageCount > seenImages) {
-        questCloudSeen.set(id, imageCount);
-        if (seenImages > 0 || imageCount > 0) {
-          questCloud('任务 #' + capture.quest + ' 出图完成：' + imageCount + ' 张', capture.quest, { done: true });
-        }
-      }
-      state.activeCaptureId = String(id);
-      state.lastCapturePollAt = Date.now();
-      return capture;
-    } catch (error) {
-      if (String(error.message) !== 'unauthorized') toast('读取回执失败：' + error.message);
-      return null;
+  function captureDoneCloud(id, quest) {
+    if (!id) return;
+    const number = Number(quest) || receiptRailQuest() || 0;
+    if (!number) return;
+    const record = receiptQuests.get(String(number));
+    const imageCount = record ? record.images.length : 0;
+    const seenImages = questCloudSeen.get(id) || 0;
+    if (imageCount <= seenImages) return;
+    questCloudSeen.set(id, imageCount);
+    questCloud('任务 #' + number + ' 出图完成：' + imageCount + ' 张', number, { done: true });
+  }
+
+  /** 当前回执栏跟的任务号（七个容器里第一个有号的；没有就 0）。 */
+  function receiptRailQuest() {
+    for (const key of Object.keys(receiptRail.quest)) {
+      const number = Number(receiptRail.quest[key]) || 0;
+      if (number) return number;
     }
+    return 0;
   }
 
   /**
-   * 跟单——**现在不轮询**：只记下"当前这条回执"（信息云与回前台补一次即时状态用它）。
+   * 跟单——**现在不轮询**：只记下"当前这条回执"（信息云与"还在跑吗"用它）。
    * 正文与图片的到达完全交给事件队列；这个函数保留名字是为了不动调用点。
+   * **不再调 `/api/capture`**（那是被停用的第二数据源）。
    */
   async function pollCapture(id, attempt = 0, follow = false) {
     const key = String(id || '');
@@ -2554,8 +2796,9 @@
     if (follow) state.activeCaptureFollow = true;
     state.activeCaptureId = key;
     state.lastCapturePollAt = Date.now();
+    state.wantsCaptureState = true;              // 还在等这条：回执栏的「执行中…」按它保留
     if (follow) state.followUntil = Date.now() + 20 * 60 * 1000;
-    return refreshCaptureState(key, 0);
+    return null;
   }
 
   /**
@@ -2589,9 +2832,10 @@
     state.followUntil = Date.now() + 20 * 60 * 1000;
     window.__captureResumeAt = Date.now();      // 探针用：确认"回前台确实补拉过"
     window.__captureResumeSource = String(source || '');
-    // 从后台回来时**不受尝试次数/静默上限限制**：链条可能早就断了（follow=false 的指令、或
-    // 浏览器把定时器节流到分钟级），必须重新把它接上，不能只补一轮就让它再次断掉。
-    pollCapture(id, 0, state.activeCaptureFollow || !!state.status?.generation?.status).catch(() => {});
+    // 回前台/重新可见：**立刻补一拍事件队列**（图片晚到的 patch、回执正文都在队列里），
+    // 顺便按服务端状态收口回执栏。**不再打 `/api/capture`**（那是被停用的第二数据源）。
+    drainChatEvents().catch(() => {});
+    receiptRailSync(receiptBusy());
     return { id, source };
   }
 
@@ -2634,11 +2878,19 @@
     try {
       state.busy++;
       const capture = await api('/api/command', { body: { command: list.join('\n'), scope: scope() } });
-      renderCapture({ texts: [], images: [], command: list.join(' ; '), busy: true });
+      // 回执栏跟这条任务：**号来自服务端响应**（`capture.quest`），当场立卡 + 「执行中…」；
+      // 正文与图片随后由**事件队列**归位进这张卡（见 receiptRailMessage / receiptRailPatch）。
+      renderCapture({ texts: [], images: [], command: list.join(' ; '), quest: capture.quest, busy: true });
       // 任务一受理就从下方冒一条信息云，带跳去 /quest/#N 的链接（一个回执 = 一次任务，可多步）。
       if (capture.quest) questCloud('任务 #' + capture.quest + ' 已下达：' + list.join(' ; '), capture.quest);
       // 出图/领取这类要等的指令：顺便开始轮询 SD 的生成进度。
-      if (follow) { state.followUntil = Date.now() + 20 * 60 * 1000; startProgressPolling(); }
+      // 出图/领取这类指令：顺便开始轮询 SD 的生成进度 + 任务队列（回执栏的"还在跑吗"也吃它）。
+      // 判据从 `follow` 扩到"命令里有 gen/get/rg"：终端里直接敲 `.gen` 时 `follow=false`，
+      // 以前那样就永远不起表、进度与回执栏状态都不动。
+      if (follow || /\b(gen|get|rg)\b/i.test(list.join(' '))) {
+        state.followUntil = Date.now() + 20 * 60 * 1000;
+        startProgressPolling();
+      }
       // 下达任务后自动刷新任务队列（不用再手点「刷新队列」）。
       if (/\b(gen|get|rg)\b/i.test(list.join(' '))) loadTasks().catch(() => {});
       await pollCapture(capture.id, 0, follow);
@@ -2655,36 +2907,14 @@
 
   // ---------------------------------------------------------------- 对话
 
-  /** 对话页渲染结果快照的存储键、上限与写盘节流。 */
-  const CHAT_LOG_PREFIX = 'pixiko-chat-log:';       // 按会话 scope 各存一份（和 pixiko-chat-scroll: 一个路子）
-  const CHAT_LOG_LIMIT = 200;                       // 条目只留最近 200 条
-  const CHAT_LOG_BYTES = 512 * 1024;                // 序列化超过约 512KB 就从最旧的开始丢
-  const CHAT_LOG_THROTTLE = 400;                    // 写盘节流：最多每 400ms 一次
+  /** 对话条目表的内存上限（和 `ChatLogStore.ENTRIES_CAP` 同值）：只用来挡住无界增长。 */
+  const CHAT_LOG_LIMIT = 200;
 
   /**
-   * 对话页的渲染结果快照：`{scope, entries, server, timer, dirty}`。
-   *
-   * <p>存的是**结构化条目**（`{role,text}` 或 `{role:'bot',text,images:[file]}`），不是整段 HTML ——
-   * 体积小，也不会把存下来的标签当代码跑。切栏目是真的一次页面加载（每个栏目一份 HTML），
-   * DOM 一没就只剩这份快照可用：服务端历史（`/api/chat/history`）里只有对话文字，
-   * 指令回执的文字与图片都不在里面，光按它渲染就是「切一下回来回执和图片全消失」的原因。
-   *
-   * <p>`server` 是「上次铺完时服务端历史有多少条」，重新加载时用它算出只该补哪一段。
-   */
-  const chatSnapshot = { scope: '', entries: [], server: 0, timer: null, dirty: false };
-
-  /** 快照的存储键（按会话 scope）。 */
-  function chatLogKey(scopeName) { return CHAT_LOG_PREFIX + (scopeName || 'default'); }
-
-  /** 当前该写哪个 scope 的键：以铺回时记下的为准，没记过就用当前会话 scope（loadChatHistory 没跑到也不会写错地方）。 */
-  function chatScopeName() { return chatSnapshot.scope || scope() || 'default'; }
-
-  /** 把一条任意来源的条目洗成能存能渲染的形状；坏数据返回 null（不抛、也不渲染半条）。 */
-  /**
-   * 对话条目里的图片路径：存档里实测见过**两种**写法 —— `"data/generated/…"` 字符串
-   * （`/api/chat/log` 的 `images` 现在是这个），以及对象 `{file:"…"}` / `{path:"…"}`
-   * （`/api/images` 与 `/api/capture` 的图片段用的是对象）。以前只认**字符串数组**，
-   * 于是对象形态会被整条过滤掉 —— 对话里就"有图但画不出来"。这里统一收敛成字符串。
+   * 对话条目里的图片路径：两种写法都认 —— `"data/generated/…"` 字符串，以及对象
+   * `{file:"…"}` / `{path:"…"}`（`/api/images` 与事件队列的图片段用的是对象）。以前只认
+   * **字符串数组**，于是对象形态会被整条过滤掉 —— 对话里就"有图但画不出来"。
+   * 现在统一收敛成字符串。
    */
   function chatImageFile(item) {
     if (typeof item === 'string') return item.trim();
@@ -2692,6 +2922,7 @@
     return String(item.file || item.path || '').trim();
   }
 
+  /** 事件条目 → 对话条目；坏数据返回 null（不抛、也不渲染半条）。 */
   function chatEntryClean(raw) {
     if (!raw || typeof raw !== 'object') return null;
     const role = raw.role === 'user' || raw.role === 'sys' ? raw.role : 'bot';
@@ -2700,73 +2931,45 @@
       ? raw.images.map(chatImageFile).filter(Boolean).slice(0, 60) : [];
     if (!text && !images.length) return null;
     const cleaned = images.length ? { role, text, images } : { role, text };
-    // 服务端给了稳定身份就记下来：`__eventId` —— 历史与事件队列按**同一个 id** 去重，
-    // 于是「历史里已经有这条、队列又送一次」不会再画第二个气泡；
-    // `__eventSeq` —— 本地游标至少要抬到它（历史与队列是同一份信息的两条路，别把同一段再取一遍）。
+    // 服务端给了稳定身份就记下来：`__eventId` 是这条对话的**唯一身份**
+    // （`quest:<回执号>:<条内序号>` / `msg:<uuid>`）—— 渲染前按它去重，`patch` 也按它找回来。
     if (raw.id) cleaned.__eventId = String(raw.id);
     if (Number(raw.seq) > 0) cleaned.__eventSeq = Number(raw.seq);
     return cleaned;
   }
 
-  /** 体积保护：只留最近 200 条；序列化超过约 512KB 就从最旧的开始丢（至少留一条，别把一条超长消息也丢了）。 */
-  function chatSnapshotTrim(entries) {
-    let list = entries.slice(-CHAT_LOG_LIMIT);
-    while (list.length > 1 && JSON.stringify(list).length > CHAT_LOG_BYTES) list = list.slice(1);
-    return list;
-  }
+  /**
+   * 对话的**渲染结果表**（内存里的那一份，**不落盘、不回读**）。
+   *
+   * <p>为什么不再持久化：这份表是"已经画出来的条目"的镜像，唯一用途是**图片按路径去重**
+   * （{@link chatAppendImages} / {@link chatMergeImages} 的 `unpaintedImages`）与"这条还在不在表里"
+   * 的判断。**对话内容的来源只有事件队列一条**（见 {@link loadChatFromQueue}）：以前这里还写/读
+   * `sessionStorage`、再和服务端 `/api/chat/log` 整份正文按条数合并，同一段对话于是有三个来源 ——
+   * 历史条目只有 `role`/`text`/`images`、**没有** `id`/`seq`（服务端把幂等键记在旁挂的
+   * `web-chat-log-appended.json` 里，`/api/chat/log` 不返回它），队列再送一次同内容的事件时
+   * 按 id 去重**必然不命中** → 同一个气泡画两遍。这正是用户报的「控制台对话还是有大量重复」。
+   * 现在把历史那一路整个砍掉，重复从根上没有了。
+   */
+  const chatSnapshot = { scope: '', entries: [], server: 0, timer: null, dirty: false };
 
-  /** 读一份快照；坏 JSON / 没有会话存储（隐私模式）都当成「没有」——聊天照常，只是不记忆。 */
-  function chatSnapshotRead(scopeName) {
-    const saved = storeJson(chatLogKey(scopeName));
-    if (!saved) return { entries: [], server: 0, dropped: false };
-    const raw = (Array.isArray(saved.entries) ? saved.entries : []).map(chatEntryClean).filter(Boolean);
-    const entries = chatSnapshotTrim(raw);
-    return { entries, server: Math.max(0, Math.floor(Number(saved.server) || 0)), dropped: entries.length !== raw.length };
-  }
+  /** 当前条目标注的会话 scope：记过的以记下的为准，没记过就用当前会话 scope。 */
+  function chatScopeName() { return chatSnapshot.scope || scope() || 'default'; }
 
-  /** 落盘一次：写失败（超配额、存储被禁、坏存储）只警告，绝不影响聊天与其它面板。 */
-  function chatSnapshotWrite() {
+  /** 条目表的**内存**上限（和 `ChatLogStore.ENTRIES_CAP` 同值）：只用来挡住无界增长。 */
+  function chatSnapshotTrim(entries) { return entries.slice(-CHAT_LOG_LIMIT); }
+
+  /** 追加消息/图片后调它：条目表本来就在内存里，这里只做一次带上限的裁剪（不写盘、不发请求）。 */
+  function chatSnapshotSchedule() {
     chatSnapshot.scope = chatScopeName();
     chatSnapshot.entries = chatSnapshotTrim(chatSnapshot.entries);
-    try {
-      sessionStorage.setItem(chatLogKey(chatSnapshot.scope),
-        JSON.stringify({ entries: chatSnapshot.entries, server: chatSnapshot.server || 0 }));
-    } catch (error) {
-      console.warn('对话快照未保存（不影响聊天）：' + (error && error.message ? error.message : error));
-    }
   }
+
+  /** 页面隐藏 / 卸载时的收尾：现在没有本地存档也没有服务端存档要补推，**一个请求都不发**。 */
+  function chatSnapshotFlush() { return Promise.resolve(null); }
 
   /**
-   * 追加消息/图片后调它：节流最多每 400ms 写一次会话存储；页面隐藏或卸载时用 {@link chatSnapshotFlush} 补一次。
-   * 同时给服务端存档标一次脏（{@link chatArchiveSchedule}，防抖 800ms）。
-   */
-  function chatSnapshotSchedule() {
-    chatSnapshot.dirty = true;
-    chatArchiveSchedule();
-    if (chatSnapshot.timer) return;
-    chatSnapshot.timer = setTimeout(() => {
-      chatSnapshot.timer = null;
-      chatSnapshotWrite();
-      chatSnapshot.dirty = false;
-    }, CHAT_LOG_THROTTLE);
-  }
-
-  /** 把节流窗口里还没写完的那次立刻写掉（pagehide / 页面隐藏时调）；服务端存档也在同一次补掉。 */
-  function chatSnapshotFlush() {
-    if (chatSnapshot.timer) { clearTimeout(chatSnapshot.timer); chatSnapshot.timer = null; }
-    if (chatSnapshot.dirty) {
-      chatSnapshot.dirty = false;
-      chatSnapshotWrite();
-    }
-    return chatArchiveFlush();
-  }
-
-  /**
-   * 清空对话：DOM、内存快照、会话存储一起删（不然清空后又「复活」）。
-   *
-   * <p>服务端那份由「清空对话」按钮先 POST `/api/chat/reset` 清掉（顺序：**先 reset 再丢本地**），
-   * 这里顺手把**待推**的存档也丢掉（{@link chatArchiveDrop}）—— 清空之后**绝不回推空内容**，
-   * 否则刚清完的服务端那份又被本地的空列表写回去（虽然结果一样，但白写一次、还可能与新消息赛跑）。
+   * 清空对话：DOM 与内存里的条目表一起清（服务端那份由「清空对话」按钮先 POST `/api/chat/reset` 清，
+   * 事件队列那份由服务端自己清）。
    */
   function chatSnapshotClear() {
     if (chatSnapshot.timer) { clearTimeout(chatSnapshot.timer); chatSnapshot.timer = null; }
@@ -2774,153 +2977,22 @@
     chatSnapshot.entries = [];
     chatSnapshot.server = 0;
     chatSnapshot.dirty = false;
-    state.chatImageRun = null;         // 快照清了：图集游标指向的那条已经不存在（#chat-log 也空了）
-    chatArchiveDrop();
-    try { sessionStorage.removeItem(chatLogKey(chatSnapshot.scope)); }
-    catch (error) { console.warn('对话快照未删除（不影响聊天）：' + (error && error.message ? error.message : error)); }
+    state.chatImageRun = null;         // 图集游标作废（列表与 DOM 一起没了）
   }
 
-  // ---------------------------------------------------------------- 对话正文的服务端存档
+  // ---------------------------------------------------------------- 对话的增量：事件队列
   //
-  // 两份东西各管各的：
-  //   · 会话存储（sessionStorage，CHAT_LOG_PREFIX）—— 本地快照，打开页面**秒开**用；
-  //   · 服务端存档（/api/chat/log 读、/api/chat/log/save 写，整份覆盖）—— 换浏览器/清缓存也在，
-  //     打开页面时按条数合并（见 loadChatHistory 里的 chatArchiveMerge）。
-  // 本地每有变化就走 chatSnapshotSchedule() → 防抖 800ms 推一份**完整 entries**（不用增量），
-  // 页面隐藏/卸载时 chatSnapshotFlush() 再补一次。
+  // **对话栏只有这一条数据来源**：服务端把"会出现在屏幕上的信息"入队一次（`/api/events`，
+  // 每件带递增 `seq` 与稳定 `id`），前端取件 → 渲染 → ack，本地只持久化 `lastSeq`
+  // （`pixiko-events-last-seq:<scope>`，sessionStorage）。
   //
-  // 容错：老后端没有这两个接口（404/500）时**一次**失败就把 chatArchive.disabled 置上，
-  // 本次会话退化成「只用本地快照」（和 sessionStorage 不可用时一个路子）：不 toast、不抛异常、
-  // 绝不中断聊天，也不会每个变化都失败一次把控制台刷满。
+  // 以前这里还有第二条：服务端正文存档（`/api/chat/log` 读 + `/api/chat/log/save` 整份覆盖写，
+  // 防抖 800ms 推一次）与本地会话存储快照，打开页面时三份按条数/正文合并。**同一段对话多个来源
+  // 就必须"缝"，缝的依据只有正文 —— 而正文会天然重复**（用户真的发过两条一样的"生成五张"），
+  // 于是去重要么误合要么漏合。现在这条路整个停用：接口保留（服务端与别的端还在用），前端**不读也不写**。
 
-  /** 服务端存档的防抖时长：本地变化后最多 800ms 推一次（同一次变化只推一份）。 */
   /** 事件队列的取件间隔（唯一的一条增量路径：取件 → 渲染 → ack）。 */
   const EVENT_DRAIN_MS = 2000;
-  const CHAT_LOG_PUSH_DELAY = 800;
-  /** 存档状态：`timer` 防抖表、`dirty` 有内容待推、`disabled` 本次会话不再尝试（接口不可用）。 */
-  const chatArchive = { timer: null, dirty: false, disabled: false };
-  /**
-   * 事件队列的**历史对齐**用：每次 drain 前后用它比对条目身份，游标由 `Sync` 推进。
-   * 初始 null = 还没对齐过（第一次只记窗口，不补画）。
-   */
-  let chatArchiveSyncSeen = null;
-
-  /**
-   * 条目的**身份键**（共用模块 `Sync.entryId`）：服务端给了 `key`/`id` 就以它为准
-   * （服务端 append 的幂等键是 `quest:<回执号>:<条内序号>`），否则用
-   * `角色 + 正文锚点`（逐字相同或严格前缀 = 同一条）复现同一口径。
-   * 手机端算的是同一个键 —— 两端因此能对同一份服务端日志得出同一份条目集合。
-   */
-  function chatArchiveIdentity(list) {
-    const ids = Sync.entryIds(list);
-    const map = new Map();
-    list.forEach((entry, index) => map.set(entry, ids[index]));
-    return { ids, of: (entry) => map.get(entry) || '' };
-  }
-
-  /** 本地有变化 → 800ms 后推一份（防抖窗口里再变化只刷新时间，不叠加请求）。 */
-  function chatArchiveSchedule() {
-    if (chatArchive.disabled) return;
-    chatArchive.dirty = true;
-    if (chatArchive.timer) return;
-    chatArchive.timer = setTimeout(() => {
-      chatArchive.timer = null;
-      chatArchiveFlush();
-    }, CHAT_LOG_PUSH_DELAY);
-  }
-
-  /** 丢掉待推的那份（清空对话、采用服务端那一份之后用：服务端已经是对的，别回推）。 */
-  function chatArchiveDrop() {
-    if (chatArchive.timer) { clearTimeout(chatArchive.timer); chatArchive.timer = null; }
-    chatArchive.dirty = false;
-  }
-
-  /**
-   * 把待推的那份立刻推掉（pagehide / 页面隐藏时调）。没有待推的就什么都不发。
-   * @returns {Promise<object|null>} 推完了（或没得推）就 resolve，调用方不用等它
-   */
-  function chatArchiveFlush() {
-    if (chatArchive.timer) { clearTimeout(chatArchive.timer); chatArchive.timer = null; }
-    if (!chatArchive.dirty) return Promise.resolve(null);
-    chatArchive.dirty = false;
-    return chatArchiveSend();
-  }
-
-  /**
-   * 整份写服务端（`POST /api/chat/log/save {scope, entries}`）。
-   *
-   * <p><b>推之前先并一次服务端那一份（并集）</b>：服务端现在也是这份正文的写入者之一 ——
-   * 它产生回执消息时会自己 append 一条（幂等键 = 回执号 + 条内序号，几分钟内就会出现在
-   * {@code /api/chat/log} 里）。如果本地这份是"上一次读到之后"的快照，直接整份覆盖回去就会把
-   * 服务端刚 append 的那条**抹掉**（用户报的「回执时不时消失一条」正是这个形状）。
-   * 并集只往本地补服务端有、本地没有的条目，**绝不删本地任何一条**，所以既不丢服务端的新消息，
-   * 也不会把用户本地更全的内容裁掉。
-   *
-   * <p>服务端读不到（老后端 404/500、网络抖动）就退回老行为：照旧推本地这一份，
-   * 失败只记一次 console.warn 并关掉本次会话的存档，本地快照与聊天链路完全不受影响。
-   */
-  function chatArchiveSend() {
-    if (chatArchive.disabled) return Promise.resolve(null);
-    const entries = chatSnapshot.entries.slice();
-    if (!entries.length) return Promise.resolve(null);   // 空内容不推：清空交给 /api/chat/reset
-    return api('/api/chat/log', { body: { scope: scope() } }).then((payload) => {
-      // 服务端那一份先、本地独有的再接上：顺序仍然是"对话的先后"，只是不会漏掉服务端新 append 的条目。
-      const remote = [];
-      (Array.isArray(payload && payload.entries) ? payload.entries : []).forEach((raw) => {
-        const clean = chatEntryClean(raw);
-        if (clean) remote.push(clean);
-      });
-      const merged = remote.length ? Sync.unionEntries(remote, chatSnapshot.entries) : entries;
-      return api('/api/chat/log/save', { body: { scope: scope(), entries: merged } });
-    }).catch((error) => {
-      // 读那一步失败也不算灾难：退回"整份推本地"的老行为，能推就推。
-      return api('/api/chat/log/save', { body: { scope: scope(), entries } }).catch((failure) => {
-        chatArchive.disabled = true;
-        console.warn('对话存档不可用（本次会话只用本地快照，不影响聊天）：' + (failure && failure.message ? failure.message : failure));
-        return null;
-      });
-    });
-  }
-
-  /**
-   * 读服务端那份正文存档，并和本地快照按**条数**合并（规则冻结）：
-   *   服务端条数 > 本地条数 → 采用服务端那一份（重建 #chat-log 与快照；服务端已是权威，不回推）；
-   *   本地条数 > 服务端条数 → 保留本地这一份，立刻整份推给服务端（含图片与指令回执）；
-   *   条数相等            → 以本地为准，**不推**（省一次写）。
-   *
-   * <p>`chatSnapshot.server`（服务端 LLM 历史条数的基准）不归这里管，原样保留 —— 合并之后
-   * loadChatHistory 还会照旧用 /api/chat/history 补文字，两条线各算各的。
-   * 读不到（老后端 404/500）就静默关掉本次会话的存档，聊天照常、只用本地快照。
-   */
-  async function chatArchiveMerge(log, saved) {
-    if (chatArchive.disabled || !log) return;
-    let list;
-    try {
-      const payload = await api('/api/chat/log', { body: { scope: scope() } });
-      list = [];
-      (Array.isArray(payload.entries) ? payload.entries : []).forEach((raw) => {
-        const clean = chatEntryClean(raw);
-        if (clean) list.push(clean);
-      });
-    } catch (error) {
-      chatArchive.disabled = true;
-      console.warn('对话存档不可用（本次会话只用本地快照，不影响聊天）：' + (error && error.message ? error.message : error));
-      return;
-    }
-    if (Sync.pickSource(list, chatSnapshot.entries) === 'remote') {
-      // 采用服务端那一份：重建快照与 #chat-log；滚动位置照 chatScrollRestore 的老规矩恢复。
-      chatSnapshot.entries = chatSnapshotTrim(list);
-      state.chatImageRun = null;                 // 整块重建之前丢掉图集游标：旧节点马上就没了
-      log.innerHTML = '';
-      // 整批铺历史：只有**最后一条**（贴底、第一眼看见）用 eager，其余交给懒加载。
-      chatSnapshot.entries.forEach((entry, index, all) => chatEntryAppend(entry, index === all.length - 1));
-      chatSnapshotWrite();                       // 只重写本地这份；服务端已经是它，不用回推
-      chatArchiveDrop();
-      chatScrollRestore(log, saved);
-      return;
-    }
-    if (Sync.pickSource(list, chatSnapshot.entries) === 'local') chatArchiveSend();   // 本地更全：整份推给服务端
-  }
 
   /**
    * 对话栏的增量入口 —— **唯一的一条**：事件队列（`/api/events`，取件 → 渲染 → ack）。
@@ -2935,22 +3007,81 @@
    */
   function drainChatEvents() {
     if (!state.token || !$('chat-log')) return Promise.resolve(0);
-    ensureEventQueue();
-    return Sync.drainNow(state.eventQueue);
+    const queue = ensureEventQueue();
+    // 起表（`Sync.startDrain`）会照常排节拍；但**回到前台**那一路要把被停掉的表重新起起来。
+    Sync.startDrain(queue);
+    return Sync.drainNow(queue);
   }
 
-  /** 事件队列的取件 / 渲染 / ack 三件事（`PixikoSync.newDrain` 只负责节拍与游标）。 */
-  function ensureEventQueue() {
+  /** 调试/自动化用：立刻取一拍事件队列（与手机端 `PixikoM.drainEvents` 同一个口径）。 */
+  window.PixikoDrain = () => drainChatEvents();
+
+  /**
+   * 已渲染条目的**身份登记表**：`id → 条目`（`quest:<回执号>:<条内序号>` / `msg:<uuid>`）。
+   *
+   * <p>这是对话**唯一的去重口径**（不再有任何"正文相同就算同一条"的启发式 —— 用户真的会发两条
+   * 一样的"生成五张"，历史里实测有 6 组同正文）。同一件事件无论从哪条路（队列重放、`/api/chat`
+   * 的乐观回显、历史）到达，只要 id 相同就只画一次。
+   *
+   * @returns {object|null} 这个 id **已经画过**就返回那条（调用方什么都不做）；没画过就返回 null
+   */
+  function chatEventClaim(id) {
+    if (!id) return null;
+    if (!state.eventIds) state.eventIds = Object.create(null);
+    return state.eventIds[id] || null;
+  }
+
+  /** 认领一个 id（画之前调）：登记成"这条已经画过"，后面同 id 的事件全部幂等跳过。 */
+  function chatEventClaimed(id, entry) {
+    if (!id) return entry;
+    if (!state.eventIds) state.eventIds = Object.create(null);
+    state.eventIds[id] = entry;
+    return entry;
+  }
+
+  /** 队列把太旧的**已 ack 前缀**裁掉时的提示（`trimmedUpTo`）：如实说"更早的内容已不在队列里"。 */
+  function chatTrimNotice(trimmedUpTo) {
+    const log = $('chat-log');
+    if (!log || !(Number(trimmedUpTo) > 0)) return;
+    if (log.querySelector('.chat-trim-notice')) return;      // 只挂一条
+    const note = el('div', 'msg sys chat-trim-notice');
+    note.textContent = '事件队列里更早的内容已被服务端裁剪（seq ≤ ' + Number(trimmedUpTo) + '）'
+      + '，那一段不再显示 —— 对话内容只从事件队列来，不回头去读历史存档。';
+    log.insertBefore(note, log.firstChild);
+  }
+
+  /** 清掉裁剪提示（重建 #chat-log 之前调，免得每次进屏都留一条旧的）。 */
+  function chatClearTrimNotice() {
+    const log = $('chat-log');
+    if (!log) return;
+    const note = log.querySelector('.chat-trim-notice');
+    if (note) note.remove();
+  }
+
+  /**
+   * 事件队列的取件 / 渲染 / ack 三件事（`PixikoSync.newDrain` 只负责节拍与游标）。
+   *
+   * @param {boolean} [noAutoFetch] true = 起表时**不要立刻取一拍**（`Sync.startDrain` 起手就
+   *   `setTimeout(tick, 0)`）。对话栏第一次铺内容由 {@link loadChatFromQueue} 自己发起 ——
+   *   它得先把游标归零、把 `#chat-log` 清空，再整条重放；boot 里那一下若也先取一拍，
+   *   就会出现"先画一排、紧接着被清掉"的空窗（CDP 实测过）。
+   */
+  function ensureEventQueue(noAutoFetch) {
     if (state.eventQueue) return state.eventQueue;
     const chatScope = () => scope() || 'default';
     const cursorKey = () => 'pixiko-events-last-seq:' + chatScope();
     state.eventQueue = Sync.newDrain({
       request: (body) => api('/api/events', { body: { scope: chatScope(), after: body.after, limit: body.limit } })
-        .then((payload) => payload)
+        .then((payload) => {
+          // 队列**是对话的唯一来源**：服务端裁过已 ack 的前缀（trimmedUpTo > 0）而本地游标还在它下面，
+          // 就如实提示"更早的内容已被裁剪" —— 绝不偷偷回去读历史存档补那一段。
+          const trimmed = Number(payload && payload.trimmedUpTo) || 0;
+          if (trimmed > 0 && (Number(body.after) || 0) < trimmed) chatTrimNotice(trimmed);
+          return payload;
+        })
         .catch((error) => {
-          // 服务端还没有这个接口（老后端 404）：置 unavailable，退化成"历史 + 写回"，不再空转。
           if (Number(error && error.status) === 404 || /未知接口/.test(String(error && error.message))) {
-            console.info('事件队列不可用（/api/events 404）：本会话退化成"历史 + 写回"模式。');
+            console.info('事件队列不可用（/api/events 404）：对话栏没有可渲染的来源。');
           }
           error.status = Number(error && error.status) || (Number(error && error.code) || 0);
           throw error;
@@ -2960,23 +3091,33 @@
         Sync.writeCursor(sessionStorage, cursorKey(), seq);
         api('/api/events/ack', { body: { scope: chatScope(), seq: seq } }).catch(() => {});
       },
-      resolve: (id) => !!(state.eventIds && state.eventIds[id]),
+      // `resolve` 只回答"这条 patch 的 target 有没有消费方"。**只要还有任何一个视图在跟这个任务号
+      // （回执栏那条 / 回执页详情那条），就必须放行** —— 否则 `eventAction` 会把 `patch` 判成
+      // `ignore`，渲染回调根本不被调用，而 `drainOnce` 照样推进游标（= ack）：**图永久丢掉**
+      // （实测 `web-events.json` 里 `seq13 target=quest:608:4` 就是这样被吞的）。
+      resolve: (id) => {
+        if (state.eventIds && state.eventIds[id]) return true;
+        const match = /^quest:(\d+):/.exec(String(id || ''));
+        if (!match) return false;
+        const number = Number(match[1]) || 0;
+        if (!number) return false;
+        if (Number(questWatch && questWatch.number) === number) return true;      // 回执页详情在跟
+        for (const key of Object.keys(receiptRail.quest)) {
+          if (Number(receiptRail.quest[key]) === number) return true;             // 某个回执栏在跟
+        }
+        return false;
+      },
       idOf: (entry) => (entry && entry.__eventId) || ''
     }, { interval: EVENT_DRAIN_MS });
-    state.eventQueue.lastSeq = Sync.readCursor(sessionStorage, cursorKey());
-    // 历史（快照）里带 seq 的条目：把游标抬到它的最大 seq —— 服务端把每条信息同时放进历史与
-    // 队列，游标停在下面就会把同一段再取一遍（渲染侧虽然按 id 幂等，但那是白跑一趟）。
-    chatSnapshot.entries.forEach((known) => {
-      const seq = Number(known.__eventSeq) || 0;
-      if (seq > state.eventQueue.lastSeq) state.eventQueue.lastSeq = seq;
-    });
+    // 游标 = 上次渲染并 ack 到的 seq（**全新会话是 0**：第一拍把整条队列完整重放一遍，这就是"读对话"）。
+    state.eventQueue.lastSeq = noAutoFetch ? 0 : Sync.readCursor(sessionStorage, cursorKey());
     Sync.writeCursor(sessionStorage, cursorKey(), state.eventQueue.lastSeq);
     Sync.startDrain(state.eventQueue);
     return state.eventQueue;
   }
 
   /**
-   * 一件事件 → 对话栏。（`message` = 追加或就地更新；`patch` = **按 target 就地补图**）
+   * 一件事件 → 对话栏。（`message` = 追加；`patch` = **按 target 就地补图**）
    *
    * <p>两种都走锚定：**只有用户本来就在底部时才贴底**，图片异步撑高也不改他正在看的位置。
    * 图片一律按**路径**去重（共用模块 `Sync.mergeImages` / `unpaintedImages`）。
@@ -2984,23 +3125,30 @@
   function renderChatEvent(action) {
     const log = $('chat-log');
     if (!log) return false;
-    if (!state.eventIds) state.eventIds = Object.create(null);
-    // 历史里已经画过的那几条也登记进来（`chatEntryClean` 记下了服务端的稳定 id）：
-    // 队列再送一次同一件事件时按 id 认出来 → **幂等**，不会再长一个气泡。
-    chatSnapshot.entries.forEach((known) => { if (known.__eventId && !state.eventIds[known.__eventId]) state.eventIds[known.__eventId] = known; });
+    // **对话栏还没开始铺**（boot 里"事件队列起表"那一下会起手取一拍，而右栏的第一次铺内容
+    // 由 {@link loadChatFromQueue} 发起：它要先清空、把游标归零、再整条重放）：这一拍什么都不画、
+    // **也不 ack**（返回 false → 游标不动），下一拍（或 loadChatFromQueue 自己那次）再取同一段。
+    if (!state.chatRailLoaded) return false;
     if (action.kind === 'message') {
-      if (state.eventIds[action.id]) return true;    // 同一条 id 只画一次
+      if (chatEventClaim(action.id)) return true;    // 同一条 id 只画一次（乐观回显/重放都走这里）
       const entry = chatSnapshotRemember(action.entry);
       if (!entry) return true;                    // 空条目：没什么可画，ack 掉
-      entry.__eventId = action.id;
-      state.eventIds[action.id] = entry;
+      entry.__eventId = String(action.id || '');
+      chatEventClaimed(action.id, entry);
       chatEntryAppend(entry, true);
+      // 带任务号的（回执里的一条）顺手归位到**回执栏**（`*-receipts`）——
+      // 同一条事件队列，两条路的正文来自同一件事件，不会各画一份。
+      receiptRailMessage(action.item);
       return true;
     }
     if (action.kind === 'patch') {
-      const entry = state.eventIds[action.target];
+      // **不管对话里找不找得到 target，回执栏那一份都要先补**：patch 是"这张图属于哪条任务"
+      // 的权威信息，回执栏消费它是它的职责（找不找得到对话条目是另一回事）。
+      receiptRailPatch(action);
+      const entry = chatEventClaim(action.target);
       if (!entry) {
-        // 历史还没加载到 / 不是这一端画的：**忽略并记一条 debug**，绝不新插一条气泡。
+        // 这条对话还没在这端画出来（本端才打开、队列里那条被裁了等）：**忽略并记一条 debug**，
+        // 绝不新插一条气泡（图必须并进它那条正文，不能自成一条）。
         console.debug('事件 patch 的目标不在本地（忽略）：' + action.target);
         return true;
       }
@@ -3035,6 +3183,10 @@
     //  `repeat(auto-fill, 140px)` 只会解析出 1 条轨道 → 缩略图会竖着排成一列，见 app.css 那条注释）。
     const node = el('div', 'msg ' + entry.role + (images.length ? ' chat-receipt-images' : '')
       + (images.length > 1 ? ' chat-gallery-entry' : ''));
+    // **身份落到 DOM 上**：队列事件渲染出来的这一条记下它的事件 id（`quest:<号>:<序号>` / `msg:<uuid>`）。
+    // 图片晚到的 `patch` 就是按 `target` = 同一个 id 找回**它那条**往里补图的（{@link chatRedrawEntry}
+    // 找不到节点时按 `[data-event]` 自己找）——不写这个属性就只能靠"还挂在末尾"这种位置启发式。
+    if (entry.__eventId) node.setAttribute('data-event', entry.__eventId);
     if (entry.text || !images.length) node.appendChild(el('div', null, entry.text || ''));
     if (images.length === 1) {
       // 点图打开查看器放大（不再跳到新标签页）。
@@ -3050,12 +3202,15 @@
     return node;
   }
 
-  /** 只渲染（不记快照）：铺回上次的对话用。`eager` 见 {@link chatEntryNode}。 */
+  /** 渲染一条（`entry.__eventId` 就是它的身份）；`eager` 见 {@link chatEntryNode}。 */
   function chatEntryAppend(entry, eager) {
     const log = $('chat-log');
     if (!log) return null;
     const anchor = chatGrabAnchor(log);          // 追加前先记"在不在底部"（见 chatGrabAnchor 注释）
     const node = chatEntryNode(entry, eager);
+    // **身份落到 DOM 上**：`patch` 就是按 `[data-event=<target>]` 找回"它那条"往里补图的
+    // （{@link chatRedrawEntry} 给 null 节点时的查法）。
+    if (entry && entry.__eventId) node.setAttribute('data-event', entry.__eventId);
     log.appendChild(node);
     chatSettle(log, anchor);                     // 在底部才贴底；用户翻历史时把位置放回原处
     return node;
@@ -3118,14 +3273,16 @@
   }
 
 
-  /** 往对话页加一条消息（同时记进快照）；不在对话页面（别的栏目）时静默跳过。 */
-  function appendMessage(kind, text, images) {
+  /**
+   * 往对话页加一条**本端才知道的**消息（目前只有"接口报错"这一种）；不在对话页面时静默跳过。
+   *
+   * <p>**不要用它画服务端也会入队的东西**（用户消息、bot 回复、回执正文、图片）：那些一律由事件队列
+   * 渲染，本端再画一条没有 id 的就成了第二个气泡、而且队列那条认不出它 —— 重复就是这么来的。
+   */
+  function appendLocalNote(kind, text) {
     const log = $('chat-log');
     if (!log) return null;                     // 每个栏目一份 HTML：别的栏目根本没有 #chat-log
-    const files = (images || []).map((image) => (image && image.file) || image).filter(Boolean).map(String);
-    const entry = { role: kind, text: String(text === undefined || text === null ? '' : text) };
-    if (files.length) entry.images = files;
-    return chatEntryAdd(entry);
+    return chatEntryAdd({ role: kind, text: String(text === undefined || text === null ? '' : text) });
   }
 
   /**
@@ -3171,6 +3328,18 @@
     input.style.height = Math.max(CHAT_INPUT_MIN, Math.min(need, cap)) + 'px';
   }
 
+  /**
+   * 右栏发一条消息：**乐观回显也用服务端给的稳定 id**，于是它和队列里那两条是**同一条**。
+   *
+   * <p>服务端在 `/api/chat` 的回复里直接给出它刚入队的两个 id（`messageId` = 用户这条、
+   * `replyId` = bot 这条，都是 `msg:<uuid>`）。这里拿它们把气泡先画出来、并记进
+   * {@link chatEventClaim} 的登记表；下一拍队列取回同一件事件时按 id 认出"已经画过"，
+   * **不会再画第二个**。以前这里是"本地 append 一条不带 id 的 + 队列再送一条带 id 的"，
+   * 两条正文一样、身份不同 → 用户自己发的消息和 bot 回复都会重一份（"大量重复"的当场那一半）。
+   *
+   * <p>没有 id（老后端）时退化成"只有队列那一条"：本地不画，等队列送 —— 宁可晚一拍，
+   * 也绝不用"正文相同"去猜身份（用户真的会发两条一样的消息）。
+   */
   async function sendChat(event) {
     if (event) event.preventDefault();
     const input = $('chat-input');
@@ -3178,98 +3347,90 @@
     if (!message) return;
     input.value = '';
     growChatInput();                       // 清空后回到 150px 的默认高度（不是 1 行）
-    appendMessage('user', message);
-    const log = $('chat-log');
-    const anchor = chatGrabAnchor(log);            // 追加前记"在不在底部"
-    const pending = el('div', 'msg bot');
-    pending.appendChild(el('span', 'spin'));
-    pending.appendChild(document.createTextNode(' 正在思考…'));
-    log.appendChild(pending);
-    chatSettle(log, anchor);                       // 发消息时通常就在底部 → 贴底；（用户翻历史发消息也不被顶走）
+    const status = el('div', 'chat-typing', '正在思考…');   // 纯状态提示，**不进对话栏**（不是一条对话）
+    const rail = $('chat-input') ? $('chat-input').parentNode : null;
+    if (rail) rail.insertBefore(status, $('chat-input'));
     $('chat-send').disabled = true;
     try {
       const result = await api('/api/chat', { body: { message, execute: $('chat-execute').checked, scope: scope() } });
-      const reply = result.reply || '(空回复)';
-      pending.textContent = reply;
-      // 就地改成回复的那条也要进快照：切页面回来位置才对，也能和服务端历史里的同一条对上（不重复画）。
-      chatSnapshotRemember({ role: 'bot', text: reply });
+      const reply = result.reply || '';
+      // 乐观回显：身份用服务端刚入队的 id（同一件事件只画一次，见 renderChatEvent 的 id 登记）。
+      const userEntry = chatSnapshotRemember({ role: 'user', text: message });
+      if (userEntry) {
+        userEntry.__eventId = String(result.messageId || '');
+        chatEventClaimed(userEntry.__eventId, userEntry);
+        chatEntryAppend(userEntry, true);
+      }
+      const replyEntry = reply ? chatSnapshotRemember({ role: 'bot', text: reply }) : null;
+      if (replyEntry) {
+        replyEntry.__eventId = String(result.replyId || '');
+        chatEventClaimed(replyEntry.__eventId, replyEntry);
+        chatEntryAppend(replyEntry, true);
+      }
       $('chat-interest').textContent = result.interest != null ? '相关度 ' + result.interest : '';
       if (result.commands && result.commands.length) {
-        appendMessage('sys', '执行指令：' + result.commands.join('  '));
+        // **不在本地画"执行指令：…"那条**：服务端把这条回执的正文入队（`quest:<回执号>:<条内序号>`），
+        // 本地再画一条没有 id 的就是重复（而且队列那条认不出它）。信息云负责"已经下达"的即时提示。
         if (result.quest) questCloud('任务 #' + result.quest + ' 已下达：' + result.commands.join(' ; '), result.quest);
         if (result.captureId) {
-          // 网页对话里要图的请求：一直跟到图片回来，直接发在对话里。
+          // 网页对话里要图的请求：记下"当前这条回执"（图片由事件队列的 patch 就地补进它那条）。
           state.followUntil = Date.now() + 20 * 60 * 1000;
           await pollCapture(result.captureId, 0, true);
         }
       }
+      // 服务端把"用户这条 + bot 这条"是在 /api/chat 返回**之前**入队的：回来立刻补一拍，
+      // 让队列那两条（以及同一批的回执正文）马上到位，不用等下一个 2 秒节拍。
+      drainChatEvents().catch(() => {});
     } catch (error) {
-      if (String(error.message) !== 'unauthorized') pending.textContent = '出错了：' + error.message;
+      if (String(error.message) !== 'unauthorized') appendLocalNote('sys', '出错了：' + error.message);
     } finally {
+      if (status.parentNode) status.remove();
       $('chat-send').disabled = false;
     }
   }
 
   /**
-   * 打开页面（右栏在**每一条路由**的页面里都有，所以每个栏目都会调它）：
-   * 先把**上次渲染过的内容**（指令回执的文字与图片都在里面）从会话存储里铺回来（秒开），
-   * 再用服务端那份正文存档按条数合并（见 {@link chatArchiveMerge}），
-   * 最后拉服务端 LLM 历史，只补「比本地基准多出来的那一段」。
+   * 对话栏的状态：清空 DOM、丢掉上一轮的 id 登记与图集游标，再把**事件队列从本地游标续取一遍**。
    *
-   * <p>服务端历史里只有文字，图片与指令回执都不在里面 —— 只按它渲染，
-   * 切一下栏目回来回执文字与图片就全没了（这就是这个函数以前的样子）。
+   * <p><b>这里绝不读服务端历史</b>：以前打开时先读 `sessionStorage` 快照、再读 `/api/chat/log`
+   * 整份正文、还读 `/api/chat/history` 补文字，同一段对话于是有**三个来源**；队列再送一次同内容
+   * 的事件（历史条目只有 `role`/`text`/`images`，**没有** `id`/`seq`，按 id 去重必然不命中）就画成
+   * 两个气泡 —— 这正是用户报的「控制台对话还是有大量重复」。现在只有一个来源：事件队列
+   * （每件都带 `seq` 与稳定 `id`）。
+   *
+   * <p>游标本地持久化（`pixiko-events-last-seq:<scope>`）：有游标就从游标续取；**全新会话
+   * （新标签页 / 清过会话存储）游标就是 0，从第一件事件完整重放一遍** ——「读对话」就是这个重放。
+   * 服务端把太旧的已 ack 前缀裁掉时会在取件回包里带 `trimmedUpTo`，据此给一句提示
+   * （**不是**偷偷回去读历史）。
+   *
+   * <p><b>一次页面加载里只许跑一遍</b>（`state.chatRailLoaded`）：这条函数是**破坏性**的
+   * （清 DOM、把游标按"重放"重算）。实测：boot 里那次"事件队列起表"和 loadPage 里这一次
+   * 会在同一毫秒内各跑一遍 —— 先画出来、后一次清空并重算游标（此刻队列已取到尾巴、取到的空批）
+   * 于是右栏**画完就空**（CDP 实测：88ms 起表、96ms 画好 2 条、101ms 被清成 0 条）。
    */
-  async function loadChatHistory() {
+  async function loadChatFromQueue() {
     const log = $('chat-log');
-    if (!log) return;                           // 极端情况：宿主里没有右栏（`#chat-log`）：什么都不做
-    // 切换会话回来时接回原来的滚动位置（按 scope 各记一份，互不污染）。
+    if (!log) return;                           // 极端情况：宿主里没有右栏（#chat-log）：什么都不做
+    const queue = ensureEventQueue(true);        // 起表，但**先别取**（下面要先把游标归零）
+    if (state.chatRailLoaded) {                  // 已经放过了：只补一拍，**不清 DOM、不动游标**
+      await drainChatEvents();
+      return;
+    }
+    state.chatRailLoaded = true;
+    // 滚动位置照旧按 scope 各记一份（那是滚动状态，不是对话内容）。
     const saved = chatScrollRead();
-    // 1) 先铺上次的快照：文字、指令回执、图片都在，顺序也照旧。
-    const scopeName = scope() || 'default';
-    const snapshot = chatSnapshotRead(scopeName);
-    chatSnapshot.scope = scopeName;
-    chatSnapshot.entries = snapshot.entries;
-    chatSnapshot.server = snapshot.server;
-    chatSnapshot.dirty = false;
-    // 读回来被裁过（超 200 条 / 超 512KB）：把裁过的版本写回去，存储里不留超限的旧账。
-    if (snapshot.dropped) chatSnapshotSchedule();
-    state.chatImageRun = null;                  // 重建 #chat-log 之前丢掉游标：旧节点马上就没了
+    state.chatImageRun = null;                  // 重建 #chat-log 之前丢掉图集游标：旧节点马上就没了
+    state.eventIds = Object.create(null);       // 上一轮的 id 登记表作废（DOM 一起没了）
     log.innerHTML = '';
-    // 整批铺历史：只有**最后一条**用 eager（右栏贴底那条就是第一眼看见的），其余 lazy。
-    chatSnapshot.entries.forEach((entry, index, all) => chatEntryAppend(entry, index === all.length - 1));
-    // 1.5) 服务端正文存档（/api/chat/log）：本地这份已经秒开在上面了，这里按条数合并
-    //      （服务端更多就采用服务端并重建，#chat-log 的滚动位置由收尾那次 chatScrollRestore 恢复；
-    //        本地更多就把本地整份推上去；一样多以本地为准不推）。
-    await chatArchiveMerge(log, saved);
-    // 2) 再拉服务端历史，只追加比基准多出来的那部分。
-    try {
-      const history = await api('/api/chat/history', { body: { scope: scope() } });
-      const list = Array.isArray(history) ? history : [];
-      // 基准 = 保存时服务端历史有多少条。服务端被清空/变短（列表比基准还短）时一段都不补，
-      // 本地内容也原样留着（不会重复渲染，也不会把本地清掉）。
-      const base = Math.min(chatSnapshot.server || 0, list.length);
-      // 本地已经有的 role+文本记一份：本地刚发出去的那条也在历史里，靠它认出来别画两回。
-      const known = new Map();
-      chatSnapshot.entries.forEach((entry) => {
-        const key = entry.role + '\n' + (entry.text || '');
-        known.set(key, (known.get(key) || 0) + 1);
-      });
-      let added = 0;
-      for (let index = base; index < list.length; index++) {
-        const raw = list[index] || {};
-        const clean = chatEntryClean({ role: raw.role === 'user' ? 'user' : 'bot', text: raw.content || '' });
-        if (!clean) continue;
-        const key = clean.role + '\n' + (clean.text || '');
-        if (known.get(key)) { known.set(key, known.get(key) - 1); continue; }
-        chatEntryAdd(clean);
-        added++;
-      }
-      const next = Math.max(chatSnapshot.server || 0, list.length);
-      const moved = next !== (chatSnapshot.server || 0);
-      chatSnapshot.server = next;
-      if (added || moved) chatSnapshotSchedule();
-    } catch { /* 历史读不到不影响使用 */ }
-    chatScrollRestore(log, saved);              // 之前在底部就贴底（图片异步加载完再校准一次）
+    chatClearTrimNotice();
+    receiptRailReset();                         // 回执栏也跟着重来（它的正文与图同样来自这条队列）
+    // 游标归零 = **从第一件事件读起**（"读对话"就是这个重放）。归零之后立刻取一拍，
+    // 整条队列于是按 seq 顺序铺进右栏；取件表本来就在跳（2000ms 一拍），不用再重起。
+    queue.lastSeq = 0;
+    Sync.writeCursor(sessionStorage, 'pixiko-events-last-seq:' + (scope() || 'default'), 0);
+    await drainChatEvents();
+    // 整条队列刚重放完："每次进来都在最下方"（`{atBottom:true}` 就是无条件贴底 + 给异步撑高的图挂校准）。
+    chatScrollRestore(log, { top: 0, atBottom: true });
   }
 
   // ---------------------------------------------------------------- 状态与设置
@@ -5443,11 +5604,42 @@
   let progressTimer = null;
 
   /** 进度条数据直接来自 SD WebUI（/sdapi/v1/progress）；队列状态来自机器人自己。 */
+  /**
+   * 读一次**服务端状态**（`/api/progress` + `/api/tasks`），并把回执栏按它收口。
+   *
+   * <p>**这一步与"进度条元素在不在"无关**：`*-receipts` 会出现在没有 `#gen-progress-box`
+   * 的栏目里（提示词/LoRA/样式…），状态照样得更新 —— 以前 `if (!box) return;` 卡在取件之前，
+   * 那些栏目永远拿不到"还在跑吗"，占位卡就永远摘不掉。
+   */
+  async function refreshServerState() {
+    const [progress, tasks] = await Promise.all([
+      api('/api/progress').catch(() => null),
+      api('/api/tasks').catch(() => null),
+    ]);
+    if (progress) { state.progress = progress; state.progressSeen = true; }
+    // `/api/tasks` 的 `running` 就是"这一轮还在出图"的服务端判据（与回执页详情同一个字段）。
+    if (Array.isArray(tasks)) {
+      state.tasks = tasks;
+      state.tasksSeen = true;
+      state.tasksRunning = tasks.some((task) => task && task.running);
+    }
+    // 服务端说没在跑了：**这条回执到此为止** —— 「执行中…」摘掉，"出图完成"的信息云也在这时冒
+    // （张数取自事件队列归位的那份，不再读 /api/capture）。
+    const stillRunning = !!state.tasksRunning || !!(state.progress && state.progress.running);
+    if (!stillRunning && state.wantsCaptureState) {
+      state.wantsCaptureState = false;
+      captureDoneCloud(state.followCaptureId, 0);
+    }
+    receiptRailSync(receiptBusy());
+    return progress;
+  }
+
   async function loadProgress() {
     const box = $('gen-progress-box');
-    if (!box) return;
-    try { renderProgress(await api('/api/progress')); }
-    catch { /* 读不到进度不影响其它功能 */ }
+    const progress = await refreshServerState();       // 状态跟队列走（回执栏靠它收口）
+    if (box && progress) {
+      try { renderProgress(progress); } catch { /* 进度条画不出来不影响回执栏 */ }
+    }
     // 队列有任务时顺带刷新任务队列：状态、进度条都是实时的。
     if (state.status?.generation?.status) loadTasks().catch(() => {});
     if (!state.status?.generation?.status) stopProgressPolling();
@@ -6626,16 +6818,17 @@
    * 加载本栏目要用的数据。页签现在是真链接（每个栏目一个 URL），切栏目＝换页面，
    * 所以这里只按 {@link PAGE} 拉这一栏的接口，不再像以前那样每个页面都把整套数据拉一遍。
    *
-   * <p>例外：右栏（对话）是外壳的一部分，**每一条路由的页面**都要把历史铺出来，所以
-   * {@link loadChatHistory} 不再挂在 `'chat'` 栏目上，而是每个栏目都调（`'setup'` 除外 —— 见下）。
+   * <p>例外：右栏（对话）是外壳的一部分，**每一条路由的页面**都要把它铺出来，所以
+   * {@link loadChatFromQueue} 不再挂在 `'chat'` 栏目上，而是每个栏目都调（`'setup'` 除外 —— 见下）。
+   * 它只打事件队列（`/api/events`），**一个历史接口都不打**。
    */
   async function loadPage() {
     try {
       // Setup 栏目要能在「还没有令牌」的首次配置阶段打开（那些接口对本机免令牌），所以不走 loadStatus。
-      // 也因此**不铺对话历史**：Setup 页还没有令牌，任何令牌接口（/api/chat/log 等）都会 401 并把锁屏弹出来。
+      // 也因此**不铺对话**：Setup 页还没有令牌，令牌接口（/api/events 等）会 401 并把锁屏弹出来。
       if (PAGE === 'setup') { await loadSetup(); banner(''); return; }
       await loadStatus();                      // 顶栏、健康点、共享状态（约 15ms）
-      await loadChatHistory();                 // 右栏在每一页都铺历史（含服务端正文存档的合并）
+      await loadChatFromQueue();               // 右栏在每一页都铺：只从事件队列放（不读历史存档）
       if (PAGE === 'gen') {
         await Promise.all([loadOptions(), loadPresets(), loadForgePresets(), loadImages(), loadTasks()]);
         // VAE 那一行动态建在「生成参数」卡里；接口不在（老的机器人）时自己降级，不往外抛、不影响上面那五项。
@@ -6850,13 +7043,16 @@
     startQuestListWatch();
     // 事件队列（取件 → 渲染 → ack）起表：**推到下一帧** —— sync.js 在本文件之后才执行，
     // 而 boot() 是解析期同步跑的，这里立刻读 window.PixikoSync 会读到 undefined。
-    // 事件队列（取件 → 渲染 → ack）起表。
+    //
+    // <p>**这里只起表，不铺内容**：队列的第一次取件由 {@link loadChatFromQueue} 发起
+    // （它要先把游标归零、`#chat-log` 清空，再整条重放）。boot 里这一下若也去取一拍，
+    // 就会"先画一排、紧接着被 loadChatFromQueue 清掉"（CDP 实测过这个空窗）。
     // **为什么不直接调**：app.js 与 sync.js 的执行顺序由页面决定，boot() 又可能是解析期就跑的 ——
     // 那一刻 `window.PixikoSync` 还不存在（实测：解析期 undefined，DOMContentLoaded 时才会有）。
     // 所以这里用就绪重试：模块到位就起表；10 秒还没到位（真的缺文件）就记一条 warn 并放弃。
     (function startEventQueueWhenReady(triesLeft, delay) {
       if (window.PixikoSync && typeof window.PixikoSync.newDrain === 'function') {
-        try { ensureEventQueue(); } catch (error) { console.warn('事件队列未起表：' + error.message); }
+        try { ensureEventQueue(true); } catch (error) { console.warn('事件队列未起表：' + error.message); }
         return;
       }
       if (triesLeft <= 0) { console.warn('事件队列未起表：共用模块 /m/pixiko-sync.js 没有加载。'); return; }

@@ -1420,6 +1420,46 @@
   /** 图集该插到哪儿：第一个".q-step"（它上面是 head / 错误行）。 */
   function bodyAnchor() { return detail.body.querySelector('.q-step'); }
 
+  /**
+   * 只重画**图集那块**（不动步骤行、不动 `idleRounds`/滚动状态）。
+   *
+   * <p>给"事件队列的 `patch` 到了"这条路用：图要当场进它那条回执，但**不能**顺手
+   * `renderDetail()` —— 那是整屏重画，会把正在跑的详情轮询的静默计数与用户滚动位置一起打乱。
+   */
+  function redrawGallery() {
+    if (!detail.body || !detail.payload) return;
+    var isMessages = Array.isArray(detail.payload.messages) && detail.payload.messages.length > 0;
+    var files = filesOf(detail.payload, isMessages ? detail.payload.messages : null);
+    detail.files = files;
+    syncGrid(detail.payload, files.slice());
+  }
+
+  /**
+   * 事件队列的 `patch`：图片晚到 ⇒ 并进**它那条**回执的图集。
+   *
+   * <p>手机上各屏懒挂载：用户直接进「回执详情」时对话屏从没建过，`chatEventEntry` 认不出这条
+   * `patch` 的 target。所以详情屏自己也吃这批事件（`PixikoM.onEvent`）：
+   *   · 命中的是别的任务号 → 直接放过（别人处理）；
+   *   · 命中当前这条 → 按**路径**去重并进 `detail.extras`，**只重画图集**。
+   * 与对话屏各渲染各的，谁都不抢 DOM，也不再起第二条轮询。
+   */
+  function onQueueEvent(action) {
+    if (!action || action.kind !== 'patch') return true;             // 别的类型不管：让对话屏去处理
+    var match = /^quest:(\d+):/.exec(String(action.target || ''));
+    var number = match ? Number(match[1]) || 0 : 0;
+    if (!number) return true;
+    if (!detail.root || !detail.number || number !== detail.number) return true;   // 不是这一条：放过
+    var before = detail.extras.length;
+    (action.images || []).forEach(function (raw) {
+      var path = normalizePath(raw);
+      if (!path) return;
+      if (detail.files.indexOf(path) >= 0 || detail.extras.indexOf(path) >= 0) return;   // 按路径去重
+      detail.extras.push(path);
+    });
+    if (detail.extras.length !== before) redrawGallery();
+    return true;
+  }
+
   /** 「还在跑，正在实时刷新…」一行：按需增删，删了就不再重建。 */
   function syncRunningLine(payload) {
     var node = detail.body.querySelector('[data-q-running]');
@@ -1498,6 +1538,19 @@
   function mountDetail(root) {
     detail.root = root;
     root.classList.add('q-screen');
+    /* 这一屏从此刻起吃事件队列的 `patch`（图片晚到就地补图）：订阅一次就够（一屏只挂载一次），
+       同时把"当前在跟哪条任务号"注册给队列的 `resolve` —— 否则手机端 `patch` 会被判 `ignore`
+       并**直接 ack 掉**（对话屏没挂载时它的 target 谁都认不出来）。 */
+    if (!detail.eventBound) {
+      detail.eventBound = true;
+      if (typeof P.onEvent === 'function') P.onEvent(onQueueEvent);
+    }
+    if (typeof P.setQuestEventTarget === 'function') {
+      P.setQuestEventTarget(function (number) {
+        return Number(detail.number) === Number(number)
+          || (detail.quest !== undefined && Number(detail.quest) === Number(number));
+      });
+    }
     var body = el('div', 'q-body');
     detail.body = body;
     detail.head = el('div');

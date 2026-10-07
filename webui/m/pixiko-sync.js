@@ -793,7 +793,9 @@
   function eventAction(item, options) {
     var opts = options || {};
     var seq = Number(item && item.seq);
-    var base = { seq: isFinite(seq) ? seq : 0, id: eventId(item), entry: null, target: '', images: [], reason: '' };
+    // `item` 一并带上（**不改形状**）：回执栏这类"除了对话还要按 quest 归位"的消费方要用到
+    // `quest` / `index` 这两个字段，事件本身是权威数据，视图不该去猜。
+    var base = { seq: isFinite(seq) ? seq : 0, id: eventId(item), entry: null, target: '', images: [], reason: '', item: item || null };
     if (!item || typeof item !== 'object') { base.kind = 'ackonly'; base.reason = 'not-an-object'; return base; }
     if (!isFinite(seq) || seq <= 0) { base.kind = 'ackonly'; base.reason = 'no-seq'; return base; }
     var type = String(item.type || '');

@@ -1904,9 +1904,16 @@
 
   /* ── 6. 屏幕：chat（对话） ───────────────────────────────────────────── */
 
-  /** 对话正文（本地为准，和服务端 data/webui/<scope>-chat-log.json 同形状）。 */
+  /**
+   * 对话（**唯一的数据来源是事件队列**：`/api/events` 的 `message` / `patch`）。
+   *
+   * <p>`eventIds` 是已渲染条目的**身份登记表**（`id → 条目`）：`quest:<回执号>:<条内序号>` /
+   * `msg:<uuid>`。同一件事件无论从哪条路到（队列重放、`/api/chat` 的乐观回显）都只画一次 ——
+   * 这是对话唯一的去重口径，没有"正文相同就算同一条"这种启发式（用户真的会发两条一样的消息）。
+   */
   var chat = {
     entries: [],
+    eventIds: Object.create(null),
     host: null,        // .chat-log
     sendBtn: null,
     input: null,
@@ -1916,9 +1923,6 @@
     loading: false,
     loaded: false,
     seq: 0,
-    /* 上一轮服务端窗口的**身份快照**（`PixikoSync.entryIds` 的结果）：算"这一轮新出现了哪几条"用。
-       null = 还没同步过（首屏已经铺好，第一次只记不补）。 */
-    logSeen: null,
     /** 用户**真的**往上翻过（不是进屏那一下的程序性贴底）：为真时周期性渲染绝不许改 scrollTop。 */
     userScrolled: false,
     /** 有内容在下面等着看（用户不在底部时不硬拽，只提示"有新消息 ↓"）。 */
@@ -1935,19 +1939,44 @@
   }
 
   /**
-   * 规范化服务端回来的条目（role 只认 user/bot/sys）。
-   * **形状清洗走共用模块**（与桌面控制台同一份 `cleanEntry`）：图片的两种写法
-   * （字符串 / `{file}` 对象）在两端收敛成同一个结果，不会再出现"一边画得出一边画不出"。
+   * 已渲染条目的**身份登记表**（`id → 条目`）。
+   *
+   * <p>这是对话**唯一的去重口径**（不再有任何"正文相同就算同一条"的启发式 —— 用户真的会发两条
+   * 一样的消息）。同一件事件无论从哪条路（队列重放、`/api/chat` 的乐观回显）到达，
+   * 只要 id 相同就只画一次。
+   *
+   * @returns {object|null} 这个 id **已经画过**就返回那条（调用方什么都不做）；没画过返回 null
    */
-  function chatNormalize(raw) {
-    var out = Sync.cleanEntries(raw);
-    // 历史条目带 id 时记下（事件队列的同一件事件靠它认出来：历史 + 增量按 id 去重）
-    for (var n = 0; n < out.length; n++) {
-      var src = Array.isArray(raw) ? raw[n] : null;
-      if (src && src.id) out[n].eventId = String(src.id);
-    }
-    for (var i = 0; i < out.length; i++) out[i].seq = ++chat.seq;
-    return out.slice(-CHAT_ENTRIES_CAP);
+  function chatEventEntry(id) {
+    if (!id) return null;
+    if (!chat.eventIds) chat.eventIds = Object.create(null);
+    return chat.eventIds[id] || null;
+  }
+
+  /** 认领一个 id（画之前调）：登记成"这条已经画过"，后面同 id 的事件全部幂等跳过。 */
+  function chatEventClaim(id, entry) {
+    if (!id) return entry;
+    if (!chat.eventIds) chat.eventIds = Object.create(null);
+    chat.eventIds[id] = entry;
+    return entry;
+  }
+
+  /** 队列把太旧的**已 ack 前缀**裁掉时的提示（回包里的 `trimmedUpTo`）：如实说"更早的内容不在队列里"。 */
+  function chatTrimNotice(trimmedUpTo) {
+    if (!chat.host || !(Number(trimmedUpTo) > 0)) return;
+    if (chat.host.querySelector('[data-chat-trim-notice]')) return;      // 只挂一条
+    var note = el('div', 'bubble sys');
+    note.setAttribute('data-chat-trim-notice', '1');
+    note.textContent = '事件队列里更早的内容已被服务端裁剪（seq ≤ ' + Number(trimmedUpTo)
+      + '），那一段不再显示 —— 对话只从事件队列来，不回头去读历史存档。';
+    chat.host.insertBefore(note, chat.host.firstChild);
+  }
+
+  /** 清掉裁剪提示（重建列表之前调，免得每次进屏都留一条旧的）。 */
+  function chatClearTrimNotice() {
+    if (!chat.host) return;
+    var note = chat.host.querySelector('[data-chat-trim-notice]');
+    if (note) note.parentNode.removeChild(note);
   }
 
   /**
@@ -2204,33 +2233,49 @@
   /** 当前 scope 的 `lastSeq` 键（每设备一份，localStorage）。 */
   function eventsCursorKey() { return 'pixiko-events-last-seq:' + PixikoM.scope(); }
 
-  /** 事件 id → 对话里那条气泡（`patch` 按它就地补图；历史没加载到就忽略并记 debug）。 */
-  function eventEntry(id) {
-    if (!id) return null;
-    for (var i = 0; i < chat.entries.length; i++) if (chat.entries[i].eventId === id) return chat.entries[i];
-    return null;
+  /** 事件 id → 对话里那条气泡（`patch` 按它就地补图；这条不在本地就忽略并记 debug）。 */
+  function eventEntry(id) { return chatEventEntry(id); }
+
+  /**
+   * 其它屏幕**订阅事件队列**的出口（`PixikoM.onEvent(fn)`）。
+   *
+   * <p>为什么要有它：事件队列是**全端唯一**的信息源，除了对话屏，回执详情屏也要吃同一批事件
+   * （`patch` 到了就把这张图补进它那条回执）。订阅者与对话屏**各渲染各的**，互不抢 DOM；
+   * 谁都不会自己再去起一条轮询（那就又回到"多源"了）。
+   *
+   * <p>渲染回调的总口径：**先喂订阅者，再画对话屏，任一成功就算成功**（否则一个视图的
+   * "这次没画成"会把整批事件的游标卡住、另一边的图也跟着不 ack）。
+   */
+  var eventSinks = [];
+  function notifyEventSinks(action) {
+    var ok = false;
+    for (var i = 0; i < eventSinks.length; i++) {
+      try { if (eventSinks[i](action) !== false) ok = true; } catch (error) { /* 一个订阅者出错不影响别的 */ }
+    }
+    return ok;
   }
 
   /** 一件事件 → 对话。返回 false 表示"这次没画成"（调用方**不 ack**，下次重取同一批）。 */
   function renderChatEvent(action) {
-    if (!chat.host) return true;                    // 不在对话屏：什么都不画（ack 掉，回屏时从历史拿）
+    var sinksOk = notifyEventSinks(action);
+    if (!chat.host) return sinksOk;                 // 不在对话屏：交给订阅者（都没接就 ack 掉）
     if (action.kind === 'message') {
-      if (eventEntry(action.id)) return true;       // 幂等：同一条 id 只画一次
+      if (chatEventEntry(action.id)) return true;    // 幂等：同一条 id 只画一次
       var entry = Sync.cleanEntry(action.entry);
       if (!entry) return true;
       entry.seq = ++chat.seq;
       entry.eventId = action.id;
+      chatEventClaim(action.id, entry);
       chat.entries.push(entry);
       if (chat.entries.length > CHAT_ENTRIES_CAP) chat.entries = chat.entries.slice(-CHAT_ENTRIES_CAP);
-      if (String(entry.role) === 'user' || String(entry.role) === 'sys') { /* 本地也发过：靠 id 幂等 */ }
       chatRenderAll();
       chatPinnedFollow();                           // 只有当场确实在底部才贴底（否则只提示"有新消息"）
       PixikoM.refreshStatus().catch(function () {});
       return true;
     }
     if (action.kind === 'patch') {
-      var target = eventEntry(action.target);
-      if (!target) {                                 // 字段兼容：历史没加载到 → 忽略 + debug，绝不新插气泡
+      var target = chatEventEntry(action.target);
+      if (!target) {                                 // 这条还没在这端画出来 → 忽略 + debug，绝不新插气泡
         if (window.console && console.debug) console.debug('事件 patch 的目标不在本地（忽略）：' + action.target);
         return true;
       }
@@ -2251,9 +2296,16 @@
     chat.queue = Sync.newDrain({
       request: function (body) {
         return PixikoM.api('/api/events', { body: { scope: PixikoM.scope(), after: body.after, limit: body.limit } })
+          .then(function (payload) {
+            // 队列**是对话的唯一来源**：服务端裁过已 ack 的前缀（`trimmedUpTo` > 0）而本地游标还在它
+            // 下面，就如实提示"更早的内容已被裁剪" —— 绝不偷偷回去读历史存档补那一段。
+            var trimmed = Number(payload && payload.trimmedUpTo) || 0;
+            if (trimmed > 0 && (Number(body.after) || 0) < trimmed) chatTrimNotice(trimmed);
+            return payload;
+          })
           .catch(function (error) {
             if (Number(error && error.status) === 404 || /未知接口/.test(String(error && error.message))) {
-              if (window.console && console.info) console.info('事件队列不可用（/api/events 404）：本会话退化成"历史 + 写回"模式。');
+              if (window.console && console.info) console.info('事件队列不可用（/api/events 404）：对话没有可渲染的来源。');
             }
             throw error;
           });
@@ -2263,7 +2315,19 @@
         Sync.writeCursor(window.localStorage, eventsCursorKey(), seq);
         PixikoM.api('/api/events/ack', { body: { scope: PixikoM.scope(), seq: seq } }).catch(function () {});
       },
-      resolve: function (id) { return !!eventEntry(id); }
+      // `resolve` 只回答"这条 patch 的 target 有没有消费方"。手机上**各屏是懒挂载的**：用户直接进
+      // 「回执详情」时 `chat.host` 从未建过，那条 `message` 的 id 也就没登记进身份表 —— 只看
+      // `chatEventEntry` 的话，`patch` 会被 `eventAction` 判成 `ignore`，渲染回调根本不被调用，
+      // 而 `drainOnce` 照样推进游标（= ack）：**图永久丢**。所以按桌面的同一口径放行：
+      // 有任一屏在跟这个任务号（`PixikoM.questEventTarget`，由 screen-quest.js 注册）就放行。
+      resolve: function (id) {
+        if (chatEventEntry(id)) return true;
+        var match = /^quest:(\d+):/.exec(String(id || ''));
+        if (!match) return false;
+        var number = Number(match[1]) || 0;
+        if (!number) return false;
+        return typeof PixikoM.questEventTarget === 'function' ? !!PixikoM.questEventTarget(number) : false;
+      }
     }, { interval: EVENT_DRAIN_MS });
     chat.queue.lastSeq = Sync.readCursor(window.localStorage, eventsCursorKey());
     Sync.startDrain(chat.queue);
@@ -2271,8 +2335,32 @@
     return chat.queue;
   }
 
+  /**
+   * 注册"这件事在跟哪个任务号"（回执详情屏用）：`PixikoM.questEventTarget(n)` 为真 ⇒
+   * 队列里 `quest:<n>:*` 的 `patch` 会被放行（不会被 `eventAction` 判成 `ignore` 而 ack 掉）。
+   * 与 `onEvent` 配套：`resolve` 决定"要不要交给订阅者"，`onEvent` 才是真正画图的那一步。
+   * @param {function} fn `fn(number) → boolean`；传 null 退订
+   */
+  PixikoM.setQuestEventTarget = function (fn) {
+    PixikoM.questEventTarget = typeof fn === 'function' ? fn : null;
+    return PixikoM.questEventTarget;
+  };
+
   /** 调试/自动化用：立刻取一拍。 */
   PixikoM.drainEvents = function () { return Promise.resolve(startEventQueue()).then(function (q) { return Sync.drainNow(q); }); };
+  /**
+   * 订阅事件队列（别的屏幕吃同一批事件用；见 {@link notifyEventSinks}）。
+   * @param {function} fn `fn(action)`：返回 `false` 表示"这次没画成"（不 ack，下次重取）
+   * @returns {function} 退订
+   */
+  PixikoM.onEvent = function (fn) {
+    if (typeof fn !== 'function') return function () { };
+    eventSinks.push(fn);
+    return function () {
+      var at = eventSinks.indexOf(fn);
+      if (at >= 0) eventSinks.splice(at, 1);
+    };
+  };
   /** 调试/自动化用：看一眼队列状态（游标 / 统计 / 是否不可用）。 */
   PixikoM.eventQueueState = function () {
     var q = chat.queue;
@@ -2392,40 +2480,42 @@
 
 
   /**
-   * 读回服务端正文（`/api/chat/log`）。
+   * 进对话屏：清空本屏列表、把事件队列的游标归零，然后**把整条队列完整重放一遍**。
    *
-   * <p>**贴底只在"用户本来就在底部"时发生**：整页重建/首次进屏时贴底是对的（用户要求"每次点进去
-   * 都在最下方"），但这条函数也会被刷新按钮 / 复位路径调用 —— 无条件 `scrollTop = scrollHeight`
-   * 就会把正在翻历史的用户拽到底（用户报的「周期性滑动到最底部的异常位移」的其中一条来源）。
-   * 现在走共用模块的锚定：改动前记锚点、改完落位。
+   * <p><b>这里是对话唯一的数据来源</b>（`/api/events` 的 `message` / `patch`）。以前这里读的是
+   * `/api/chat/log` 那份服务端正文，而队列再送一遍同一段内容 —— 历史条目上**没有** `id`
+   * （`/api/chat/log` 只给 role/text/images，幂等键在旁挂的 `<scope>-chat-log-appended.json` 里
+   * 不对外返回），于是事件队列那条按 id 去重**必然不命中**，同一个气泡画两遍。这就是
+   * 「对话大量重复」的根：**同一段对话两个来源**。现在把历史那一路整个砍掉。
+   *
+   * <p>归零游标是为了"重建页面 = 重新读一遍对话"（用户要求"每次点进去都在最下方"）：
+   * 队列是唯一的账本，从第一件事件重放就是"读对话"。服务端裁过已 ack 的前缀时回包里带
+   * `trimmedUpTo`，会挂一条"更早的内容已被裁剪"的提示，**绝不回头去读历史存档**。
+   *
+   * <p>贴底只在"用户本来就在底部"时发生：这条函数也会被刷新按钮 / 复位路径调用 ——
+   * 无条件贴底就会把正在翻历史的用户拽到底。锚定走共用模块。
    */
   async function chatLoad() {
     if (chat.loading) return;
     chat.loading = true;
     chat.loaded = false;
     var anchor = chatGrabAnchor();
-    if (chat.host) { clear(chat.host); chat.host.appendChild(skeleton(4, 'bubble')); }
+    if (chat.host) {
+      clear(chat.host);
+      chatClearTrimNotice();
+      chat.host.appendChild(skeleton(4, 'bubble'));
+    }
+    chat.entries = [];
+    chat.seq = 0;
+    chat.eventIds = Object.create(null);          // 上一轮的 id 登记表作废（列表与 DOM 一起没了）
     try {
-      // 接口：POST /api/chat/log {scope} → {entries:[{role,text,images,id?}], count}
-      var data = await PixikoM.api('/api/chat/log', { body: { scope: PixikoM.scope() } });
-      chat.entries = chatNormalize(data && data.entries);
-      // 历史条目带 `id`/`seq` 时记下来：
-      //   · `eventId` —— 队列里的同一件事件再送一次也能按 id 认出来、不重复画；
-      //   · `seq`     —— 历史已经覆盖到哪，游标至少要抬到它（服务端会把每条信息同时放进
-      //                 历史与队列，游标停在下面就会把同一段再取一遍）。
-      var maxSeq = 0;
-      chat.entries.forEach(function (entry, index) {
-        var raw = (data && data.entries && data.entries[index]) || {};
-        if (raw && raw.id) entry.eventId = String(raw.id);
-        if (raw && Number(raw.seq) > maxSeq) maxSeq = Number(raw.seq);
-      });
-      if (chat.queue && maxSeq > chat.queue.lastSeq) {
-        chat.queue.lastSeq = maxSeq;
-        Sync.writeCursor(window.localStorage, eventsCursorKey(), maxSeq);
-      }
+      // 游标归零：这一次 mount 要"从第一件事件读起"（队列就是对话的全文）。
+      Sync.writeCursor(window.localStorage, eventsCursorKey(), 0);
+      var queue = startEventQueue();
+      queue.lastSeq = 0;
+      await PixikoM.drainEvents();
       chat.loaded = true;
-      chatRenderAll();
-      // 进屏/重建之后贴底（在设计上就是"每次进来都贴底"）；用户翻历史时这一条走锚定、不动他。
+      // 进屏/重建之后贴底（设计上就是"每次进来都贴底"）；用户翻历史时这一条走锚定、不动他。
       if (anchor && anchor.atBottom === false && chat.userScrolled) chatSettle(anchor);
       else chatEnterBottom();
     } catch (error) {
@@ -2436,14 +2526,24 @@
     }
   }
 
-  /** 发送一条消息 → 追加 → 若有指令回执就跟着轮询 /api/capture。 */
+  /**
+   * 发送一条消息。**乐观回显用服务端给的稳定 id**，于是它和队列里那两条是**同一条**。
+   *
+   * <p>服务端在 `/api/chat` 的回复里给出它刚入队的两个 id（`messageId` = 用户这条、
+   * `replyId` = bot 这条，都是 `msg:<uuid>`）。这里拿它们把气泡画出来（`eventId` 登记进
+   * `chat.eventIds`），下一拍队列取回同一件事件时按 id 认出"已经画过" → **不会再画第二个**。
+   * 以前这里是"本地画一条不带 id 的 + 队列再送一条带 id 的"：正文一样、身份不同 → 自己发的消息
+   * 和 bot 回复都重一份（"对话大量重复"里当场的那一半）。
+   *
+   * <p>`data.commands` 那条"已执行：…"**不再本地画**：服务端把回执正文入队
+   * （`quest:<回执号>:<条内序号>`），本地再画一条没 id 的就是重复。
+   */
   async function chatSend() {
     if (chat.sending || !chat.input) return;
     var message = chat.input.value.trim();
     if (!message) { PixikoM.toast('先写点什么再发。'); return; }
     chat.input.value = '';
     chatInputAutoGrow();
-    chatAppend(chatEntry('user', message), true);
     chat.sending = true;
     if (chat.sendBtn) chat.sendBtn.disabled = true;
     var typing = el('div', 'typing');
@@ -2457,18 +2557,27 @@
     // 之后用户再上滑，scroll 监听照样会把 follow 打回 false（C2 那条断言依赖它）。
     chat.follow = true;
     try {
-      // 接口：POST /api/chat {message, execute, history?, scope} → {reply, commands[], captureId?, quest?, interest?}
+      // 接口：POST /api/chat {message, execute, history?, scope} → {reply, commands[], captureId?, quest?, interest?, messageId?, replyId?}
       var data = await PixikoM.api('/api/chat', {
         body: { message: message, execute: !!chat.execute, scope: PixikoM.scope() },
         timeout: LONG_REQUEST_TIMEOUT
       });
       if (typing.parentNode) typing.parentNode.removeChild(typing);
       var reply = data && data.reply ? String(data.reply) : '';
-      if (reply) chatAppend(chatEntry('bot', reply), true);
-      var commands = (data && data.commands) || [];
-      if (commands.length) chatAppend(chatEntry('sys', '已执行：' + commands.join('、')), true);
-      else chatFollow();
+      // 乐观回显：身份 = 服务端刚入队的那个 id（同一件事件只画一次，见 renderChatEvent 的 id 登记）。
+      var userEntry = chatEntry('user', message);
+      userEntry.eventId = String((data && data.messageId) || '');
+      chatAppend(userEntry, true);
+      if (reply) {
+        var replyEntry = chatEntry('bot', reply);
+        replyEntry.eventId = String((data && data.replyId) || '');
+        chatAppend(replyEntry, true);
+      }
+      chatFollow();
       if (data && data.captureId) followCapture(String(data.captureId), data.quest);
+      // 服务端把"用户这条 + bot 这条"是在 /api/chat 返回**之前**入队的：回来立刻补一拍，
+      // 让队列那两条（以及同一批的回执正文）马上到位，不用等下一拍轮询。
+      PixikoM.drainEvents().catch(function () {});
     } catch (error) {
       if (typing.parentNode) typing.parentNode.removeChild(typing);
       chatAppend(chatEntry('sys', '（发送失败）' + error.message), true);
