@@ -683,7 +683,16 @@
 <div id="toast" class="toast" hidden></div>
 <!-- 任务信息云：从下方弹出，带跳去 /quest/#N 的链接 -->
 <div id="quest-clouds" class="quest-clouds" aria-live="polite"></div>
+<!-- 两端共用的**信息交互逻辑**（条目身份与增量对账 / 服务端对话日志的并集与对齐 / 事件队列 /
+     未读记账 / 滚动锚定）：与手机端（webui/m/app.js）引的是**同一个文件**。
+     它在 app.js **之前**：服务端 WebPages.render 会把页面标记（PIXIKO_PAGE，别在这里写出那串完整
+     标识符——服务端按字符串数它出现的次数）紧贴在本脚本之前注入，所以 app.js 之前只允许有这一个
+     <script>，而它正好也必须在 app.js 之前，`window.PixikoSync` 才一定就位（boot() 是解析期跑的）。 -->
+<script src="/m/pixiko-sync.js"></script>
 <script src="/app.js?v=1.5.2"></script>
+<!-- 控制台的「日志文件」视图（logs/ 下真实文件的增量跟随）：只依赖 app.js 暴露的
+     window.__pixikoTerminal 那三个方法，所以放在 app.js **之后**、独立成文件。 -->
+<script src="/logs-view.js"></script>
 <!-- 数字框那对「上下调整箭头」的点击热区（.num-step）在这里接线。
      app.css 已经把原生 spinner 关掉（appearance: textfield），并**逐字节复用下拉框（模型预设）
      那张 16×16 双 chevron 的 data URI** 画在数字框右侧 —— 所以箭头的外观 100% 是标准那一个，

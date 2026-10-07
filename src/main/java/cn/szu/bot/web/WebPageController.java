@@ -204,8 +204,8 @@ public class WebPageController {
         }
     }
 
-    /** 静态资源：app.js / app.css / 图标。目录穿越一律 404。 */
-    @RequestMapping(value = {"/app.js", "/app.css", "/favicon.ico", "/favicon-32.png",
+    /** 静态资源：app.js / app.css / 日志文件视图 / 图标。目录穿越一律 404。 */
+    @RequestMapping(value = {"/app.js", "/app.css", "/logs-view.js", "/favicon.ico", "/favicon-32.png",
             "/apple-touch-icon.png", "/icon-192.png", "/icon-512.png"},
             method = RequestMethod.GET)
     public ResponseEntity<byte[]> asset(HttpServletRequest request) {

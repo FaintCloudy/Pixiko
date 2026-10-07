@@ -50,6 +50,7 @@ public final class GlobalInfixTest {
             targetSideStaysApart(root);
             conflictResolverDefaultOff(root);
             deepSeekScreen(root);
+            jsonPollutionGuard(root);
             screenReceiptKeepsOnlyProblems(root);
             partModeKeepsOldBehaviour(root);
             modeCommandAndUndo(root);
@@ -630,6 +631,146 @@ public final class GlobalInfixTest {
             check(run.last().contains("这次没有改动任何词条"), "回执如实说明没有改动：" + run.last());
             check(run.reviews() == 0, "没有落地就不做检查：" + run.calls);
         }
+    }
+
+    // ------------------------------- ④a 模型把整段 JSON 当内容写回来（用户实测的事故）
+
+    /**
+     * 用户实测（2026-10-07 09:21，scope=web）：模型把 {@code {"positive":"…","negative":"…"}} 整段塞进了
+     * {@code fixed_positive} 字段（原文见 logs/prompt-review.log 检查 #5），解析侧只读了那个**字符串**，
+     * 于是整段 JSON 被当成"新增的正向词条"写进提示词，LoRA 标签也跟着从提示词里消失。
+     *
+     * <p>这一组用例把修复钉死：解析必须是"严格 JSON 优先 + 字段必须是纯词条字符串"，任何结构痕迹一律
+     * 视为解析失败 → 重试 → 仍失败就**一个字都不改**并如实回执。
+     */
+    private static void jsonPollutionGuard(Path root) throws Exception {
+        // 用户原话 + 模型那种"中文顿号 + 全角引号"的假 JSON 字段内容。
+        String userInstruction = "掀起裙子露出内裤，画面中要能看到内裤";
+        // ① 整段被引号包住（模型把对象塞进字段时最常见的形态）。
+        try (Fixture f = new Fixture("pollute-quoted-", false)) {
+            String scope = "456";
+            String poisoned = "{\"positive\":\"Yasaka Menoa、1girl、skirt lift、panties visible、visible panties、"
+                    + "white panties、<lora:kotori:1>\",\"negative\":\"(censorship:1.2)、text、watermark\"}";
+            f.seed(scope, "Yasaka Menoa, white cape, pleated skirt, <lora:kotori:1>",
+                    "(censorship:1.2),text,watermark");
+            f.rewrites.add("{\"positive\":" + Json.GSON.toJson(poisoned) + ",\"negative\":\"(censorship:1.2)\"}");
+            Run run = f.run(".infix " + userInstruction, scope, true);
+            String landed = run.prompts().positive();
+            check(!landed.contains("{") && !landed.contains("}") && !landed.contains("\"positive\"")
+                            && !landed.contains("“positive”") && !landed.contains("=>") && !landed.contains("\""),
+                    "① 提示词里没有任何 JSON 结构痕迹：" + landed);
+            check(!InfixIntent.hasCjk(landed), "① 提示词里没有中文：" + landed);
+            check(landed.contains("<lora:kotori:1>"), "① LoRA 标签仍在：" + landed);
+            check(run.last().contains("没有改动任何词条") || run.last().contains("一个字都没改"),
+                    "① 回执如实说明这次没有改动：" + run.last());
+        }
+        // ② 同一个事故的另一种写法：模型用中文顿号与全角引号写键名，半角引号一个都认不出来。
+        try (Fixture f = new Fixture("pollute-fullwidth-", false)) {
+            String scope = "456";
+            String poisoned = "｛“positive”：“Yasaka Menoa、1girl、skirt lift、<lora:kotori:1>”｝";
+            f.seed(scope, "1girl, <lora:kotori:1>", "bad_hands");
+            f.rewrites.add("{\"positive\":" + Json.GSON.toJson(poisoned) + ",\"negative\":\"bad_hands\"}");
+            Run run = f.run(".infix " + userInstruction, scope, true);
+            check(!run.prompts().positive().contains("positive") && !run.prompts().positive().contains("、")
+                            && !run.prompts().positive().contains("内裤")
+                            && run.prompts().positive().contains("<lora:kotori:1>"),
+                    "② 全角引号/中文顿号写的 JSON 同样一个字都没落地：" + run.prompts().positive());
+            check(run.last().contains("没有改动任何词条") || run.last().contains("一个字都没改"),
+                    "② 回执如实说明：" + run.last());
+        }
+        // ③ 合法 JSON → 正常采纳；词条被正确切开（不是整段），也不重复。
+        try (Fixture f = new Fixture("pollute-valid-", false)) {
+            String scope = "456";
+            f.seed(scope, "1girl, <lora:kotori:1>", "bad_hands");
+            f.rewrites.add("{\"positive\":\"1girl, grass, <lora:kotori:1>\",\"negative\":\"bad_hands\"}");
+            f.reviews.add("{\"ok\":true,\"conflicts\":[]}");
+            Run run = f.run(".infix 加入草地", scope, true);
+            String landed = run.prompts().positive();
+            check(landed.contains("grass") && landed.contains("1girl") && landed.contains("<lora:kotori:1>"),
+                    "③ 合法 JSON 正常采纳：" + landed);
+            check(landed.split("1girl", -1).length == 2, "③ 词条不重复：" + landed);
+            check(run.last().contains("智能修改已应用"), "③ 回执如实说已应用：" + run.last());
+        }
+        // ④ 乱文本/半个 JSON → 一个字都不改 + 如实说明（不是"成功"）。
+        try (Fixture f = new Fixture("pollute-junk-", false)) {
+            String scope = "456";
+            f.seed(scope, "1girl, <lora:kotori:1>", "bad_hands");
+            f.rewrites.add("{\"positive\":\"1girl, grass, <lora:kotori");       // 半个 JSON
+            Run run = f.run(".infix 加入草地", scope, true);
+            check(run.prompts().positive().equals("1girl, <lora:kotori:1>"),
+                    "④ 半个 JSON → 提示词原样：" + run.prompts().positive());
+            check(!run.last().contains("智能修改已应用") && (run.last().contains("没有改动任何词条")
+                            || run.last().contains("未完成") || run.last().contains("一个字都没改")),
+                    "④ 回执不假装成功：" + run.last());
+        }
+        // ⑤ "移除"侧必须过滤 LoRA：模型把某个词条换成了别的，却顺手把 LoRA 标签删了 → 整份改写稿不许落地。
+        try (Fixture f = new Fixture("pollute-lora-drop-", false)) {
+            String scope = "456";
+            f.seed(scope, "1girl, <lora:kotori:1>", "bad_hands");
+            f.rewrites.add("{\"positive\":\"1girl, military_uniform\",\"negative\":\"bad_hands\"}");
+            Run run = f.run(".infix 换成军装", scope, true);
+            check(run.prompts().positive().contains("<lora:kotori:1>"), "⑤ LoRA 仍在（整份改写稿被拒、没落地）：" + run.prompts().positive());
+            check(!run.prompts().positive().contains("military_uniform"), "⑤ 丢了 LoRA 的改写稿一个字都没落地");
+            check(run.last().contains("丢了 LoRA/嵌入标签"), "⑤ 回执说清为什么没落地：" + run.last());
+            check(run.reviews() == 0, "⑤ 没落地就不做画面检查：" + run.calls);
+        }
+        // ⑥ 落地前校验：修正稿里带结构痕迹（花括号 / 全角引号包着的键名）→ 拒绝并回滚。
+        try (Fixture f = new Fixture("pollute-correction-", false)) {
+            String scope = "456";
+            f.seed(scope, "1girl, <lora:kotori:1>", "bad_hands");
+            f.rewrites.add("@add:grass");
+            String poisoned = "{\"positive\":\"1girl, grass, <lora:kotori:1>\",\"negative\":\"bad_hands\"}";
+            f.reviews.add("{\"ok\":false,\"conflicts\":[{\"what\":\"取景冲突\",\"why\":\"两种构图不能同时成立\"}],"
+                    + "\"fixed_positive\":" + Json.GSON.toJson(poisoned) + ",\"fixed_negative\":\"bad_hands\"}");
+            Run run = f.run(".infix 加入草地", scope, true);
+            String landed = run.prompts().positive();
+            check(!landed.contains("{") && !landed.contains("}") && !landed.contains("\"positive\""),
+                    "⑥ 结构痕迹的修正稿被拒绝、没落地：" + landed);
+            check(landed.contains("grass") && landed.contains("<lora:kotori:1>"),
+                    "⑥ 回滚到改写后的版本：" + landed);
+            check(run.last().contains("画面检查：未通过"), "⑥ 回执如实说明检查不可用：" + run.last());
+        }
+        // ⑦ 中文顿号当分隔符：模型用「、」分隔词条时也要逐条切开（默认档不做词库过滤，走的是"规范化"这条路）。
+        try (Fixture f = new Fixture("pollute-separators-", false)) {
+            String scope = "456";
+            f.seed(scope, "1girl, <lora:kotori:1>", "bad_hands");
+            f.rewrites.add("{\"positive\":\"1girl、solo、blue sky、grass、<lora:kotori:1>\",\"negative\":\"bad_hands\"}");
+            f.reviews.add("{\"ok\":true,\"conflicts\":[]}");
+            Run run = f.run(".infix 加入草地", scope, true);
+            String landed = run.prompts().positive();
+            check(!landed.contains("、") && Bot.usesTerm(landed, "solo") && Bot.usesTerm(landed, "blue sky")
+                            && Bot.usesTerm(landed, "grass") && landed.contains("<lora:kotori:1>"),
+                    "⑦ 顿号分隔的词条各自落地（不是一整段）：" + landed);
+            check(!InfixIntent.hasCjk(landed), "⑦ 落地后的提示词没有中文：" + landed);
+        }
+        // ⑦b 严格词库档（.infix filter on）：顿号同样逐条切开，词库外的词条被丢弃、LoRA 仍在。
+        try (Fixture f = new Fixture("pollute-separators-strict-", false)) {
+            String scope = "456";
+            f.command(".infix filter on", scope);
+            f.seed(scope, "1girl, <lora:kotori:1>", "bad_hands");
+            f.rewrites.add("{\"positive\":\"1girl、standing、blue sky、grass、<lora:kotori:1>\",\"negative\":\"bad_hands\"}");
+            f.reviews.add("{\"ok\":true,\"conflicts\":[]}");
+            Run run = f.run(".infix 加入草地", scope, true);
+            String landed = run.prompts().positive();
+            check(Bot.usesTerm(landed, "standing") && Bot.usesTerm(landed, "grass") && landed.contains("<lora:kotori:1>")
+                            && !landed.contains("blue sky") && !landed.contains("、"),
+                    "⑦b 严格档：顿号词条各自过词库、词库外的被丢弃、LoRA 仍在：" + landed);
+            check(run.last().contains("blue sky") && run.last().contains("已忽略词库外新词"),
+                    "⑦b 回执如实列出被丢弃的词条：" + run.last());
+        }
+        // ⑧ 复现证据：旧校验"整串包含"会放行这段污染（LoRA 被裹在 JSON 文本里、中文全是存量词），
+        //    新校验逐条术语比对 + 结构痕迹检查则挡住它。
+        String blob = "{\"positive\":\"Yasaka Menoa、1girl、skirt lift、panties visible、visible panties、"
+                + "white panties、<lora:Yasaka_Menoa_1_nai:1>\",\"negative\":\"(censorship:1.2)、text\"}";
+        String baseline = "Yasaka Menoa, white cape, panties fully covered by skirt, <lora:Yasaka_Menoa_1_nai:1>";
+        check(baseline.contains("<lora:Yasaka_Menoa_1_nai:1>") && blob.contains("<lora:Yasaka_Menoa_1_nai:1>")
+                        && Bot.promptModelTags(blob).contains("<lora:Yasaka_Menoa_1_nai:1>")
+                        && !Bot.missingModelTags(baseline, blob).isEmpty(),
+                "⑧ 整串包含判 LoRA『还在』（旧校验放行的原因），逐条术语比对照样判它已丢："
+                        + Bot.missingModelTags(baseline, blob));
+        check(DeepSeekPrompts.promptTrace(blob) != null && DeepSeekPrompts.promptTrace(baseline) == null,
+                "⑧ 结构痕迹检查只对污染文本报警：blob=" + DeepSeekPrompts.promptTrace(blob)
+                        + "，baseline=" + DeepSeekPrompts.promptTrace(baseline));
     }
 
     private static void checkEmptyCorrection(Path root) throws Exception {

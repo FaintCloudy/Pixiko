@@ -18,13 +18,33 @@ public final class PromptEditor {
             else if (ch == ')' || ch == ']' || ch == '>') {
                 char expected = ch == ')' ? '(' : ch == ']' ? '[' : '<';
                 if (stack.isEmpty() || stack.pop() != expected) throw new IllegalArgumentException("提示词括号不匹配，请修正后重试。");
-            } else if ((ch == ',' || ch == '，') && stack.isEmpty()) {
+            } else if (isSeparator(ch) && stack.isEmpty()) {
                 add(result, text.substring(start, i)); start = i + 1;
             }
         }
         if (!stack.isEmpty() || escaped) throw new IllegalArgumentException("提示词括号或转义不完整，请修正后重试。");
         add(result, text.substring(start));
         return result;
+    }
+    /**
+     * 词条分隔符：半角逗号、全角逗号 {@code ，}、中文顿号 {@code 、}。
+     *
+     * <p>模型经常用中文标点写词条列表（用户实测那次是 {@code "Yasaka Menoa、1girl、skirt lift…"}）：
+     * 只认半角逗号时整段会被当成**一个**词条，LoRA 标签也会跟着被判成"不在提示词里"。
+     */
+    public static boolean isSeparator(char ch) { return ch == ',' || ch == '，' || ch == '、'; }
+    /**
+     * 把全角逗号/顿号统一成半角逗号，并把**原样保留**的全角引号折成半角：
+     * 这是模型输出落地前的规范化（见 Bot 的落地路径），保证多写的分隔符不会变成一个巨型词条。
+     * 括号/转义写坏时原样返回，交给调用方既有的校验去拒绝。
+     */
+    public static String normalizeSeparators(String text) {
+        if (text == null || text.isBlank()) return text;
+        if (text.indexOf('，') < 0 && text.indexOf('、') < 0
+                && text.indexOf('\u201c') < 0 && text.indexOf('\u201d') < 0) return text;
+        List<String> parts;
+        try { parts = parts(text); } catch (IllegalArgumentException broken) { return text; }
+        return String.join(", ", parts).replace('\u201c', '"').replace('\u201d', '"');
     }
     private static void add(List<String> result, String value) { if (!value.isBlank()) result.add(value.strip()); }
     private static String unwrapped(String text) {

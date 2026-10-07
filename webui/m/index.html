@@ -71,6 +71,9 @@
   <p id="m-frame-note" class="frame-note" hidden>这是手机界面预览（390 × 844）· 点一下就是触摸点击 · 缩放 <span id="m-frame-scale">100%</span></p>
 </div>
 
+<!-- 两端共用的**信息交互逻辑**（身份/增量对账/跟单/未读/滚动锚定）：必须在 app.js 之前载入。
+     与控制台（webui/app.js）引的是**同一个文件**（服务端由既有的 /m/** 静态路由伺服）。 -->
+<script src="/m/pixiko-sync.js"></script>
 <script src="/m/app.js" defer></script>
 <script src="/m/screen-quest.js" defer></script>
 <script src="/m/screen-styles.js" defer></script>

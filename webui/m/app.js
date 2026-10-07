@@ -5,7 +5,10 @@
  * 浮层（sheet / confirm / prompt / toast / 图片查看器）、以及两个核心屏幕
  * （对话 chat、出图 gen）。其余屏幕由 screen-*.js 通过 PixikoM.register() 挂进来。
  *
- * 与桌面控制台（webui/app.js）的关系：**一份代码都不共用**，但复用同一套 /api 接口。
+ * 与桌面控制台（webui/app.js）的关系：**视图层一份代码都不共用**（桌面两栏 / 手机全屏 + 底部 tab），
+ * 但**信息交互逻辑共用同一份实现** {@code webui/m/pixiko-sync.js}（页面里由 `<script src="/m/pixiko-sync.js">`
+ * 在 app.js 之前载入 → `window.PixikoSync`）：条目身份与增量对账、服务端对话日志的并集/对齐、
+ * 跟单状态机（`/api/capture` + `/api/progress`）、未读记账、滚动锚定，全部走它。
  * 所有接口的形状都是照 src/main/java/cn/szu/bot/web/WebApiController.java 的
  * route() 分支与 Bot.java 的 web*() 实现逐个核对过的（字段名见各函数注释）。
  *
@@ -20,6 +23,15 @@
  * ========================================================================== */
 (function () {
   'use strict';
+
+  /**
+   * 两端共用的**信息交互逻辑**（身份/对账/跟单/未读/滚动锚定）。
+   * 页面必须在本脚本之前引 `/m/pixiko-sync.js`；缺了就抛一句人话（不要静默降级成两套逻辑）。
+   */
+  var Sync = (typeof window !== 'undefined' && window.PixikoSync) || null;
+  if (!Sync || typeof Sync.diffEntries !== 'function') {
+    throw new Error('缺少共用模块 /m/pixiko-sync.js（必须在 app.js 之前载入）：信息交互逻辑只有这一份实现。');
+  }
 
   /* ── 1. 常量与工具 ───────────────────────────────────────────────────── */
 
@@ -51,29 +63,6 @@
    */
   var CAPTURE_FOLLOW_MAX_MS = 15 * 60 * 1000;
   var PROGRESS_POLL_MS = 1500;                 // 生成进度轮询间隔（与桌面版一致）
-  /**
-   * 「我正在跟哪条回执」在 localStorage 里的键。
-   *
-   * <p><b>为什么必须落盘</b>：跟单现场（captureId / 任务号）原先**只在内存里**（`chat.captureStop`
-   * 那个闭包）。安卓在后台回收渲染进程、或系统把 App 收掉再打开时，页面是**整页重来**的 ——
-   * 内存里的跟单现场一起没了，于是"服务端早就投递好的图，回到前台再也没人接"，
-   * 而对话正文（`data/webui/&lt;scope&gt;-chat-log.json`）是客户端存上去的，缺的那几张就永远缺着
-   * （用户报的「手机端挂起（在浏览其他应用）也收不到图」里，属于"页面被重建"的那一半）。
-   * 落盘之后，重建立刻能从服务端把这条回执补回来，并把跟单续上（见 {@link catchUpReceipts}）。
-   */
-  var FOLLOW_KEY = 'pixiko-follow-capture';
-  /**
-   * **跟单那条**回执的补拉窗口：只补最近这么久的；更老的留在回执屏里看，不往对话正文里灌历史。
-   *
-   * <p>注意它**只**管"正在跟的那条"（跟单本身另有 {@link CAPTURE_FOLLOW_MAX_MS} 兜底）。
-   * "这次页面会话错过的那些"由 {@link catchUpCutoff} 那个闸门管，**不能**用这个 6 小时窗口 ——
-   * 6 小时内的老回执全都会满足它，那正是「对话框莫名其妙插入历史对话」的来源。
-   */
-  var CATCHUP_WINDOW_MS = 6 * 60 * 60 * 1000;
-  /** 一次补拉最多补几条（"正在跟的那条"另算）。防止冷启动把历史回执整片灌进对话。 */
-  var CATCHUP_MAX_QUESTS = 3;
-  /** 两次补拉之间的最小间隔：用户手势会频繁唤醒，别把请求打爆（回到前台那条路不受此限）。 */
-  var CATCHUP_MIN_GAP_MS = 10000;
 
   var TABS = [
     { id: 'chat', title: '对话' },
@@ -290,8 +279,7 @@
    *   mount(root) 只在首次进入时调用一次，root 是一张干净的 <section class="screen">。
    *   refresh() 可选：app bar 的刷新按钮与下拉刷新会调它。
    */
-  PixikoM.register = function (id, spec) {
-    if (!id || typeof id !== 'string') throw new Error('register 需要一个字符串 id');
+  PixikoM.register = function (id, spec) {    if (!id || typeof id !== 'string') throw new Error('register 需要一个字符串 id');
     if (!spec || typeof spec.mount !== 'function') throw new Error('register 的 mount 必须是函数');
     screens[id] = { id: id, title: spec.title || TITLES[id] || id, mount: spec.mount, refresh: spec.refresh || null };
     if (spec.title) TITLES[id] = spec.title;
@@ -1927,7 +1915,15 @@
     captureStop: null,
     loading: false,
     loaded: false,
-    seq: 0
+    seq: 0,
+    /* 上一轮服务端窗口的**身份快照**（`PixikoSync.entryIds` 的结果）：算"这一轮新出现了哪几条"用。
+       null = 还没同步过（首屏已经铺好，第一次只记不补）。 */
+    logSeen: null,
+    /** 用户**真的**往上翻过（不是进屏那一下的程序性贴底）：为真时周期性渲染绝不许改 scrollTop。 */
+    userScrolled: false,
+    /** 有内容在下面等着看（用户不在底部时不硬拽，只提示"有新消息 ↓"）。 */
+    wantBottom: false,
+    lastHintAt: 0
   };
 
   var CHAT_ENTRIES_CAP = 200;      // 与 ChatLogStore.ENTRIES_CAP 同值
@@ -1938,19 +1934,19 @@
     return entry;
   }
 
-  /** 规范化服务端回来的条目（role 只认 user/bot/sys）。 */
+  /**
+   * 规范化服务端回来的条目（role 只认 user/bot/sys）。
+   * **形状清洗走共用模块**（与桌面控制台同一份 `cleanEntry`）：图片的两种写法
+   * （字符串 / `{file}` 对象）在两端收敛成同一个结果，不会再出现"一边画得出一边画不出"。
+   */
   function chatNormalize(raw) {
-    var out = [];
-    var list = raw || [];
-    for (var i = 0; i < list.length; i++) {
-      var item = list[i];
-      if (!item || typeof item !== 'object') continue;
-      var role = item.role === 'user' || item.role === 'sys' ? item.role : 'bot';
-      var text = item.text === null || item.text === undefined ? '' : String(item.text);
-      var images = Array.isArray(item.images) ? item.images.filter(function (p) { return typeof p === 'string' && p; }) : [];
-      if (!text && !images.length) continue;
-      out.push({ role: role, text: text, images: images, seq: ++chat.seq });
+    var out = Sync.cleanEntries(raw);
+    // 历史条目带 id 时记下（事件队列的同一件事件靠它认出来：历史 + 增量按 id 去重）
+    for (var n = 0; n < out.length; n++) {
+      var src = Array.isArray(raw) ? raw[n] : null;
+      if (src && src.id) out[n].eventId = String(src.id);
     }
+    for (var i = 0; i < out.length; i++) out[i].seq = ++chat.seq;
     return out.slice(-CHAT_ENTRIES_CAP);
   }
 
@@ -2051,23 +2047,6 @@
     return { follow: chat.follow !== false, gap: chatGapToBottom(), threshold: CHAT_FOLLOW_PX };
   };
 
-  /** 贴底（无动画）。列表有滚动时才动；外层 #m-main 也一起收敛（它现在一般不滚）。 */
-  function scrollChatToBottom(options) {
-    var smooth = !!(options && options.smooth);
-    var targets = chatScrollTargets();
-    if (!targets.length) { chatScrollToEnd(smooth); return 0; }
-    for (var i = 0; i < targets.length; i++) {
-      var node = targets[i];
-      if (smooth) {
-        try { node.scrollTo({ top: node.scrollHeight, behavior: 'smooth' }); } catch (error) { node.scrollTop = node.scrollHeight; }
-      } else {
-        node.scrollTop = node.scrollHeight;
-      }
-    }
-    return targets.length;
-  }
-  PixikoM.scrollChatToBottom = scrollChatToBottom;    // 给对话相关的屏幕复用
-
   /**
    * 跟随新内容（新消息、图片解码完、回执陆续到达、回执卡片变化…）。
    * **只在 follow 为真时才贴底**；follow 为假就一动不动。
@@ -2078,6 +2057,26 @@
     scrollChatToBottom({ smooth: false });
     chat.follow = chatNearBottom();
   }
+
+  /**
+   * 滚动**锚定** —— 两端同一套判据，实现在共用模块里（`PixikoSync.grabAnchor`/`settleAnchor`）。
+   *
+   * <p>用户报的「手机端会出现周期性滑动到最底部的异常位移」就是缺了这一对：轮询/补拉/渲染/图片
+   * 异步撑高这些**周期性**行为如果无条件 `scrollTop = scrollHeight`，正在翻历史的用户每隔几秒
+   * 就被拽到底。现在的规矩只有一条：
+   *   **改动列表内容之前 `chatGrabAnchor()` 记锚点，改完 `chatSettle(anchor)` 落位；
+   *     原本在底部 → 贴新底；原本不在底部 → 位置放回原处（`scrollTop` 一个像素都不动）。**
+   * 所有会改内容的时机都必须走它：`chatSyncEntries` / `chatLoad` / `chatWatchMedia`（图片撑高）/
+   * 事件队列的渲染（message 追加 / patch 就地补图）每轮，以及图片异步撑高时。
+   */
+  function chatGrabAnchor(node) {
+    return Sync.grabAnchor(node || chat.host, Sync.STICK_PX);
+  }
+  function chatSettle(anchor, node) {
+    return Sync.settleAnchor(node || chat.host, anchor, { smooth: false });
+  }
+  /** 调试/自动化用：直接量一次锚点。 */
+  PixikoM.chatAnchor = function () { return chatGrabAnchor(); };
 
   /**
    * 每样滚动的"真实容器"到底是谁 —— 现在的布局里就是 #m-main 里的 .chat-log，
@@ -2094,138 +2093,210 @@
   }
 
   /**
-   * 滚到最底（进入对话屏、发消息、跟随新内容都用它）。
-   * `{smooth:false}` = 直接设 scrollTop，不带动画 —— 首次进入时不希望"看见滑动一下"。
+   * 滚到最底（**只给用户自己的动作与"刚进屏"用**：进入对话屏、发消息、下拉刷新）。
+   *
+   * <p>`{smooth:false}` = 直接设 scrollTop，不带动画 —— 首次进入时不希望"看见滑动一下"。
+   *
+   * <p>**周期性路径一律不许调它**：那些地方改内容前后要用 {@link chatGrabAnchor}/{@link chatSettle}
+   * （用户往上翻过之后，任何周期行为都不许改变 scrollTop）。这里也把 `chat.follow` 一起置成
+   * "贴底"，否则贴完底之后第一次 `chatNearBottom()` 判定的窗口里再来一轮就会打架。
    */
-  function legacyScrollChatToBottomRemoved() { return 0; }
-  void legacyScrollChatToBottomRemoved;
-
+  function scrollChatToBottom(options) {
+    var smooth = !!(options && options.smooth);
+    var targets = chatScrollTargets();
+    if (!targets.length) { chatScrollToEnd(smooth); chat.follow = true; return 0; }
+    for (var i = 0; i < targets.length; i++) {
+      var node = targets[i];
+      if (smooth) {
+        try { node.scrollTo({ top: node.scrollHeight, behavior: 'smooth' }); } catch (error) { node.scrollTop = node.scrollHeight; }
+      } else {
+        node.scrollTop = node.scrollHeight;
+      }
+    }
+    chat.follow = true;
+    return targets.length;
+  }
+  PixikoM.scrollChatToBottom = scrollChatToBottom;    // 给对话相关的屏幕复用
   /**
-   * 把 `chat.entries` 同步进 DOM —— **增量**：只 append 还没画过的条目，内容变了的原地换掉。
+   * 把 `chat.entries` 同步进 DOM —— 走**共用模块的增量对账**（`PixikoSync.diffEntries`）。
    *
-   * <p>为什么要增量：回执跟随时每轮 `chatRenderAll()` 都会 `clear(chat.host)` 整屏重建，
-   * 已经加载好的 `<img>` 被反复销毁重建 —— 浏览器要重新建连接、重新解码，"每次加载都有延迟"
-   * 就是它（`loading=lazy` 的图还会被重新判定成屏外）。现在已画过的气泡原样不动。
+   * <p>为什么是增量：回执跟随时每轮 `chatRenderAll()` 都整屏重建的话，已经加载好的 `<img>`
+   * 被反复销毁重建 —— 浏览器要重新建连接、重新解码，"每次加载都有延迟"就是它
+   * （`loading=lazy` 的图还会被重新判定成屏外）。
    *
-   * <p>为什么还要认"内容变了"：回执的文字与图片是**分几次**到达的（先来文字、几秒到几十秒后
-   * 才来图片，见 followCapture）。只 append 的话，先画好的那条气泡**永远不会再更新** ——
-   * 服务端把图发出来了、`chat.entries` 里也有了、存档也写进去了，用户眼前那一条却还是没图
-   * （用户报的「下命令之后不回图片」在对话屏里就是它）。所以给每个气泡记一份内容签名
-   * （{@link chatEntrySig}），对不上的那一格原地换成新节点（只换这一格，别的图不动、不重新解码）。
+   * <p>**按条目身份 diff，不按下标也不按长度**（身份规则见 pixiko-sync.js 的 `entryId`：
+   * 逐字相同或严格前缀算同一条）：只 append 新增、只原地换掉内容变了的（回执的文字与图片是
+   * 分几次到的：先文字、几秒到几十秒后才有图，只 append 的话那条气泡永远不再更新），
+   * 中间插进来的历史**只能是 add**（绝不整块重建、绝不插到中间）。
    *
-   * <p>认"画过没画过"用 `entry.seq`（`chatEntry`/`chatNormalize` 都发单调递增号），
-   * 记在气泡的 `data-seq` 上；数量对不上（比如被别的分支清过）就退回整屏重建一次。
+   * <p>**滚动位置由共用模块的锚定保证**：改内容**之前**记锚点、改完落位；用户往上翻过之后
+   * 任何一轮渲染都不会改变 `scrollTop`（见本文件 `chatSettle`/`chatGrabAnchor` 的包装）。
    */
   function chatSyncEntries() {
     if (!chat.host) return;
     if (!chat.entries.length) {
+      var empty = chatGrabAnchor();
       clear(chat.host);
       chat.host.appendChild(emptyState('还没有对话。下面输入一句话就能开始（这一屏的 scope 是「' + PixikoM.scope() + '」）。'));
+      chatSettle(empty);
       return;
     }
     var placeholder = chat.host.querySelector('[data-state="empty"]');
+    var anchor = chatGrabAnchor();
     if (placeholder) clear(chat.host);
     var painted = chat.host.querySelectorAll('[data-seq]');
-    var first = painted.length ? Number(painted[0].getAttribute('data-seq')) : 0;
-    // 第一条对不上说明 DOM 与 entries 不同步（清空过/整屏换过）→ 重建一次，之后都走增量
-    if (!painted.length || first !== chat.entries[0].seq || painted.length > chat.entries.length) {
-      clear(chat.host);
-      chat.entries.forEach(function (entry) {
-        var node = chatBubble(entry);
-        node.setAttribute('data-seq', String(entry.seq));
-        node.setAttribute('data-sig', chatEntrySig(entry));
-        chat.host.appendChild(node);
-      });
-    } else {
-      // ① 已经画过、但内容变了的（回执跟随时"后到的图片"就落在这里）：只换这一格
-      for (var k = 0; k < painted.length; k++) {
-        var known = chat.entries[k];
-        if (!known) break;
-        var want = chatEntrySig(known);
-        if (painted[k].getAttribute('data-sig') === want) continue;
-        var redraw = chatBubble(known);
-        redraw.setAttribute('data-seq', String(known.seq));
-        redraw.setAttribute('data-sig', want);
-        if (painted[k].parentNode) painted[k].parentNode.replaceChild(redraw, painted[k]);
-      }
-      // ② 还没画过的尾巴：照旧 append
-      for (var i = painted.length; i < chat.entries.length; i++) {
-        var fresh = chatBubble(chat.entries[i]);
-        fresh.setAttribute('data-seq', String(chat.entries[i].seq));
-        fresh.setAttribute('data-sig', chatEntrySig(chat.entries[i]));
-        chat.host.appendChild(fresh);
+    /* "上一轮画过的那份"从 **DOM 自己**读（`data-seq` 是每条条目的单调号）——
+       不另存一份状态，就不会出现"状态位与 DOM 不一致"的整块重建。 */
+    var prev = [];
+    if (painted.length) {
+      var fromSeq = Number(painted[0].getAttribute('data-seq'));
+      var toSeq = Number(painted[painted.length - 1].getAttribute('data-seq'));
+      for (var s = 0; s < chat.entries.length; s++) {
+        var seq = Number(chat.entries[s].seq);
+        if (seq >= fromSeq && seq <= toSeq) prev.push(chat.entries[s]);
       }
     }
+    var plan = Sync.diffEntries(prev, chat.entries);
+    // 画出来的节点数与对账结果对不上（DOM 被别的分支清过 / 整屏换过）→ 重建一次，之后都走增量。
+    if (!painted.length || prev.length !== painted.length
+      || plan.items.length !== chat.entries.length || plan.items[0].op !== 'keep') {
+      clear(chat.host);
+      chat.entries.forEach(function (entry) { chat.host.appendChild(chatBubbleNode(entry)); });
+      chatSettle(anchor);
+      chatWatchMedia();
+      return;
+    }
+    // ① 内容变了的（回执"后到的图片"就落在这里）：只换这一格，别的图不动、不重新解码
+    for (var k = 0; k < plan.items.length && k < painted.length; k++) {
+      var item = plan.items[k];
+      if (item.op !== 'keep') break;
+      if (!item.changed) continue;
+      var redraw = chatBubbleNode(item.entry);
+      if (painted[k].parentNode) painted[k].parentNode.replaceChild(redraw, painted[k]);
+    }
+    // ② 还没画过的尾巴：照旧 append
+    for (var i = painted.length; i < chat.entries.length; i++) {
+      chat.host.appendChild(chatBubbleNode(chat.entries[i]));
+    }
+    chatSettle(anchor);
     chatWatchMedia();
   }
+
+  /** 一条条目 → 一个气泡节点（`data-seq`/`data-sig` 是"画过没画过、内容变没变"的依据）。 */
+  function chatBubbleNode(entry) {
+    var node = chatBubble(entry);
+    node.setAttribute('data-seq', String(entry.seq));
+    node.setAttribute('data-sig', chatEntrySig(entry));
+    return node;
+  }
+
+  /* ── 对话的**唯一增量路径**：事件队列（取件 → 渲染 → ack） ──────────────────
+   *
+   * 用户定的契约（冻结）：`POST /api/events {scope,after,limit}` → `{items,next,latest,hasMore}`，
+   * 条目 `{seq,id,type,at}`；`type=message` 是新消息，`type=patch` 是"图片晚到、按 target 就地补图"；
+   * 渲染成功后再 `POST /api/events/ack {scope,seq}`；本地只持久化 `lastSeq`。
+   *
+   * 以前是三四个源各来一次（`/api/chat/log` 轮询 + `/api/capture` 跟单 + `/api/quests` 补拉），
+   * 前端必须自己"缝"；缝错就是「回执重复 / 图片重复 / 回执时不时少一条」。现在只有这一条路。
+   */
+  var EVENT_DRAIN_MS = 2000;
+
+  /** 当前 scope 的 `lastSeq` 键（每设备一份，localStorage）。 */
+  function eventsCursorKey() { return 'pixiko-events-last-seq:' + PixikoM.scope(); }
+
+  /** 事件 id → 对话里那条气泡（`patch` 按它就地补图；历史没加载到就忽略并记 debug）。 */
+  function eventEntry(id) {
+    if (!id) return null;
+    for (var i = 0; i < chat.entries.length; i++) if (chat.entries[i].eventId === id) return chat.entries[i];
+    return null;
+  }
+
+  /** 一件事件 → 对话。返回 false 表示"这次没画成"（调用方**不 ack**，下次重取同一批）。 */
+  function renderChatEvent(action) {
+    if (!chat.host) return true;                    // 不在对话屏：什么都不画（ack 掉，回屏时从历史拿）
+    if (action.kind === 'message') {
+      if (eventEntry(action.id)) return true;       // 幂等：同一条 id 只画一次
+      var entry = Sync.cleanEntry(action.entry);
+      if (!entry) return true;
+      entry.seq = ++chat.seq;
+      entry.eventId = action.id;
+      chat.entries.push(entry);
+      if (chat.entries.length > CHAT_ENTRIES_CAP) chat.entries = chat.entries.slice(-CHAT_ENTRIES_CAP);
+      if (String(entry.role) === 'user' || String(entry.role) === 'sys') { /* 本地也发过：靠 id 幂等 */ }
+      chatRenderAll();
+      chatPinnedFollow();                           // 只有当场确实在底部才贴底（否则只提示"有新消息"）
+      PixikoM.refreshStatus().catch(function () {});
+      return true;
+    }
+    if (action.kind === 'patch') {
+      var target = eventEntry(action.target);
+      if (!target) {                                 // 字段兼容：历史没加载到 → 忽略 + debug，绝不新插气泡
+        if (window.console && console.debug) console.debug('事件 patch 的目标不在本地（忽略）：' + action.target);
+        return true;
+      }
+      var merged = Sync.mergeImages([target], action.images, { role: target.role || 'bot' });
+      if (!merged || !merged.added.length) return true;   // 图已经有了：幂等
+      chatRenderAll();                              // 走增量路径（只换那一条，且锚定不动用户的滚动）
+      chatPinnedFollow();
+      PixikoM.refreshStatus().catch(function () {});
+      return true;
+    }
+    return true;                                    // 未知 type / 坏条目：忽略并 ack（契约要求不许崩）
+  }
+
+
+  /** 起表：一个定时器（drain 循环）+ 唤醒时立刻补一拍。 */
+  function startEventQueue() {
+    if (chat.queue) return chat.queue;
+    chat.queue = Sync.newDrain({
+      request: function (body) {
+        return PixikoM.api('/api/events', { body: { scope: PixikoM.scope(), after: body.after, limit: body.limit } })
+          .catch(function (error) {
+            if (Number(error && error.status) === 404 || /未知接口/.test(String(error && error.message))) {
+              if (window.console && console.info) console.info('事件队列不可用（/api/events 404）：本会话退化成"历史 + 写回"模式。');
+            }
+            throw error;
+          });
+      },
+      render: renderChatEvent,
+      ack: function (seq) {
+        Sync.writeCursor(window.localStorage, eventsCursorKey(), seq);
+        PixikoM.api('/api/events/ack', { body: { scope: PixikoM.scope(), seq: seq } }).catch(function () {});
+      },
+      resolve: function (id) { return !!eventEntry(id); }
+    }, { interval: EVENT_DRAIN_MS });
+    chat.queue.lastSeq = Sync.readCursor(window.localStorage, eventsCursorKey());
+    Sync.startDrain(chat.queue);
+    PixikoM.onWake(function () { Sync.drainNow(chat.queue); });      // 回前台/重新可见：立刻补一拍
+    return chat.queue;
+  }
+
+  /** 调试/自动化用：立刻取一拍。 */
+  PixikoM.drainEvents = function () { return Promise.resolve(startEventQueue()).then(function (q) { return Sync.drainNow(q); }); };
+  /** 调试/自动化用：看一眼队列状态（游标 / 统计 / 是否不可用）。 */
+  PixikoM.eventQueueState = function () {
+    var q = chat.queue;
+    return q ? { lastSeq: q.lastSeq, unavailable: q.unavailable, stats: q.stats, entries: chat.entries.length } : null;
+  };
 
   function chatRenderAll() {
     if (!chat.host) return;
     chatSyncEntries();
   }
 
-  /** 一条条目的签名（角色+正文+图片），用来对齐"服务端有哪些、本地已经有哪条"。 */
+  /** 一条条目的签名（角色+正文+图片）—— 与桌面控制台同一份实现（共用模块的 `entrySig`）。 */
   function chatEntrySig(entry) {
-    return entry.role + '\u0001' + entry.text + '\u0001' + (entry.images || []).join('\u0002');
+    return Sync.entrySig(entry);
   }
 
   /**
-   * 轻轮询服务端存档，**只追加**本地还没有的尾巴。
+   * **已停用**：以前这里每 4 秒重读整份 `/api/chat/log` 再按"正文互为前缀"合并。
    *
-   * <p>为什么需要：出图完成时那条带图的条目不一定是"这台手机自己发的"——控制台 / QQ / 别台设备出的图
-   * 也会写进同一条正文存档里；而对话屏以前只在**进屏那一次**（和手动刷新）读存档，用户已经停在对话屏时
-   * 那张图永远不出现，只能去回执看（用户报的正是这个）。
-   *
-   * <p>为什么是"合并"而不是整屏重读：重读会把用户正在输入/刚发出去、还没防抖存回去的那条冲掉。
-   * 这里按 {@link chatEntrySig} 对齐 —— 本地已有的（含还没存上去的）一条都不动，只补服务端多出来的。
-   * 新增的条目走正常的 `chatRenderAll()` 增量路径，图仍是缩略图 `&w=320` 且命中 {@link imageCache}。
+   * <p>现在信息的唯一入口是事件队列（见 {@link startEventQueue}）：服务端把每条信息入队一次、
+   * 带稳定 id 与递增 seq，前端只负责按顺序渲染 + ack。这里保留一个空函数是为了让老调用点
+   * 语义明确（"什么都不做"），**绝不再从第二个源画同一份内容**。
    */
-  function chatPollMerge() {
-    if (chat.loading || chat.sending) return Promise.resolve(null);
-    return PixikoM.api('/api/chat/log', { body: { scope: PixikoM.scope() } }).then(function (data) {
-      var fresh = chatNormalize(data && data.entries);
-      if (!fresh.length) return 0;
-      var have = Object.create(null);
-      var byText = Object.create(null);
-      chat.entries.forEach(function (entry) {
-        var key = chatEntrySig(entry);
-        have[key] = (have[key] || 0) + 1;
-        var textKey = entry.role + '\u0001' + entry.text;
-        (byText[textKey] || (byText[textKey] = [])).push(entry);
-      });
-      var added = 0, changed = 0;
-      fresh.forEach(function (entry) {
-        var key = chatEntrySig(entry);
-        if (have[key]) { have[key]--; return; }
-        /* 服务端这一条本地没有完全一样的：先看是不是"同一条的完整版"——
-           本地那条先落了文字（还没图）就被防抖存了上去，图片到达后服务端那份已经是带图的。
-           以前这种情况会被当成新条目 **再 append 一条**，于是同一段回执在对话里出现两遍
-           （一份没图、一份有图）—— 用户报的「回执重复」。这里改成"并进本地那一条"。 */
-        var same = byText[entry.role + '\u0001' + entry.text];
-        var target = same && same.length ? same.shift() : null;
-        if (target) {
-          var mine = target.images || [];
-          var missing = (entry.images || []).filter(function (src) { return mine.indexOf(src) < 0; });
-          if (missing.length) {
-            target.images = mine.concat(missing);
-            have[key] = (have[key] || 0) + 1;      // 记上，免得同一份再并一次
-            changed++;
-            return;
-          }
-        }
-        chat.entries.push(entry);
-        added++;
-      });
-      if (!added && !changed) return 0;
-      if (chat.entries.length > CHAT_ENTRIES_CAP) chat.entries = chat.entries.slice(-CHAT_ENTRIES_CAP);
-      var placeholder = chat.host && chat.host.querySelector('[data-state="empty"]');
-      if (placeholder) clear(chat.host);
-      chatRenderAll();
-      chatFollow();                 // 只有用户本来就在底部附近才跟着走（不抢正在上翻的视口）
-      if (changed && !added) saveChatLogDebounced();   // 本地内容变了：把完整版存回去，别再产生分叉
-      return added || changed;
-    }).catch(function () { return null; });
-  }
+  function chatPollMerge() { return Promise.resolve(0); }
 
   function chatAppend(entry, scroll) {
     chat.entries.push(entry);
@@ -2241,13 +2312,12 @@
     chatWatchMedia();
     if (scroll !== false && shouldFollow) scrollChatToBottom({ smooth: false });
     chat.follow = chatNearBottom();
-    saveChatLogDebounced();
   }
 
   /**
-   * 进入对话屏：**立刻、无动画**贴到最底。
+   * 进入对话屏：**立刻、无动画**贴到最底（这是"用户自己的动作"那条路径，贴底是对的）。
    * 内层列表的高度会随后续帧（图片解码、字体、样式）再变，所以在几帧之后补一次；
-   * 但只有在用户本来就在底部附近时才补，避免抢走正在上翻的视口。
+   * 但只有在用户本来就在底部附近时才补（**用户进来之后马上上滑翻历史，这几次补排就不许再动他**）。
    */
   function chatEnterBottom() {
     chat.lastEnteredAt = Date.now();
@@ -2257,105 +2327,107 @@
     delays.forEach(function (ms) {
       setTimeout(function () {
         if (currentId !== 'chat') return;
-        // 刚进入对话屏的 1 秒内一律贴底（列表高度还在随后续帧变），之后交给 follow 标志
+        // 刚进入对话屏的 1 秒内贴底（列表高度还在随后续帧变），之后交给 follow 标志：
+        // 1 秒之后 follow 为假（用户已经上滑）就一次都不许动 —— 否则就是用户报的"被拽到底"。
         if (Date.now() - (chat.lastEnteredAt || 0) < 1000 || chat.follow !== false) scrollChatToBottom({ smooth: false });
+        else chatSettle(chatGrabAnchor());
       }, ms);
     });
   }
 
   /**
-   * 图片解码完会让列表变高：只要用户本来在底部附近就跟到底。
-   * 只挂一次（img.complete 的补一次），避免每次渲染都叠监听器。
+   * 图片解码完会让列表变高 —— 这是**周期性抖动**最容易的来源（每轮轮询/渲染都会挂新的 load 监听）。
+   *
+   * <p>规矩与别处一样（共用模块的 `stickImages`）：**只在挂监听那一刻本来就在底部时才贴底**；
+   * 用户往上翻着读历史时，图加载完**一动不动**。
    */
   function chatWatchMedia() {
     if (!chat.host) return;
+    Sync.stickImages(chat.host, Sync.STICK_PX);
     var images = chat.host.querySelectorAll('img');
     for (var i = 0; i < images.length; i++) {
       (function (img) {
         if (img.dataset.pixikoFollow) return;
         img.dataset.pixikoFollow = '1';
-        if (img.complete) { setTimeout(chatFollow, 0); return; }
-        img.addEventListener('load', function () { setTimeout(chatFollow, 0); }, { once: true });
-        img.addEventListener('error', function () { setTimeout(chatFollow, 0); }, { once: true });
+        // `complete` 的补一次也走"当场量几何、只在底部才贴"的判据（不看 chat.follow 这个可能过期的状态位）
+        if (img.complete) { setTimeout(chatPinnedFollow, 0); return; }
+        img.addEventListener('load', function () { setTimeout(chatPinnedFollow, 0); }, { once: true });
+        img.addEventListener('error', function () { setTimeout(chatPinnedFollow, 0); }, { once: true });
       })(images[i]);
     }
   }
 
-  /** 800ms 防抖写回服务端正文（页面隐藏时另有补一次，见 installVisibilityFlush）。 */
-  var saveChatLogDebounced = debounce(function () { saveChatLog(); }, 800);
-  var saveChatLogInFlight = null;
   /**
-   * 整份写回服务端正文，但**推之前先与服务端那一份并一次集**。
+   * 图片加载完那一拍：**当场量一次几何**，只有此刻确实在底部才贴底；不在底部就只提示"有新消息 ↓"。
    *
-   * <p>服务端现在也是这份正文的写入者之一（产生回执消息时自己 append 一条，幂等键 = 回执号 + 序号，
-   * 见 {@code ChatLogStore.append}）。手机端这一份是"上一次读到之后"的快照时，直接整份覆盖回去
-   * 就会把服务端刚 append 的那条抹掉（"回执时不时少一条"就是这个形状）。
-   * 并集只往本地补"服务端有、本地没有"的条目，**绝不删本地任何一条**。
-   *
-   * <p>服务端读不到就退回老行为：照旧推本地这一份（失败只 toast，不影响聊天）。
+   * <p>为什么不看 `chat.follow`：那是个"上次滚动事件算出来的"状态位，图片撑高会改变几何而不派发
+   * 用户滚动，用它当判据就会出现"明明已经离开底部还被贴一次"。
    */
-  async function saveChatLog() {
-    if (!chat.loaded) return;                       // 还没读到服务端正文就先别写，免得把别人的覆盖掉
-    if (saveChatLogInFlight) return saveChatLogInFlight;   // 上一笔还没回来就跳过这一次（防抖下不会积压）
-    saveChatLogInFlight = (async function () {
-      var payload = chat.entries.map(function (entry) {
-        var item = { role: entry.role, text: entry.text };
-        if (entry.images && entry.images.length) item.images = entry.images.slice(0);
-        return item;
-      });
-      if (!payload.length) return;                  // 空内容不推：清空走 /api/chat/reset
-      var outgoing = payload;
-      try {
-        var remote = await PixikoM.api('/api/chat/log', { body: { scope: PixikoM.scope() } });
-        // 并集用**服务端原样的条目**（不是 chatNormalize 之后的：那个会补 seq/空 images，
-        // 并集比的是"角色 + 正文 + 图片"，键必须与本地这一份同口径）。
-        var list = remote && Array.isArray(remote.entries) ? remote.entries : [];
-        if (list.length) outgoing = unionChatEntries(list, payload);
-      } catch (error) { /* 读不到就照老行为整份推本地这一份 */ }
-      await PixikoM.api('/api/chat/log/save', { body: { scope: PixikoM.scope(), entries: outgoing } });
-    })().catch(function (error) {
-      if (error.code !== 'unauthorized') PixikoM.toast('对话正文没存上：' + error.message);
-    }).then(function () { saveChatLogInFlight = null; });
-    return saveChatLogInFlight;
+  function chatPinnedFollow() {
+    if (!chat.host) return;
+    if (Sync.nodeAtBottom(chat.host, CHAT_FOLLOW_PX)) {
+      chat.host.scrollTop = chat.host.scrollHeight;
+      chat.follow = true;
+      chat.wantBottom = false;
+    } else {
+      chat.follow = false;
+      chatHintNew();
+    }
   }
 
   /**
-   * 两份正文的**并集**（服务端那份在前、本地独有的接在后面）：按"角色 + 正文 + 图片"对齐
-   * （同一条重复出现时按出现次数配对），只补本地缺的，**不删任何一条**。
+   * 用户**不在底部**时来了新内容：绝不硬拽视口，只给一句"有新消息 ↓"（节流 6 秒，不刷屏）。
+   *
+   * <p>这就是"只有用户本来就在底部时才贴底"的另一半：用户往上翻过之后，周期行为只提示、不动他。
+   * 用户自己滑回底部（或点进对话屏）时提示状态复位。
    */
-  function unionChatEntries(remote, local) {
-    var known = Object.create(null);
-    function keyOf(entry) {
-      var images = entry && entry.images && entry.images.length ? entry.images.join('\u0002') : '';
-      return String((entry && entry.role) || '') + '\u0001' + String((entry && entry.text) || '') + '\u0001' + images;
-    }
-    for (var i = 0; i < remote.length; i++) {
-      var key = keyOf(remote[i]);
-      known[key] = (known[key] || 0) + 1;
-    }
-    var extra = [];
-    for (var j = 0; j < local.length; j++) {
-      var localKey = keyOf(local[j]);
-      var left = known[localKey] || 0;
-      if (left > 0) { known[localKey] = left - 1; continue; }   // 服务端已经有了 → 不重复
-      extra.push(local[j]);                                     // 本地独有的 → 接在后面
-    }
-    if (!extra.length) return remote.slice(0);
-    return remote.concat(extra).slice(-200);                    // 与本地快照同一条 200 条上限
+  function chatHintNew() {
+    chat.wantBottom = true;
+    var now = Date.now();
+    if (now - (chat.lastHintAt || 0) < 6000) return;
+    chat.lastHintAt = now;
+    PixikoM.toast('有新消息 ↓（正在看历史，没有把你拽到底）');
   }
 
+
+
+  /**
+   * 读回服务端正文（`/api/chat/log`）。
+   *
+   * <p>**贴底只在"用户本来就在底部"时发生**：整页重建/首次进屏时贴底是对的（用户要求"每次点进去
+   * 都在最下方"），但这条函数也会被刷新按钮 / 复位路径调用 —— 无条件 `scrollTop = scrollHeight`
+   * 就会把正在翻历史的用户拽到底（用户报的「周期性滑动到最底部的异常位移」的其中一条来源）。
+   * 现在走共用模块的锚定：改动前记锚点、改完落位。
+   */
   async function chatLoad() {
     if (chat.loading) return;
     chat.loading = true;
     chat.loaded = false;
+    var anchor = chatGrabAnchor();
     if (chat.host) { clear(chat.host); chat.host.appendChild(skeleton(4, 'bubble')); }
     try {
-      // 接口：POST /api/chat/log {scope} → {entries:[{role,text,images}], count}
+      // 接口：POST /api/chat/log {scope} → {entries:[{role,text,images,id?}], count}
       var data = await PixikoM.api('/api/chat/log', { body: { scope: PixikoM.scope() } });
       chat.entries = chatNormalize(data && data.entries);
+      // 历史条目带 `id`/`seq` 时记下来：
+      //   · `eventId` —— 队列里的同一件事件再送一次也能按 id 认出来、不重复画；
+      //   · `seq`     —— 历史已经覆盖到哪，游标至少要抬到它（服务端会把每条信息同时放进
+      //                 历史与队列，游标停在下面就会把同一段再取一遍）。
+      var maxSeq = 0;
+      chat.entries.forEach(function (entry, index) {
+        var raw = (data && data.entries && data.entries[index]) || {};
+        if (raw && raw.id) entry.eventId = String(raw.id);
+        if (raw && Number(raw.seq) > maxSeq) maxSeq = Number(raw.seq);
+      });
+      if (chat.queue && maxSeq > chat.queue.lastSeq) {
+        chat.queue.lastSeq = maxSeq;
+        Sync.writeCursor(window.localStorage, eventsCursorKey(), maxSeq);
+      }
       chat.loaded = true;
       chatRenderAll();
-      chatEnterBottom();                       // 读完正文就贴底（首次进入不带动画）
+      // 进屏/重建之后贴底（在设计上就是"每次进来都贴底"）；用户翻历史时这一条走锚定、不动他。
+      if (anchor && anchor.atBottom === false && chat.userScrolled) chatSettle(anchor);
+      else chatEnterBottom();
     } catch (error) {
       PixikoM.state.lastError = { code: error.code || 'unknown', message: error.message };
       if (chat.host) clear(chat.host).appendChild(errorState(error, function () { chatLoad(); }));
@@ -2407,473 +2479,20 @@
   }
 
   /**
-   * 跟着一条回执轮询 POST /api/capture {id}，把陆续到达的文本与图片追加成**一条图文条目**（去重）。
-   * 结束条件：closed === true，或「done 且静默两轮**且生成队列也空了**」。
+   * **已停用**：以前这里跟一条回执轮询 `/api/capture`，再靠 `/api/progress` 判断何时收工。
    *
-   * <p><b>为什么不能只看 done</b>：`/gen` 这类指令把出图丢进队列就返回，`done` 在**受理后几十毫秒**
-   * 就变成 true（实测：受理 0.0s、done 0.2s、图进正文 19.8s）。老写法只看 `done && 静默两轮`
-   * 于是 3.7 秒就收工，图 16 秒后才回来 —— **图发到了服务端，页面却早就不接了**
-   * （用户报的「下命令之后有概率不回图片」；在对话屏里这几乎是必然，不是概率）。
-   * 现在收工前再问一次只读的 {@link /api/progress}：SD 还在生成、或生成队列里还有任务就继续跟；
-   * 队列空了再多等两轮（覆盖"图已投递、正要落进回执"的那几十毫秒），并且整体有时长兜底，绝不无限跟。
+   * <p>现在"还在跑的那条"由事件队列表达：指令回执的每一段正文都是一件 `message` 事件，
+   * 图片晚到是一件 `patch` 事件 —— 不需要任何"跟多久 / 有图了没 / done 了没"的启发式，
+   * 也就不会出现"图发到了服务端、页面却早就不跟了"。
    */
-  function followCapture(id, quest) {
-    if (chat.captureStop) chat.captureStop();
-    var seenImages = Object.create(null);
-    var idleRounds = 0;
-    var queueRounds = 0;                      // 「回执已 done，但生成队列还没空」时多等的轮数
-    /* 这条回执**每一条消息各自的条目**：消息下标 → 气泡。
-       一条回执本来就有多条不同正文（汇总 / 每步 / 结算 / 领取），它们各自成泡才对；
-       只有"同一条消息的重复版本"（先无图后有图）才并进同一个气泡 —— 判据见下面的索引对账。 */
-    var parts = [];
-    var startedAt = Date.now();
-    /* 跟单现场落盘：页面被重建（挂起期间渲染进程被系统回收 / 下拉刷新 / 进程被收掉）之后，
-       启动时靠它把这条回执补回来并接着跟（见 catchUpReceipts）。收工时清掉（见下面的 settled 分支）。 */
-    if (id) rememberFollow({ scope: PixikoM.scope(), id: String(id), quest: Number(quest) || 0, at: Date.now() });
-    chat.captureStop = PixikoM.pollWhileVisible(async function () {
-      var data;
-      try { data = await PixikoM.api('/api/capture', { body: { id: id, scope: PixikoM.scope() } }); }
-      catch (error) {
-        if (chat.captureStop) chat.captureStop();
-        chat.captureStop = null;
-        return;
-      }
-      /* 去重只按**图片路径**：文字一律按索引认（同一条回执里两段一模一样的正文也是两条消息）。 */
-      var texts = (data && data.texts) || [];
-      var allImages = (data && data.images) || [];
-      var images = [];
-      for (var j = 0; j < allImages.length; j++) {
-        var file = allImages[j] && allImages[j].file ? String(allImages[j].file) : '';
-        if (!file || seenImages[file]) continue;
-        seenImages[file] = true; images.push(file);
-      }
+  function followCapture() { return Promise.resolve(0); }
+  /** 清掉跟单现场（现在只是历史遗留的 localStorage 键）。 */
 
-      /* `/api/capture` 每轮给的是**到此刻为止的整份正文**（一条一个元素），索引就是消息身份。
-         按索引认条目：同一个索引 = 同一条消息（可能只是"多了图"）→ 并进它那个气泡；
-         索引是新的 = 另一条消息 → **新开一个气泡**。绝不按正文前缀猜。 */
-      var touched = [];            // 这一轮动过的条目（按消息顺序）
-      var added = false;           // 这一轮真的有新东西（新消息 / 新图）：没有就别反复存账本
-      for (var t = 0; t < texts.length; t++) {
-        var part = String(texts[t] || '');
-        if (!part) continue;
-        if (!parts[t]) {
-          var entry = chatEntry('bot', part, []);
-          if (quest) entry.quest = quest;
-          parts[t] = entry;
-          chat.entries.push(entry);
-          added = true;
-        }
-        touched.push(parts[t]);
-      }
-      if (touched.length || images.length) {
-        idleRounds = 0;
-        if (touched.length) {
-          var placeholder2 = chat.host && chat.host.querySelector('[data-state="empty"]');
-          if (placeholder2) clear(chat.host);
-        }
-        if (images.length) {
-          /* 图归到"这条消息"自己的气泡上：这一轮刚到的最后一条消息（先无图后有图 → 并进同一个），
-             没有新文字时就沿用最后一条消息的气泡。回执本来没有正文、只有图（纯图回执）才新开一个空泡。 */
-          var picture = touched.length ? touched[touched.length - 1] : (parts.length ? parts[parts.length - 1] : null);
-          if (!picture) { picture = chatEntry('bot', '', []); chat.entries.push(picture); }
-          picture.images = (picture.images || []).concat(images);
-          added = true;
-        }
-        chatRenderAll();            // 新增条目与"后到的图"都走 chatSyncEntries 的增量路径
-        chatFollow();               // 回执里的文字/图片是异步到达的：只在用户本来就在底部附近才跟随
-        if (added) saveChatLogDebounced();
-      } else {
-        idleRounds++;
-      }
 
-      var settled = !!(data && data.closed);
-      if (!settled && data && data.done && idleRounds >= 2) {
-        var live = null;
-        try { live = await PixikoM.api('/api/progress', { body: { scope: PixikoM.scope() } }); }
-        catch (error) { live = null; }
-        var pending = !!(live && (live.running || Number(live.queue) > 0));
-        if (pending) queueRounds = 0; else queueRounds++;
-        if (queueRounds >= 2) settled = true;
-      }
-      if (!settled && Date.now() - startedAt > CAPTURE_FOLLOW_MAX_MS) {
-        settled = true;               // 兜底：异常残留的回执不会让这个轮询永远跑下去
-      }
-      if (settled) {
-        if (chat.captureStop) chat.captureStop();
-        chat.captureStop = null;
-        forgetFollow();               // 跟单收工：下次启动不必再补它
-        if (quest) PixikoM.refreshStatus().catch(function () { /* 角标刷不到不影响对话 */ });
-      }
-    }, CAPTURE_POLL_MS);
-  }
 
-  /* ── 6b. 回执补拉：页面被重建 / 从挂起回到前台后，把「我这台设备」还没领到的回执补齐 ────────
-   *
-   * 用户报的「手机端挂起（在浏览其他应用）也收不到图」有两半，分开治：
-   *   ① **页面还活着、只是被冻住**：系统在后台会整体冻结 WebView 的定时器与网络（省电行为，
-   *      网页里对抗不了）。能做的是"回到前台立刻补一拍" —— 由 PixikoM.onWake（visibilitychange /
-   *      focus / pageshow / resume / 用户碰一下）＋ pollWhileVisible 的看门狗保证。
-   *   ② **页面被重建**：安卓在后台回收渲染进程、或用户下拉刷新、或进程被系统收掉再打开，
-   *      页面整页重来 —— 内存里的跟单现场（`chat.captureStop` 那个闭包）一起没了，
-   *      服务端早就投递好的图**再也没人接**；而对话正文是客户端存上去的，缺的那几张永远缺着。
-   *      这一半由这里治：跟单现场落盘（{@link #FOLLOW_KEY}）＋ 启动/回前台按 scope 补拉。
-   */
 
-  /** 读回跟单现场（原样，不做新旧判断）—— 只是给 {@link rememberFollow} 沿用"最早那次的时间"。 */
-  function readFollowRaw() {
-    var raw;
-    try { raw = localStorage.getItem(FOLLOW_KEY); } catch (error) { return null; }
-    if (!raw) return null;
-    try {
-      var record = JSON.parse(raw);
-      return record && typeof record === 'object' ? record : null;
-    } catch (error) { return null; }
-  }
 
-  /** 记下「正在跟哪条回执」（页面重建后靠它续上）。 */
-  function rememberFollow(record) {
-    if (!record || !record.id) return;
-    var previous = readFollowRaw();
-    /* 同一条回执继续跟：沿用**最早那次**的时间。否则每次重载都把窗口续命，
-       一条异常残留的回执能被无限跟下去（followCapture 的 15 分钟兜底就形同虚设）。 */
-    if (previous && String(previous.id) === String(record.id)
-      && Number(previous.quest) === Number(record.quest) && Number(previous.at) > 0) {
-      record.at = Number(previous.at);
-    }
-    try { localStorage.setItem(FOLLOW_KEY, JSON.stringify(record)); } catch (error) { /* 隐私模式：只在本次会话里有效 */ }
-  }
 
-  /** 这条回执收工了：清掉跟单现场。 */
-  function forgetFollow() {
-    try { localStorage.removeItem(FOLLOW_KEY); } catch (error) { /* ignore */ }
-  }
-
-  /**
-   * 读回跟单现场，**同一台设备、且不太老**才算数：
-   * scope 不同（外壳把这一页换给了另一台设备）或超过 {@link CAPTURE_FOLLOW_MAX_MS} 的一律丢掉。
-   */
-  function readFollow(scope) {
-    var record = readFollowRaw();
-    if (!record) return null;
-    if (String(record.scope === null || record.scope === undefined ? '' : record.scope) !== String(scope || '')) return null;
-    var at = Number(record.at) || 0;
-    if (!at || Date.now() - at > CAPTURE_FOLLOW_MAX_MS) return null;
-    return record;
-  }
-
-  /**
-   * 「回执号 + 序号 → 正文里哪个气泡」的对齐表（**本页内存**，换页重建就没了，没有持久化的必要）。
-   *
-   * <p>为什么有它：服务端现在也是对话正文的写入者之一（产生回执消息时顺手 append，
-   * 幂等键就是"回执号 + 条内序号"）。有了这张表，补拉回执时第 N 段正文能**直接命中**同一条，
-   * 不必再靠"正文互为前缀"去猜 —— 猜错就是用户报过的「多条消息并成一个气泡」。
-   * 键用 {@code quest|序号}；同一段正文再来一次（先文字后图）也命中同一个气泡，所以不会长出新泡。
-   */
-  var receiptAlign = Object.create(null);
-
-  /** 对齐表的键：回执号 + 条内序号（与服务端 append 的幂等键同一个口径）。 */
-  function alignKey(payload, seq) {
-    var number = Number(payload && payload.quest) || 0;
-    return number > 0 ? number + '|' + seq : '';
-  }
-
-  /** 这一段正文（第 seq 段）是不是已经对齐到某个气泡了？没被本轮别的段占用才算命中。 */
-  function alignmentHit(payload, seq, used) {
-    var at = receiptAlign[alignKey(payload, seq)];
-    if (typeof at !== 'number' || at < 0 || at >= chat.entries.length) return -1;
-    var entry = chat.entries[at];
-    if (!entry || entry.role !== 'bot' || used[at]) return -1;
-    return at;
-  }
-
-  /** 记下/更新"这条回执的第 seq 段正文 = 正文里第 at 个条目"。 */
-  function rememberAlign(payload, seq, at) {
-    var key = alignKey(payload, seq);
-    if (!key || typeof at !== 'number' || at < 0) return;
-    receiptAlign[key] = at;
-  }
-
-  /**
-   * 服务端那一趟给每一张图定的"条内序号"（0 = 还没有正文，与 {@link ChatLogStore#receipt} 同口径）：
-   * 每个**带正文的**消息 +1，图片归到它**前面**那条正文上。`/api/quest` 回来的 `messages` 就是服务端
-   * 分组的原样，所以这里算出来的序号与"服务端 append 时用的键"一致，图片就能落到同一个气泡上。
-   *
-   * <p>老后端（或老回执）没有 `messages` 时返回空数组：调用方退回原来的"图并进最后一条正文"。
-   */
-  function imageAlignments(payload) {
-    var groups = payload && payload.messages;
-    var out = [];
-    if (!groups || !groups.length) return out;
-    var seq = 0;
-    for (var g = 0; g < groups.length; g++) {
-      var segments = groups[g] || [];
-      var hasText = false;
-      var files = [];
-      for (var s = 0; s < segments.length; s++) {
-        var segment = segments[s] || {};
-        if (segment.type === 'text' && String(segment.text || '').length) hasText = true;
-        else if (segment.type === 'image' && segment.file && files.indexOf(String(segment.file)) < 0) files.push(String(segment.file));
-      }
-      if (hasText) { seq++; continue; }
-      for (var f = 0; f < files.length; f++) out.push({ file: files[f], seq: seq });
-    }
-    return out;
-  }
-
-  /**
-   * 把一条回执（`/api/quest` 的返回）并进对话正文 —— **每条消息各自成一个气泡**，且可以重复调用。
-   *
-   * <p>为什么不是简单地 append：页面重建后 `chatLoad()` 已经从服务端读回了正文，
-   * 那条回执的文字**可能已经在里面**（挂起前存上去的、只是缺图）。再 append 一条就会变成
-   * "同一条回执出现两遍（一份没图一份有图）"—— 用户报过的「回执重复」正是这个形状。
-   *
-   * <p><b>按消息身份对账，不按正文前缀猜</b>：`payload.texts` 的下标就是服务端的消息序号，
-   * 一个下标 = 一条消息 = 一个气泡。下标是新的 → 新开一个气泡（多步回执的汇总 / 每步 / 结算 / 领取
-   * 本来就该各占一个）；只有"同一条消息的重复版本"（先无图后有图、服务端这一段比本地更长）才并进
-   * 同一个气泡。老写法把几条正文 `join('\n')` 成一条、又对"最后一条有正文的 bot 条目"做**互为前缀**
-   * 判断，于是「多步执行完成：2/2 条…」「任务 #12 已完成…」「本次领取完成…」这种共享前缀的不同消息
-   * 被并成一个气泡 —— 用户报的「多个信息合并成一个气泡」。
-   *
-   * <p>幂等：同一份 payload 反复调用只补缺的文字/图片，绝不重复新增（"同一批不重复"）。
-   *
-   * @returns {number} 真的有变化返回 1，什么都没动返回 0
-   */
-  function mergeReceiptIntoChat(payload) {
-    if (!payload || payload.error) return 0;
-    /* 消息序号 → 这一段正文（**空段保留**：索引就是身份，不能因为空就往下挤）。 */
-    var parts = [];
-    var rawTexts = payload.texts || [];
-    for (var i = 0; i < rawTexts.length; i++) {
-      parts[i] = rawTexts[i] === null || rawTexts[i] === undefined ? '' : String(rawTexts[i]);
-    }
-    var images = [];
-    var rawImages = payload.images || [];
-    for (var j = 0; j < rawImages.length; j++) {
-      var file = rawImages[j] && rawImages[j].file ? String(rawImages[j].file) : '';
-      if (file && images.indexOf(file) < 0) images.push(file);
-    }
-    if (!parts.length && !images.length) return 0;
-
-    /* 先把"这一段正文已经在哪个气泡里"对出来。对账只看**存在的条目**，且只认**正文逐字相同**
-       （本地那条可能只是缺图）。
-
-       为什么不认"本地那条是它的前缀"（这里曾经就是 `text.indexOf(entry.text) === 0`）：
-       共享前缀的不同消息太多了 ——「任务 #12 已受理」「任务 #12 已完成」「任务 #12 已完成：1/1」
-       在服务端是**三条不同消息（条内序号 1/2/3）**，前缀判定却会把它们串成一个气泡。
-       更要命的是它**跨历史**：补拉一条老回执时，本地那条几小时前的短正文会被当成"它长出来的"，
-       于是图/新正文被并进一条与本次会话无关的老气泡里。
-       对不上就新开一个气泡：没有稳定身份时宁可各占一个，也不拿前缀去猜
-       （稳定的那一半在服务端落盘时用"回执号 + 条内序号"钉住，见 {@link alignmentHit}）。 */
-    var used = Object.create(null);      // 这个气泡已经被本回执的哪一段认领了（含本轮新建的）
-    var targets = [];
-    var adopted = 0;
-    /** 这个气泡是不是这一段正文的「同一条消息」：**正文逐字相同**（服务端就地更新过的版本也相同）。 */
-    function sameMessage(entry, text) {
-      return !!entry.text && entry.text === text;
-    }
-    for (var t = 0; t < parts.length; t++) {
-      var text = parts[t];
-      if (!text) { targets[t] = null; continue; }
-      // ① 先按**回执号 + 序号**直接对齐：服务端现在是对话正文的权威写入者之一，它 append 的条目
-      //    就带着这两个身份（顺序 + 内容都对得上）。命中就并进同一条，压根不进入下面的启发式。
-      var at = alignmentHit(payload, t, used);
-      if (at < 0) {
-        // ② 兜底（老后端 / 正文里那条还没被服务端 append 过）：沿用"正文相同或本地是它前缀"的对账。
-        //    只认**还没被别的段认领**的条目：同一条回执里两段一模一样的正文是两条消息，不能挤一个气泡
-        for (var k = chat.entries.length - 1; k >= 0; k--) {
-          var entry = chat.entries[k];
-          if (!entry || entry.role !== 'bot' || used[k] || !sameMessage(entry, text)) continue;
-          at = k; break;
-        }
-      }
-      if (at < 0) {
-        var made = chatEntry('bot', text, []);
-        chat.entries.push(made);
-        used[chat.entries.length - 1] = true;
-        targets[t] = made;
-        adopted++;
-      } else {
-        used[at] = true;
-        targets[t] = chat.entries[at];
-        if (text.length > (chat.entries[at].text || '').length) chat.entries[at].text = text;
-      }
-      // 这一条对上了就把"这条回执的第几段正文 = 正文里哪个下标"记下来，给同一条回执的后续补拉用。
-      if (targets[t]) rememberAlign(payload, t, chat.entries.indexOf(targets[t]));
-    }
-    var changed = adopted;
-
-    if (images.length) {
-      /* 图归到"这条消息"自己的气泡。
-         **首选"回执号 + 序号"对齐**：服务端 append 时就把图挂在了它前面那条正文的同一个序号上，
-         所以按序号命中就与服务端落盘的形状**逐条一致**，也不会把图塞给后面那条正文
-         （那正是"先文字后图被拆成两个气泡 / 图跑到下一条上"的来源）。
-         命不中才退回老口径：这条回执最后一条有正文的消息；只有纯图回执才另起一个空泡。
-         —— 绝不为了图去新开一个气泡（那样「先无图后有图」会多出一个空泡）。 */
-      var mapped = imageAlignments(payload);
-      var seqHits = Object.create(null);
-      var imageTargets = Object.create(null);   // 图片路径 → 它应该挂进的那条条目
-      for (var m = 0; m < mapped.length; m++) {
-        var seq = mapped[m].seq;
-        if (seqHits[seq] === undefined) seqHits[seq] = seq > 0 ? alignmentHit(payload, seq, used) : -1;
-        var hit = seqHits[seq];
-        if (hit >= 0) imageTargets[mapped[m].file] = chat.entries[hit];   // 命中：图就挂在那条正文上
-      }
-      var picture = null;
-      for (var p = targets.length - 1; p >= 0 && !picture; p--) { if (targets[p]) picture = targets[p]; }
-      if (!picture && parts.length) {
-        for (var q = chat.entries.length - 1; q >= 0 && !picture; q--) {
-          var tail = chat.entries[q];
-          if (tail && tail.role === 'bot' && tail.text) picture = tail;
-        }
-      }
-      if (!picture) {
-        for (var r = chat.entries.length - 1; r >= 0 && !picture; r--) {
-          var blank = chat.entries[r];
-          if (blank && blank.role === 'bot' && !blank.text && !(blank.images || []).length) picture = blank;
-        }
-        if (!picture) {
-          picture = chatEntry('bot', '', []);
-          chat.entries.push(picture);
-          changed++;
-        }
-      }
-      for (var z = 0; z < images.length; z++) {
-        var target = imageTargets[images[z]] || picture;     // 对齐命中就挂那条正文，命不中退回兜底那条
-        var mine = target.images || [];
-        if (mine.indexOf(images[z]) >= 0) continue;
-        target.images = mine.concat([images[z]]);
-        changed++;
-      }
-    }
-
-    if (!changed) return 0;
-    if (chat.entries.length > CHAT_ENTRIES_CAP) chat.entries = chat.entries.slice(-CHAT_ENTRIES_CAP);
-    var placeholder = chat.host && chat.host.querySelector('[data-state="empty"]');
-    if (placeholder) clear(chat.host);
-    chatRenderAll();
-    chatFollow();
-    saveChatLogDebounced();
-    return 1;
-  }
-
-  /**
-   * 补拉链：从服务端把「正在跟的那条回执」与「这一趟页面会话**真的错过**的回执」补齐（幂等）。
-   *
-   * <p><b>只补该补的，绝不动用户在看的这段历史。</b>两条来源，一条都不许放宽：
-   *   <ol>
-   *     <li>{@link readFollow} 里那条正在跟的回执（挂起时被系统收掉的现场）—— 顺带把跟单**续上**；
-   *         且仍然受 {@link CATCHUP_WINDOW_MS} 约束（跟单本身有 {@code CAPTURE_FOLLOW_MAX_MS} 兜底）；</li>
-   *     <li>**本条页面会话开始之后才发生**的回执 —— 覆盖挂起/被回收期间新到的那几条。
-   *         判据是"开始时间晚于这次页面加载"，见 {@link catchUpCutoff}。</li>
-   *   </ol>
-   *
-   * <p><b>为什么不能靠"未读 / 有图 / 比跟单新 / 6 小时内"</b>（这里曾经就是这么写的，是
-   * 「对话框莫名其妙插入历史对话」的元凶）：`unread` 只会被用户在**回执屏**手动标记才清零，
-   * 手机上几乎永远是 true；`busy` 在"受理后立刻 done"的指令上也是 false；于是几小时前那几条
-   * 老回执条条都满足条件，被当成"这次错过的"重新 {@link mergeReceiptIntoChat} 进来 ——
-   * 用户删掉（或清掉）的老回执正文就这样**又冒出来，而且是追加到对话末尾**。
-   * 现在窗口按"这次页面会话"收死：老回执一条都不补（要看在回执屏里看）。
-   *
-   * <p>只在对话屏挂好之后跑：正文还没读回来时补进去的条目会被 {@link chatLoad} 整屏重读冲掉。
-   *
-   * @param {boolean} [force] 回到前台 / 页面刚重建时为 true：立刻补，不受最小间隔限制
-   */
-  var catchUpAt = 0;
-  var catchUpInFlight = null;
-  /**
-   * 「这条回执算不算这一次页面会话里发生的」的时间闸门（见 {@link catchUpReceipts}）。
-   *
-   * <p>取"这次页面加载那一刻"，再往前留 {@link CATCHUP_CLOCK_SLACK_MS} 的余量（只为了让
-   * 页面加载与回执受理之间正常的先后抖动不至于把**刚发生**的那条挡在外面）。老回执动辄
-   * 几小时前，余量多大都不影响判据；真正错过的那条一定是"页面加载之后才受理"的
-   * （受理在先、页面加载在后 = 它早就在正文存档里了）。
-   *
-   * <p>重算时机见 {@link catchUpCutoff}：每次"整页重建/首次进对话屏"都会重算，
-   * 所以下拉刷新之后仍然只补刷新之后发生的那几条。
-   */
-  var CATCHUP_CLOCK_SLACK_MS = 10000;
-  var catchUpCutoffAt = 0;
-
-  /** 本条页面会话的补拉时间闸门（毫秒墙钟）；没定过就现在定，页面重建后会重新定。 */
-  function catchUpCutoff() {
-    if (!catchUpCutoffAt) catchUpCutoffAt = Date.now() - CATCHUP_CLOCK_SLACK_MS;
-    return catchUpCutoffAt;
-  }
-
-  /** 服务端那条回执的受理时刻（毫秒墙钟）；解析不出来给 0（= 认不出新旧，按"老"处理）。 */
-  function questStartedAt(row) {
-    var raw = row && (row.startedAt === null || row.startedAt === undefined ? '' : String(row.startedAt).trim());
-    if (!raw) return 0;
-    var at = Date.parse(raw);
-    return isNaN(at) ? 0 : at;
-  }
-
-  function catchUpReceipts(force) {
-    if (catchUpInFlight) return catchUpInFlight;
-    if (!chat.loaded || currentId !== 'chat') return Promise.resolve(0);
-    var now = Date.now();
-    if (!force && now - catchUpAt < CATCHUP_MIN_GAP_MS) return Promise.resolve(0);
-    catchUpAt = now;
-
-    var scope = PixikoM.scope();
-    var cutoff = catchUpCutoff();
-    var follow = readFollow(scope);
-    /* 跟单现场太老（超过补拉窗口）就不认它 —— 与下面的时间闸门同一个口径：补拉只服务"眼下的这一趟"。 */
-    if (follow && follow.at && Date.now() - Number(follow.at) > CATCHUP_WINDOW_MS) follow = null;
-    var followQuest = follow ? Number(follow.quest) || 0 : 0;
-    var wanted = followQuest > 0 ? [followQuest] : [];
-    var followed = null;
-    var merged = 0;
-
-    catchUpInFlight = PixikoM.api('/api/quests', { body: { limit: 8, scope: scope } }).then(function (data) {
-      var rows = (data && data.quests) || [];
-      var extra = 0;
-      for (var i = 0; i < rows.length && extra < CATCHUP_MAX_QUESTS; i++) {
-        var row = rows[i] || {};
-        var number = Number(row.number) || 0;
-        if (number <= 0 || wanted.indexOf(number) >= 0) continue;
-        /* 闸门①：**这次页面会话之后**才受理的才算"我错过的"。老回执一条都不补 ——
-           它就是靠这一条被挡在门外的（不看 unread / busy / 有没有图，那些都会漏）。 */
-        if (questStartedAt(row) < cutoff) continue;
-        /* 闸门②：还在跑 / 有新正文 / 有新图 —— 三种都算"有新东西"，避免把一条空回执补进来。
-           注意这里不再用"比跟单那条新"当宽松条件：那对新会话是恒真的（followQuest=0 时谁都比它新）。 */
-        if (!(row.unread === true || row.busy === true || Number(row.texts) > 0 || Number(row.images) > 0)) continue;
-        wanted.push(number);
-        extra++;
-      }
-      // 一条一条来：并发会让"并进哪一条条目"的前缀判断互相打架
-      return wanted.reduce(function (chain, number) {
-        return chain.then(function () {
-          return PixikoM.api('/api/quest', { body: { id: number, scope: scope } }).then(function (payload) {
-            if (followQuest > 0 && number === followQuest) followed = payload;
-            merged += mergeReceiptIntoChat(payload);
-          }).catch(function () { /* 单条失败不影响别的（回执可能刚被淘汰/不属于这个会话） */ });
-        });
-      }, Promise.resolve());
-    }).catch(function () { /* 列表拿不到：这一轮不补，下一轮或下次唤醒再来 */
-    }).then(function () {
-      catchUpInFlight = null;
-      /* 跟单续上：这条回执**还在跑**、当前又没人在跟，就接着跟它的 /api/capture
-         （页面重建前干到哪就接着干；收工条件与正常路径完全一样，见 followCapture）。
-
-         为什么必须判"还在跑"：命令跑完但出图队列还没空时也要跟（done 且 busy，图片还在路上）；
-         真跑完的（done 且不忙）或磁盘读回来的（closed，服务端明确说"收集器等同于已关闭"）
-         一律不跟 —— 那种回执的图已经由上面的 /api/quest 一次性取全了，再跟只是白打请求。 */
-      var stillRunning = !!followed && !followed.error && followed.closed !== true
-        && (followed.done !== true || followed.busy === true);
-      if (follow && follow.id && stillRunning && !chat.captureStop) {
-        followCapture(String(follow.id), followQuest > 0 ? followQuest : undefined);
-      }
-      return merged;
-    });
-    return catchUpInFlight;
-  }
-
-  /** 调试/自动化用：手动触发一次补拉（`force` 默认为 true）。 */
-  PixikoM.catchUpReceipts = function (force) { return catchUpReceipts(force !== false); };
-
-  /** 调试/自动化用：看一眼本次页面会话的补拉闸门（= 只补这个时刻之后受理的回执）。 */
-  PixikoM.catchUpCutoff = function () { return catchUpCutoff(); };
 
   /** 清空对话：POST /api/chat/reset {scope} 之后再清本地。 */
   async function clearChat() {
@@ -2915,16 +2534,18 @@
     root.classList.add('chat');
     /* 整页重建（挂起被回收 / 下拉刷新）之后重新起算补拉闸门：这次页面会话之前受理的回执一律不补。
        放在 mount 里而不是 boot 里 —— mount 才是"用户的对话屏从这一刻起"的那个时刻。 */
-    catchUpCutoffAt = 0;
     var log = el('div', 'chat-log');
     log.setAttribute('data-chat-log', '1');
     root.appendChild(log);
     chat.host = log;
     // 用户自己滚到离底 > 阈值 → 停止跟随；滑回贴底 → 恢复跟随。
-    // 这个标志位就是"新消息到底要不要把我拽到底"的唯一依据（见 chatFollow 的注释）。
+    // 这个标志位就是"新消息到底要不要把我拽到底"的依据（见 chatFollow 的注释）；
+    // `userScrolled` 是"用户**真的**动过滚动条"的另一半（进屏时那次程序性贴底不算）。
     log.addEventListener('scroll', function () {
       chat.lastScrollAt = Date.now();
       chat.follow = chatNearBottom();
+      if (!chat.follow) { chat.userScrolled = true; chat.wantBottom = true; }
+      else { chat.userScrolled = false; chat.wantBottom = false; }
     }, { passive: true });
 
     var composer = el('div', 'composer');
@@ -2996,23 +2617,32 @@
        而系统的冻结期我们本来就无能为力，能省的每一毫秒都该省）。与下面 chat.poll 里那条链同一个口径，
        两边都有 chat.loaded / chat.loading 挡着，不会重复读。 */
     if (!chat.loaded) {
-      chatLoad().then(function () { return catchUpReceipts(true); })
+      chatLoad().then(function () { return PixikoM.drainEvents(); })
         .catch(function () { /* 读不回来就交给轮询下一拍 */ });
     }
 
     /* 对话屏的轻轮询：只补服务端多出来的尾巴（别的入口出的图也能自己冒出来），
        页面隐藏 / 不在这一屏 / 有浮层 都自动跳过；用户在输入或正在发消息时不读，避免打架。
-       首次读回正文之后紧接着补拉一次回执（catchUpReceipts）—— 页面刚被重建时，
+   * 首次读回正文（历史）之后紧接着取一拍事件队列（增量从这里来）。
        缺的那几张图只存在于服务端的回执里，正文存档里根本没有（见 6b 那一段的说明）。
        参数 `stalled` 来自 pollWhileVisible 的看门狗：这一拍是"被系统冻过之后补的"，
        于是补拉要**绕过最小间隔**（"回到前台立刻补一拍"，不靠任何事件也不靠外壳）。 */
-    chat.poll = PixikoM.pollWhileVisible(function (stalled) {
-      if (currentId !== 'chat') return;
-      if (!chat.loaded) return chatLoad().then(function () { return catchUpReceipts(true); });
+    chat.poll = PixikoM.pollWhileVisible(function () {
+      if (currentId !== 'chat') {
+        // 不在对话屏也照样取件（角标/回执屏要即时更新），但只在队列可用时；取件很轻。
+        if (chat.queue && !chat.queue.unavailable) PixikoM.drainEvents().catch(function () {});
+        return;
+      }
+      if (!chat.loaded) return chatLoad().then(function () { return PixikoM.drainEvents(); });
       if (PixikoM.overlayBusy && PixikoM.overlayBusy()) return;
-      return Promise.resolve(chatPollMerge()).then(function () { return catchUpReceipts(!!stalled); });
+      return PixikoM.drainEvents();
     }, 4000);
   }
+
+  /** 调试/自动化用：立刻重读一次服务端正文（等价于右上角刷新），并返回当前条目数。 */
+  PixikoM.chatReload = function () {
+    return Promise.resolve(chatLoad()).then(function () { return chat.entries.length; });
+  };
 
   PixikoM.register('chat', {
     title: '对话',
@@ -3712,7 +3342,12 @@
       PixikoM.api('/api/images', { body: { limit: 24, scope: PixikoM.scope() } })
     ]);
     if (results[0].status === 'fulfilled') PixikoM.state.progress = results[0].value || {};
-    if (results[1].status === 'fulfilled') PixikoM.state.tasks = (results[1].value && results[1].value.tasks) || [];
+    if (results[1].status === 'fulfilled') {
+      /* /api/tasks 回的是**裸数组**（WebApiController → bot.webTasks()）。老写法按 {tasks:[…]} 取，
+         结果 state.tasks 恒为空 —— 手机上的队列卡连同「取消/挂起/置顶」永远不渲染（取消按钮因此点不到）。 */
+      var queue = results[1].value;
+      PixikoM.state.tasks = Array.isArray(queue) ? queue : ((queue && queue.tasks) || []);
+    }
     if (results[2].status === 'fulfilled') gen.images = (results[2].value && results[2].value.images) || [];
     var failed = results.filter(function (r) { return r.status === 'rejected'; });
     if (failed.length === 3) {
@@ -3902,9 +3537,7 @@
   /** 页面隐藏时把没存上的对话正文补一次（iOS/Android 切后台随时可能被杀）。 */
   function installVisibilityFlush() {
     document.addEventListener('visibilitychange', function () {
-      if (document.hidden && chat.loaded && chat.entries.length) saveChatLog();
     });
-    window.addEventListener('pagehide', function () { if (chat.loaded && chat.entries.length) saveChatLog(); });
   }
 
   /** 底部 tab 用 <a href="#/...">，交给 hash 路由；这里只补 :active 反馈与 aria。 */
@@ -3968,13 +3601,15 @@
     // 状态轮询：只在"这一屏可见"时跑（pollWhileVisible 自己会判断），顺便喂回执角标。
     PixikoM.pollWhileVisible(function () { return PixikoM.refreshStatus(); }, 6000);
 
-    /* 「回到前台 / 页面刚重建」立刻补一拍回执（补拉链见 catchUpReceipts）。
-       挂起期间什么都不会发生（系统冻住了定时器与网络，对抗不了），唯一能做的是回来这一下
-       立刻把缺的图补齐。用户手势（touch/pointer/keydown）太频繁，走"最小间隔"那一档；
-       其余信号（visibilitychange / pageshow / focus / resume / online）都是"真的回来了"，立刻补。 */
-    PixikoM.onWake(function (why) {
-      if (currentId !== 'chat' || !chat.loaded) return;
-      catchUpReceipts(!/^user:/.test(String(why || '')));
+    /* 「回到前台 / 页面刚重建」立刻补一拍**事件队列**：断线/挂起期间的事件都还在队列里
+       （系统在后台会冻结定时器与网络，那是省电行为、网页里对抗不了），所以回来这一下最要紧。
+       用户手势太频繁，交给队列自己的最小间隔；其余信号（visibilitychange / pageshow / focus /
+       resume / online / 用户碰一下）都是"真的回来了"，立刻取一拍。 */
+    PixikoM.onWake(function () {
+      if (chat.queue) Sync.drainNow(chat.queue);
+    });
+    PixikoM.onWake(function () {
+      if (chat.queue) Sync.drainNow(chat.queue);
     });
 
     // 出图屏的进度轮询：常驻注册，pollWhileVisible 保证只在页面可见时跑，

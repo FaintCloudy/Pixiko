@@ -1224,6 +1224,7 @@ public final class Bot implements AutoCloseable {
         /infix mode [global|parts] — infix 档位（按会话保存，默认 global）：global 把一条指令里的所有改写要求合成一次、作用在整份提示词上；parts 是旧的分组多步实现；/infix conflict on|off 才是传统正反义词排斥器开关
         /infix filter — 查看标准词库约束状态；/infix filter on|off 按会话开启或关闭（默认关闭＝自由改写，仅 owner/admin）
         /infix conflict — 查看传统正反义词排斥器状态；/infix conflict on|off 按会话切换（默认关闭：矛盾交给上面那次整份提示词画面检查判断，仅 owner/admin）
+        /infix log [N] — 查看最近 N 条**改写原文**存档（logs/prompt-rewrite.log，含模型的完整原文与重试的每一次；N 不限上限、默认 1；/infix log review [N] 看画面检查原文）
         /progen <文字描述> — 通过 DeepSeek API 生成英文正反向提示词供查看，不自动修改当前 prompt
         /settings — 查看当前尺寸、采样方法、步数、CFG、种子、基础模型和数据来源
         /sampler — 查看当前采样方法
@@ -1330,6 +1331,10 @@ public final class Bot implements AutoCloseable {
         // 顺手把同一条 append 进去（幂等键 = 回执号 + 条内序号），这样页面只读一个源就够，
         // 不再需要靠前端去"猜身份"缝合回执与正文。页面整组 push（/api/chat/log/save）语义不变。
         this.chatLog = new ChatLogStore(settings.root);
+        // 事件队列（data/webui/<scope>-events.json）：**队列是新的一等公民**——网页/手机取信息只走它
+        // （POST /api/events 出队 + /api/events/ack 确认），前端不再靠 /api/capture 那套轮询去猜身份。
+        // 旧接口（/api/chat/log、/api/quests、/api/capture）一个都没删，两边各存各的、互不污染。
+        this.eventQueue = new cn.szu.bot.web.EventQueueStore(settings.root);
         // 回执索引：只存摘要与已读标记，列表在重启后也还在（读失败就是空索引，不影响回执）。
         this.questFile = settings.root.resolve("data/quests.json");
         this.questIndex = new QuestIndex();
@@ -1856,6 +1861,12 @@ public final class Bot implements AutoCloseable {
      */
     private void infix(JsonObject event, String instruction) throws Exception {
         String lowerInstruction = instruction == null ? "" : instruction.toLowerCase(Locale.ROOT);
+        // .infix log [N] / .infix log review [N]：把存档的**完整原文**原样读回来（用户"看不着自言自语"的入口）。
+        // 放在最前面：它既不是改写要求，也不走模型，更不参与合并（见 infixControlCommand）。
+        if (lowerInstruction.equals("log") || lowerInstruction.startsWith("log ")) {
+            infixLog(event, instruction.strip().substring("log".length()).strip());
+            return;
+        }
         if (instruction.equalsIgnoreCase("filter") || lowerInstruction.startsWith("filter ")) {
             String conversation = ChatService.conversationKey(event);
             String argument = instruction.length() > "filter".length() ? instruction.substring("filter".length()).strip() : "";
@@ -1996,7 +2007,9 @@ public final class Bot implements AutoCloseable {
                 SdClient.Prompts original = effectivePrompts(scope);
                 var client = clientFor();
                 DeepSeekPrompts.Result rewritten;
-                try { rewritten = client.edit(instruction, original, TermCategories.describe(usageIndex(), original.positive())); }
+                // 改写原文一律存档（成功/失败/重试的每一次），常规日志只留一条指针；判定逻辑一个字不动。
+                try { rewritten = runRewrite(scope, conversation, instruction,
+                        () -> client.edit(instruction, original, TermCategories.describe(usageIndex(), original.positive()))); }
                 catch (Exception model) {
                     Log.warn("提示词改写调用没有成功：" + error(model));
                     message = "智能修改未完成：" + error(model) + "\n（一个字都没改，你的提示词保持原样）";
@@ -2145,22 +2158,252 @@ public final class Bot implements AutoCloseable {
             Log.warn("画面检查原文没能存档（不影响这次指令）：" + error(failed));
         }
     }
+    /** 改写原文的存档序号（只用于日志定位，不参与任何判定）。 */
+    private final java.util.concurrent.atomic.AtomicInteger rewriteArchiveSeq = new java.util.concurrent.atomic.AtomicInteger();
+    /** 一次模型改写调用（返回值与异常都原样传递，只为了在它外面挂上"改写原文存档"的上下文）。 */
+    @FunctionalInterface
+    private interface RewriteCall { DeepSeekPrompts.Result edit() throws Exception; }
+    /**
+     * 执行一次模型改写，并把这次调用里模型返回的**每一次完整原文**（失败重试的每一次都算）存档到
+     * {@code logs/prompt-rewrite.log}。
+     *
+     * <p>存档是纯旁路：改写本身的返回值、异常、落地判定一个字都不动，存档出错也不影响这次指令。
+     * **常规日志里只留一条指针**（"改写原文已记录，见 logs/prompt-rewrite.log（scope=…，#N）"），
+     * 原文绝不进常规日志、更不进回执——回执仍然安静（normal 档"每条指令 ≤1 条文本"不破）。
+     */
+    private DeepSeekPrompts.Result runRewrite(String scope, String conversation, String instruction, RewriteCall call) throws Exception {
+        List<Integer> recorded = new ArrayList<>();
+        int[] attempts = {0};
+        DeepSeekPrompts.beginRewriteArchive((raw, parsed, why) -> {
+            int number = archiveRewriteRaw(scope, conversation, instruction, ++attempts[0], parsed, why, raw);
+            if (number > 0) recorded.add(number);
+        });
+        try {
+            return call.edit();
+        } finally {
+            DeepSeekPrompts.endRewriteArchive();
+            if (!recorded.isEmpty())
+                Log.info("改写原文已记录，见 logs/prompt-rewrite.log（scope=" + scope + "，#" + recorded.get(0)
+                        + (recorded.size() == 1 ? "" : "–#" + recorded.get(recorded.size() - 1)
+                            + "，" + recorded.size() + " 条") + "）");
+        }
+    }
+    /**
+     * 把改写模型返回的**完整原文**（含它自言自语/推理、以及夹带的 JSON）追加进
+     * {@code logs/prompt-rewrite.log}（UTF-8 追加、带时间戳，头信息与 {@code logs/prompt-review.log} 同风格：
+     * scope/会话/序号/指令/第几次请求/解析结果）。**成功与失败都落**——用户要的是"模型到底吐了什么"，
+     * 尤其是它把整段 JSON 写进提示词字段那种事故，必须能事后逐字归因。
+     *
+     * <p>返回分配到的存档序号；原文为空（没东西可存）时返回 {@code -1}。存档失败只记一条日志。
+     */
+    private int archiveRewriteRaw(String scope, String conversation, String instruction, int attempt,
+                                  boolean parsed, String why, String raw) {
+        if (raw == null || raw.isBlank()) return -1;
+        int number = rewriteArchiveSeq.incrementAndGet();
+        String stamp = java.time.LocalDateTime.now().truncatedTo(java.time.temporal.ChronoUnit.SECONDS).toString();
+        Path file = settings.root.resolve("logs/prompt-rewrite.log");
+        String head = "[" + stamp + "] 改写原文（scope=" + scope + "，会话=" + conversation + "，改写 #" + number
+                + "，指令=" + flatLine(instruction) + "，第 " + attempt + " 次请求，"
+                + (parsed ? "已采纳" : "未采纳：" + flatLine(why)) + "）：";
+        try {
+            Files.createDirectories(file.getParent());
+            Files.writeString(file, head + raw + System.lineSeparator(), StandardCharsets.UTF_8,
+                    java.nio.file.StandardOpenOption.CREATE, java.nio.file.StandardOpenOption.APPEND);
+            return number;
+        } catch (Exception failed) {
+            Log.warn("改写原文没能存档（不影响这次指令）：" + error(failed));
+            return -1;
+        }
+    }
+    /** 头信息里的单行化（时间/scope/指令/失败原因都挤在一行，原文另起一行原样保存、绝不改动）。 */
+    private static String flatLine(String text) {
+        return text == null ? "" : text.replaceAll("[\\p{Cntrl}\\p{Cf}]+", " ").replaceAll("\\s+", " ").strip();
+    }
+    /** 两个原文存档（{@code .infix log} 的读取对象）。 */
+    private static final String REWRITE_LOG = "logs/prompt-rewrite.log";
+    private static final String REVIEW_LOG = "logs/prompt-review.log";
+    /**
+     * 传输层的分片长度：与 QQ 客户端转发节点一致。**这不是内容上限**——分片只决定"一条消息装多少"，
+     * 一片都不会少给（见 {@link #splitForTransport}）。
+     */
+    private static final int LOG_CHUNK_CHARS = 3000;
+    /** 存档文件的记录头：{@code [时间] 改写原文（…）：} / {@code [时间] 画面检查原文（…）：}。 */
+    private static final Pattern LOG_RECORD_HEAD = Pattern.compile(
+            "(?m)^\\[(\\d{4}-\\d{2}-\\d{2}T[\\d:]+)\\] (改写原文|画面检查原文)（");
+    /**
+     * {@code .infix log [N]} / {@code .infix log review [N]}：把存档里的**完整原文**原样读回来——这就是
+     * "机器人自言自语我怎么看不着"的入口。
+     *
+     * <p>**没有条数上限**：N 是任意正整数（默认 1），要多少给多少，唯一的上限是"日志里实际有多少条"；
+     * **内容一个字都不截断**（没有省略号、不砍长度），只在传输层按协议分片发送（{@code 【1/2】…}）；
+     * 权限与 {@code .infix} 本身一致。
+     */
+    private void infixLog(JsonObject event, String argument) throws Exception {
+        String text = argument == null ? "" : argument.strip();
+        String lower = text.toLowerCase(Locale.ROOT);
+        boolean review = false;
+        if (lower.equals("review") || lower.startsWith("review ")) {
+            review = true; text = text.substring("review".length()).strip();
+        } else if (lower.equals("检查") || lower.startsWith("检查 ")) {
+            review = true; text = text.substring("检查".length()).strip();
+        }
+        long wanted = 1;
+        if (!text.isEmpty()) {
+            try { wanted = Long.parseLong(text); } catch (NumberFormatException invalid) { throw new IllegalArgumentException(logUsage()); }
+            if (wanted <= 0) throw new IllegalArgumentException(logUsage());
+        }
+        Path file = settings.root.resolve(review ? REVIEW_LOG : REWRITE_LOG);
+        String label = review ? "画面检查原文" : "改写原文";
+        List<String> records;
+        try { records = readLogRecords(file, wanted); }
+        catch (Exception broken) { throw new IllegalStateException("读不了 " + (review ? REVIEW_LOG : REWRITE_LOG) + "：" + error(broken)); }
+        if (records.isEmpty()) {
+            String empty = "日志里还没有" + label + "记录。\n文件：" + file.toAbsolutePath()
+                    + (Files.isRegularFile(file) ? "（文件存在，但里面还没有记录）"
+                        : "（文件还不存在：到现在为止没有一次" + (review ? "画面检查" : "改写") + "的原文被存档）");
+            sendLogOutput(event, empty);
+            completeChatWorkflowStep(event, true);
+            return;
+        }
+        int shown = records.size();
+        StringBuilder out = new StringBuilder(label + "存档（" + (review ? REVIEW_LOG : REWRITE_LOG) + "）："
+                + "最近 " + shown + " 条完整原文" + (wanted > shown ? "（整份日志里一共只有 " + shown + " 条）" : "") + "。");
+        for (String record : records) out.append("\n\n").append(record);
+        out.append("\n\n文件：").append(file.toAbsolutePath());
+        sendLogOutput(event, out.toString());
+        completeChatWorkflowStep(event, true);
+    }
+    /** {@code .infix log} 的用法（N 非法时原样回给用户）。 */
+    private static String logUsage() {
+        return "用法：/infix log [N]、/infix log review [N]"
+                + "\nN 是正整数（默认 1），**不限上限**：要多少条给多少条，唯一的上限是日志里实际有多少条。"
+                + "\n内容按原文**完整**给出（不省略、不截断），太长只按协议分片（【1/2】这样的分片头）。"
+                + "\n/infix log 读改写原文（" + REWRITE_LOG + "）；/infix log review 读画面检查原文（" + REVIEW_LOG + "）。";
+    }
+    /**
+     * 把存档原文发给用户：装得下就一条；超过传输层单条上限时**按协议分片**逐条发出（{@code 【i/n】}），
+     * **绝不因为长而少给一个字**。走 {@link #sendReply}（不经过 {@code publicCommands} 的指令规范化、
+     * 也不进回执窗口），所以正文与存档文件逐字一致。
+     */
+    private void sendLogOutput(JsonObject event, String text) {
+        List<String> chunks = splitForTransport(text, LOG_CHUNK_CHARS);
+        if (chunks.size() == 1) { sendReply(event, text); return; }
+        for (int index = 0; index < chunks.size(); index++)
+            sendReply(event, "【" + (index + 1) + "/" + chunks.size() + "】\n" + chunks.get(index));
+    }
+    /**
+     * 只为传输层切分：每片不超过 {@code max} 个字符，优先在换行处切（记录之间本来就有空行），
+     * **一个字都不丢**（超长单行硬切；代理对不劈开）。这是协议分片，不是内容上限。
+     */
+    static List<String> splitForTransport(String text, int max) {
+        List<String> chunks = new ArrayList<>();
+        String rest = text == null ? "" : text;
+        while (rest.length() > max) {
+            int cut = rest.lastIndexOf('\n', max - 1);
+            if (cut <= 0) {
+                cut = max;
+                if (Character.isHighSurrogate(rest.charAt(cut - 1))) cut--;
+            } else cut = cut + 1;
+            chunks.add(rest.substring(0, cut));
+            rest = rest.substring(cut);
+        }
+        chunks.add(rest);
+        return chunks;
+    }
+    /**
+     * 读日志文件里**最近 wanted 条**完整记录（wanted 想要多少给多少；文件里不够就全给）。
+     * 从文件尾部按窗口往前读，窗口不够就按 4 倍扩大一直扩到文件开头：读 1 条不必把整份日志读进内存。
+     * 记录边界是 {@link #LOG_RECORD_HEAD}（原文里可以有换行，所以不能按行切）；从中间截起的半条记录
+     * 因为找不到自己的头而被自然丢掉。
+     */
+    private static List<String> readLogRecords(Path file, long wanted) throws IOException {
+        if (!Files.isRegularFile(file)) return List.of();
+        long size = Files.size(file);
+        long window = 64L * 1024;
+        while (true) {
+            long from = Math.max(0, size - window);
+            List<String> records = recordsIn(readRange(file, from, size));
+            if (from == 0 || records.size() >= wanted) {
+                int keep = (int) Math.min(wanted, records.size());
+                return List.copyOf(records.subList(records.size() - keep, records.size()));
+            }
+            window = window >= size / 4 + 1 ? size : window * 4;
+        }
+    }
+    /** 按记录头切分一段日志文本：记录从自己的头开始，到下一条记录的头（或文本末尾）为止，原样保留。 */
+    static List<String> recordsIn(String text) {
+        Matcher matcher = LOG_RECORD_HEAD.matcher(text == null ? "" : text);
+        List<Integer> starts = new ArrayList<>();
+        while (matcher.find()) starts.add(matcher.start());
+        List<String> records = new ArrayList<>();
+        for (int index = 0; index < starts.size(); index++) {
+            int start = starts.get(index);
+            int end = index + 1 < starts.size() ? starts.get(index + 1) : text.length();
+            records.add(text.substring(start, end).strip());
+        }
+        return records;
+    }
+    /** 读文件的 [from, size) 这段（UTF-8）。窗口从记录中间切起时，前几个字节可能不是一个完整字符，无所谓：
+     *  那半条记录会被 {@link #recordsIn} 丢掉（它找不到自己的记录头）。 */
+    private static String readRange(Path file, long from, long size) throws IOException {
+        try (java.io.RandomAccessFile reader = new java.io.RandomAccessFile(file.toFile(), "r")) {
+            reader.seek(from);
+            byte[] buffer = new byte[(int) Math.min(size - from, Integer.MAX_VALUE)];
+            int read = reader.read(buffer);
+            return new String(buffer, 0, Math.max(read, 0), StandardCharsets.UTF_8);
+        }
+    }
     /**
      * 落地前校验：任一不满足就返回一句"为什么不能落地"（调用方据此回滚到改写后的版本），全部满足返回 null。
-     * 三条判据与既有硬规矩一致：① 改后提示词不能空；② LoRA/嵌入标签一个都不能少；③ 不能出现原先没有的中文。
+     * 四条判据与既有硬规矩一致：① 改后提示词不能空；② 模型标签（LoRA/嵌入）**逐条完整**保留（同名同括号，
+     * 混在别的内容里不算数）；③ 不能出现原先没有的中文；④ 不能有 JSON 结构痕迹（{@code {} } / 引号包着的
+     * 键名 / {@code "positive"} / {@code =>}）——模型把整段 JSON 当内容写回来的那次事故就是这条拦下的。
      */
     private String promptRejection(SdClient.Prompts candidate, String scope) {
+        return promptRejection(candidate, scope, true);
+    }
+    /**
+     * 同上；{@code checkModelTags} 在"模型给的整份改写稿"这条路上传 {@code true}——改写结果丢了 LoRA 标签
+     * 同样不许落地（不交付被改坏的提示词）。{@code fallback} 是回滚到的那一版（回执要写清"已回滚到哪一版"）。
+     */
+    private String promptRejection(SdClient.Prompts candidate, String scope, boolean checkModelTags) {
         if (candidate == null) return "没有内容";
         if (candidate.positive().isBlank()) return "正向提示词被清空了";
+        // 结构痕迹先查，且**不依赖**提示词当前的基线：这类内容永远不是词条，任何一条路径都不许落地。
+        String trace = DeepSeekPrompts.promptTrace(candidate.positive());
+        if (trace == null) trace = DeepSeekPrompts.promptTrace(candidate.negative());
+        if (trace != null) return "提示词里混进了 JSON 结构痕迹（" + trace + "），不是纯词条";
         SdClient.Prompts current;
         try { current = userPrompts.prompts(scope); } catch (Exception ignored) { current = candidate; }
         try {
-            for (String tag : promptModelTags(current.positive()))
-                if (!promptModelTags(candidate.positive()).contains(tag)) return "丢了 LoRA/嵌入标签 " + tag;
+            if (checkModelTags) {
+                List<String> missing = missingModelTags(current.positive(), candidate.positive());
+                if (!missing.isEmpty()) return "丢了 LoRA/嵌入标签 " + String.join("、", missing);
+            }
             String newChinese = newChineseText(current, candidate);
             if (!newChinese.isBlank()) return "把中文写进了提示词：" + newChinese;
         } catch (Exception broken) { return "校验失败：" + error(broken); }
         return null;
+    }
+    /**
+     * 基线里的模型标签中**没有原样出现**在候选提示词里的那些。
+     *
+     * <p>刻意用"逐条术语比对（忽略大小写、必须是术语本身）"而不是"整串包含"：那次事故里
+     * {@code <lora:Yasaka_Menoa_1_nai:1>} 被裹在一段 JSON 文本内部，{@code contains} 判定它"还在"，
+     * 落地后 LoRA 却真的从提示词里消失了。术语比对要求标签**自己就是一条词条**，"混在别的内容里"算丢失。
+     */
+    static List<String> missingModelTags(String before, String after) {
+        List<String> missing = new ArrayList<>();
+        List<String> landed = new ArrayList<>();
+        try { landed.addAll(PromptEditor.parts(after == null ? "" : after)); }
+        catch (IllegalArgumentException broken) { return promptModelTags(before); }
+        for (String tag : promptModelTags(before)) {
+            boolean present = false;
+            for (String term : landed)
+                if (term.strip().equalsIgnoreCase(tag.strip())) { present = true; break; }
+            if (!present) missing.add(tag);
+        }
+        return missing;
     }
     /**
      * 候选提示词里**新出现**的中文词项（空串＝没有）。存量中文不算：用户自己的提示词里本来就可能带中文，
@@ -2378,11 +2621,12 @@ public final class Bot implements AutoCloseable {
         try { return settings.infixMode(ChatService.conversationKey(event)); }
         catch (Exception ignored) { return Settings.InfixMode.GLOBAL; }
     }
-    /** 这个 .infix 是不是控制指令（模式/词库约束/互斥开关）——控制指令不参与合并，也不走改写。 */
+    /** 这个 .infix 是不是控制指令（模式/词库约束/互斥开关/查看日志）——控制指令不参与合并，也不走改写。 */
     static boolean infixControlCommand(String instruction) {
         String lower = instruction == null ? "" : instruction.strip().toLowerCase(Locale.ROOT);
         return lower.startsWith("mode") || lower.startsWith("档位")
-                || lower.startsWith("filter") || lower.startsWith("conflict") || lower.startsWith("互斥");
+                || lower.startsWith("filter") || lower.startsWith("conflict") || lower.startsWith("互斥")
+                || lower.equals("log") || lower.startsWith("log ");
     }
     /**
      * 这条指令是不是在切 infix 档位（{@code .infix mode global|parts}）。会切档位的指令按顺序执行，
@@ -2410,9 +2654,10 @@ public final class Bot implements AutoCloseable {
             try {
                 SdClient.Prompts original = effectivePrompts(scope);
                 // 词库约束只在会话显式开启时生效；确定性与模型两条路共用这一个开关。
-                boolean strictDictionary = settings.infixFilterEnabled(ChatService.conversationKey(event));
+                String conversation = ChatService.conversationKey(event);
+                boolean strictDictionary = settings.infixFilterEnabled(conversation);
                 // 传统正反义词排斥器（默认关）：只在会话显式 .infix conflict on 时才做本地互斥整理。
-                boolean conflict = settings.infixConflictEnabled(ChatService.conversationKey(event));
+                boolean conflict = settings.infixConflictEnabled(conversation);
                 // 纯"按类别筛选"的改写要求（"仅保留人物和服饰，其余清空"）：程序按分类直接执行，
                 // 不花模型额度、也不会因为模型自由发挥而漏删词条。分类清单与投喂给模型的是同一份。
                 CategorySurgery surgery = parseCategorySurgery(instruction);
@@ -2429,7 +2674,8 @@ public final class Bot implements AutoCloseable {
                         message = applyInfixIntent(scope, original, intent, instruction, conflict);
                         succeeded = true;
                     } else {
-                        ModelOutcome outcome = infixByModel(scope, original, instruction, intent, blocked, strictDictionary, conflict);
+                        ModelOutcome outcome = infixByModel(scope, conversation, original, instruction, intent, blocked,
+                                strictDictionary, conflict);
                         message = outcome.message();
                         // 改写调用本身失败时仍然算这一步没成功（链式指令的后续步骤必须停下，
                         // 否则会拿着没改过的 prompt 继续 .gen）——与改动前的外层 catch 语义一致。
@@ -2503,18 +2749,20 @@ public final class Bot implements AutoCloseable {
      * 句式认不出来（{@code intent == null}）与认出来了但不能直接落地（中文描述型等，{@code blocked != null}）。
      * 后者第一次改写没给出可应用的变化时，会用更严格的指令再问一次（见 {@link #infixTranslationRetry}）。
      */
-    private ModelOutcome infixByModel(String scope, SdClient.Prompts original, String instruction, InfixIntent.Intent intent,
-                                      String blocked, boolean strictDictionary, boolean conflict) throws Exception {
+    private ModelOutcome infixByModel(String scope, String conversation, SdClient.Prompts original, String instruction,
+                                      InfixIntent.Intent intent, String blocked, boolean strictDictionary, boolean conflict) throws Exception {
         // 提示词改写走生图频道：与聊天频道的模型/密钥/额度完全分开。
         DeepSeekPrompts client = clientFor();
         // 自由改写：不做拆解、不喂候选词，模型按自己的判断改写；词库约束只在显式开启时生效。
         // 同时把当前 prompt 的**分类清单**交给模型，让它能理解"按类别"的要求（只保留人物和服饰）。
         DeepSeekPrompts.Result rewritten = null;
         String modelError = null;
-        try { rewritten = client.edit(instruction, original, TermCategories.describe(usageIndex(), original.positive())); }
+        // 改写原文一律存档（含解析失败重试的每一次），常规日志只留一条指针；判定逻辑一个字不动。
+        try { rewritten = runRewrite(scope, conversation, instruction,
+                () -> client.edit(instruction, original, TermCategories.describe(usageIndex(), original.positive()))); }
         catch (Exception model) { modelError = error(model); Log.warn("提示词改写调用没有成功：" + modelError); }
         if (rewritten == null)   // 调用失败：这一步不算成功（链式指令的后续步骤要停下）
-            return new ModelOutcome(infixIntentFallback(scope, original, instruction, intent, blocked, List.of(), modelError, strictDictionary, conflict), false);
+            return new ModelOutcome(infixIntentFallback(scope, conversation, original, instruction, intent, blocked, List.of(), modelError, strictDictionary, conflict), false);
         InfixFilter filtered = strictDictionary
                 ? filterInfixVocabulary(settings.root, original, rewritten)
                 : new InfixFilter(rewritten, List.of());
@@ -2522,7 +2770,7 @@ public final class Bot implements AutoCloseable {
         if (applied != null) return new ModelOutcome(applied, true);
         // 模型结果与当前提示词一致（没有可应用的变化）→ 走兜底：中文描述型再严格重试一次，否则如实说明。
         // 调用本身是成功的，所以这一步仍算成功（与改动前"没有可应用的变化"回执的语义一致）。
-        return new ModelOutcome(infixIntentFallback(scope, original, instruction, intent, blocked, filtered.rejected(), null, strictDictionary, conflict), true);
+        return new ModelOutcome(infixIntentFallback(scope, conversation, original, instruction, intent, blocked, filtered.rejected(), null, strictDictionary, conflict), true);
     }
     /** 一次模型改写路径的结果：给用户的回执 + 这一步算不算成功（链式指令据此决定要不要往下走）。 */
     private record ModelOutcome(String message, boolean succeeded) { }
@@ -2541,6 +2789,23 @@ public final class Bot implements AutoCloseable {
             if(!current.positive().equals(original.positive()) || !current.negative().equals(original.negative()))
                 throw new IllegalStateException("等待 DeepSeek 时提示词已被修改，本次结果未覆盖新内容，请重新 /infix。");
             if(result.positive().equals(original.positive()) && result.negative().equals(original.negative())) return null;
+            // 词条分隔符规范化：模型爱用全角标点写列表（用户实测那次是「Yasaka Menoa、1girl、skirt lift…」），
+            // 只认半角逗号会让整段变成一个巨型词条、LoRA 标签也跟着被判成"不在提示词里"。这一步只把全角
+            // 逗号/顿号折成半角逗号、把全角引号折成半角，**绝不删改任何词条**（词条本身一个字符都不动）。
+            DeepSeekPrompts.Result normalized = new DeepSeekPrompts.Result(
+                    PromptEditor.normalizeSeparators(result.positive()), PromptEditor.normalizeSeparators(result.negative()));
+            if (!normalized.positive().equals(result.positive()) || !normalized.negative().equals(result.negative()))
+                Log.info("改写结果里的全角分隔符已规范化（" + scope + "）");
+            result = normalized;
+            // 落地前校验（与画面检查修正稿同一道门）：任何一条路径都不许把"模型原文/JSON 结构"写进提示词。
+            // 那次事故正是这条路：模型把 {"positive":"…","negative":"…"} 整段塞进了 positive 字段，
+            // 这里没有校验、直接落盘（见 promptRejection 的注释）。
+            String rejectedRewrite = promptRejection(new SdClient.Prompts(result.positive(), result.negative(),
+                    UserPromptStore.PERSONAL_SOURCE), scope, true);
+            if (rejectedRewrite != null) {
+                Log.warn("改写结果没通过落地前校验，一个字都没改（" + scope + "）：" + rejectedRewrite);
+                throw new IllegalArgumentException("改写结果没通过落地前校验（" + rejectedRewrite + "），本次一个字都没改。");
+            }
             PromptFunctions functions = new PromptFunctions(settings.root); functions.recover(() -> userPrompts.prompts(scope), scope);
             SdClient.Prompts updated = applyPersonalInfix(userPrompts, scope, original, result);
             functions.forget(scope, false, List.of(), true); functions.forget(scope, true, List.of(), true);
@@ -2569,11 +2834,11 @@ public final class Bot implements AutoCloseable {
      * 模型没给出可应用改动时的兜底：要求里有中文描述（A 认得出句式、但内容必须由模型翻译成英文词条）时，
      * 用更严格的指令再问一次；仍然不行就如实说明是哪一步没懂。
      */
-    private String infixIntentFallback(String scope, SdClient.Prompts original, String instruction, InfixIntent.Intent intent,
-                                       String blocked, List<String> rejected, String modelError, boolean strictDictionary,
-                                       boolean conflict) throws Exception {
+    private String infixIntentFallback(String scope, String conversation, SdClient.Prompts original, String instruction,
+                                       InfixIntent.Intent intent, String blocked, List<String> rejected, String modelError,
+                                       boolean strictDictionary, boolean conflict) throws Exception {
         if (modelError == null && InfixIntent.hasCjk(instruction)) {
-            String retry = infixTranslationRetry(scope, original, instruction, strictDictionary, conflict);
+            String retry = infixTranslationRetry(scope, conversation, original, instruction, strictDictionary, conflict);
             if (retry != null) return retry;
         }
         return infixNothingUnderstood(intent, instruction, rejected, modelError, blocked);
@@ -2582,15 +2847,17 @@ public final class Bot implements AutoCloseable {
      * 中文描述型的第二次尝试：第一次改写没产出变化时，明确要求它"只返回改好的完整提示词 JSON"，
      * 并把中文必须翻译成英文词条这条硬规矩再写一遍。成功返回回执，失败返回 {@code null}（由调用方报失败）。
      */
-    private String infixTranslationRetry(String scope, SdClient.Prompts original, String instruction, boolean strictDictionary,
-                                         boolean conflict) {
+    private String infixTranslationRetry(String scope, String conversation, SdClient.Prompts original, String instruction,
+                                         boolean strictDictionary, boolean conflict) {
         String nudge = "【重试】这条要求里有中文描述，必须由你翻译成标准英文词条后落实；"
                 + "只返回 JSON：{\"positive\":\"...\",\"negative\":\"...\"}（改好后的完整提示词），"
                 + "不要解释、不要 Markdown、不要把任何中文写进 positive/negative。原要求：";
         if (instruction.length() + nudge.length() > 8000) return null;
         try {
-            DeepSeekPrompts.Result again = clientFor()
-                    .edit(nudge + instruction, original, TermCategories.describe(usageIndex(), original.positive()));
+            DeepSeekPrompts client = clientFor();
+            // 第二次尝试的原文同样存档（与第一次前后相邻，能直接对比"两次吐了什么"）。
+            DeepSeekPrompts.Result again = runRewrite(scope, conversation, nudge + instruction,
+                    () -> client.edit(nudge + instruction, original, TermCategories.describe(usageIndex(), original.positive())));
             InfixFilter filtered = strictDictionary
                     ? filterInfixVocabulary(settings.root, original, again)
                     : new InfixFilter(again, List.of());
@@ -3435,6 +3702,16 @@ public final class Bot implements AutoCloseable {
         List<String> kept=new ArrayList<>();
         Set<String> seen=new HashSet<>();
         for(String term:PromptEditor.parts(text)) {
+            // 结构痕迹片段（半个 JSON / 引号包着的键名）永远不是词条：**任何筛选都不许保留它**，
+            // 直接丢弃并记入 rejected（回执里如实列出"丢弃了什么"），免得污染扩散到落盘。
+            String trace = DeepSeekPrompts.promptTrace(term);
+            if (trace != null) { rejected.add(field + "：" + term + "（JSON 结构痕迹：" + trace + "）"); continue; }
+            // LoRA/嵌入标签是硬规矩里的"绝不删"：词库不认它也照样保留（模型重写成别的写法时由调用方另行处置）。
+            if (isLoraOrEmbedding(term)) {
+                // 同名标签已经保留过就不重复加（同一个词条只保留第一次出现）。
+                if (!seen.add(PromptEditor.key(term))) continue;
+                kept.add(term); continue;
+            }
             // 同一个词条只保留第一次出现：模型偶尔会重复输出（回执里就会出现"新增 3d_background、3d_background"）。
             if(!seen.add(PromptEditor.key(term))) continue;
             if(allowed.contains(PromptEditor.key(term))) { kept.add(term); continue; }
@@ -5835,6 +6112,10 @@ public final class Bot implements AutoCloseable {
     }
 
     private void sdSettings(JsonObject event, String option, String arguments) throws Exception {
+        // `.size 840x1280` 与 `.size 840 1280` 是同一条：模型按规划规则产出的就是「.size <宽>x<高>」，
+        // 这里只把紧凑写法补成 `/size set <宽> <高>`，落地路径一个字都不改。
+        if (option.equals("size") && arguments.matches("[0-9]+\\s*[xX×*]\\s*[0-9]+"))
+            arguments = "set " + arguments.replaceAll("\\s*[xX×*]\\s*", " ");
         arguments = selectedArguments(event, option, arguments);
         // `.vae` 与 /sampler、/size 这类生成参数同一权限：不做 owner/admin 限制。
         if (option.equals("vae")) { vaeCommand(event, arguments); return; }
@@ -5870,7 +6151,7 @@ public final class Bot implements AutoCloseable {
                     + "/style import webui [overwrite]、/style prompt <名称|#编号>、/style load <名称|#编号> [nolora]、"
                     + "/style rename [overwrite] <名称|#编号|#起-#止> <新名称或前缀>、/style delete <名称|#编号|#起-#止>、"
                     + "/style category <名称|#编号|#起-#止> [分类名]";
-            default -> "用法：/size 或 /size set <宽> <高>；宽高须为 64–2048 的整数且为 8 的倍数。";
+            default -> "用法：/size、/size set <宽> <高> 或 /size <宽>x<高>；宽高须为 64–2048 的整数且为 8 的倍数。";
         };
         if (arguments.isEmpty()) {
             SdClient.GenerationSettings current = sd.settings();
@@ -6513,8 +6794,12 @@ public final class Bot implements AutoCloseable {
         String lastError = "";
         /** 挂起：不参与调度，插到队首也不会被取；已经在下发的那一张会跑完。 */
         boolean suspended;
-        /** 取消：跑完当前这张就结算（已生成的图片照常可领取）。 */
+        /** 取消：跑完当前这张就结算（已经生成的图片照常可领取）。 */
         boolean cancelled;
+        /** 这一张正提交给 SD（工作线程在 sd.generate 里）：取消据此决定"要不要真去中断 SD"。 */
+        volatile boolean generating;
+        /** 这一张被取消从中途掐断了（SD 已确认停止）：半成品不发布、不发送，也不算"成功一次"。 */
+        volatile boolean interrupted;
         /** 出图前的 VAE 冲突检查只做一次（这一任务的第一张之前），不必每张都查。 */
         boolean vaeChecked;
         /** 出图前的防呆拒绝了这次生成：整条任务到此为止（剩余次数由结算统一清账）。 */
@@ -6556,9 +6841,10 @@ public final class Bot implements AutoCloseable {
                 for (GenerationJob job : generationJobs) { job.cancelled = true; cancelled.add(job); }
                 BigInteger freed = waitingGenerations.add(suspendedGenerations);
                 waitingGenerations = BigInteger.ZERO; suspendedGenerations = BigInteger.ZERO;
-                Log.info("取消全部生成任务：" + cancelled.size() + " 个（含正在生成的那张会跑完）");
+                Log.info("取消全部生成任务：" + cancelled.size() + " 个");
                 return "已取消队列里的全部任务（" + cancelled.size() + " 个，共 " + freed + " 次待生成）。"
-                        + "\n正在下发的那一张会跑完，其余不再生成；已经生成的图片照常可以领取（" + (settings.autoGet() ? "会自动领取" : "用 .get 领取") + "）。";
+                        + stopCurrentGeneration()
+                        + "\n其余不再生成；已经生成的图片照常可以领取（" + (settings.autoGet() ? "会自动领取" : "用 .get 领取") + "）。";
             }
             if (target.isEmpty()) return "用法：.gen hold|resume|cancel|first #编号（.gen list 查看编号；取消全部用 .gen cancel all）";
             GenerationJob job = null;
@@ -6595,9 +6881,9 @@ public final class Bot implements AutoCloseable {
                     waitingGenerations = waitingGenerations.subtract(job.remaining);
                     if (job.suspended) suspendedGenerations = suspendedGenerations.subtract(job.remaining);
                     job.remaining = BigInteger.ZERO;
-                    Log.info("生成任务 #" + job.number + " 已取消（" + (job == currentGeneration ? "当前这张跑完即停" : "直接跳过") + "）");
+                    Log.info("生成任务 #" + job.number + " 已取消（" + (job == currentGeneration ? "当前这张已在 SD 那边处理" : "直接跳过") + "）");
                     return "任务 #" + job.number + " 已取消：不再生成剩下的 " + freed + " 次。"
-                            + (job == currentGeneration ? "\n正在下发的那一张会跑完。" : "")
+                            + (job == currentGeneration ? stopCurrentGeneration() : "")
                             + "\n已经生成的 " + job.images + " 张照常保留，" + (settings.autoGet() ? "任务结算后自动领取。" : "用 .get 领取。");
                 }
                 case "first" -> {
@@ -6615,6 +6901,31 @@ public final class Bot implements AutoCloseable {
                 default -> { return "用法：.gen hold|resume|cancel|first #编号"; }
             }
         }
+    }
+    /**
+     * 取消正在下发的那一张：真的去停 SD（{@code POST /sdapi/v1/interrupt}，再等 progress 确认停下），
+     * 返回一句**如实**的说明（停了 / 没确认 / 到得太晚它已经跑完）。
+     *
+     * <p>为什么非真停不可：出图那一路是阻塞在 {@code POST /sdapi/v1/txt2img} 上的，只置标志没人会去打断它。
+     * 实测（2026-10-07，Forge Neo 7861）取消之后 SD 照旧一路跑完（progress 0.01 → 0.968，interrupted 始终
+     * false），13.6 秒后图照旧发出来——"取消"于是等于没取消。中断牌子必须在发请求**之前**立起来，
+     * 工作线程拿到 Forge 回的那张半成品（实测中断后仍回 200 + 只跑了一两步的图）时才不会发布它。
+     *
+     * <p>调用方须持有 {@link #generationLock}（两个调用点都在 {@code generationControl} 的同步块里）：
+     * 确认期间一直占着锁，工作线程要么在看标志之前就把图发完了（那说明这一张是取消前生成好的，照发没错），
+     * 要么一定看得到最终结论——不会出现"半成品已经发出去、标志才立起来"的缝。
+     */
+    private String stopCurrentGeneration() {
+        GenerationJob running = currentGeneration;
+        if (running == null) return "";
+        if (!running.generating) return "\n正在下发的这一张还没提交给 SD，取消后不会再提交。";
+        running.interrupted = true;
+        SdClient.Interrupt stop = sd.interrupt(java.time.Duration.ofSeconds(5));
+        Log.info("取消：停 SD 当前生成 → 中断请求" + (stop.sent() ? "已发出" : "失败") + "，"
+                + (stop.stopped() ? "SD 已确认停止" : "没等到停止确认") + (stop.note().isEmpty() ? "" : "（" + stop.note() + "）"));
+        if (!stop.sent()) return "\n正在生成的这一张没能停下来（" + stop.note() + "）；它可能照旧跑完，但跑完的那张不会发出。";
+        if (stop.stopped()) return "\n正在生成的这一张已被中断（SD 已确认停止），半成品不会发出。";
+        return "\n已请求 SD 中断正在生成的这一张，但" + stop.note() + "；跑完的那张不会发出。";
     }
     /** 队列空了但还有活时把工作线程拉起来（置顶/继续之后必须调用）。 */
     private void ensureGenerationWorker() {
@@ -6855,19 +7166,36 @@ public final class Bot implements AutoCloseable {
                 if (job.refused != null) {
                     // 拒绝：不调用 SD（绝不会默默出一张灰图），拒绝原因由下面的结算回执带出。
                 } else {
-                    List<Path> result = sd.generate(job.snapshot, job.taskId);
-                    // 出图后的最后一道防线：灰图自检 + 自动修复 + 只重试一次（独立于上面的冲突检测）。
-                    GrayCheck gray = grayCheck(job, result);
-                    if (!gray.notice().isEmpty()) replyProcess(job.event, gray.notice());
-                    if (gray.failed()) synchronized (generationLock) {
-                        job.failed = job.failed.add(BigInteger.ONE);
-                        job.lastError = "出图全是灰图（纯色废图）：VAE/额外模块与当前模型冲突，自动修复后重试仍失败；用 .vae check 查看";
+                    // 与取消那一路对齐：先把"正在提交 SD"的牌子立起来（volatile），再在锁里确认没被取消。
+                    // 于是取消只有两种结果——要么看得见牌子、真去中断 SD；要么它已经先置好 cancelled，这一张根本不提交。
+                    job.generating = true;
+                    boolean submit;
+                    synchronized (generationLock) { submit = !job.cancelled; }
+                    if (!submit) {
+                        job.generating = false;
+                        Log.info("生成任务 #" + job.number + " 在提交给 SD 之前已取消：这一次不提交（SD 不会被调用）");
+                    } else {
+                        List<Path> result;
+                        try { result = sd.generate(job.snapshot, job.taskId, () -> job.interrupted); }
+                        finally { job.generating = false; }
+                        if (job.interrupted) {
+                            // 取消把这一张从 SD 那边真的掐断了：SdClient 不会落盘（半成品不入待发送队列）。
+                            Log.info("生成任务 #" + job.number + " 的这一次已被取消中断：半成品不发布、不发送，耗时 " + millis(started) + " ms");
+                        } else {
+                            // 出图后的最后一道防线：灰图自检 + 自动修复 + 只重试一次（独立于上面的冲突检测）。
+                            GrayCheck gray = grayCheck(job, result);
+                            if (!gray.notice().isEmpty()) replyProcess(job.event, gray.notice());
+                            if (gray.failed()) synchronized (generationLock) {
+                                job.failed = job.failed.add(BigInteger.ONE);
+                                job.lastError = "出图全是灰图（纯色废图）：VAE/额外模块与当前模型冲突，自动修复后重试仍失败；用 .vae check 查看";
+                            }
+                            result = gray.images();
+                            job.completedImages.addAll(result);
+                            synchronized (generationLock) { job.images = job.images.add(BigInteger.valueOf(result.size())); }
+                            Log.info("生成任务 #"+job.number+" 第 "+job.done.add(BigInteger.ONE)+"/"+job.total+" 次成功："
+                                    +result.size()+" 张，耗时 "+millis(started)+" ms");
+                        }
                     }
-                    result = gray.images();
-                    job.completedImages.addAll(result);
-                    synchronized (generationLock) { job.images = job.images.add(BigInteger.valueOf(result.size())); }
-                    Log.info("生成任务 #"+job.number+" 第 "+job.done.add(BigInteger.ONE)+"/"+job.total+" 次成功："
-                            +result.size()+" 张，耗时 "+millis(started)+" ms");
                 }
             } catch (Exception e) {
                 synchronized (generationLock) { job.failed = job.failed.add(BigInteger.ONE); job.lastError = error(e); }
@@ -6920,9 +7248,12 @@ public final class Bot implements AutoCloseable {
         job.remaining = BigInteger.ZERO;
         finishedJobs.addFirst(job); while (finishedJobs.size() > 20) finishedJobs.removeLast();
         // 被出图前防呆拒绝时没生成过任何图片：成功次数按 0 报（done 记的是"这次尝试"）。
-        BigInteger succeeded = job.refused != null ? BigInteger.ZERO : job.done.subtract(job.failed);
+        // 被取消中断的那一次同样不算成功：SD 只跑了几步就被掐断，Forge 回的那张半成品没有被发布。
+        BigInteger succeeded = job.refused != null ? BigInteger.ZERO
+                : job.done.subtract(job.failed).subtract(BigInteger.valueOf(job.interrupted ? 1 : 0)).max(BigInteger.ZERO);
         return "任务 #" + job.number + " " + reason + "：" + job.done + "/" + job.total
                 + "，图片生成成功 " + succeeded + " 次，生成失败 " + job.failed + " 次，共 " + job.images + " 张。"
+                + (job.interrupted ? "\n正在生成的这一张已被中断（SD 已确认停止），半成品没有发出。" : "")
                 + (job.lastError.isEmpty() ? "" : (job.refused != null ? "\n拒绝原因：" : "\n最近失败原因：") + job.lastError)
                 + (settings.autoGet() ? "\n已生成的图片将自动领取。" : "\n发送 /get 领取已生成的图片。");
     }
@@ -7521,6 +7852,14 @@ public final class Bot implements AutoCloseable {
      * 照旧可用 —— 两者共用一个 store 的锁，不会互相写坏。
      */
     private final ChatLogStore chatLog;
+    /**
+     * 事件队列（{@code data/webui/<scope>-events.json}）：服务端"入队"、前端"出队渲染"的那条队列。
+     *
+     * <p>凡是会产生**前端可见信息**的落点都往它里面追加一条（见 {@link #appendQuestToEventQueue} 与
+     * {@link #webChat}）：用户消息、bot 回应、回执里的每条正文、晚到的图片（patch）。
+     * 旧接口（{@code /api/chat/log}、{@code /api/quests}、{@code /api/capture}）照旧，两边互不影响。
+     */
+    private final cn.szu.bot.web.EventQueueStore eventQueue;
     /** 索引写盘节流：距上次写盘不足 2 秒、且内容没变，就不写——900ms 一次的轮询不能把磁盘写爆。 */
     private static final long QUEST_SAVE_INTERVAL_MILLIS = 2000;
     private volatile long questSavedMillis;
@@ -7907,6 +8246,8 @@ public final class Bot implements AutoCloseable {
         if (capture == null) return;
         // 对话正文的追加**不依赖索引**：索引造不出来时回执照旧要进正文（两件事互不牵连）。
         appendQuestToChatLog(capture);
+        // 事件队列与正文**同一个落点、同一个时刻**：前端从队列出队就能拿到"这条回执产生的每条信息"。
+        appendQuestToEventQueue(capture);
         QuestIndex index = questIndex;
         if (index == null) return;
         index.observe(capture);
@@ -7940,6 +8281,30 @@ public final class Bot implements AutoCloseable {
         if (messages.isEmpty() || messages.size() <= capture.chatAppended) return;
         chatLog.append(scope, ChatLogStore.receipt(String.valueOf(capture.number), messages));
         capture.chatAppended = messages.size();
+    }
+    /**
+     * 把这条回执已经攒下的出站消息**入队**（{@code data/webui/<scope>-events.json}）—— 事件队列这一半
+     * 与 {@link #appendQuestToChatLog} 完全同源：同一个落点、同一份 messages、同一套分组规则。
+     *
+     * <p>为什么在这里：出站消息无论来自同步的指令步骤还是异步的"生成完成/领取图片"，都必经
+     * {@code webAware} 捕获，捕获之后一定走 {@link #observeQuest}。放在这里只有一个落点，
+     * 同步与异步、文字与图片一视同仁。
+     *
+     * <p><b>幂等</b>：每次都用**整份 messages 重新推导**，逐条带稳定键交给
+     * {@link cn.szu.bot.web.EventQueueStore#appendReceipt}（回执正文 = {@code quest:<号>:<序号>}）。
+     * 重复调用、机器人重启、页面补拉都只入队一次；图后到时**不改原条目**，而是补一条
+     * {@code patch}（目标 = 那条 message 的 id），由前端按 target 就地补图。
+     *
+     * <p>不落 QQ 会话（scope 为空）、不落老构造器造出来的无归属回执：那些不是"网页会话的信息"。
+     * 队列写失败只 warn（绝不抛）：回执本身与聊天都不受影响。
+     */
+    private void appendQuestToEventQueue(WebCapture capture) {
+        if (capture == null || eventQueue == null) return;
+        String scope = capture.scope();
+        if (scope == null || scope.isBlank() || capture.number <= 0) return;
+        List<JsonArray> messages = new ArrayList<>(capture.messages);
+        if (messages.isEmpty()) return;
+        eventQueue.appendReceipt(scope, String.valueOf(capture.number), messages);
     }
     /**
      * 一条回执的正文落盘：{@code data/quests/&lt;number&gt;.json}（{@link Json#atomicWrite}，UTF-8 无 BOM）。
@@ -8193,7 +8558,18 @@ public final class Bot implements AutoCloseable {
         }        JsonObject result = new JsonObject();
         // 回复（或规划）之后落人格状态：好感度/情绪按 K4 触发表与模型给的字段更新。
         chat.applyPersonaState(scope, message, plan);
-        result.addProperty("reply", Bot.publicCommands(plan.reply()));
+        String reply = Bot.publicCommands(plan.reply());
+        result.addProperty("reply", reply);
+        // 用户消息 + bot 回应入队：这两条就是"对话里的一条"（id 稳定 = msg:<uuid>，同一次请求重放不重复）。
+        // 回执里的每条正文由 appendQuestToEventQueue 入队，两边各是自己那一类信息，谁也不替谁。
+        String userRef = UUID.randomUUID().toString();
+        eventQueue.append(scope, cn.szu.bot.web.EventQueueStore.userMessage(userRef, message, List.of()));
+        result.addProperty("messageId", "msg:" + userRef);
+        if (!reply.isBlank()) {
+            String replyRef = UUID.randomUUID().toString();
+            eventQueue.append(scope, cn.szu.bot.web.EventQueueStore.botMessage(replyRef, reply, List.of()));
+            result.addProperty("replyId", "msg:" + replyRef);
+        }
         result.add("commands", Json.GSON.toJsonTree(plan.commands()));
         result.addProperty("interest", plan.interest());
         if (execute && !plan.commands().isEmpty()) {
@@ -8203,6 +8579,36 @@ public final class Bot implements AutoCloseable {
         }
         return result;
     }
+    /**
+     * 网页接口 {@code POST /api/events}：**出队**（队列是新的一等公民，前端不再轮询回执自己缝）。
+     *
+     * <p>契约（前端按这个接）：body {@code {"scope":"<会话 scope>","after":<上次拿到的 seq，首次 0>,
+     * "limit":<可选，默认 200>}} → {@code {"scope","items":[…],"next","latest","hasMore","acked",
+     * "trimmedUpTo"}}。{@code items} 严格按 {@code seq} 升序；{@code next} 是下次该带的 after
+     * （空批时等于请求里的 after）；{@code hasMore} 为 true 就接着取，直到 false。
+     *
+     * <p>scope 就是"这是谁的对话"：控制台一个、每台手机一个，各自一条队列、互不影响。
+     */
+    public JsonObject webEvents(String scope, long after, int limit) {
+        return eventQueue.fetch(scope, after, limit);
+    }
+
+    /**
+     * 网页接口 {@code POST /api/events/ack}：确认出队（body {@code {"scope":"…","seq":124}}）。
+     *
+     * <p>ack 只推进、不回退，按 scope 各存一份；返回值就是 {@code {"ok":true,"acked":<推进后的值>}}。
+     */
+    public JsonObject webEventAck(String scope, long seq) {
+        long acked = eventQueue.ack(scope, seq);
+        JsonObject result = new JsonObject();
+        result.addProperty("ok", true);
+        result.addProperty("acked", acked);
+        return result;
+    }
+
+    /** 测试用：直接拿到事件队列。 */
+    cn.szu.bot.web.EventQueueStore eventQueue() { return eventQueue; }
+
     private JsonObject speakerFor(String scope) {
         JsonObject speaker = new JsonObject();
         speaker.addProperty("id", UserPromptStore.scopeOf(scope));

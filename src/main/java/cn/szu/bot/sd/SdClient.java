@@ -11,6 +11,7 @@ import java.time.*;
 import java.time.format.DateTimeFormatter;
 import java.util.*;
 import java.util.regex.*;
+import java.util.function.BooleanSupplier;
 import cn.szu.bot.Bot;
 import cn.szu.bot.Json;
 import cn.szu.bot.Log;
@@ -2496,8 +2497,16 @@ public final class SdClient {
     }
 
     /** Generate exactly the previously captured values; later browser/chat edits cannot alter this request. */
-    public List<Path> generate(GenerationRequest generation) throws Exception { return generate(generation, null); }
-    public List<Path> generate(GenerationRequest generation, String taskId) throws Exception {
+    public List<Path> generate(GenerationRequest generation) throws Exception { return generate(generation, null, null); }
+    public List<Path> generate(GenerationRequest generation, String taskId) throws Exception { return generate(generation, taskId, null); }
+    /**
+     * {@code aborted}（可空）在**收到 SD 响应之后、落盘之前**被问一次：为真表示这一次生成已经被取消中断。
+     *
+     * <p>为什么非问不可：实测（Forge Neo，2026-10-07）出图中途 {@code POST /sdapi/v1/interrupt} 之后，
+     * 那个还在飞的 {@code /sdapi/v1/txt2img} **照旧回 HTTP 200 + 一张只跑了一两步的半成品图**。
+     * 半成品绝不能落盘，更不能进待发送队列——否则"取消"就变成了"发一张废图"。
+     */
+    public List<Path> generate(GenerationRequest generation, String taskId, BooleanSupplier aborted) throws Exception {
         if (taskId != null && !UUID.fromString(taskId).toString().equals(taskId)) throw new IllegalArgumentException("Invalid generation task ID");
         Objects.requireNonNull(generation);
         Prompts prompts = generation.prompts();
@@ -2533,6 +2542,10 @@ public final class SdClient {
         payload.addProperty("send_images", true);
         payload.addProperty("save_images", false);
         JsonObject result = responseJson(request("/sdapi/v1/txt2img", "POST", payload, true, false), "生成图片");
+        if (aborted != null && aborted.getAsBoolean()) {
+            Log.info("[SD] 这一次生成已被取消中断：半成品不保存、不入待发送队列。");
+            return List.of();
+        }
         JsonElement images = result.get("images");
         if (images == null || !images.isJsonArray() || images.getAsJsonArray().isEmpty())
             throw new IOException("Stable Diffusion 未返回图片；请检查 WebUI 模型与控制台。");
@@ -2932,6 +2945,44 @@ public final class SdClient {
         percent = Math.max(0, Math.min(1, percent));
         if (!Double.isFinite(eta) || eta < 0) eta = 0;
         return new GenerationProgress(true, true, job, percent, Math.max(0, step), Math.max(0, steps), eta);
+    }
+
+    /**
+     * 停掉 SD 正在生成的这一张：{@code POST /sdapi/v1/interrupt}，再等 SD 自己报空闲
+     * （{@code GET /sdapi/v1/progress} 的 {@code state.job_count=0}）确认。
+     *
+     * <p>为什么"请求成功"不算数：实测（Forge Neo，2026-10-07）中断之后，那个还在飞的
+     * {@code /sdapi/v1/txt2img} 照旧回 HTTP 200 + 一张只跑了一两步的半成品图，而中断接口本身也只回
+     * {@code {}}。所以只有 progress 说停了才算停；确认不了就 {@code stopped=false}，由调用方如实回执，
+     * 绝不假装已取消。
+     */
+    public Interrupt interrupt(Duration confirmWithin) {
+        long deadline = System.nanoTime() + confirmWithin.toNanos();
+        while (true) {
+            try { request("/sdapi/v1/interrupt", "POST", new JsonObject(), false, false); }
+            catch (Exception failure) { return new Interrupt(false, false, "调用 SD 中断接口失败：" + message(failure)); }
+            // 每次请求后给它一段生效时间；模型还在加载时那一次中断会被丢掉（实测：step 还是 0，
+            // 中断被吃掉了，SD 照旧跑完整张），所以没停下来就再补一次，直到确认停下或用完预算。
+            long slice = Math.min(deadline, System.nanoTime() + 1_000_000_000L);
+            while (System.nanoTime() < slice) {
+                GenerationProgress now = progress();
+                if (now.reachable() && !now.running()) return new Interrupt(true, true, "");
+                try { Thread.sleep(200); }
+                catch (InterruptedException interrupted) { Thread.currentThread().interrupt();
+                    return new Interrupt(true, false, "等待 SD 确认中断时被打断"); }
+            }
+            if (System.nanoTime() >= deadline)
+                return new Interrupt(true, false, "中断请求已发出，但 " + confirmWithin.toSeconds() + " 秒内没等到 SD 报空闲");
+        }
+    }
+
+    /** {@link #interrupt} 的结果：{@code sent}=中断请求被 SD 接受；{@code stopped}=确认 SD 已停（这一张真被掐断）。 */
+    public record Interrupt(boolean sent, boolean stopped, String note) {}
+
+    /** 异常的一句话说明（不带头部类名，回执里直接用）。 */
+    private static String message(Exception failure) {
+        String text = failure.getMessage();
+        return text == null || text.isBlank() ? failure.getClass().getSimpleName() : text;
     }
 
     /**

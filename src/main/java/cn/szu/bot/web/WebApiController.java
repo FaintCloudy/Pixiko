@@ -197,11 +197,15 @@ public class WebApiController {
             }
             case "/api/logs": {
                 // 日志分两路：all（全部）/ qq（QQ 侧）/ web（网页侧）；网页日志面板可以随意切换。
+                // `files` 是 logs/ 目录的**真实文件清单**（控制台「日志文件」下拉用它；只读、只列不读内容）。
                 JsonObject result = new JsonObject();
                 result.add("lines", logTail(Json.str(body, "source", "all"), Json.num(body, "lines", 200)));
                 result.addProperty("source", Json.str(body, "source", "all"));
+                result.add("files", logFiles());
                 return WebJson.ok(result);
             }
+            case "/api/logs/tail": return logTailBytes(Json.str(body, "name", ""), Json.num(body, "offset", -1),
+                    body.has("maxBytes") ? Integer.valueOf(Json.num(body, "maxBytes", 0)) : null);
             case "/api/command": {
                 String command = Json.str(body, "command", "").strip();
                 if (command.isBlank()) throw new IllegalArgumentException("指令不能为空。");
@@ -237,6 +241,22 @@ public class WebApiController {
             case "/api/capture/close": {
                 bot.webClose(Json.str(body, "id", ""));
                 return WebJson.ok(Json.parse("{\"closed\":true}"));
+            }
+            // 事件队列：**前端取信息的主路**（服务端入队、前端拿到就出队渲染）。旧的 /api/capture 轮询
+            // 一个都没删（历史与回执列表还要用），但队列是新的一等公民，前端不必再猜身份去缝回执。
+            // 契约（POST，body 带 scope）：{"scope","after","limit"} → {"scope","items","next","latest",
+            // "hasMore","acked","trimmedUpTo"}；items 按 seq 严格升序，hasMore 为 true 就接着取。
+            case "/api/events": {
+                requirePost(method);
+                long after = longParam(body, "after", 0L);
+                int limit = (int) Math.min(Integer.MAX_VALUE, Math.max(0, longParam(body, "limit", 0L)));
+                return WebJson.ok(bot.webEvents(scope, after, limit));
+            }
+            // 确认出队：{"scope","seq"} → {"ok":true,"acked":N}。只推进、不回退，按 scope 各存一份
+            // （控制台一个、每台手机一个，互不影响）。
+            case "/api/events/ack": {
+                requirePost(method);
+                return WebJson.ok(bot.webEventAck(scope, longParam(body, "seq", 0L)));
             }
             case "/api/chat": {
                 String message = Json.str(body, "message", "").strip();
@@ -402,6 +422,15 @@ public class WebApiController {
         catch (Exception error) { throw new IllegalArgumentException("请求体不是合法 JSON。"); }
     }
 
+    /**
+     * 队列参数（{@code after} / {@code limit} / {@code seq}）：必须是整数，认不出来就用默认值。
+     * 不整份 400：前端一次手误不该让队列停摆（下一个数字类型的字段就能继续）。
+     */
+    static long longParam(JsonObject body, String key, long fallback) {
+        if (body == null || !body.has(key) || body.get(key).isJsonNull()) return fallback;
+        try { return body.get(key).getAsLong(); } catch (RuntimeException ignored) { return fallback; }
+    }
+
     /** 本机访问时用的主机名：优先回环地址，避免给出 0.0.0.0 这种点不开的链接。 */
     static String localHost(HttpServletRequest request) {
         String host = request.getHeader("Host");
@@ -504,9 +533,133 @@ public class WebApiController {
                 ImageThumbs.IMAGE_CACHE_CONTROL);
     }
 
-    /** 读取当天日志的最后若干行（网页日志面板）：source 取 all / qq / web。 */
-    private JsonArray logTail(String source, int lines) {
+    /**
+     * {@code logs/} 目录下的**真实文件清单**（只读）：名字 / 大小 / 修改时间。
+     *
+     * <p>控制台「日志文件」下拉就靠它 —— 所以列的是目录里**实际有什么**（{@code bot-*.log}、
+     * {@code qq-*.log}、{@code web-*.log}、{@code prompt-rewrite.log}、{@code prompt-review.log}、
+     * {@code bot-stdout.log}、{@code sd-autostart.log} …），不是写死的一份名单。
+     * 目录不存在或读不动就回空数组（面板显示"还没有日志文件"），绝不 500。
+     */
+    private JsonArray logFiles() {
         JsonArray result = new JsonArray();
+        Path dir = logsDir();
+        try (java.util.stream.Stream<Path> stream = Files.isDirectory(dir) ? Files.list(dir) : null) {
+            if (stream == null) return result;
+            List<Path> files = stream.filter(Files::isRegularFile)
+                    .sorted(java.util.Comparator.comparingLong((Path file) -> lastModified(file)).reversed())
+                    .toList();
+            for (Path file : files) {
+                JsonObject item = new JsonObject();
+                item.addProperty("name", file.getFileName().toString());
+                item.addProperty("size", sizeOf(file));
+                item.addProperty("modified", java.time.Instant.ofEpochMilli(lastModified(file)).toString());
+                result.add(item);
+            }
+        } catch (Exception error) {
+            Log.warn("WebUI 日志文件清单读取失败：" + Bot.error(error));
+        }
+        return result;
+    }
+
+    /**
+     * 读一个日志文件的字节（**只读**，UTF-8 解码）：{@code offset} 起、最多 {@code maxBytes} 字节。
+     *
+     * <p>规矩（用户要求）：
+     *   <ul>
+     *     <li>文件名只允许 {@code logs/} 目录里的**单层**普通文件：{@code ..}、绝对路径、子目录、符号链接
+     *         一律 403（{@code normalize + startsWith + 父目录必须就是 logs/}）；</li>
+     *     <li>{@code offset < 0}（不传）→ 取**尾部**：{@code maxBytes} 给了就取最后这么多字节，
+     *         没给就按 {@value #LOG_TAIL_DEFAULT_BYTES} 字节兜底（大文件不要一次全读进页面）；</li>
+     *     <li>{@code offset >= 0} → 从该字节起取（增量跟随就靠它）；{@code maxBytes} 不传 = 取到结尾；</li>
+     *     <li>UTF-8 解码**保留半截多字节字符**（从 {@code offset} 往前后各让几个字节，≤4 字节，
+     *         不改变总长度）；否则按字节切会让中文变乱码；</li>
+     *     <li>**不设人为的条数/长度上限**（用户明确讨厌那个）。</li>
+     *   </ul>
+     */
+    private ResponseEntity<?> logTailBytes(String rawName, int offset, Integer maxBytes) {
+        Path dir = logsDir();
+        Path file;
+        try {
+            file = logFileIn(dir, rawName);
+        } catch (IllegalArgumentException error) {
+            return WebJson.of(HttpStatus.FORBIDDEN, WebJson.error(error.getMessage()));
+        }
+        if (file == null || !Files.isRegularFile(file)) {
+            return WebJson.of(HttpStatus.NOT_FOUND, WebJson.error("日志文件不存在：" + rawName));
+        }
+        try (java.nio.channels.FileChannel channel = java.nio.channels.FileChannel.open(file, java.nio.file.StandardOpenOption.READ)) {
+            long size = channel.size();
+            long start;
+            int want;
+            if (offset >= 0) {
+                start = Math.min(offset, size);
+                want = maxBytes == null ? (int) Math.min(Integer.MAX_VALUE, size - start)
+                        : Math.max(1, Math.min(maxBytes, (int) Math.min(Integer.MAX_VALUE, size - start)));
+            } else if (maxBytes != null) {
+                want = Math.max(1, maxBytes);
+                start = Math.max(0, size - want);
+            } else {
+                want = LOG_TAIL_DEFAULT_BYTES;
+                start = Math.max(0, size - want);
+            }
+            byte[] bytes = new byte[want];
+            int read = 0;
+            while (read < want) {
+                int count = channel.read(java.nio.ByteBuffer.wrap(bytes, read, want - read), start + read);
+                if (count <= 0) break;
+                read += count;
+            }
+            // 半截多字节字符：往前让到首字节，再往后让到完整序列的末尾（都是纯字节运算）。
+            int from = 0;
+            while (from < read && (bytes[from] & 0x80) != 0 && (bytes[from] & 0xC0) != 0xC0) from++;
+            int to = read;
+            while (to > from && (bytes[to - 1] & 0xC0) == 0x80) to--;
+            String text = new String(bytes, from, Math.max(0, to - from), StandardCharsets.UTF_8);
+            JsonObject result = new JsonObject();
+            result.addProperty("name", file.getFileName().toString());
+            result.addProperty("size", size);
+            result.addProperty("offset", start + from);
+            result.addProperty("text", text);
+            result.addProperty("truncated", start + from > 0);
+            return WebJson.ok(result);
+        } catch (Exception error) {
+            Log.warn("WebUI 日志读取失败（" + rawName + "）：" + Bot.error(error));
+            return WebJson.of(HttpStatus.INTERNAL_SERVER_ERROR, WebJson.error("日志读取失败。"));
+        }
+    }
+
+    /** 一个日志文件名 → logs/ 目录里的真实路径；非法（穿越/绝对路径/子目录）抛 {@link IllegalArgumentException}。 */
+    private Path logFileIn(Path dir, String rawName) {
+        String name = rawName == null ? "" : rawName.strip();
+        if (name.isEmpty()) throw new IllegalArgumentException("日志名不能为空。");
+        if (name.contains("..") || name.contains("/") || name.contains("\\") || name.startsWith("~")
+                || name.indexOf(':') >= 0 || !name.matches("[A-Za-z0-9._-]+")) {
+            throw new IllegalArgumentException("日志名不合法（只允许 logs/ 目录里的文件名）：" + name);
+        }
+        Path target = dir.resolve(name).normalize();
+        // 双重保险：解析后必须仍在 logs/ 内、且父目录就是 logs/（挡掉符号链接指出去的写法）。
+        if (!target.startsWith(dir) || !dir.equals(target.getParent())) {
+            throw new IllegalArgumentException("日志名不合法（只允许 logs/ 目录里的文件名）：" + name);
+        }
+        return target;
+    }
+
+    private Path logsDir() { return settings.root.toAbsolutePath().normalize().resolve("logs"); }
+
+    private static long lastModified(Path file) {
+        try { return Files.getLastModifiedTime(file).toMillis(); } catch (Exception error) { return 0L; }
+    }
+
+    private static long sizeOf(Path file) {
+        try { return Files.size(file); } catch (Exception error) { return 0L; }
+    }
+
+    /** {@code /api/logs/tail} 不传 {@code maxBytes} 且不传 {@code offset} 时的尾部字节数（大文件别整读）。 */
+    private static final int LOG_TAIL_DEFAULT_BYTES = 256 * 1024;
+
+    /** 读取当天日志的最后若干行（网页日志面板）：source 取 all / qq / web。 */
+    private JsonArray logTail(String source, int lines) {        JsonArray result = new JsonArray();
         int wanted = Math.max(1, Math.min(2000, lines));
         String prefix = switch (source == null ? "all" : source.strip().toLowerCase(Locale.ROOT)) {
             case "qq" -> "qq-";

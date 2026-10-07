@@ -200,6 +200,16 @@
       collapsed: { positive: false, negative: true },   // 反向默认折叠：一进屏先看正向
       showAll: { positive: false, negative: false },
       meanings: { positive: null, negative: null },
+      /**
+       * 两段输入框里"用户敲了、还没按保存"的编辑（正/反向各一个标记）。
+       *
+       * <p>为什么必须有：render(side) 由每一次 load() 触发，而 load() 会把**两段**都重画一遍
+       * （add / remove / clear / undo 之后都会重取）。用户在两段里都直接改了文本、只按了其中一侧的
+       * 保存时，另一侧刚敲的文本会被服务端那份旧值抹掉，接着按它自己的「保存」存下去的就是旧文本 ——
+       * 与控制台提示词面板同一处事故（2026-10-07「提示词直接修改不会应用」）。
+       * 判据：**有未提交编辑的那一侧不重画**；只有这次改动落在的那一侧（undo 是两段）才重画。
+       */
+      edited: { positive: false, negative: false },
       sug: null,          // { side, seq, items }
       seq: 0,             // 请求序号：晚到的响应一律丢掉，别覆盖新的
       inflight: null,
@@ -232,7 +242,7 @@
       input.placeholder = side === 'positive'
         ? '逐条输入（逗号分隔）'
         : '反向提示词（逗号分隔）';
-      input.addEventListener('input', function () { autoGrow(input); });
+      input.addEventListener('input', function () { autoGrow(input); state.edited[side] = true; });
       panel.appendChild(input);
 
       var actions = el('div', 'pr-actions');
@@ -420,7 +430,9 @@
       var node = state.nodes[side];
       var terms = termsOf(data, side);
 
-      node.input.value = data[side] == null ? '' : String(data[side]);
+      // 用户在这一段里敲了还没保存就一个字都不写（见 state.edited）：load() 会把两段都重画一遍，
+      // 抹掉另一段刚敲的文本就是「直接修改不会应用」那处事故。
+      if (!state.edited[side]) node.input.value = data[side] == null ? '' : String(data[side]);
       autoGrow(node.input);
       node.count.textContent = terms.length + ' 个词条';
       node.block.classList.toggle('pr-collapsed', !!state.collapsed[side]);
@@ -606,6 +618,11 @@
     }
 
     function edit(side, action, value) {
+      // 这一次改动落在哪一侧：add / remove / set / clear 只影响 side，undo 是两段一起回退。
+      // 清掉标记，下面 load() 才会把服务端确认后的文本写回该侧；另一侧没提交的编辑留着不重画。
+      if (side === 'positive' || side === 'negative') state.edited[side] = false;
+      if (String(action == null ? '' : action).trim().toLowerCase() === 'undo')
+        state.edited = { positive: false, negative: false };
       var body = { side: side, action: action, value: value == null ? '' : String(value), scope: P.scope() };
       return P.api('/api/prompt/edit', { body: body }).then(function (data) {
         if (data && data.message && !quietEditToast(action)) P.toast(data.message);
@@ -698,6 +715,9 @@
         state.seq++;
         state.inflight = null;
         state.showAll = { positive: false, negative: false };
+        // 新的一次挂载＝新的输入框：上一次留下的"未提交编辑"标记必须一起清掉，
+        // 否则新框会一直不被服务端文本填上（见 state.edited）。
+        state.edited = { positive: false, negative: false };
         clear(root);
         root.appendChild(build());
         load();
