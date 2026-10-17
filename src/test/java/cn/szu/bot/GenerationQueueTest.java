@@ -146,12 +146,22 @@ public final class GenerationQueueTest {
     private static void atomicFifoQueueWithCapturedSettings() throws Exception {        try (Fixture f = new Fixture()) {
             f.holdGenerations = true;
             f.edit("A", 512, "Euler a", List.of());
+            // 生成参数由机器人自己拥有（2026-10-07「生成参数与 Forge 独立」）：A 批次的 512 / Euler a / 无样式
+            // 写进机器人侧，页面那份（f.edit）从此只负责提示词，不再参与出图。
+            f.botSettings(512, 512, "Euler a", List.of());
+            // 提交只读一次页面 → 每次提交正好一次快照读取（机器人侧改参数自己也会读，故按提交前后的增量数）。
+            int readsBeforeFirst = f.promptReads.get();
             check(f.command("group", ".gen 21").contains("共 21 次生成"), "single batch exceeds old per-command and queue caps");
+            equal(readsBeforeFirst + 1, f.promptReads.get(), "one immutable snapshot per submission");
             Call first = f.call();
             check(f.command("private", ".gen status").contains("运行中，等待 20 个"), "running count correct");
             f.edit("B", 768, "DPM++ 2M", List.of("样式 B"));
+            // 上面这行改的是页面/桥接侧，快照不会采纳了；B 批次真正的参数得从机器人侧写，
+            // 这样 B 提交那一刻才会按 768 / DPM++ 2M / 样式 B 拍快照（与 A 批次不同）。
+            f.botSettings(768, 1216, "DPM++ 2M", List.of("样式 B"));
+            int readsBeforeSecond = f.promptReads.get();
             check(f.command("private", ".gen 3").contains("共 3 次生成"), "queue accepts subsequent batch beyond twenty");
-            equal(2, f.promptReads.get(), "one immutable snapshot per submission");
+            equal(readsBeforeSecond + 1, f.promptReads.get(), "one immutable snapshot per submission");
             f.edit("later", 256, "other", List.of("later"));
             for (int index = 0; index < 24; index++) {
                 Call call = index == 0 ? first : f.call();
@@ -345,6 +355,17 @@ public final class GenerationQueueTest {
             for (String scope : List.of("456", Settings.DEFAULT_OWNER))
                 prompts.replace(scope, new SdClient.Prompts(prompt, prompt + " negative", UserPromptStore.PERSONAL_SOURCE));
         }
+        /**
+         * 机器人侧的生成参数入口：尺寸/采样方法/预设样式写进机器人自己那份本地参数。
+         *
+         * <p>2026-10-07「生成参数与 Forge 独立」之后 {@code SdClient.refresh} 不再采纳页面/桥接回写，
+         * 快照只认这一份——所以队列用例要造"两批参数不同"，必须从这里写，写页面（{@link #edit}）没用。
+         */
+        void botSettings(int width, int height, String sampler, List<String> styles) throws Exception {
+            client.setSize(width, height);
+            client.setSampler(sampler);
+            client.setStyles(styles);
+        }
         List<Path> seed(int count, long length) throws Exception {
             List<Path> paths = new ArrayList<>(); Path directory = root.resolve("data/generated/seed"); Files.createDirectories(directory);
             for (int index = 0; index < count; index++) {
@@ -365,8 +386,17 @@ public final class GenerationQueueTest {
             try {
                 String path = exchange.getRequestURI().getPath();
                 if (path.equals("/pixiko-bridge/v1/prompts")) {
-                    promptReads.incrementAndGet();
+                    // GET = 提交时读一次页面（promptReads 只数这个）；PUT = 机器人把自己的参数推给页面，
+                    // 2026-10-07「生成参数与 Forge 独立」之后这类回写不再被采纳，不算"读页面"。
+                    if (exchange.getRequestMethod().equals("GET")) promptReads.incrementAndGet();
+                    exchange.getRequestBody().readAllBytes();
                     synchronized (this) { send(exchange, 200, state.toString()); }
+                } else if (path.equals("/sdapi/v1/samplers")) {
+                    // 机器人侧 .sampler / setSampler 的选择清单：机器人自己的参数入口要能查到名字。
+                    send(exchange, 200, "[{\"name\":\"Euler a\",\"aliases\":[]},{\"name\":\"DPM++ 2M\",\"aliases\":[]}]");
+                } else if (path.equals("/sdapi/v1/prompt-styles")) {
+                    // 机器人侧 setStyles 校验用的预设样式清单（这里只有 B 批次用到的那一个）。
+                    send(exchange, 200, "[{\"name\":\"样式 B\"}]");
                 } else if (path.equals("/sdapi/v1/txt2img")) {
                     int active = activeApiCalls.incrementAndGet(); peakApiCalls.accumulateAndGet(active, Math::max);
                     try {
