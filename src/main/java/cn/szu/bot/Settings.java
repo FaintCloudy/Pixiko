@@ -556,7 +556,7 @@ public final class Settings {
         updated.addProperty("gen_auto_get", enabled);
         Json.atomicWrite(root.resolve("config.json"), updated); data = updated; return enabled;
     }
-    public synchronized boolean isAdmin(String user) { return contains("admin_user_ids", user, false); }
+    public synchronized boolean isAdmin(String user) { return contains("admin_user_ids", user); }
     /** True once any admin_user_ids entry exists; an empty list means the operator has not been configured yet. */
     public synchronized boolean hasAdmin() {
         JsonElement value = data.get("admin_user_ids");
@@ -638,17 +638,98 @@ public final class Settings {
      * in config.json (see config.example.json); until then owner-only commands are refused.
      */
     public static final String DEFAULT_OWNER = "";
-    public synchronized boolean allowed(JsonObject e) {
+    /**
+     * 公共指令白名单的开关（{@code whitelist.enabled}）。
+     *
+     * <p><b>缺键＝关闭</b>，老配置与 {@code config.example.json} 都不用改：关闭时所有指令照旧对所有人可用，
+     * 与改造前完全一致——所以它是"可选的显式打开"，不是新的必需键。
+     */
+    public synchronized boolean commandWhitelistEnabled() {
+        return Json.bool(Json.obj(data, "whitelist"), "enabled", false);
+    }
+    /** 打开/关闭公共指令白名单（只写这一个键，配置里别的段一律不动）。返回开关后的状态。 */
+    public synchronized boolean setCommandWhitelistEnabled(boolean enabled) throws IOException {
+        JsonObject next = freshSnapshot(), section = Json.obj(next, "whitelist");
+        section.addProperty("enabled", enabled); next.add("whitelist", section);
+        Json.atomicWrite(root.resolve("config.json"), next); data = next;
+        return enabled;
+    }
+    /**
+     * 白名单里的**群号**（沿用既有的 {@code allowed_group_ids}，没有新增键名）。
+     * 只返回合法号码，坏条目忽略（与 {@link #adminIds()} 同一套写法）。
+     */
+    public synchronized java.util.List<String> whitelistGroups() { return ids("allowed_group_ids"); }
+    /** 白名单里的 **QQ 号**（沿用既有的 {@code allowed_user_ids}）。 */
+    public synchronized java.util.List<String> whitelistUsers() { return ids("allowed_user_ids"); }
+    /** 加入一个白名单 QQ 号；已经在名单里就明确报错（不静默忽略）。返回保存后的名单。 */
+    public synchronized java.util.List<String> addWhitelistUser(String user) throws IOException {
+        if (!isUserId(user)) throw new IllegalArgumentException("请提供有效的 QQ 号。");
+        if (whitelistUsers().contains(user)) throw new IllegalArgumentException("该 QQ 号已在白名单中：" + user);
+        java.util.TreeSet<String> updated = new java.util.TreeSet<>(whitelistUsers());
+        updated.add(user);
+        return writeIds("allowed_user_ids", updated);
+    }
+    /** 移出一个白名单 QQ 号；不在名单里就明确报错。返回保存后的名单。 */
+    public synchronized java.util.List<String> removeWhitelistUser(String user) throws IOException {
+        java.util.TreeSet<String> updated = new java.util.TreeSet<>(whitelistUsers());
+        if (!updated.remove(user)) throw new IllegalArgumentException("该 QQ 号不在白名单中：" + user);
+        return writeIds("allowed_user_ids", updated);
+    }
+    private java.util.List<String> ids(String key) {
+        java.util.List<String> found = new java.util.ArrayList<>();
+        JsonElement value = data.get(key);
+        if (value != null && value.isJsonArray())
+            for (JsonElement item : value.getAsJsonArray())
+                if (item != null && item.isJsonPrimitive() && isUserId(item.getAsString())) found.add(item.getAsString());
+        return java.util.List.copyOf(found);
+    }
+    private java.util.List<String> writeIds(String key, java.util.TreeSet<String> ids) throws IOException {
+        JsonObject updated = freshSnapshot();
+        JsonArray values = new JsonArray();
+        for (String id : ids) values.add(id);
+        updated.add(key, values);
+        Json.atomicWrite(root.resolve("config.json"), updated);
+        data = updated;
+        return java.util.List.copyOf(ids);
+    }
+    /**
+     * 白名单判定的**唯一**入口（Bot 只调这一个方法）。
+     *
+     * <p>语义按需求表来：白名单**只管公共指令**。聊天在不在这里判——{@code accept()} 先把聊天分流走、
+     * 一律放行，只有指令才走到这里。管理指令的白名单通过之后仍照旧走 owner/admin 校验，不受本开关影响。
+     *
+     * <ul>
+     *   <li>开关关闭（含老配置缺键）：放行一切；</li>
+     *   <li>owner：隐式豁免，不需要把自己写进名单；</li>
+     *   <li>群聊：群号在 {@code allowed_group_ids} 里（整群放行）**或**发信人 QQ 号在
+     *       {@code allowed_user_ids} 里（只放行群内这几个人）；</li>
+     *   <li>私聊：只看发信人 QQ 号。</li>
+     * </ul>
+     *
+     * <p>旧实现 {@code allowed()} 用 {@code contains(..., emptyAllows=true)}：**空数组＝全放行**，
+     * 现场两个数组长度都是 0，这道门于是完全空转。现在"空名单"在开启状态下**不放行任何人**
+     * （owner 除外），要让谁可用就显式加进去——不再有"看起来开了其实谁都能用"的假门。
+     *
+     * <p>网页控制台的合成事件（{@code webui=true}）在 {@code Bot} 侧先行放行，不落到这里：控制台与网页聊天
+     * 走的是访问令牌鉴权，是 owner 自己的通道。
+     */
+    public synchronized boolean commandWhitelistAllows(JsonObject e) {
+        if (!commandWhitelistEnabled()) return true;
+        if (isOwner(Json.str(e, "user_id", ""))) return true;
         return switch (Json.str(e, "message_type", "")) {
-            case "group" -> contains("allowed_group_ids", Json.str(e, "group_id", ""), true);
-            case "private" -> contains("allowed_user_ids", Json.str(e, "user_id", ""), true);
+            case "group" -> contains("allowed_group_ids", Json.str(e, "group_id", ""))
+                    || contains("allowed_user_ids", Json.str(e, "user_id", ""));
+            case "private" -> contains("allowed_user_ids", Json.str(e, "user_id", ""));
             default -> false;
         };
     }
-    private boolean contains(String key, String value, boolean emptyAllows) {
-        JsonArray values = data.has(key) ? data.getAsJsonArray(key) : new JsonArray();
-        if (values.isEmpty()) return emptyAllows;
-        for (JsonElement item : values) if (item.getAsString().equals(value)) return true;
+    /** 精确匹配一个 id 是否在名单里；**空数组不放行**（旧实现这里是空数组＝放行，门因此空转）。 */
+    private boolean contains(String key, String value) {
+        if (value == null || value.isBlank()) return false;
+        JsonElement list = data.get(key);
+        if (list == null || !list.isJsonArray()) return false;
+        for (JsonElement item : list.getAsJsonArray())
+            if (item != null && item.isJsonPrimitive() && value.equals(item.getAsString())) return true;
         return false;
     }
 }

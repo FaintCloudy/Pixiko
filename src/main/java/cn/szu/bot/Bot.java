@@ -949,7 +949,11 @@ public final class Bot implements AutoCloseable {
     }
 
     void executeChatCommands(JsonObject event, List<String> commands, JsonObject choices) throws Exception {        ChatActions.validate(commands);
-        if (closed.get() || !settings.allowed(event)) throw new IllegalArgumentException("当前会话无操作权限或机器人正在关闭。");
+        if (closed.get()) throw new IllegalArgumentException("机器人正在关闭。");
+        // 聊天计划生成出来的指令，在执行前过**同一道**白名单检查（这条链路以前靠"重新进 accept()"顺带检查，
+        // 现在显式写在这里：聊天本身不受白名单影响，但"在聊天里让机器人执行指令"不能成为绕开白名单的后门）。
+        // 网页控制台的合成事件（webui=true）在 commandAllowed() 里直接放行，所以控制台与网页聊天不受影响。
+        requireCommandWhitelist(event);
         // 一条指令里的多个 .infix 步骤先合成一步：默认（global）档下"一条指令只执行一次 infix"，
         // 否则每一步都拿整份提示词改写一次、互相删掉对方刚写进去的内容（实测 3 个 infix + 1 个 gen 的案例）。
         // parts 档不合并（旧行为完整保留）。
@@ -1162,7 +1166,7 @@ public final class Bot implements AutoCloseable {
     private static final Pattern LORA_COMMAND = Pattern.compile("^/lora(?:\\s+([\\s\\S]*))?$", Pattern.CASE_INSENSITIVE);
     private static final Pattern QUOTED_LORA = Pattern.compile("^(\"(?:[^\"\\\\]|\\\\.)*\")(?:\\s+(\\S+))?$");
     private static final Gson STRICT_JSON = new GsonBuilder().setStrictness(Strictness.STRICT).create();
-    private static final Pattern PUBLIC_COMMAND_PREFIX=Pattern.compile("(?<![\\p{L}\\p{N}_:/])/(help|yh|liv|get|settings|chat|admin|char|batch|sampler|style|size|steps|cfg|seed|model|promptR|prompt|preset|function|lora|gen|rg|imgcnt|imgmode|mode|usage|map|progen|infix|progress|vae|sd)(?![\\p{L}\\p{N}_-])",Pattern.CASE_INSENSITIVE);
+    private static final Pattern PUBLIC_COMMAND_PREFIX=Pattern.compile("(?<![\\p{L}\\p{N}_:/])/(help|yh|liv|get|settings|chat|admin|whitelist|char|batch|sampler|style|size|steps|cfg|seed|model|promptR|prompt|preset|function|lora|gen|rg|imgcnt|imgmode|mode|usage|map|progen|infix|progress|vae|sd)(?![\\p{L}\\p{N}_-])",Pattern.CASE_INSENSITIVE);
     public static final String HELP = publicCommands("""
         神户小鸟 · Pixiko（SD 生图机器人）　群聊、私聊均可
         群聊先用 @机器人或小鸟名字唤醒；同一用户此后 30 分钟内可连续对话并滚动续期。私聊无需唤名，指令仍直接响应。
@@ -1185,6 +1189,8 @@ public final class Bot implements AutoCloseable {
         /admin list — 查看 owner 与 admin 名单（仅 owner/admin）
         /admin add <@成员|QQ号|群名片> — 添加 admin（仅 owner）
         /admin remove <@成员|QQ号|群名片> — 移除 admin（仅 owner）
+        /whitelist toggle|list|add <QQ号>|remove <QQ号> — 公共指令白名单，只限制公共指令（仅 owner）
+        白名单关闭时所有人都能执行公共指令；开启后只有名单内的群/QQ 号（owner 免写）能执行，日常聊天始终可用，管理指令仍按 owner/admin 校验。
         /yh — 发送粤海地图
         /liv — 发送丽湖地图
         /prompt — 查看正向、反向 prompt 和数据来源
@@ -1431,10 +1437,8 @@ public final class Bot implements AutoCloseable {
                 observeNotice(event);
                 return;
             }
-            if (!settings.allowed(event)) {
-                Log.info("消息被白名单拒绝：" + describeConversation(event));
-                return;
-            }
+            // 白名单**不在这里判**：它只管"公共指令"。原先这道判断在聊天/指令分流之前，私聊里不在
+            // allowed_user_ids 的人连普通聊天都被丢掉；现在先分流，聊天一律放行（见下面的 return）。
             mute.selfId(Json.str(event, "self_id", ""));
             if (Json.str(event, "user_id", "!").equals(Json.str(event, "self_id", "?"))) return;
             String text = messageText(event.has("message") ? event.get("message") : event.get("raw_message"));
@@ -1446,6 +1450,7 @@ public final class Bot implements AutoCloseable {
                 event.addProperty("quoted_text", quoted);
             }
             if (!text.startsWith("/")) {
+                // 聊天一律放行：白名单（若开启）只约束"公共指令"，日常聊天对所有会话、所有账号都可用。
                 // A plain "同意" answers a pending proposal; without one the message stays ordinary chat.
                 if (marriageConsent(event, text)) return;
                 // 群禁言期间连规划都不做：回复发不出去，只会白花一次模型调用。
@@ -1464,7 +1469,14 @@ public final class Bot implements AutoCloseable {
                 chat.accept(event, speakableNumbers(quoted.isEmpty() ? text : "[引用] " + quoted + "\n" + REQUEST_MARK + text));
                 return;
             }
-            // 到这里就是一条真的指令了：开常规档的收据窗口（debug 档 / 已经在一条指令里 → null＝照旧直接发）。
+            // 到这里就是一条真的指令了：白名单（若开启）只在这一条路径上生效。
+            // 网页控制台的合成事件在 commandAllowed() 里直接放行（见那里的注释与行号）。
+            if (!commandAllowed(event)) {
+                Log.info("指令被白名单拒绝（" + describeConversation(event) + "，用户 " + maskedId(Json.str(event, "user_id", "")) + "）");
+                replyFailure(event, WHITELIST_DENIED);
+                return;
+            }
+            // 开常规档的收据窗口（debug 档 / 已经在一条指令里 → null＝照旧直接发）。
             window = openNormalWindow(event);
             if (text.matches("(?i)^[./](jrlp|强娶|离婚|结婚|同意|拒绝|wife|marry|propose|divorce|accept|reject)(?:\\s+[\\s\\S]*)?$")) { marriage(event, text); return; }
             if (text.matches("(?i)^[./]affinity(?:\\s+[\\s\\S]*)?$")) { affinityCommand(event, text.replaceFirst("(?i)^[./]affinity","")); return; }
@@ -1523,6 +1535,7 @@ public final class Bot implements AutoCloseable {
             if (chatting.matches()) { chatCommand(event, Objects.requireNonNullElse(chatting.group(1), "").strip()); return; }
             if (text.equals("/help")) { reply(event, HELP); return; }
             if (text.equals("/admin") || text.startsWith("/admin ")) { adminCommand(event, text); return; }
+            if (text.equals("/whitelist") || text.startsWith("/whitelist ")) { whitelistCommand(event, text); return; }
             if (text.equals("/sd") || text.startsWith("/sd ")) { sdCommand(event, text.substring(3).strip()); return; }
             if (text.equals("/batch") || text.startsWith("/batch ")) { batchCommand(event, text); return; }
             Matcher usage = USAGE.matcher(text);
@@ -6669,6 +6682,78 @@ public final class Bot implements AutoCloseable {
         reply(event, (adding ? "已添加 admin：" : "已移除 admin：") + target
                 + "\n当前 admin（" + admins.size() + "）：" + (admins.isEmpty() ? "（无）" : String.join("、", admins)));
     }
+    /**
+     * /whitelist — 公共指令白名单：{@code toggle}（开/关）、{@code list}（编号列出成员与开关）、
+     * {@code add <QQ号>}、{@code remove <QQ号>}。四个子命令都**仅 owner**。
+     *
+     * <p>它管的是"公共指令"：日常聊天始终对所有会话可用，管理指令在通过白名单之后仍照旧按 owner/admin 校验
+     * （本指令自己就是 owner 指令）。{@code list} 的编号**只用于查看**：{@code remove} 必须给 QQ 号，
+     * 否则一次列表刷新就能让"编号"指向别人，权限操作不能依赖临时编号。
+     */
+    private void whitelistCommand(JsonObject event, String text) throws Exception {
+        String arguments = text.length() > "/whitelist".length() ? text.substring("/whitelist".length()).strip() : "";
+        String usage = "用法：/whitelist toggle（开/关）、/whitelist list（开关与成员）、"
+                + "/whitelist add <QQ号>、/whitelist remove <QQ号>";
+        requireOwner(event, arguments.isBlank() ? "/whitelist"
+                : "/whitelist " + arguments.split("\\s+", 2)[0].toLowerCase(Locale.ROOT));
+        if (arguments.isEmpty() || arguments.equalsIgnoreCase("list") || arguments.equals("列表")) {
+            reply(event, whitelistReport());
+            return;
+        }
+        if (arguments.equalsIgnoreCase("toggle") || arguments.equals("切换")) {
+            boolean enabled = settings.setCommandWhitelistEnabled(!settings.commandWhitelistEnabled());
+            Log.info("公共指令白名单：" + (enabled ? "开启" : "关闭"));
+            reply(event, "公共指令白名单：" + (enabled ? "已开启" : "已关闭") + "\n"
+                    + "开启时只有名单内的群与 QQ 号（owner 不必写进名单）能执行公共指令；日常聊天不受影响。\n"
+                    + whitelistMembers());
+            return;
+        }
+        Matcher command = Pattern.compile("^(add|remove)(?:\\s+([\\s\\S]+))?$", Pattern.CASE_INSENSITIVE).matcher(arguments);
+        if (!command.matches()) throw new IllegalArgumentException(usage);
+        boolean adding = command.group(1).equalsIgnoreCase("add");
+        // 群里「/whitelist add @某人」的 @ 是独立消息段、不在文本里：这时用 mentionedUser 补出来。
+        String value = command.group(2) == null ? "" : command.group(2).strip();
+        if (value.isEmpty()) {
+            String mentioned = mentionedUser(event);
+            if (mentioned != null && Settings.isUserId(mentioned)) value = mentioned;
+        }
+        String target = whitelistTarget(value, usage);
+        List<String> users = adding ? settings.addWhitelistUser(target) : settings.removeWhitelistUser(target);
+        Log.info("白名单" + (adding ? "添加" : "移除") + "：" + maskedId(target) + "；现在共 " + users.size() + " 个 QQ 号");
+        reply(event, (adding ? "已加入白名单：" : "已移出白名单：") + target + "\n" + whitelistReport());
+    }
+    /** 只接受 @一个成员 或 纯 QQ 号：白名单是权限操作，不做群名片模糊解析（免得"昵称撞车"改错人）。 */
+    private String whitelistTarget(String value, String usage) {
+        String plain = value.strip();
+        Matcher mention = MENTION.matcher(plain);
+        if (mention.find()) {
+            String qq = mention.group(1);
+            if (Settings.isUserId(qq)) return qq;
+        }
+        if (Settings.isUserId(plain)) return plain;
+        throw new IllegalArgumentException("「" + plain + "」不是有效的 QQ 号。\n" + usage);
+    }
+    private static final Pattern MENTION = Pattern.compile("\\[CQ:at,qq=([1-9][0-9]{0,19})\\]");
+    /** 开关状态 + 成员名单（群/用户分开标注；编号只用于查看）。 */
+    private String whitelistReport() {
+        boolean enabled = settings.commandWhitelistEnabled();
+        return "公共指令白名单：" + (enabled
+                    ? "已开启（只有名单内的群/QQ 号能执行公共指令；日常聊天始终可用；owner 不必写进名单）"
+                    : "已关闭（所有会话、所有账号都能执行公共指令）")
+                + "\n" + whitelistMembers();
+    }
+    private String whitelistMembers() {
+        List<String> groups = settings.whitelistGroups(), users = settings.whitelistUsers();
+        if (groups.isEmpty() && users.isEmpty())
+            return "成员（0 个）：（空）——白名单开启时除 owner 外没人能执行公共指令。";
+        StringBuilder body = new StringBuilder("成员（" + (groups.size() + users.size()) + " 个：群 " + groups.size()
+                + "、用户 " + users.size() + "）：");
+        int index = 0;
+        for (String group : groups) body.append("\n").append(++index).append(". 群 ").append(group);
+        for (String user : users) body.append("\n").append(++index).append(". 用户 ").append(user);
+        body.append("\n编号只用于查看；/whitelist remove 请直接给 QQ 号。");
+        return body.toString();
+    }
     /** 网页控制台来的合成事件：已经用访问令牌鉴权过，不再要求 QQ owner/admin 身份。 */
     static boolean fromWebConsole(JsonObject event) {
         return event != null && Json.bool(event, "webui", false);
@@ -6677,6 +6762,37 @@ public final class Bot implements AutoCloseable {
         if (fromWebConsole(event)) return;
         if (!settings.isOwner(Json.str(event, "user_id", "")))
             throw new IllegalArgumentException("「" + action + "」仅 owner 可用（owner QQ：" + settings.ownerId() + "）。");
+    }
+    /** 指令被白名单拒绝时发出去的那句话（失败说明；常规档也一定发出，不吞）。 */
+    static final String WHITELIST_DENIED =
+            "白名单已开启：当前账号不在名单内，公共指令暂不可用（日常聊天不受影响）。需要权限请联系 owner。";
+    /**
+     * 公共指令白名单的唯一判定入口（Bot 侧）。三种情况直接放行：
+     * <ol>
+     *   <li>白名单没开（默认，含老配置缺键）——行为与改造前一致；</li>
+     *   <li><b>网页控制台的合成事件</b>（{@link #fromWebConsole}：{@code webui=true}）——控制台与网页聊天
+     *       走的是访问令牌鉴权，是 owner 自己的通道，不该被 QQ 侧白名单拦住（否则 allowed_user_ids 一非空，
+     *       网页控制台与网页聊天会全报"当前会话无操作权限"）；</li>
+     *   <li>owner —— 隐式豁免，不需要把自己写进名单。</li>
+     * </ol>
+     * 其余情况交给 {@link Settings#commandWhitelistAllows}（群号整群放行 / 名单内 QQ 号放行）。
+     */
+    private boolean commandAllowed(JsonObject event) {
+        if (fromWebConsole(event)) return true;
+        return settings.commandWhitelistAllows(event);
+    }
+    /** 指令入口的统一闸门：不许就抛用法说明（聊天计划的指令由 ChatService 转成一句"未全部完成"的回执）。 */
+    private void requireCommandWhitelist(JsonObject event) {
+        if (commandAllowed(event)) return;
+        Log.info("指令被白名单拒绝（" + describeConversation(event) + "，用户 " + maskedId(Json.str(event, "user_id", "")) + "）");
+        throw new IllegalArgumentException(WHITELIST_DENIED);
+    }
+    /** 日志与测试输出里的号码一律掩码：{@code 2***272}（首位 + 三位星 + 末三位）。 */
+    static String maskedId(String id) {
+        String value = id == null ? "" : id.strip();
+        if (value.isEmpty()) return "（无）";
+        if (value.length() <= 4) return "***";
+        return value.charAt(0) + "***" + value.substring(value.length() - 3);
     }
     private void requireStaff(JsonObject event, String action) throws IOException {
         if (fromWebConsole(event)) return;
@@ -10599,7 +10715,7 @@ public final class Bot implements AutoCloseable {
     }
     /** 控制台认识的指令名（与 PUBLIC_COMMAND_PREFIX 一致，另加常用中文别名）。 */
     private static final Set<String> CONSOLE_COMMANDS = Set.of(
-            "help", "yh", "liv", "get", "settings", "chat", "admin", "char", "batch",
+            "help", "yh", "liv", "get", "settings", "chat", "admin", "whitelist", "char", "batch",
             "sampler", "style", "size", "steps", "cfg", "seed", "model", "prompt", "promptr",
             "preset", "function", "lora", "gen", "rg", "imgcnt", "imgmode", "mode", "usage", "map", "progen", "infix", "progress", "vae", "sd",
             "affinity",
