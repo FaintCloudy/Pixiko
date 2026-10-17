@@ -1,8 +1,10 @@
 package cn.szu.bot;
 
+import cn.szu.bot.testsupport.TestEnvironment;
 import cn.szu.bot.web.WebUiServer;
 import com.google.gson.*;
 
+import java.io.ByteArrayOutputStream;
 import java.net.ServerSocket;
 import java.net.URI;
 import java.net.http.*;
@@ -12,11 +14,17 @@ import java.security.MessageDigest;
 import java.time.Duration;
 import java.util.*;
 import java.util.concurrent.CompletableFuture;
+import java.util.zip.ZipEntry;
+import java.util.zip.ZipOutputStream;
 
 /**
- * 「实测请求/响应原文（含头）」的取证测试：起真的 WebUi 服务，但**渠道目录里放的是真机上那两份真 APK 的
- * 硬链接**（{@code F:\Bot\work\apk-lanip\release} 与 {@code F:\Bot\android\dist}）——不复制 6 MB 文件、
- * 不改真机任何东西（只读源文件；临时根目录在私有 work 里，退出时删掉）。
+ * 「实测请求/响应原文（含头）」的取证测试：起真的 WebUi 服务，渠道目录里放的是**测试现场造的两份假 APK**
+ * （放在本次 run 的临时根 {@code work\tests\<run-id>\AppUpdateEvidenceTest\...} 里），不再硬链真机
+ * {@code work/apk-lanip/release} 与 {@code android/dist}——那些是生产/真机文件，第 14 节要求测试不碰。
+ *
+ * <p>版本号同样不再硬编码：{@code versionName}/{@code versionCode} 从仓库的 {@code android/app/build.gradle}
+ * 解析，假 APK 的文件名按解析结果生成，接口返回的字段再和解析值比对。这样发版升号（163 → 164…）不会让取证
+ * 用例变红，也不会因为"本机没有那两份 APK"而跑不起来。
  *
  * <p>它把两个接口的完整请求行 + 响应头逐条打出来，方便写交付报告；断言只钉最关键的几条
  * （实测 sha256/字节数与磁盘一致、Range 的字节级切片、白名单拒绝），断言数计入自己的统计。
@@ -26,9 +34,10 @@ public final class AppUpdateEvidenceTest {
     private static final HttpClient HTTP = HttpClient.newBuilder()
             .connectTimeout(Duration.ofSeconds(10)).followRedirects(HttpClient.Redirect.NORMAL).build();
     private static final String TOKEN = "evidence-token-123456";
-    private static final Path REAL_ROOT = Path.of("F:\\Bot");
-    private static final String REAL_RELEASE = "work/apk-lanip/release/pixiko-1.6.0-debug.apk";
-    private static final String REAL_DEV = "android/dist/pixiko-1.6.0-debug.apk";
+    /** 假 APK 的 {@code classes.dex} 里"烧"的地址：证明 notes 的地址确实是从 APK 字节里抠出来的。 */
+    private static final String BAKED_ADDRESS = "10.20.30.40:8899";
+    private static final int DEV_SIZE = 96 * 1024 + 13;
+    private static final int RELEASE_SIZE = 128 * 1024 + 7;
 
     private static int assertions;
 
@@ -38,9 +47,26 @@ public final class AppUpdateEvidenceTest {
         Path root = Files.createTempDirectory(work, "evidence-");
         int port = freePort();
         try {
-            hardLink(root.resolve(REAL_RELEASE), REAL_ROOT.resolve(REAL_RELEASE));
-            hardLink(root.resolve(REAL_DEV), REAL_ROOT.resolve(REAL_DEV));
-            hardLink(root.resolve("android/app/build.gradle"), REAL_ROOT.resolve("android/app/build.gradle"));
+            // 版本号的唯一事实来源：仓库里的 build.gradle（解析，不硬编码）。
+            Path repo = TestEnvironment.productionRoot();
+            Path gradle = repo.resolve("android/app/build.gradle");
+            check(Files.isRegularFile(gradle), "仓库里有 android/app/build.gradle：" + gradle);
+            GradleVersion version = readGradleVersion(gradle);
+            check(version.code() > 0 && !version.name().isBlank(),
+                    "从 build.gradle 解析出版本号：versionName=" + version.name() + "，versionCode=" + version.code());
+            String apkName = "pixiko-" + version.name() + "-debug.apk";
+            // 被测服务只认自己根目录下的 android/app/build.gradle：把仓库那份原样放进测试根（只读源文件，
+            // 不是生产数据），于是 versionCode 走"读 gradle"的正常路径，而不是兜底公式。
+            Path rootGradle = root.resolve("android/app/build.gradle");
+            Files.createDirectories(rootGradle.getParent());
+            Files.copy(gradle, rootGradle, StandardCopyOption.REPLACE_EXISTING);
+
+            // 现场造的两份假 APK（dev 是 zip，dex 里带烧入地址；release 是普通字节）。
+            byte[] devBytes = writeZipApk(root.resolve("android/dist").resolve(apkName), BAKED_ADDRESS, DEV_SIZE);
+            byte[] releaseBytes = writePlainApk(root.resolve("work/apk-lanip/release").resolve(apkName),
+                    0xC3, RELEASE_SIZE);
+            Path devFile = root.resolve("android/dist").resolve(apkName);
+            Path releaseFile = root.resolve("work/apk-lanip/release").resolve(apkName);
 
             JsonObject config = new JsonObject();
             JsonObject webui = new JsonObject();
@@ -56,14 +82,16 @@ public final class AppUpdateEvidenceTest {
             Files.createDirectories(root.resolve("data"));
             Files.writeString(root.resolve("data/deepseek-api-key.txt"), "test-key-not-real\n");
 
-            long releaseSize = Files.size(root.resolve(REAL_RELEASE));
-            long devSize = Files.size(root.resolve(REAL_DEV));
-            String releaseSha = sha256(Files.readAllBytes(root.resolve(REAL_RELEASE)));
-            String devSha = sha256(Files.readAllBytes(root.resolve(REAL_DEV)));
-            System.out.println("REAL release dir file: " + REAL_ROOT.resolve(REAL_RELEASE)
-                    + "  size=" + releaseSize + "  sha256=" + releaseSha);
-            System.out.println("REAL dist    file:    " + REAL_ROOT.resolve(REAL_DEV)
-                    + "  size=" + devSize + "  sha256=" + devSha);
+            long releaseSize = releaseBytes.length;
+            long devSize = devBytes.length;
+            String releaseSha = sha256(releaseBytes);
+            String devSha = sha256(devBytes);
+            System.out.println("FIXTURE dev     file: " + devFile + "  size=" + devSize + "  sha256=" + devSha);
+            System.out.println("FIXTURE release file: " + releaseFile + "  size=" + releaseSize
+                    + "  sha256=" + releaseSha);
+            System.out.println("FIXTURE 版本号来自 " + gradle + "：versionName=" + version.name()
+                    + " versionCode=" + version.code());
+            System.out.println("FIXTURE dev APK 的 classes.dex 里烧入地址：" + BAKED_ADDRESS);
 
             Settings settings = new Settings(root);
             JsonObject sdConfig = new JsonObject();
@@ -75,19 +103,23 @@ public final class AppUpdateEvidenceTest {
                 server.start();
                 String base = "http://127.0.0.1:" + port;
 
-                // ① dev（默认渠道，真机 android/dist 那份）——不带任何令牌
+                // ① dev（默认渠道，临时根 android/dist 里那份假 APK）——不带任何令牌
                 HttpResponse<String> update = send(base, "POST", "/api/app/update", "{}", Map.of());
                 dump("POST /api/app/update（无令牌，Host: 127.0.0.1:" + port + "）", update, false);
                 JsonObject dev = Json.parse(update.body());
                 equal(200, update.statusCode(), "无令牌 update 回 200");
                 equal("dev", str(dev, "channel"), "默认渠道是 dev");
-                equal(devSize, dev.get("sizeBytes").getAsLong(), "dev 的 sizeBytes == 真机 dist APK 实测字节数");
-                equal(devSha, str(dev, "sha256"), "dev 的 sha256 == 真机 dist APK 实测哈希");
+                equal(version.name(), str(dev, "version"), "version 来自假 APK 文件名（= build.gradle 的 versionName）");
+                equal(devSize, dev.get("sizeBytes").getAsLong(), "dev 的 sizeBytes == 磁盘上假 APK 的实测字节数");
+                equal(devSha, str(dev, "sha256"), "dev 的 sha256 == 磁盘上假 APK 的实测哈希");
                 equal(base + "/api/app/apk", str(dev, "apkUrl"), "apkUrl 用请求的 Host 拼");
-                equal(161, dev.get("versionCode").getAsInt(), "versionCode 读真机 build.gradle（当前 1.6.1/161；发版升号时同步这里）");
+                equal(version.code(), dev.get("versionCode").getAsInt(),
+                        "versionCode 读 build.gradle（" + version.code() + "，从文件解析后比对，不硬编码）");
                 check(str(dev, "notes").contains("本机测试包"), "dev 的 notes 说明是测试包");
+                check(str(dev, "notes").contains(BAKED_ADDRESS),
+                        "dev 的 notes 带上了从 APK 字节里抠出的地址（" + BAKED_ADDRESS + "）：" + str(dev, "notes"));
                 check(str(dev, "notes").matches("(?s).*\\d+\\.\\d+\\.\\d+\\.\\d+:\\d+.*"),
-                        "dev 的 notes 带上了真实地址：" + str(dev, "notes"));
+                        "dev 的 notes 带上了 地址:端口：" + str(dev, "notes"));
 
                 // ② Host 拼接的两种证据：① 真实请求里 apkUrl 就是「请求方连上来的地址:端口」；
                 //    ② 换一个 Host 头的对照在 AppUpdateTest 里做（java.net.http 禁止设置 Host 头，
@@ -106,11 +138,11 @@ public final class AppUpdateEvidenceTest {
                 System.out.println("< （字节体 " + apk.body().length + " 字节，前 16 字节 "
                         + hex(apk.body(), 16) + "）");
                 equal(200, apk.statusCode(), "apk 整份下载回 200");
-                equal(devSize, (long) apk.body().length, "字节数 == dist APK 大小");
+                equal(devSize, (long) apk.body().length, "字节数 == 假 APK 大小");
                 equal(devSha, sha256(apk.body()), "下载字节的 sha256 == update 报的 sha256");
                 equal("application/vnd.android.package-archive", header(apk, "Content-Type"), "Content-Type 正确");
                 equal(String.valueOf(devSize), header(apk, "Content-Length"), "Content-Length 正确");
-                equal("attachment; filename=\"pixiko-1.6.0-debug.apk\"", header(apk, "Content-Disposition"),
+                equal("attachment; filename=\"" + apkName + "\"", header(apk, "Content-Disposition"),
                         "Content-Disposition 正确");
                 equal(devSha, header(apk, "X-Pixiko-Sha256"), "X-Pixiko-Sha256 正确");
                 equal("bytes", header(apk, "Accept-Ranges"), "Accept-Ranges: bytes");
@@ -126,18 +158,18 @@ public final class AppUpdateEvidenceTest {
                 equal(206, head.statusCode(), "Range 回 206");
                 equal(100, head.body().length, "Range 正好 100 字节");
                 equal("bytes 0-99/" + devSize, header(head, "Content-Range"), "Content-Range 正确");
-                byte[] full = Files.readAllBytes(root.resolve(REAL_DEV));
-                check(Arrays.equals(Arrays.copyOf(full, 100), head.body()), "前 100 字节与真机 APK 逐字节相同");
+                byte[] full = Files.readAllBytes(devFile);
+                check(Arrays.equals(Arrays.copyOf(full, 100), head.body()), "前 100 字节与假 APK 逐字节相同");
                 // 拼三段（含末尾）验证断点续传的拼接结果
                 ByteArrayParts parts = new ByteArrayParts();
-                for (String range : new String[]{"bytes=0-99999", "bytes=100000-", "bytes=-64"}) {
+                for (String range : new String[]{"bytes=0-65535", "bytes=65536-", "bytes=-64"}) {
                     HttpResponse<byte[]> piece = sendBytes(base, "/api/app/apk", range, Map.of());
                     equal(206, piece.statusCode(), "拼接 Range " + range + " 回 206");
                     System.out.println("< 拼接段 " + range + " -> " + piece.body().length + " 字节，前 8 字节 "
                             + hex(piece.body(), 8) + "，Content-Range=" + header(piece, "Content-Range"));
                     parts.add(range, piece.body());
                 }
-                check(parts.matchesTail(full), "分段拼接（含后缀区间）与真机 APK 的对应片段逐字节一致");
+                check(parts.matchesTail(full), "分段拼接（含后缀区间）与假 APK 的对应片段逐字节一致");
                 HttpResponse<byte[]> tooBig = sendBytes(base, "/api/app/apk", "bytes=" + (devSize + 5) + "-", Map.of());
                 equal(416, tooBig.statusCode(), "越界 Range 回 416");
                 equal("bytes */" + devSize, header(tooBig, "Content-Range"), "416 带 bytes */总长");
@@ -146,10 +178,11 @@ public final class AppUpdateEvidenceTest {
                 System.out.println();
                 System.out.println("=== 白名单（带 path= 的请求，全部应为 404）");
                 for (String bad : new String[]{"../../config.json", "..\\..\\config.json", "config.json",
-                        "F:/Bot/" + REAL_RELEASE, "F:\\Bot\\" + REAL_DEV,
-                        "work/apk-lanip/lanip/pixiko-1.6.0-debug.apk",
-                        "pixiko-1.6.0-debug-prev-20261005-040404.apk",
-                        "pixiko-1.4.0-debug.apk", "pixiko-1.6.0-debug.apk.bak", "pixiko-DEBUG.apk"}) {
+                        repo.toString().replace('\\', '/') + "/" + "work/apk-lanip/release/" + apkName,
+                        repo.toString() + "\\android\\dist\\" + apkName,
+                        "work/apk-lanip/lanip/" + apkName,
+                        "pixiko-" + version.name() + "-debug-prev-20261005-040404.apk",
+                        "pixiko-1.4.0-debug.apk", apkName + ".bak", "pixiko-DEBUG.apk"}) {
                     HttpResponse<byte[]> denied = sendBytes(base, "/api/app/apk?path="
                             + java.net.URLEncoder.encode(bad, StandardCharsets.UTF_8), null, Map.of());
                     System.out.println("< path=" + bad + " -> " + denied.statusCode());
@@ -157,7 +190,7 @@ public final class AppUpdateEvidenceTest {
                 }
                 // 对照组：只写文件名（不带目录）是允许的
                 HttpResponse<byte[]> allowed = sendBytes(base, "/api/app/apk?path="
-                        + java.net.URLEncoder.encode("pixiko-1.6.0-debug.apk", StandardCharsets.UTF_8), null, Map.of());
+                        + java.net.URLEncoder.encode(apkName, StandardCharsets.UTF_8), null, Map.of());
                 equal(200, allowed.statusCode(), "只写合法文件名可以下载（对照组，说明上面的 404 不是「一律拒绝」）");
 
                 // ⑥ release 渠道：同一台服务改配置立刻生效，字节换成发行包
@@ -180,11 +213,11 @@ public final class AppUpdateEvidenceTest {
                 // 渠道隔离：release 渠道下 dev 目录那份（名字一样、内容不同）下不到；
                 // 反过来「只写渠道目录名」是允许的（等价于当前那份，已由 ⑤ 的对照组覆盖）。
                 HttpResponse<byte[]> crossChannel = sendBytes(base, "/api/app/apk?path=" + java.net.URLEncoder
-                        .encode("android/dist/pixiko-1.6.0-debug.apk", StandardCharsets.UTF_8), null, Map.of());
-                System.out.println("< 跨渠道 path=android/dist/pixiko-1.6.0-debug.apk -> " + crossChannel.statusCode());
+                        .encode("android/dist/" + apkName, StandardCharsets.UTF_8), null, Map.of());
+                System.out.println("< 跨渠道 path=android/dist/" + apkName + " -> " + crossChannel.statusCode());
                 equal(404, crossChannel.statusCode(), "release 渠道下不许下 dev 渠道目录里的包");
                 HttpResponse<byte[]> sameName = sendBytes(base, "/api/app/apk?path=" + java.net.URLEncoder
-                        .encode("pixiko-1.6.0-debug.apk", StandardCharsets.UTF_8), null, Map.of());
+                        .encode(apkName, StandardCharsets.UTF_8), null, Map.of());
                 equal(releaseSize, (long) sameName.body().length, "同名的当前渠道那份照常能下（内容=发行包）");
 
                 // ⑦ 对照组：别的 /api/** 不带令牌仍然 401
@@ -202,17 +235,70 @@ public final class AppUpdateEvidenceTest {
             }
         }
         System.out.println();
-        System.out.println("AppUpdateEvidenceTest: " + assertions + " assertions passed（真机 APK 硬链接实测）");
+        System.out.println("AppUpdateEvidenceTest: " + assertions
+                + " assertions passed（临时根里的假 APK 实测；版本号从 build.gradle 解析）");
     }
 
-    /** 把真机文件硬链接进临时根目录（同盘才行）；失败就退回复制。 */
-    private static void hardLink(Path target, Path source) throws Exception {
+    // ------------------------------------------------------------------ 假 APK 夹具
+
+    /**
+     * 造一个**合法 zip** 的假 APK：{@code classes.dex} 里带 {@code 地址:端口}，用来验证
+     * {@code AppUpdate.bakedAddress} 真的从包内字节里抠地址（不是拿配置里的值假装知道）。
+     */
+    private static byte[] writeZipApk(Path target, String address, int size) throws Exception {
         Files.createDirectories(target.getParent());
-        try {
-            Files.createLink(target, source);
-        } catch (Exception error) {
-            Files.copy(source, target, StandardCopyOption.REPLACE_EXISTING);
+        ByteArrayOutputStream buffer = new ByteArrayOutputStream();
+        try (ZipOutputStream zip = new ZipOutputStream(buffer)) {
+            zip.putNextEntry(new ZipEntry("AndroidManifest.xml"));
+            zip.write("<?xml version=\"1.0\" encoding=\"utf-8\"?><manifest package=\"cn.szu.bot.test\"/>"
+                    .getBytes(StandardCharsets.UTF_8));
+            zip.closeEntry();
+            zip.putNextEntry(new ZipEntry("classes.dex"));
+            zip.write(fakeDex(address, size));
+            zip.closeEntry();
         }
+        byte[] bytes = buffer.toByteArray();
+        Files.write(target, bytes);
+        return bytes;
+    }
+
+    /**
+     * 假 {@code classes.dex} 的字节：开头是 {@code BuildConfig} 里的烧入地址，后面是**不可压缩**的伪随机字节
+     * （用固定种子的 LCG，所以内容确定、zip 不会被压成几百字节——Range 用例需要文件本身够大）。
+     */
+    private static byte[] fakeDex(String address, int size) {
+        byte[] dex = new byte[Math.max(size, 512)];
+        byte[] prefix = ("dex\n035\u0000PIXIKO_DEFAULT_HOST=" + address + "\u0000").getBytes(StandardCharsets.ISO_8859_1);
+        System.arraycopy(prefix, 0, dex, 0, Math.min(prefix.length, dex.length));
+        long state = 0x2545F4914F6CDD1DL;
+        for (int index = prefix.length; index < dex.length; index++) {
+            state = state * 6364136223846793005L + 1442695040888963407L;
+            dex[index] = (byte) (state >>> 56);
+        }
+        return dex;
+    }
+
+    /** 造一个内容确定但**不是 zip** 的假 APK（release 渠道只用到字节数/哈希）。 */
+    private static byte[] writePlainApk(Path target, int seed, int size) throws Exception {
+        Files.createDirectories(target.getParent());
+        byte[] bytes = new byte[size];
+        for (int index = 0; index < size; index++) bytes[index] = (byte) ((seed + index * 31) & 0xFF);
+        Files.write(target, bytes);
+        return bytes;
+    }
+
+    /** {@code android/app/build.gradle} 里的版本号（测试从文件解析，绝不硬编码）。 */
+    private record GradleVersion(int code, String name) { }
+
+    private static GradleVersion readGradleVersion(Path gradle) throws Exception {
+        String text = Files.readString(gradle, StandardCharsets.UTF_8);
+        java.util.regex.Matcher code = java.util.regex.Pattern
+                .compile("(?m)^\\s*versionCode\\s+(\\d+)").matcher(text);
+        java.util.regex.Matcher name = java.util.regex.Pattern
+                .compile("(?m)^\\s*versionName\\s+[\"']([^\"']+)[\"']").matcher(text);
+        if (!code.find()) throw new AssertionError("build.gradle 里没有 versionCode 行：" + gradle);
+        if (!name.find()) throw new AssertionError("build.gradle 里没有 versionName 行：" + gradle);
+        return new GradleVersion(Integer.parseInt(code.group(1)), name.group(1));
     }
 
     private static final class ByteArrayParts {
@@ -220,14 +306,14 @@ public final class AppUpdateEvidenceTest {
 
         void add(String label, byte[] bytes) { parts.put(label, bytes); }
 
-    /** 三段拼接后与整份文件的对应位置逐字节比较：前 10 万 + 从 10 万到末尾-64 + 最后 64。 */
+    /** 三段拼接后与整份文件的对应位置逐字节比较：前 64 KiB + 从 64 KiB 到末尾-64 + 最后 64。 */
     boolean matchesTail(byte[] full) {
-        byte[] a = parts.get("bytes=0-99999");
-        byte[] b = parts.get("bytes=100000-");
+        byte[] a = parts.get("bytes=0-65535");
+        byte[] b = parts.get("bytes=65536-");
         byte[] c = parts.get("bytes=-64");
         if (a == null || b == null || c == null) return false;
         if (!diff("a", a, full, 0)) return false;
-        if (!diff("b", b, full, 100000)) return false;
+        if (!diff("b", b, full, 65536)) return false;
         if (!diff("c", c, full, full.length - 64)) return false;
         return true;
     }

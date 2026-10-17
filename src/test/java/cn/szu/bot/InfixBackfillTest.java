@@ -7,6 +7,7 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CopyOnWriteArrayList;
 import cn.szu.bot.sd.SdClient;
 import cn.szu.bot.sd.UserPromptStore;
+import cn.szu.bot.testsupport.VocabularyFixture;
 
 /**
  * v2（词库约束版）链路的零件回归：DeepSeek 改写把"草地/喘气/行军"这类要求换成词库外的词时的补齐判定、
@@ -23,7 +24,17 @@ public final class InfixBackfillTest {
         Files.createDirectories(work);
         Path root = Files.createTempDirectory(work, "case-");
         try {
-            Path dictionary = Path.of(".").toAbsolutePath().normalize();
+            // 词库隔离：只在本次 run 的临时根里装最小词条子集，被测代码读的就是它（见 VocabularyFixture）。
+            // 老实现用"当前目录"解析仓库根下的真实 data/prompt-tags.txt（生产数据），已移除。
+            VocabularyFixture.requireTestRoot(root);
+            List<Path> fixture = VocabularyFixture.install(root);
+            VocabularyFixture.requireInstalled(root, fixture);
+            check(Files.isRegularFile(root.resolve("data/prompt-tags.txt")),
+                    "词库夹具已写入测试根：" + root.resolve("data/prompt-tags.txt"));
+            check(fixture.get(0).toAbsolutePath().normalize()
+                            .equals(root.resolve("data/prompt-tags.txt").toAbsolutePath().normalize()),
+                    "被测代码读的词库路径 = 测试根里的夹具，不是生产根下的 data/prompt-tags.txt");
+            Path dictionary = root;
             // 用户在群里真正说过的那句话：三个要求里只有一个（军装）曾被改写命中。
             Set<String> allowed = Bot.vocabulary(dictionary, new SdClient.Prompts("", "", "test"));
             String request = "将地点切换为草地，服饰切换为军装，女性喘着气在艰苦行军";
@@ -48,7 +59,8 @@ public final class InfixBackfillTest {
                     "普通添加语序不受替换规则影响");
             botLevelBackfill(root);
             filterSwitch(root);
-            System.out.println("InfixBackfillTest: " + checks + " assertions passed: 词条补齐与替换识别（v2 零件）、消息段事件不再崩溃、词库约束开关（默认关闭）");
+            System.out.println("InfixBackfillTest: " + checks + " assertions passed: 词条补齐与替换识别（v2 零件）、消息段事件不再崩溃、词库约束开关（默认关闭）；"
+                    + "词库来自测试根里的 " + VocabularyFixture.TAGS.size() + " 条夹具（不读生产 data/prompt-tags.txt）");
         } finally {
             try (var walk = Files.walk(root)) {
                 walk.sorted(Comparator.reverseOrder()).forEach(path -> {
@@ -68,7 +80,7 @@ public final class InfixBackfillTest {
         config.addProperty("owner_user_id", "10000001");
         Json.atomicWrite(root.resolve("config.json"), config);
         Files.createDirectories(root.resolve("data"));
-        Files.copy(Path.of("data/prompt-tags.txt"), root.resolve("data/prompt-tags.txt"));
+        // 词库已由 VocabularyFixture 装进 root/data：这里**不再**从仓库根的 data/ 拷贝生产词库。
         List<JsonArray> sent = new CopyOnWriteArrayList<>();
         Bot.Sender sender = new Bot.Sender() {
             @Override public CompletableFuture<Void> send(JsonObject event, JsonArray segments) {

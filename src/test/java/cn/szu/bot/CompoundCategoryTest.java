@@ -4,6 +4,7 @@ import cn.szu.bot.prompt.CategoryModel;
 import cn.szu.bot.prompt.PromptEditor;
 import cn.szu.bot.prompt.PromptUsage;
 import cn.szu.bot.prompt.TermCategories;
+import cn.szu.bot.testsupport.VocabularyFixture;
 import java.nio.file.*;
 import java.util.*;
 
@@ -27,19 +28,39 @@ public final class CompoundCategoryTest {
     private static int checks;
 
     public static void main(String[] args) throws Exception {
-        classification();
-        compoundPhrases();
-        fragmentDrop();
-        dropKeepsEverythingElse();
-        formatCleanUp();
-        singleAspectRegression();
-        sharpenedMatching();
-        modelPathUntouched();
-        System.out.println("CompoundCategoryTest: " + checks + " checks passed：复合短语分类、按片段删除、格式收拾、既有分类回归");
+        Path work = Path.of(System.getProperty("bot.test.work", "work"), "compound-category").toAbsolutePath();
+        Files.createDirectories(work);
+        Path root = Files.createTempDirectory(work, "case-");
+        try {
+            // 词库隔离：分类/中文词库一律读本次 run 的临时根（夹具手写子集），不读 F:\Bot\data。
+            VocabularyFixture.requireTestRoot(root);
+            List<Path> fixture = VocabularyFixture.install(root);
+            VocabularyFixture.requireInstalled(root, fixture);
+            check(Files.isRegularFile(root.resolve("data/prompt-usage.json")),
+                    "分类词库夹具已写入测试根：" + root.resolve("data/prompt-usage.json"));
+            check(Files.isRegularFile(root.resolve("data/prompt-zh-tags.json")),
+                    "中文词库夹具已写入测试根：" + root.resolve("data/prompt-zh-tags.json"));
+            classification(root);
+            compoundPhrases();
+            fragmentDrop();
+            dropKeepsEverythingElse();
+            formatCleanUp();
+            singleAspectRegression();
+            sharpenedMatching();
+            modelPathUntouched(root);
+            System.out.println("CompoundCategoryTest: " + checks + " checks passed：复合短语分类、按片段删除、格式收拾、既有分类回归；"
+                    + "词库来自测试根夹具（" + VocabularyFixture.LIBRARY_ENTRIES + " 条中文条目，不读生产 data/prompt-usage.json）");
+        } finally {
+            try (var walk = Files.walk(root)) {
+                walk.sorted(Comparator.reverseOrder()).forEach(path -> {
+                    try { Files.deleteIfExists(path); } catch (Exception ignored) { }
+                });
+            }
+        }
     }
 
     // ---- 1. 用户那 4 条：分类 + 只删目标片段 ----
-    private static void classification() {
+    private static void classification(Path root) {
         // multiple views / multiple_views 整条就是镜头词 → 仍然归镜头。
         check(TermCategories.categoryOf(null, "multiple views").equals("镜头"), "multiple views 仍然归镜头");
         check(TermCategories.categoryOf(null, "multiple_views").equals("镜头"), "multiple_views 仍然归镜头");
@@ -62,8 +83,10 @@ public final class CompoundCategoryTest {
         check(TermCategories.matchedCategories("male pulling her panties aside from behind").size() >= 2,
                 "male pulling… 牵涉多个方面：" + TermCategories.matchedCategories("male pulling her panties aside from behind"));
 
-        // 用真实词库时也必须是同样的结论（词库优先级不能把复合短语拉回镜头）。
-        PromptUsage usage = library();
+        // 有词库时也必须是同样的结论（词库优先级不能把复合短语拉回镜头）。
+        PromptUsage usage = library(root);
+        check(usage != null && usage.librarySize() == VocabularyFixture.LIBRARY_ENTRIES,
+                "确实加载了测试根里的词库夹具（中文条目 " + VocabularyFixture.LIBRARY_ENTRIES + " 条），不是缺文件时的降级路径");
         check(TermCategories.categoryOf(usage, "multiple views").equals("镜头"), "有词库时 multiple views 仍是镜头");
         check(TermCategories.categoryOf(usage, "standing sex from behind").equals(TermCategories.OTHER),
                 "有词库时 standing sex from behind 仍是其他：" + TermCategories.categoryOf(usage, "standing sex from behind"));
@@ -77,9 +100,14 @@ public final class CompoundCategoryTest {
                 "有词库时也只摘 extreme close-up 这一段");
     }
 
-    /** 真实分类词库（data/prompt-usage.json）；读不到时返回 null，测试退化为只用英文词表。 */
-    private static PromptUsage library() {
-        try { return new PromptUsage(Path.of(".")); }
+    /**
+     * 分类词库（{@code <测试根>/data/prompt-usage.json} + {@code prompt-zh-tags.json}）：只读本次 run 的临时根。
+     *
+     * <p>老实现是 {@code new PromptUsage(<当前目录>)} —— 直接解析生产根下的 {@code data}（生产数据）。
+     * 现在夹具由 {@link VocabularyFixture} 写进测试根，读不到才返回 null（用例自身仍只用英文词表兜底）。
+     */
+    private static PromptUsage library(Path root) {
+        try { return new PromptUsage(root); }
         catch (java.io.IOException error) { return null; }
     }
 
@@ -266,10 +294,7 @@ public final class CompoundCategoryTest {
     }
 
     // ---- 8. 模型通道关闭时上面这套本地判定仍然生效 ----
-    private static void modelPathUntouched() throws Exception {
-        Path work = Path.of(System.getProperty("bot.test.work", "work"), "compound-category");
-        Files.createDirectories(work);
-        Path root = Files.createTempDirectory(work, "case-");
+    private static void modelPathUntouched(Path root) throws Exception {
         CategoryModel model = new CategoryModel(root, request -> null);
         model.setEnabled(false);
         check(!model.enabled(), "测试用的 CategoryModel 已关闭");

@@ -8,6 +8,7 @@ import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import cn.szu.bot.chat.ChatActions;
 import cn.szu.bot.chat.DeepSeekPrompts;
+import cn.szu.bot.testsupport.VocabularyFixture;
 
 /**
  * Offline evaluation of the natural-language task chain. A scripted transport replays model
@@ -24,11 +25,14 @@ public final class ChainEvalTest {
         Path root = Files.createTempDirectory(work, "case-");
         Files.createDirectories(root.resolve("data"));
         Files.writeString(root.resolve("data/deepseek-api-key.txt"), "eval-key");
+        // 词条归一化用的词库只从测试根读：夹具是手写子集，不再指向 F:\Bot\data（生产数据）。
+        VocabularyFixture.requireTestRoot(root);
+        VocabularyFixture.requireInstalled(root, VocabularyFixture.install(root));
 
         multiRequirementChain(root);
         consistencyGuardRetries(root);
         declaredChainRules(root);
-        sceneTagNormalisation(Path.of(".").toAbsolutePath().normalize());
+        sceneTagNormalisation(root);
         userFacingContract();
         questionAndAdjustParsing();
 
@@ -38,7 +42,8 @@ public final class ChainEvalTest {
         for (String line : RESULTS) markdown.append("- ").append(line).append("\n");
         Files.writeString(report, markdown.toString());
         if (passed != RESULTS.size()) throw new AssertionError("chain evaluation failures: " + RESULTS);
-        System.out.println("ChainEvalTest PASS: " + passed + " chain scenarios (" + report + ")");
+        System.out.println("ChainEvalTest PASS: " + passed + " chain scenarios (" + report
+                + ")；词条归一化的词库 = 测试根夹具（" + VocabularyFixture.TAGS.size() + " 条，不读生产 data/prompt-tags.txt）");
     }
 
     /** One sentence with several requirements must become several ordered commands, ending in a generation. */
@@ -79,7 +84,12 @@ public final class ChainEvalTest {
      */
     private static void sceneTagNormalisation(Path root) {
         try {
+            record(java.nio.file.Files.isRegularFile(root.resolve("data/prompt-tags.txt")),
+                    "词库夹具在测试根里（不是生产 data/prompt-tags.txt）：" + root.resolve("data/prompt-tags.txt"));
             java.util.Set<String> allowed = cn.szu.bot.Bot.vocabulary(root, new cn.szu.bot.sd.SdClient.Prompts("", "", "test"));
+            record(allowed.containsAll(cn.szu.bot.testsupport.VocabularyFixture.keys()),
+                    "测试根词库包含夹具声明的 " + cn.szu.bot.testsupport.VocabularyFixture.TAGS.size()
+                            + " 条标准词条（实际 " + allowed.size() + " 条）");
             record(cn.szu.bot.Bot.allowedContains(allowed, "soft_focus"), "多词标准词条 soft_focus 能被识别");
             record(cn.szu.bot.Bot.allowedContains(allowed, "maid"), "单词标准词条 maid 能被识别");
             java.util.List<String> missing = cn.szu.bot.Bot.missingRequestedTags(

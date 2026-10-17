@@ -15,6 +15,10 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Consumer;
 import java.util.regex.*;
 import javax.imageio.ImageIO;
+import cn.szu.bot.application.command.CommandContext;
+import cn.szu.bot.application.command.CommandDispatcher;
+import cn.szu.bot.application.command.CommandRegistry;
+import cn.szu.bot.application.command.CommandResult;
 import cn.szu.bot.application.generation.GenerationJobState;
 import cn.szu.bot.application.generation.GenerationSnapshot;
 import cn.szu.bot.chat.ChatActions;
@@ -102,6 +106,34 @@ public final class Bot implements AutoCloseable {
     /** 机器人自己的样式库：与 WebUI 的预设样式完全分开，同名也不会冲突。 */
     private final cn.szu.bot.sd.LocalStyles localStyles;
     private final LoraDownloader loraDownloader;
+    /**
+     * 已搬进指令注册表的那几条指令（Phase 2 第 1 步只有 {@code .help}/{@code .mode}/{@code .imgmode}）。
+     *
+     * <p>每条 handler 内部**仍然调用原来的实现**（{@code reply(event, HELP)}、{@code qqMode}、
+     * {@code imageMode}），所以回执逐字不变；门（第二个参数）复刻原来 dispatch 里的判据：
+     * {@code /help} 是逐字相等，{@code /mode}、{@code /imgmode} 是原来那两条正则（大小写不敏感、可带参数）。
+     * 门不通过就当作没命中，一律回落 {@link #legacyDispatch}——所以 {@code /HELP}、{@code /modeX} 这些
+     * 原来不认的写法，现在也还是不认。
+     *
+     * <p>其余几十条指令一条都没登记，走的还是 {@link #legacyDispatch}，行为零变化。
+     */
+    private final CommandDispatcher commandDispatcher = new CommandDispatcher(new CommandRegistry()
+            .register("help", context -> context.raw().equals("/help"),
+                    context -> { reply(context.event(), HELP); return CommandResult.replied(); })
+            .register("mode", context -> QQ_MODE_COMMAND.matcher(context.raw()).matches(),
+                    context -> {
+                        Matcher matcher = QQ_MODE_COMMAND.matcher(context.raw());
+                        matcher.matches();
+                        qqMode(context.event(), Objects.requireNonNullElse(matcher.group(1), "").strip());
+                        return CommandResult.replied();
+                    })
+            .register("imgmode", context -> IMAGE_MODE_COMMAND.matcher(context.raw()).matches(),
+                    context -> {
+                        Matcher matcher = IMAGE_MODE_COMMAND.matcher(context.raw());
+                        matcher.matches();
+                        imageMode(context.event(), Objects.requireNonNullElse(matcher.group(1), "").strip());
+                        return CommandResult.replied();
+                    }));
     /**
      * 本机 LoRA 触发词的耐久存储（data/lora-triggers.json）：下载成功那一刻写入，之后随时可查。
      * 触发词与"是否加载模型""是否写进提示词"无关——用户要的只是留着做参考。
@@ -1530,7 +1562,21 @@ public final class Bot implements AutoCloseable {
         }
         return commands.size() > 1 ? List.copyOf(commands) : List.of(text);
     }
+    /**
+     * 指令入口：先查指令注册表，命中就交给已搬家的 handler；没命中（含门不通过）就调用
+     * {@link #legacyDispatch}——也就是原来的那整条 if 链，一个字都没改。
+     *
+     * <p>这里刻意**忽略** {@code CommandResult}：Phase 2 的三条 handler 都自己回消息
+     * （{@link CommandResult#replied()}），dispatcher 不会再发第二条。
+     */
     private void dispatch(JsonObject event, String text) throws Exception {
+        commandDispatcher.dispatch(commandContext(event, text), () -> legacyDispatch(event, text));
+    }
+    /** 把一次派发需要的元数据从事件里取出来（取不到就是占位值，绝不因为缺字段改变指令走向）。 */
+    private CommandContext commandContext(JsonObject event, String text) {
+        return CommandContext.of(event, text, output -> reply(event, output));
+    }
+    private void legacyDispatch(JsonObject event, String text) throws Exception {
             Matcher chatting = Pattern.compile("^/chat(?:\\s+([\\s\\S]*))?$", Pattern.CASE_INSENSITIVE).matcher(text);
             if (chatting.matches()) { chatCommand(event, Objects.requireNonNullElse(chatting.group(1), "").strip()); return; }
             if (text.equals("/help")) { reply(event, HELP); return; }

@@ -19,6 +19,9 @@ public final class Main {
     }
     private static void run(String[] args) throws Exception {
         Path root = Path.of(System.getProperty("bot.home", ".")).toAbsolutePath().normalize();
+        // 测试隔离守卫（用户第十四节第 11 条）：生产模式若带 bot.test.mode / 解析到测试根 → 在读 config.json 之前直接拒启；
+        // 测试模式若目标解析到生产 data/logs/config.json → 立即失败（不是警告）。
+        TestModeGuard.refuseProductionStartup(root);
         seedFirstRunConfig(root);
         Settings settings = new Settings(root);
         if (args.length > 0 && args[0].equals("--set-map")) {

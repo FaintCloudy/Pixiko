@@ -1,6 +1,7 @@
 package cn.szu.bot;
 
 import cn.szu.bot.web.WebUiServer;
+import cn.szu.bot.testsupport.TestEnvironment;
 import com.google.gson.*;
 
 import java.net.ServerSocket;
@@ -66,6 +67,9 @@ public final class AppUpdateTest {
             Files.createDirectories(gradle);
             Files.writeString(gradle.resolve("build.gradle"),
                     "android {\n    defaultConfig {\n        versionCode 170\n        versionName \"1.7.0\"\n    }\n}\n");
+            // 夹具的版本号同样"从文件里读"，断言里不出现魔法数字。
+            GradleVersion fixtureVersion = readGradleVersion(gradle.resolve("build.gradle"));
+            equal(DEV_VERSION, fixtureVersion.name(), "夹具 build.gradle 的 versionName 与 dev 包文件名一致");
 
             byte[] devBytes = createApk(root, "android/dist", "pixiko-" + DEV_VERSION + "-debug.apk", 0x5A, DEV_SIZE);            byte[] releaseBytes = createApk(root, "work/apk-lanip/release",
                     "pixiko-" + RELEASE_VERSION + "-debug.apk", 0xC3, RELEASE_SIZE);
@@ -96,7 +100,8 @@ public final class AppUpdateTest {
                         "update 的键就是契约那 8 个 + channel/remoteVersion");
                 equal("dev", str(update, "channel"), "不配 channel 时默认 dev");
                 equal(DEV_VERSION, str(update, "version"), "dev 渠道的版本来自文件名");
-                equal(170, update.get("versionCode").getAsInt(), "versionCode 读 android/app/build.gradle");
+                equal(fixtureVersion.code(), update.get("versionCode").getAsInt(),
+                        "versionCode 读夹具 build.gradle");
                 equal((long) DEV_SIZE, update.get("sizeBytes").getAsLong(), "sizeBytes 是磁盘实测字节数");
                 equal(devSha, str(update, "sha256"), "sha256 是磁盘实测哈希");
                 equal(base + "/api/app/apk", str(update, "apkUrl"), "apkUrl 用请求的 Host 拼");
@@ -142,7 +147,7 @@ public final class AppUpdateTest {
                 equal((long) RELEASE_SIZE, release.get("sizeBytes").getAsLong(), "release 的 sizeBytes 是实测值");
                 equal(releaseSha, str(release, "sha256"), "release 的 sha256 是实测值");
                 check(!releaseSha.equals(devSha), "两个渠道的 APK 确实不同（哈希不同）");
-                equal(170, release.get("versionCode").getAsInt(), "versionCode 仍以 build.gradle 为准");
+                equal(fixtureVersion.code(), release.get("versionCode").getAsInt(), "versionCode 仍以 build.gradle 为准");
                 check(str(release, "notes").contains("发行包"), "release 渠道 notes 写明是发行包");
                 check(str(release, "notes").contains("不含局域网地址"), "release 渠道 notes 说明不含局域网地址");
                 check(!str(release, "notes").contains("本机测试包"), "release 渠道不再声称是测试包");
@@ -211,7 +216,8 @@ public final class AppUpdateTest {
                         "path=" + enc("work/apk-lanip/release/../../config.json"), null).statusCode(),
                         "带 .. 的路径被拒绝");
                 equal(404, raw(base, "/api/app/apk",
-                        "path=" + enc("F:/Bot/work/apk-lanip/release/pixiko-1.6.0-debug.apk"), null).statusCode(),
+                        "path=" + enc(TestEnvironment.productionRoot().toString().replace('\\', '/')
+                                + "/work/apk-lanip/release/pixiko-" + RELEASE_VERSION + "-debug.apk"), null).statusCode(),
                         "Windows 绝对路径被拒绝");
                 equal(404, raw(base, "/api/app/apk", "path=" + enc("/api/app/apk"), null).statusCode(),
                         "前导斜杠的伪路径被拒绝");
@@ -435,11 +441,20 @@ public final class AppUpdateTest {
                     Files.write(gradleRoot.resolve("android/app/build.gradle"), new byte[]{(byte) 0xFF, 0, 1, 2});
                     equal(1005030, cn.szu.bot.web.AppUpdateFixture.versionCodeViaGradle(gradleRoot, "1.5.3", candidates),
                             "build.gradle 读坏了也不抛，退回兜底（1.5.3 → 1005030）");
-                    // 真机那份 build.gradle（versionCode 161）优先：与真机 android/app/build.gradle 对齐
-                    equal(161, cn.szu.bot.web.AppUpdateFixture.versionCodeViaGradle(
-                                    Path.of("F:\\Bot"), "1.6.0",
-                                    List.of(Path.of("F:\\Bot\\work\\apk-lanip\\release\\pixiko-1.6.0-debug.apk"))),
-                            "真机 build.gradle 的 versionCode 161 被读到（gradle 永远优先）");
+                    // 真机那份 build.gradle：版本号**从文件里解析**再与实现比对（不再硬编码 161/170）。
+                    // 这样以后发版升号（163 → 164…）不会让用例变红；只有"实现不按 gradle 取值"才会红。
+                    Path repoRoot = TestEnvironment.productionRoot();
+                    Path repoGradle = repoRoot.resolve("android/app/build.gradle");
+                    check(Files.isRegularFile(repoGradle), "仓库里有 android/app/build.gradle：" + repoGradle);
+                    GradleVersion repoVersion = readGradleVersion(repoGradle);
+                    check(repoVersion.code() > 0 && !repoVersion.name().isBlank(),
+                            "从 build.gradle 解析出版本号：versionName=" + repoVersion.name()
+                                    + "，versionCode=" + repoVersion.code());
+                    equal(repoVersion.code(),
+                            cn.szu.bot.web.AppUpdateFixture.versionCodeViaGradle(repoRoot, repoVersion.name(),
+                                    List.of(repoRoot.resolve("android/dist"))),
+                            "真机 build.gradle 的 versionCode（" + repoVersion.code() + "，从 "
+                                    + repoGradle + " 解析）被读到（gradle 永远优先；不硬编码版本号）");
                 } finally {
                     try (var walk = Files.walk(gradleRoot)) {
                         walk.sorted(Comparator.reverseOrder()).forEach(path -> {
@@ -461,10 +476,31 @@ public final class AppUpdateTest {
                 + "Range（206/416/整段拼接）、安全白名单（穿越/绝对路径/另一渠道/备份包）、"
                 + "免令牌白名单与其它接口仍 401、远端 GitHub 桩与失败兜底、sha256 mtime 缓存、"
                 + "versionCode 兜底口径（定宽字段：1.6.0→1006000、1.5.3→1005030、1.4.0→1004000，"
-                + "1.0.0–1.9.99 共 1000 个版本号全程严格递增；gradle 可读时永远以 gradle 为准）。");
+                + "1.0.0–1.9.99 共 1000 个版本号全程严格递增；gradle 可读时永远以 gradle 为准，"
+                + "真机版本号从 build.gradle 解析后比对，不硬编码）。");
     }
 
     // ------------------------------------------------------------------ 夹具
+
+    /** {@code android/app/build.gradle} 里的版本号；测试从文件解析它，**绝不硬编码**具体数值。 */
+    private record GradleVersion(int code, String name) { }
+
+    /**
+     * 从 {@code build.gradle} 读 {@code versionCode} / {@code versionName}：版本号的唯一事实来源。
+     *
+     * <p>以前的用例把真机号写死成 161，发版升到 163 就红——那是在测"版本号没变"，不是在测"实现读对了 gradle"。
+     * 现在只断言"解析出来的值 == 实现读到的值"，发版升号不再影响本用例。
+     */
+    private static GradleVersion readGradleVersion(Path gradle) throws Exception {
+        String text = Files.readString(gradle, StandardCharsets.UTF_8);
+        java.util.regex.Matcher code = java.util.regex.Pattern
+                .compile("(?m)^\\s*versionCode\\s+(\\d+)").matcher(text);
+        java.util.regex.Matcher name = java.util.regex.Pattern
+                .compile("(?m)^\\s*versionName\\s+[\"']([^\"']+)[\"']").matcher(text);
+        if (!code.find()) throw new AssertionError("build.gradle 里没有 versionCode 行：" + gradle);
+        if (!name.find()) throw new AssertionError("build.gradle 里没有 versionName 行：" + gradle);
+        return new GradleVersion(Integer.parseInt(code.group(1)), name.group(1));
+    }
 
     private static int freePort() throws Exception {
         try (ServerSocket socket = new ServerSocket(0)) { return socket.getLocalPort(); }

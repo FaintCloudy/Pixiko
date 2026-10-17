@@ -5,6 +5,7 @@ import cn.szu.bot.civitai.CivitaiClient;
 import cn.szu.bot.qq.QqClient;
 import cn.szu.bot.sd.SdClient;
 import cn.szu.bot.testsupport.FakeOneBot;
+import cn.szu.bot.testsupport.IsolationProbe;
 import cn.szu.bot.testsupport.TestEnvironment;
 import cn.szu.bot.testsupport.TestRuntime;
 import com.google.gson.JsonObject;
@@ -21,6 +22,7 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.CompletableFuture;
@@ -30,7 +32,7 @@ import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 /**
- * 第 14 节的隔离性回归测试（a–e 五条），一个类、可单独运行。
+ * 第 14 节的隔离性回归测试（a–g 七条），一个类、可单独运行。
  *
  * <pre>
  * java -ea -Dfile.encoding=UTF-8 -Dstdout.encoding=UTF-8 -Dbot.test.mode=true \
@@ -42,7 +44,7 @@ import java.util.regex.Pattern;
  * <p>它自己就是一次隔离 run：{@link TestEnvironment} 建 {@code F:\Bot\work\tests\<uuid>}，四个假服务全在
  * {@code 127.0.0.1} 的动态端口上；测试跑完（含失败）目录会被删掉。
  *
- * <h2>五条用例</h2>
+ * <h2>七条用例</h2>
  * <ol>
  *   <li><b>a</b>：测试前后生产端口的监听者（生产 Pixiko 的 PID）与本机 java/node/python 进程集合一致；
  *       本次 run 打开的每个端口都断言"不是生产端口、只在 127.0.0.1"。<b>全程不连生产端口</b>——连一下
@@ -54,6 +56,11 @@ import java.util.regex.Pattern;
  *       进程也确实没了（不遗留监听端口与子进程）。</li>
  *   <li><b>e</b>：主 Pixiko 正在跑（本机 java 进程带 {@code bot.home=F:\Bot} 与 {@code pixiko.jar}）时，
  *       上面这些隔离用例全部通过；测试用的是自己 run 目录里的 {@code bot.lock}，不碰生产 {@code data/bot.lock}。</li>
+ *   <li><b>f</b>：生产路径守卫——测试模式下目标路径解析到生产 {@code config.json} / {@code data} /
+ *       {@code logs} / {@code maps} / {@code build} 时必须**立即失败**（抛异常或子进程非 0 退出），不是警告。</li>
+ *   <li><b>g</b>：本批收尾的五个套件（AppUpdate / AppUpdateEvidence / InfixBackfill / CompoundCategory /
+ *       ChainEval）源码里不许再出现 {@code Path.of(".")}、{@code F:\Bot}、{@code Files.copy(Path.of(…)} 这类
+ *       "读生产数据"的写法（静态回归守卫，防止改回去）。</li>
  * </ol>
  */
 public final class IsolationTest {
@@ -100,9 +107,11 @@ public final class IsolationTest {
                 c_parallelRuns(env);
                 d_abnormalExit(env);
                 e_liveProduction(env, pixikoBefore);
+                f_productionPathGuard(env, production);
             }
         }
         check(!Files.exists(runHome), "第 12 条：run 根在 close() 之后被删干净：" + runHome);
+        g_suitesDoNotReadProductionData(production);
 
         String structureAfter = TestEnvironment.productionStructureFingerprint(production, MAX_FINGERPRINT_ENTRIES);
         String configStampAfter = TestEnvironment.productionConfigStamp(production);
@@ -130,7 +139,7 @@ public final class IsolationTest {
         }
 
         System.out.println("IsolationTest PASS: " + checks + " checks（a 端口/进程、b 生产数据、c 并行、d 异常退出、"
-                + "e 主实例在跑）；生产 config.json=" + configStampAfter
+                + "e 主实例在跑、f 生产路径守卫立即失败、g 已修套件不再读生产）；生产 config.json=" + configStampAfter
                 + "，data 结构指纹=" + shorten(structureAfter) + "，生产 PID=" + pixikoAfter);
     }
 
@@ -380,7 +389,156 @@ public final class IsolationTest {
                 + "本 run 用自己的 bot.lock=" + ourLock);
     }
 
+    // ------------------------------------------------------------------ f：生产路径守卫（第 11 条）
+
+    /**
+     * 第 14 节第 11 条：**测试模式下，目标路径一旦解析到生产 config.json / data / logs / maps / build，
+     * 就必须立即失败，而不是打一行警告继续跑**。
+     *
+     * <p>两处守卫各验一遍：{@link TestModeGuard#refuseProductionStartup(Path)}（生产启动入口）与
+     * {@link TestEnvironment#assertIsolatedRoot(Path, Path)}（测试侧建根）。再用子进程证明"立即失败"
+     * 真的表现为非 0 退出；同时反证生产正常启动（不带测试参数、根是仓库根）时守卫是空操作。
+     */
+    private static void f_productionPathGuard(TestEnvironment env, Path production) throws Exception {
+        // ① 测试模式下，生产启动守卫立刻拒绝（抛异常），不是警告。
+        IllegalStateException refused = expectRefusal(() -> TestModeGuard.refuseProductionStartup(production),
+                "测试模式下用生产根 " + production + " 启动");
+        check(TestModeGuard.testMode(), "本进程确实是测试模式（-Dbot.test.mode=true）");
+        check(refused.getMessage().contains("拒绝以生产模式启动"),
+                "失败信息明确写着「拒绝」，不是警告：" + refused.getMessage());
+        check(refused.getMessage().contains("bot.test"),
+                "失败信息点名是测试隔离参数导致的拒绝：" + refused.getMessage());
+
+        // ② 测试根落在生产 data / logs / maps / config.json / build 上 → 硬失败（不是"尽量避开"）。
+        for (String guarded : List.of("data", "logs", "maps", "config.json", "build")) {
+            Path target = production.resolve(guarded);
+            IllegalStateException error = expectRefusal(
+                    () -> TestEnvironment.assertIsolatedRoot(target, production),
+                    "把测试根指到生产 " + guarded);
+            check(error.getMessage().contains("测试隔离守卫"), "拒绝理由来自测试隔离守卫：" + error.getMessage());
+            check(error.getMessage().contains("生产"), "拒绝信息点名了生产路径：" + error.getMessage());
+        }
+        expectRefusal(() -> TestEnvironment.assertIsolatedRoot(production, production),
+                "把生产根本身当测试根");
+        expectRefusal(() -> TestEnvironment.assertIsolatedRoot(production.resolve("work"), production),
+                "把测试根指到 <生产根>\\work（不在 work\\tests 下）");
+
+        // ③ 子进程证据：「立即失败」= JVM 以非 0 退出，进程根本没机会继续跑。
+        String classpath = System.getProperty("java.class.path");
+        String javaExe = Path.of(System.getProperty("java.home"), "bin", "java").toString();
+        ProbeResult testMode = runGuardProbe(javaExe, classpath, "-Dbot.test.mode=true", production.toString());
+        equal(IsolationProbe.GUARD_REFUSED, testMode.exit(),
+                "子进程：测试模式 + 生产根 → 立即失败（exit 3，不是 0）：\n" + tail(testMode.output()));
+        check(testMode.output().contains("GUARD-REFUSED"),
+                "子进程把拒绝理由打了出来，而不是静默继续：" + tail(testMode.output()));
+
+        ProbeResult testHome = runGuardProbe(javaExe, classpath,
+                "-Dbot.test.home=" + production.resolve("data"), production.toString());
+        equal(IsolationProbe.GUARD_REFUSED, testHome.exit(),
+                "-Dbot.test.home 指到生产 data/ → 同样立即失败：\n" + tail(testHome.output()));
+
+        // ④ 反证：生产正常启动（不带任何测试参数、根是仓库根）时守卫是空操作，生产行为零变化。
+        ProbeResult productionMode = runGuardProbe(javaExe, classpath, null, production.toString());
+        equal(0, productionMode.exit(), "反证：生产模式 + 生产根 → 放行（exit 0）：\n" + tail(productionMode.output()));
+        check(productionMode.output().contains("GUARD-ALLOWED"),
+                "反证：守卫对生产启动没有副作用：" + tail(productionMode.output()));
+
+        // ⑤ 反证：不带测试参数、但根目录里有测试标记 → 也必须拒绝（测试目录不许当生产用）。
+        Path markerRoot = env.home().resolve("marker-root");
+        Files.createDirectories(markerRoot);
+        Files.writeString(markerRoot.resolve(TestModeGuard.MARKER),
+                "run-id=" + env.runId() + System.lineSeparator(), StandardCharsets.UTF_8);
+        try {
+            ProbeResult marked = runGuardProbe(javaExe, classpath, null, markerRoot.toString());
+            equal(IsolationProbe.GUARD_REFUSED, marked.exit(),
+                    "子进程：不带测试参数但根里有 " + TestModeGuard.MARKER + " → 拒绝：\n" + tail(marked.output()));
+            check(marked.output().contains(TestModeGuard.MARKER),
+                    "拒绝理由指出是 " + TestModeGuard.MARKER + " 标记：" + tail(marked.output()));
+        } finally {
+            TestCleanup.deleteQuietly(markerRoot, 4, 100);
+        }
+        System.out.println("PASS f：生产路径守卫是硬失败（测试模式/生产 data 路径/" + TestModeGuard.MARKER
+                + " 标记都 exit!=0），生产模式 + 仓库根则放行");
+        // 事实核对（只打印，不作为失败条件）：守卫本身已实现且验证过；它是否被 Main.run() 调用是**业务代码**的事，
+        // 不在本批（只改测试）范围。接上之后，上面的探针就变成"生产启动即拒绝"的端到端证据。
+        Path main = production.resolve("src/main/java/cn/szu/bot/Main.java");
+        if (Files.isRegularFile(main)
+                && !Files.readString(main, StandardCharsets.UTF_8).contains("refuseProductionStartup")) {
+            System.out.println("NOTE f：Main.run() 目前没有调用 TestModeGuard.refuseProductionStartup（守卫已实现、"
+                    + "测试侧 assertIsolatedRoot 与子进程探针都证明是硬失败；接线属业务代码，本批未改）");
+        }
+    }
+
+    // ------------------------------------------------------------------ g：源码静态回归守卫
+
+    /**
+     * 第 14 节"测试不许读写生产数据"的静态回归守卫：本批收尾的五个套件里不许再出现
+     * {@code Path.of(".")}、{@code F:\Bot}、{@code Files.copy(Path.of(…)}、{@code REAL_ROOT/REAL_RELEASE}
+     * 这些"去生产目录拿词库/APK"的写法。
+     *
+     * <p>为什么只锁这五个：它们就是这次从"读生产"改成"读测试根夹具"的套件；其它套件另有批次在收尾，
+     * 这里锁住已修好的，防止回退。
+     */
+    private static void g_suitesDoNotReadProductionData(Path production) throws Exception {
+        Path directory = production.resolve("src/test/java/cn/szu/bot");
+        check(Files.isDirectory(directory), "能找到测试源码目录：" + directory);
+        List<String> suites = List.of("AppUpdateTest.java", "AppUpdateEvidenceTest.java", "InfixBackfillTest.java",
+                "CompoundCategoryTest.java", "ChainEvalTest.java");
+        for (String name : suites) {
+            Path file = directory.resolve(name);
+            check(Files.isRegularFile(file), "测试源码存在：" + file);
+            String text = Files.readString(file, StandardCharsets.UTF_8);
+            check(!text.contains("Path.of(\".\")"), name + " 不再用 Path.of(\".\") 解析生产路径");
+            check(!text.contains("Path.of(\"F:\\\\Bot\")") && !text.contains("F:/Bot"),
+                    name + " 不再硬编码 F:\\Bot");
+            check(!text.contains("Files.copy(Path.of("), name + " 不再从仓库根拷贝生产词库/数据");
+            check(!text.contains("REAL_ROOT") && !text.contains("REAL_RELEASE"),
+                    name + " 不再引用真机 APK 常量");
+        }
+        check(Files.isRegularFile(directory.resolve("testsupport/VocabularyFixture.java")),
+                "词库夹具（testsupport/VocabularyFixture.java）存在，测试根里的词库由它写");
+        check(Files.isDirectory(production.resolve("data")), "生产 data/ 仍然存在（本测试只读元数据，不删不改）");
+        System.out.println("PASS g：五个已修套件的源码里没有 Path.of(\".\")/F:\\Bot/Files.copy(生产) 这类写法");
+    }
+
     // ------------------------------------------------------------------ 工具
+
+    /** 一段"期望被拒绝"的调用。 */
+    private interface Guard { void run() throws Exception; }
+
+    /** 断言被 {@link IllegalStateException} 硬拒绝；放过任何"没拒绝"或"抛了别的异常"的情况。 */
+    private static IllegalStateException expectRefusal(Guard guard, String label) {
+        try {
+            guard.run();
+        } catch (IllegalStateException expected) {
+            checks++;
+            return expected;
+        } catch (Exception other) {
+            throw new AssertionError("FAIL（IsolationTest）：" + label + " 期望被拒绝，实际抛了别的异常：" + other, other);
+        }
+        throw new AssertionError("FAIL（IsolationTest）：" + label + " 没有被拒绝（守卫只是警告？）——第 11 条要求立即失败");
+    }
+
+    /** 子进程守卫探针的结果：退出码 + 输出。 */
+    private record ProbeResult(int exit, String output) { }
+
+    /** 起一个隔离子进程跑 {@code IsolationProbe guard <root>}（只调守卫，不建环境、不起服务、不连端口）。 */
+    private static ProbeResult runGuardProbe(String javaExe, String classpath, String property, String root)
+            throws Exception {
+        List<String> command = new ArrayList<>(List.of(javaExe, "-ea", "-Dfile.encoding=UTF-8",
+                "-Dstdout.encoding=UTF-8", "-Dstderr.encoding=UTF-8"));
+        if (property != null) command.add(property);
+        command.addAll(List.of("-cp", classpath, "cn.szu.bot.testsupport.IsolationProbe", "guard", root));
+        Process process = new ProcessBuilder(command).redirectErrorStream(true).start();
+        try {
+            boolean finished = process.waitFor(120, TimeUnit.SECONDS);
+            String output = new String(process.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
+            check(finished, "守卫探针在 120 秒内结束（root=" + root + "）");
+            return new ProbeResult(process.exitValue(), output);
+        } finally {
+            if (process.isAlive()) process.destroyForcibly();
+        }
+    }
 
     private static Map<String, Integer> parsePorts(String output) {
         Map<String, Integer> ports = new LinkedHashMap<>();
@@ -413,5 +571,9 @@ public final class IsolationTest {
     private static void check(boolean condition, String message) {
         checks++;
         if (!condition) throw new AssertionError("FAIL（IsolationTest）：" + message);
+    }
+
+    private static void equal(Object expected, Object actual, String message) {
+        check(Objects.equals(expected, actual), message + "（expected=" + expected + ", actual=" + actual + "）");
     }
 }
