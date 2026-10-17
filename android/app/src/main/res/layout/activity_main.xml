@@ -36,6 +36,43 @@
         android:visibility="invisible" />
 
     <!--
+      「选择服务器…」入口：**加载期间始终可点**。
+
+      为什么要单独一条：/m 下原生 ActionBar 是收起来的（菜单点不到），而 WebView 白屏/首屏慢/
+      原生错误页盖上来的时候，用户唯一想做的就是"换一台"。这条不依赖 ActionBar、不依赖网页是否
+      加载成功 —— MainActivity.setLoading(true) 时它出现，onPageFinished 时收起（见 setLoading）。
+      默认 gone：正常浏览时不占地方。
+    -->
+    <LinearLayout
+        android:id="@+id/pick_server_bar"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:background="@color/pixiko_bar"
+        android:gravity="center_vertical"
+        android:orientation="horizontal"
+        android:paddingStart="12dp"
+        android:paddingEnd="8dp"
+        android:visibility="gone">
+
+        <TextView
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:text="@string/pick_server_loading_hint"
+            android:textColor="@color/pixiko_muted"
+            android:textSize="11sp" />
+
+        <Button
+            android:id="@+id/pick_server"
+            style="?android:attr/borderlessButtonStyle"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:minWidth="0dp"
+            android:text="@string/pick_server_entry"
+            android:textSize="13sp" />
+    </LinearLayout>
+
+    <!--
       「发现新版本」横幅：**明显但不打断** —— 贴在最上面一条，网页可以照常滚动/操作，
       用户可以不理它，也可以点「稍后」（本次运行内不再出现）。
       默认 gone，只有真的查到更新的 versionCode 时才由 MainActivity.showUpdateBanner() 显示。

@@ -134,6 +134,29 @@ public final class NativeHook {
     }
 
     /**
+     * 回到前台时给网页的「你回来了」信号（{@link android.app.Activity#onResume()} 里调用）。
+     *
+     * <p><b>为什么原生要主动说这一句</b>：网页侧的唤醒通道与补拉链（{@code webui/m/app.js} 的
+     * {@code PixikoM.onWake} / {@code catchUpReceipts}）挂的就是
+     * {@code visibilitychange / focus / pageshow / resume / online} 这几个事件，
+     * 但安卓 WebView（尤其国产 ROM）**不保证**切后台/回前台会派发它们 ——
+     * 网页里那段注释写得很直白（"某些安卓壳会派这个"、"visibilitychange 可能根本不派发"）。
+     * 只靠网页自己的 1.5 秒看门狗也能醒，但那是"最坏 1.5 秒"，而用户报的正是
+     * 「挂起回前台收不到图」。由外壳在 onResume 里补这一次，补拉在**同一帧**就开始跑。
+     *
+     * <p>刻意<b>不</b>派发 {@code visibilitychange}：那要连带把 {@code document.visibilityState}
+     * 说成 {@code 'visible'}，而有些壳里它一直停在 {@code 'hidden'}，硬掰会和网页自己的判断打架。
+     * {@code focus} 与 {@code resume} 是纯"回来了"的信号，不撒谎。
+     */
+    public static String resumeScript() {
+        return "(function(){try{"
+                + "window.dispatchEvent(new Event('focus'));"
+                + "document.dispatchEvent(new Event('resume'));"
+                + "return 'woke';"
+                + "}catch(e){return 'error:'+e;}})()";
+    }
+
+    /**
      * 图片长按/右键注入脚本（幂等）。整段是 IIFE，返回一句状态字符串，方便在 logcat 里确认注入成功。
      */
     public static String hookScript() {

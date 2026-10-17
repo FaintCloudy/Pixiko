@@ -16,6 +16,7 @@ import android.os.Bundle;
 import android.os.Environment;
 import android.os.Handler;
 import android.os.Looper;
+import android.view.Gravity;
 import android.view.Menu;
 import android.view.MenuItem;
 import android.view.View;
@@ -33,7 +34,9 @@ import android.webkit.WebStorage;
 import android.webkit.WebView;
 import android.webkit.WebViewClient;
 import android.widget.Button;
+import android.widget.LinearLayout;
 import android.widget.ProgressBar;
+import android.widget.ScrollView;
 import android.widget.TextView;
 
 import androidx.activity.OnBackPressedCallback;
@@ -46,6 +49,8 @@ import androidx.core.content.ContextCompat;
 import androidx.swiperefreshlayout.widget.SwipeRefreshLayout;
 
 import java.io.File;
+import java.util.ArrayList;
+import java.util.List;
 
 /**
  * 主界面：把网页控制台整站装进 WebView。
@@ -84,6 +89,18 @@ public class MainActivity extends AppCompatActivity {
      * 首屏却干净了。这是本功能<b>不阻塞首屏</b>的具体做法（另一层保证：整个检查都在子线程）。
      */
     private static final long AUTO_UPDATE_CHECK_DELAY_MS = 6_000L;
+
+    /**
+     * 首屏加载超过这么久还没 {@code onPageFinished} → 自动弹一次「选择服务器」并顺手扫一次局域网。
+     *
+     * <p>为什么是 6 秒：局域网里真有服务的机器首屏在 1 秒内就起来了；6 秒还没完成，
+     * 基本就是"地址不对/那台机器没开/不在同一个网段"，与其让用户盯着白屏，不如把选择器摆出来。
+     * <b>只弹一次</b>（{@link #autoPickerShown}），页面后来真加载完了也不会再打扰。
+     */
+    private static final long LOAD_TIMEOUT_MS = 6_000L;
+
+    /** 自动发现时用来判断「已保存的地址还通不通」的探活超时（局域网 RTT 是毫秒级）。 */
+    private static final int DISCOVERY_PROBE_TIMEOUT_MS = 500;
 
     /** 跨 Activity 通知「有新版本」的广播（MainActivity 横幅 ↔ SettingsActivity 红点）。 */
     static final String ACTION_UPDATE_STATUS = "cn.szu.bot.app.action.UPDATE_STATUS";
@@ -150,6 +167,50 @@ public class MainActivity extends AppCompatActivity {
     private PixikoBridge bridge;
     private ValueCallback<Uri[]> pendingFileCallback;
 
+    // ---- 局域网优先：候选排序 + 扫描 + 「选择服务器」 ----
+
+    /**
+     * 「选择服务器…」入口：<b>加载期间一直可点</b>（见 {@link #setLoading(boolean)}）。
+     *
+     * <p>为什么要有这个入口：WebView 在加载/白屏/原生错误页时，用户最想做的事就是"换一台"，
+     * 而原生 ActionBar 在 {@code /m} 下是收起来的（见 {@link #applyActionBarVisibility}），
+     * 菜单点不到 —— 于是必须有一条不依赖 ActionBar、不依赖网页是否加载成功就能点的路。
+     */
+    private View pickServerBar;
+
+    /** WebView 现在是不是在加载（决定入口可见性 + 首屏看门狗）。 */
+    private boolean loading;
+
+    /** 首屏加载超时的看门狗任务；{@code onPageFinished} 里撤掉。 */
+    private Runnable loadTimeoutTask;
+
+    /** 本次加载是否已经自动弹过选择器（超时/失败只弹一次，别反复打扰）。 */
+    private boolean autoPickerShown;
+
+    /** 本次加载是不是失败过（失败/超时之后才允许"自动切到扫到的局域网地址"）。 */
+    private boolean loadFailed;
+
+    /** 当前打开着的选择器（扫描有新结果时就地刷新，不再弹第二个）。 */
+    private ServerPicker openPicker;
+
+    /** 扫描发现的基地址（候选排序里「扫描」那一档）。 */
+    private final List<String> scannedBases = new ArrayList<>();
+
+    /** 这次运行是否已经发起过扫描（一次运行最多扫一次，省电也省时间）。 */
+    private boolean lanScanStarted;
+    /** 扫描是否已经结束（没结束就在 UI 上显示"正在扫描…"）。 */
+    private boolean lanScanDone;
+    /** 扫描进度（已探/总数），给选择器里的状态行用。 */
+    private int lanScanDoneCount;
+    private int lanScanTotal;
+    /** 扫描失败/无网卡时的可读原因（空串＝正常）。 */
+    private String lanScanProblem = "";
+    private LanScanner lanScanner;
+    /** 「启动时优先找局域网」这条自动发现是否已经跑过（一次运行只跑一次）。 */
+    private boolean lanDiscoveryStarted;
+    /** 扫描出局域网地址时要不要自动切过去（启动发现阶段置 true；用户在手动挑时不抢他的操作）。 */
+    private boolean lanAutoSwitch;
+
     private static final String PREF_UI = "pixiko_ui";
     private static final String KEY_KEEP_SCREEN_ON = "keep_screen_on";
 
@@ -213,6 +274,7 @@ public class MainActivity extends AppCompatActivity {
 
         bindErrorPage();
         bindUpdateBanner();
+        bindPickServer();
         configureWebView();
         configureSwipe();
         applyKeepScreenOnState();
@@ -236,6 +298,9 @@ public class MainActivity extends AppCompatActivity {
         } else {
             loadHome();
         }
+        // 「手机端优先用局域网 IP」：已保存的地址可达就什么都不做（跳过扫描，省电省时）；
+        // 不可达才扫一次所在网段，扫到局域网地址就自动切过去。全程在子线程，不挡首屏。
+        startLanFirstDiscovery();
         // 从这里就开始计时（而不是等 onPageFinished）：首屏慢的时候也要保证「启动后几秒就检查」这个语义。
         // 重复调用是安全的 —— scheduleAutoUpdateCheck 里的 autoCheckScheduled 保证只排一次。
         scheduleAutoUpdateCheck();
@@ -351,6 +416,51 @@ public class MainActivity extends AppCompatActivity {
         // 错误页这三个按钮都挂在内容区（不是 ActionBar/菜单上），所以 /m 隐藏原生栏以后照样能用。
         findViewById(R.id.error_settings).setOnClickListener(view -> openServerSettings());
         findViewById(R.id.error_browser).setOnClickListener(view -> openInBrowser());
+    }
+
+    // ------------------------------------------------------------------ 「选择服务器」入口 / 加载看门狗
+
+    /**
+     * 挂上「选择服务器…」这个<b>始终可点</b>的入口（{@code activity_main.xml} 的
+     * {@code pick_server_bar} / {@code pick_server}）。
+     *
+     * <p>它是"加载期间不许锁死"的落点：WebView 白屏、首屏慢、原生错误页盖上来的时候，
+     * 菜单和 ActionBar 都可能不在（{@code /m} 下 ActionBar 是收起来的），只有这一条永远在。
+     */
+    private void bindPickServer() {
+        pickServerBar = findViewById(R.id.pick_server_bar);
+        View pick = findViewById(R.id.pick_server);
+        if (pick != null) pick.setOnClickListener(view -> showServerPicker(false));
+    }
+
+    /**
+     * 标记"WebView 正在加载/已经结束"：同时控制入口可见性与 6 秒看门狗。
+     *
+     * @param value true＝开始加载（入口显示、看门狗开始计时）；false＝加载结束（入口收起、看门狗撤掉）
+     */
+    private void setLoading(boolean value) {
+        loading = value;
+        if (pickServerBar != null) pickServerBar.setVisibility(value ? View.VISIBLE : View.GONE);
+        if (value) scheduleLoadTimeout(); else cancelLoadTimeout();
+    }
+
+    /** 首屏看门狗：{@code LOAD_TIMEOUT_MS} 后还没加载完，就弹一次选择器 + 扫一次局域网。 */
+    private void scheduleLoadTimeout() {
+        cancelLoadTimeout();
+        loadTimeoutTask = () -> {
+            loadTimeoutTask = null;
+            if (!loading || isFinishing() || isDestroyed()) return;
+            Log.w("加载超过 " + LOAD_TIMEOUT_MS + "ms 仍未完成 → 自动弹出服务器选择器（本次加载只弹一次）");
+            ToastBus.shortToast(this, getString(R.string.load_timeout_hint, LOAD_TIMEOUT_MS / 1000));
+            showServerPicker(true);
+        };
+        mainHandler.postDelayed(loadTimeoutTask, LOAD_TIMEOUT_MS);
+    }
+
+    private void cancelLoadTimeout() {
+        if (loadTimeoutTask == null) return;
+        mainHandler.removeCallbacks(loadTimeoutTask);
+        loadTimeoutTask = null;
     }
 
     // ------------------------------------------------------------------ 检查更新（横幅）
@@ -780,6 +890,11 @@ public class MainActivity extends AppCompatActivity {
     private void loadUrl(String url) {
         hideErrorPage();
         currentUrl = url;
+        // 新一轮加载 = 一次新的机会：允许这次加载再自动弹一次选择器，「失败过」的标记也清掉。
+        autoPickerShown = false;
+        loadFailed = false;
+        // 立刻进入"加载中"：入口出现、6 秒看门狗开始计时（不等 onPageStarted，免得中间有一段空窗）。
+        setLoading(true);
         webView.loadUrl(url);
     }
 
@@ -787,10 +902,14 @@ public class MainActivity extends AppCompatActivity {
         errorDetail.setText(detail == null ? "" : detail);
         errorPage.setVisibility(View.VISIBLE);
         swipe.setRefreshing(false);
+        // 错误页也是"加载没成"的一种：这时候更不能把「选择服务器…」收起来
+        // （用户看着错误页，第一件想做的事就是换一台；/m 下菜单还在收起的 ActionBar 里）。
+        if (pickServerBar != null) pickServerBar.setVisibility(View.VISIBLE);
     }
 
     private void hideErrorPage() {
         if (errorPage.getVisibility() != View.GONE) errorPage.setVisibility(View.GONE);
+        if (!loading && pickServerBar != null) pickServerBar.setVisibility(View.GONE);
     }
 
     /**
@@ -921,6 +1040,7 @@ public class MainActivity extends AppCompatActivity {
             hideErrorPage();
             progress.setVisibility(View.VISIBLE);
             progress.setProgress(0);
+            setLoading(true);
             attachNativeBridgeIfTrusted(url);
             maybeInjectToken();
         }
@@ -931,6 +1051,10 @@ public class MainActivity extends AppCompatActivity {
             progress.setVisibility(View.INVISIBLE);
             swipe.setRefreshing(false);
             if (mainFrameFailed) return;      // 失败页由 onReceivedError 负责，别把它当成正常页面
+            // 正常加载完成：撤掉看门狗、收起「选择服务器…」入口。
+            // **不许**在这里自动弹选择器 —— 加载成功还弹就是打扰（用户要的是"失败/超时才弹"）。
+            loadFailed = false;
+            setLoading(false);
             currentUrl = url;
             // 前进/后退回到 /m 也要收起原生下拉刷新：这条路径不经过 loadHome()/toggleUi()，
             // onPageFinished 是唯一会经过的钩子。判据与 applyActionBarVisibility 一致
@@ -955,8 +1079,8 @@ public class MainActivity extends AppCompatActivity {
             CharSequence description = error == null ? "" : error.getDescription();
             progress.setVisibility(View.INVISIBLE);
             swipe.setRefreshing(false);
-            showErrorPage("加载失败：" + description + "\n" + UrlHelper.stripQuery(request.getUrl().toString()));
             Log.w("主文档加载失败：" + description + " → " + UrlHelper.stripQuery(request.getUrl().toString()));
+            onMainFrameLoadFailed("加载失败：" + description + "\n" + UrlHelper.stripQuery(request.getUrl().toString()));
         }
 
         @SuppressWarnings("deprecation")
@@ -967,7 +1091,7 @@ public class MainActivity extends AppCompatActivity {
             mainFrameFailed = true;
             progress.setVisibility(View.INVISIBLE);
             swipe.setRefreshing(false);
-            showErrorPage("加载失败：" + description + "\n" + UrlHelper.stripQuery(failingUrl));
+            onMainFrameLoadFailed("加载失败：" + description + "\n" + UrlHelper.stripQuery(failingUrl));
         }
 
         @Override
@@ -978,7 +1102,7 @@ public class MainActivity extends AppCompatActivity {
             int code = errorResponse == null ? 0 : errorResponse.getStatusCode();
             if (code >= 400) {
                 mainFrameFailed = true;
-                showErrorPage("服务端返回 HTTP " + code + "\n" + UrlHelper.stripQuery(request.getUrl().toString()));
+                onMainFrameLoadFailed("服务端返回 HTTP " + code + "\n" + UrlHelper.stripQuery(request.getUrl().toString()));
             }
         }
 
@@ -1284,6 +1408,331 @@ public class MainActivity extends AppCompatActivity {
         }
     }
 
+    // ------------------------------------------------------------------ 局域网优先 / 选择服务器
+    //
+    // 三件事，对应三条用户要求：
+    //   ① 启动时「已保存的地址可达就跳过扫描」，不可达才扫一次所在网段，扫到局域网地址就自动切过去
+    //      （见 startLanFirstDiscovery / startLanScan）；
+    //   ② 首屏失败/超过 LOAD_TIMEOUT_MS 还没完成 → 自动弹一次选择器，并顺带扫一次（见 onMainFrameLoadFailed
+    //      与 scheduleLoadTimeout），**只弹一次**，正常加载完成时绝不弹（见 onPageFinished 里那句注释）；
+    //   ③ 加载期间永远有一个「选择服务器…」入口（见 bindPickServer / setLoading）。
+    //
+    // 候选排序不在这里算：统一交给 ServerCandidates.rank（局域网整档在前，同档内 已保存 > 默认 > 扫描），
+    // 这样「扫描页看到的顺序」「自动切的目标」「选择器的顺序」用的是同一份判据。
+
+    /**
+     * 主文档加载失败的统一收尾：原生错误页 + <b>自动弹一次</b>选择器（同时触发一次局域网扫描）。
+     *
+     * <p>为什么失败时要把选择器直接摆出来：这一屏已经是错误页了，用户唯一能做的有效动作就是"换一台"，
+     * 让他再去菜单里找「切换服务器」是多余的（{@code /m} 下菜单还藏在收起的 ActionBar 里）。
+     */
+    private void onMainFrameLoadFailed(String detail) {
+        loadFailed = true;
+        setLoading(false);
+        showErrorPage(detail);
+        showServerPicker(true);
+    }
+
+    /**
+     * 启动时的「局域网优先」自动发现：<b>已保存的地址可达就跳过扫描</b>（省电、省时间），
+     * 不可达才扫一次所在网段；扫到局域网地址（且和当前用的不是同一台）就自动切过去。
+     *
+     * <p>探活在子线程（{@link #baseReachable}），扫描由 {@link LanScanner} 自己起后台线程，
+     * 两层都不挡首屏。
+     */
+    private void startLanFirstDiscovery() {
+        if (lanDiscoveryStarted || current == null) return;
+        lanDiscoveryStarted = true;
+        final String savedBase = current.base;
+        if (savedBase == null || savedBase.isBlank()) {
+            startLanScan(false);
+            return;
+        }
+        new Thread(() -> {
+            final boolean reachable = baseReachable(savedBase);
+            mainHandler.post(() -> {
+                if (isFinishing() || isDestroyed()) return;
+                if (reachable) {
+                    Log.d("已保存的地址可达（" + UrlHelper.hostOf(savedBase) + "）→ 跳过局域网扫描（省电省时）");
+                    return;
+                }
+                Log.i("已保存的地址不可达（" + UrlHelper.hostOf(savedBase) + "）→ 扫一次所在网段（局域网优先）");
+                lanAutoSwitch = true;
+                startLanScan(false);
+            });
+        }, "pixiko-lan-discovery").start();
+    }
+
+    /**
+     * 一个基地址的 {@code /healthz} 通不通（200–299）。
+     *
+     * <p>判据本体在 {@link LanScanner#reachable(String, int)}（与扫描用的是同一套"200 才算在"），
+     * 这里只补上「启动发现」用的超时。
+     */
+    static boolean baseReachable(String base) {
+        return LanScanner.reachable(base, DISCOVERY_PROBE_TIMEOUT_MS);
+    }
+
+    /**
+     * 发起一次局域网扫描。<b>一次运行最多扫一次</b>（{@link #lanScanStarted} 挡重复），
+     * {@code force=true} 是用户在选择器里按「重新扫描」。
+     */
+    private void startLanScan(boolean force) {
+        if (!force && (lanScanStarted || lanScanner != null)) {
+            if (openPicker != null) openPicker.refresh();
+            return;
+        }
+        if (lanScanner != null) {
+            lanScanner.cancel();       // 用户要求重扫：先把上一轮停掉，别让两轮抢带宽
+            lanScanner = null;
+        }
+        scannedBases.clear();
+        lanScanStarted = true;
+        lanScanDone = false;
+        lanScanDoneCount = 0;
+        lanScanTotal = 0;
+        lanScanProblem = "";
+        Log.i("开始扫描局域网（局域网优先）：网段="
+                + (LanScanner.localPrefixes().isEmpty() ? "（没有私网网卡）" : String.join("、", LanScanner.localPrefixes())));
+
+        final LanScanner scanner = new LanScanner();
+        lanScanner = scanner;
+        scanner.start(new LanScanner.Listener() {
+            @Override public void onProgress(int done, int total) {
+                lanScanDoneCount = done;
+                lanScanTotal = total;
+                if (openPicker != null) openPicker.refreshStatus();
+            }
+
+            @Override public void onFound(String base, String host) {
+                if (!scannedBases.contains(base)) scannedBases.add(base);
+                if (openPicker != null) openPicker.refresh();
+            }
+
+            @Override public void onFinished(List<String> found, boolean cancelled) {
+                LanScanner.Report report = scanner.report();
+                if (lanScanner == scanner) lanScanner = null;
+                lanScanDone = true;
+                lanScanProblem = report == null ? "" : report.problem;
+                if (report != null) Log.i("局域网扫描结束：" + report.describe());
+                if (found != null) {
+                    for (String base : found) if (!scannedBases.contains(base)) scannedBases.add(base);
+                }
+                onLanScanFinishedInternal(found, cancelled);
+            }
+        });
+    }
+
+    /**
+     * 扫描结束：① 加载失败过（或启动时发现已保存地址不可达）且扫到了局域网地址 → <b>自动切过去</b>；
+     * ② 否则只把打开着的选择器就地刷新一下。
+     */
+    private void onLanScanFinishedInternal(List<String> found, boolean cancelled) {
+        String best = null;
+        if (!cancelled && (loadFailed || lanAutoSwitch) && found != null) {
+            for (String base : found) {
+                if (LanScanner.isPrivateV4(UrlHelper.hostOnly(base))) { best = base; break; }
+            }
+        }
+        if (best != null && current != null && !best.equals(current.base)) {
+            Log.i("扫描到可用的局域网地址，自动切过去（局域网优先）：" + best);
+            // 已经替用户选好一台能连的了，就别让他还对着选择器发呆。
+            if (openPicker != null) openPicker.close();
+            switchTo(best);
+            return;
+        }
+        if (openPicker != null) openPicker.refresh();
+    }
+
+    /** 候选列表：已保存 + 烧进 APK 的默认地址 + 扫描到的，按「局域网优先」排好。 */
+    private List<ServerCandidates.Candidate> candidates() {
+        List<String> saved = new ArrayList<>();
+        for (ServerConfig config : repository.list()) {
+            if (config != null && config.base != null && !config.base.isBlank()) saved.add(config.base);
+        }
+        return ServerCandidates.rank(saved, BuildConfig.PIXIKO_DEFAULT_HOST, new ArrayList<>(scannedBases));
+    }
+
+    /**
+     * 打开「选择服务器」。
+     *
+     * @param auto true＝这次是失败/超时自动弹的（本次加载只弹一次，并顺带扫一次局域网）；
+     *             false＝用户自己点「选择服务器…」打开的
+     */
+    private void showServerPicker(boolean auto) {
+        if (isFinishing() || isDestroyed()) return;
+        if (auto) {
+            if (autoPickerShown) {
+                Log.d("本次加载已经自动弹过一次选择器了，不再打扰");
+                return;
+            }
+            autoPickerShown = true;
+            Log.i("自动弹出「选择服务器」（" + (loading ? "加载超过 " + LOAD_TIMEOUT_MS + "ms" : "加载失败")
+                    + "），并顺带扫一次局域网");
+        }
+        if (openPicker != null) {
+            openPicker.refresh();      // 已经开着：就地刷新，不再叠第二个弹窗
+            return;
+        }
+        openPicker = new ServerPicker();
+        openPicker.show();
+        if (auto) startLanScan(false);
+    }
+
+    /**
+     * 选中一台服务器：切过去、<b>记住这个选择</b>、并保留既有的 {@code /m?scope=…} 注入。
+     *
+     * <p>三个「不改变」：地址校验仍走 {@link UrlHelper#normalizeBase}（坏地址直接拒绝）、
+     * 已保存过的地址不会被重复存一条（按 base 匹配复用原记录）、令牌沿用当前服务器
+     * （换机器不用重新抄一遍令牌，也不会被清空）。
+     *
+     * <p>记住的方式就是存进 {@link ServerRepository}：下次启动它就在「已保存」那一档里，
+     * 而排序仍按「局域网优先」（见 {@link ServerCandidates#rank}）。
+     */
+    void switchTo(String rawBase) {
+        final String normalized = UrlHelper.normalizeBase(rawBase);
+        if (normalized == null) {
+            ToastBus.shortToast(this, getString(R.string.pick_server_bad_address));
+            return;
+        }
+        final String token = current == null || current.token == null ? "" : current.token;
+        ServerConfig target = null;
+        for (ServerConfig config : repository.list()) {
+            if (config != null && normalized.equals(config.base)) { target = config; break; }
+        }
+        if (target == null) {
+            target = new ServerConfig("", UrlHelper.hostOnly(normalized), normalized, token);
+            repository.upsert(target);
+            Log.i("把选中的地址记成一台服务器（下次它在「已保存」里）：" + UrlHelper.hostOf(normalized)
+                    + "，沿用当前令牌 " + Log.mask(token));
+        }
+        current = target;
+        repository.setLastId(target.id);
+        // 换服务器 → 令牌重新注入，用户之前手动清除登录的意图不再延续（与菜单「切换服务器」同一套）。
+        tokenInjected = false;
+        suppressTokenInjection = false;
+        bridgeAttached = false;
+        webView.clearHistory();
+        hideErrorPage();
+        loadHome();     // homeUrl() 里仍然走 DeviceScope.pageUrl → /m?scope=…
+        ToastBus.shortToast(this, getString(R.string.pick_server_switched, UrlHelper.hostOf(normalized)));
+        invalidateOptionsMenu();
+        if (getSupportActionBar() != null) getSupportActionBar().setSubtitle(UrlHelper.hostOf(current.base));
+        Log.i("已切换到服务器：" + UrlHelper.hostOf(normalized) + "（已记住；排序仍按局域网优先）");
+    }
+
+    /** 候选来源的短标签（「已保存 / 默认 / 扫描到」）。 */
+    private String tagOf(ServerCandidates.Source source) {
+        if (source == ServerCandidates.Source.SAVED) return getString(R.string.pick_server_tag_saved);
+        if (source == ServerCandidates.Source.DEFAULT) return getString(R.string.pick_server_tag_default);
+        return getString(R.string.pick_server_tag_scanned);
+    }
+
+    /**
+     * 「选择服务器」弹窗：列表＝<b>扫描到的局域网地址 + 已保存 + 烧进 APK 的默认地址</b>，
+     * 局域网整档在前（{@link ServerCandidates#rank}）。
+     *
+     * <p>为什么自己拼一个 LinearLayout 而不是 {@code AlertDialog.setItems}：扫描是<b>边扫边出结果</b>的
+     * （最多 3 秒），固定数组的 setItems 没法就地追加；这里每来一台就 {@link #refresh()} 一次。
+     */
+    private final class ServerPicker {
+        private final AlertDialog dialog;
+        private final LinearLayout rows;
+        private final TextView status;
+
+        ServerPicker() {
+            LinearLayout root = new LinearLayout(MainActivity.this);
+            root.setOrientation(LinearLayout.VERTICAL);
+            root.setPadding(dp(16), dp(4), dp(16), dp(4));
+
+            status = new TextView(MainActivity.this);
+            status.setTextColor(ContextCompat.getColor(MainActivity.this, R.color.pixiko_muted));
+            status.setTextSize(12f);
+            root.addView(status);
+
+            rows = new LinearLayout(MainActivity.this);
+            rows.setOrientation(LinearLayout.VERTICAL);
+            ScrollView scroll = new ScrollView(MainActivity.this);
+            scroll.addView(rows);
+            root.addView(scroll, new LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT, dp(260)));
+
+            Button rescan = new Button(MainActivity.this);
+            rescan.setText(R.string.pick_server_rescan);
+            rescan.setAllCaps(false);
+            rescan.setOnClickListener(view -> startLanScan(true));
+            root.addView(rescan);
+
+            dialog = new AlertDialog.Builder(MainActivity.this, R.style.Theme_Pixiko_Dialog)
+                    .setTitle(R.string.pick_server_title)
+                    .setView(root)
+                    .setNegativeButton(R.string.pick_server_close, null)
+                    .setOnDismissListener(closed -> {
+                        if (openPicker == this) openPicker = null;
+                    })
+                    .create();
+        }
+
+        void show() {
+            dialog.show();
+            refresh();
+        }
+
+        void close() {
+            if (dialog.isShowing()) dialog.dismiss();
+        }
+
+        /** 列表变了就整份重建（候选最多十来条，重建比 diff 便宜也更不容易出错）。 */
+        void refresh() {
+            refreshStatus();
+            rows.removeAllViews();
+            List<ServerCandidates.Candidate> candidates = candidates();
+            if (candidates.isEmpty()) {
+                TextView empty = new TextView(MainActivity.this);
+                empty.setText(R.string.pick_server_none);
+                empty.setTextColor(ContextCompat.getColor(MainActivity.this, R.color.pixiko_text));
+                empty.setTextSize(13f);
+                empty.setPadding(0, dp(8), 0, dp(8));
+                rows.addView(empty);
+                return;
+            }
+            for (ServerCandidates.Candidate candidate : candidates) rows.addView(row(candidate));
+        }
+
+        /** 状态行：没扫就提示去扫，扫描中显示进度，扫完显示结果或失败原因（没网卡/没权限也说得清）。 */
+        void refreshStatus() {
+            if (!lanScanStarted) {
+                status.setText(R.string.pick_server_idle);
+            } else if (!lanScanDone) {
+                status.setText(getString(R.string.pick_server_scanning, lanScanDoneCount, lanScanTotal));
+            } else if (!lanScanProblem.isEmpty()) {
+                status.setText(lanScanProblem);
+            } else {
+                status.setText(getString(R.string.pick_server_scanned, scannedBases.size()));
+            }
+            status.setVisibility(View.VISIBLE);
+        }
+
+        private View row(final ServerCandidates.Candidate candidate) {
+            Button button = new Button(MainActivity.this);
+            boolean here = current != null && candidate.base.equals(current.base);
+            button.setText(UrlHelper.hostOf(candidate.base) + "　" + tagOf(candidate.source)
+                    + (here ? "　● 当前" : ""));
+            button.setAllCaps(false);
+            button.setTextSize(13f);
+            button.setGravity(Gravity.START | Gravity.CENTER_VERTICAL);
+            button.setOnClickListener(view -> {
+                close();
+                switchTo(candidate.base);
+            });
+            return button;
+        }
+    }
+
+    private int dp(int value) {
+        return Math.round(getResources().getDisplayMetrics().density * value);
+    }
+
     // ------------------------------------------------------------------ 常亮
 
     private boolean keepScreenOnEnabled() {
@@ -1387,6 +1836,13 @@ public class MainActivity extends AppCompatActivity {
     @Override
     protected void onDestroy() {
         releaseUpdateWiring();
+        // 扫描线程与看门狗都必须停：退出界面后不该还在往 254 个地址发包，也不该再弹窗。
+        cancelLoadTimeout();
+        if (lanScanner != null) {
+            lanScanner.cancel();
+            lanScanner = null;
+        }
+        openPicker = null;
         if (bridge != null) bridge.shutdown();
         if (webView != null) {
             webView.removeJavascriptInterface(NativeHook.INTERFACE_NAME);

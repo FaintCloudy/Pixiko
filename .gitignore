@@ -153,3 +153,16 @@ desktop.ini
 
 # 只保留示例配置：显式放行（防止将来有人用 config* 通配把示例也挡掉）
 !config.example.json
+
+# --- 2026-10-18 重构 Phase 0 追加（只增不删）---
+config.json
+data/
+logs/
+work/
+build/
+lib/
+android/dist/
+*.apk
+*.jar
+.env
+*.secret

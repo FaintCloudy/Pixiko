@@ -36,8 +36,8 @@ import java.util.List;
  *       列表每一项都有「使用/编辑/删除」，点「编辑」只是把值灌回上面的输入框；</li>
  *   <li>测试连接走 {@link Probe}：先 /healthz（免令牌）再 /api/status（验令牌），
  *       所以能区分「连不上」与「令牌不对」；</li>
- *   <li>扫描局域网走 {@link LanScanner}：并发 32、单个 400ms、总 10s、可取消；
- *       onDestroy 里必须 cancel，否则线程会拖着 IO 活到进程结束。</li>
+ *   <li>扫描局域网走 {@link LanScanner}：按「本机地址 + 前缀长度」算网段，并发 32、单个 300ms、
+ *       总 3s、可取消；onDestroy 里必须 cancel，否则线程会拖着 IO 活到进程结束。</li>
  * </ul>
  */
 public class SettingsActivity extends AppCompatActivity {
@@ -1080,11 +1080,15 @@ public class SettingsActivity extends AppCompatActivity {
         scanButton.setText("取消扫描");
         scanProgress.setVisibility(View.VISIBLE);
         scanProgress.setProgress(0);
-        List<String> prefixes = LanScanner.localPrefixes();
-        setStatus(getString(R.string.scan_running) + "\n网段：" + (prefixes.isEmpty() ? "（没找到局域网网卡，先连上 Wi-Fi）" : String.join("、", prefixes) + "x"), false);
+        // 网段按「本机地址 + 前缀长度」算：/24 就是一整个 /24 的 1–254；比 /24 短（如 /16）
+        // 只取包含本机的那个 /24 切片（3 秒预算只够这么多个地址，见 LanScanner 的类注释）。
+        List<String> segments = LanScanner.localPrefixes();
+        setStatus(getString(R.string.scan_running) + "\n网段："
+                + (segments.isEmpty() ? "（没找到局域网网卡，先连上 Wi-Fi）" : String.join("、", segments)), false);
 
-        scanner = new LanScanner();
-        scanner.start(new LanScanner.Listener() {
+        final LanScanner current = new LanScanner();
+        scanner = current;
+        current.start(new LanScanner.Listener() {
             @Override public void onProgress(int done, int total) {
                 if (isFinishing()) return;
                 scanProgress.setMax(total);
@@ -1099,14 +1103,20 @@ public class SettingsActivity extends AppCompatActivity {
             }
 
             @Override public void onFinished(List<String> found, boolean cancelled) {
-                scanner = null;
+                LanScanner.Report report = current.report();
+                if (scanner == current) scanner = null;
                 if (isFinishing()) return;
                 scanButton.setText(R.string.settings_scan);
                 scanProgress.setVisibility(View.GONE);
-                if (found.isEmpty()) {
+                if (report != null && !report.problem.isEmpty()) {
+                    // 没有 Wi-Fi / 系统不让读网卡 / 探测不可用：说清楚原因，**不崩**，
+                    // 地址仍然可以手填（既有的「保存 + 测试连接」那条路一点没动）。
+                    setStatus(report.problem, true);
+                } else if (found.isEmpty()) {
                     setStatus(getString(R.string.scan_none), true);
                 } else {
-                    setStatus((cancelled ? "扫描已中断。" : "扫描完成。") + "发现 " + found.size() + " 台：\n"
+                    setStatus((cancelled ? "扫描已中断。" : "扫描完成。") + "发现 " + found.size() + " 台（"
+                            + (report == null ? "?" : report.elapsedMs + "ms") + "）：\n"
                             + String.join("\n", found), false);
                 }
                 renderDiscovered(found);

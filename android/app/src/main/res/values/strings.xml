@@ -45,6 +45,26 @@
     <string name="scan_running">正在扫描局域网…</string>
     <string name="scan_none">没有扫到正在运行的控制台。确认机器人已启动、手机与它在同一个 Wi-Fi。</string>
 
+    <!-- ================= 局域网优先 / 选择服务器 =================
+         入口在 activity_main.xml 的 pick_server_bar（加载期间始终可点）；
+         列表顺序由 ServerCandidates.rank 决定：局域网整档在前，同档内 已保存 > 默认 > 扫描。 -->
+    <string name="pick_server_entry">选择服务器…</string>
+    <string name="pick_server_loading_hint">正在加载…连不上可以换一台</string>
+    <string name="pick_server_title">选择服务器</string>
+    <string name="pick_server_close">取消</string>
+    <string name="pick_server_rescan">重新扫描局域网</string>
+    <string name="pick_server_idle">还没扫描。点「重新扫描局域网」找一台能连的。</string>
+    <string name="pick_server_scanning">正在扫描局域网… 已探 %1$d / %2$d 个地址</string>
+    <string name="pick_server_scanned">扫描完成：发现 %1$d 台局域网服务（局域网地址排在前面）</string>
+    <string name="pick_server_none">还没有可用的地址。点「重新扫描局域网」，或去「服务器设置」里填一个。</string>
+    <string name="pick_server_tag_saved">已保存</string>
+    <string name="pick_server_tag_default">内置默认</string>
+    <string name="pick_server_tag_scanned">扫描到</string>
+    <string name="pick_server_switched">已切换到 %1$s</string>
+    <string name="pick_server_bad_address">这个地址不能用，换一个试试。</string>
+    <!-- 首屏超过 LOAD_TIMEOUT_MS（6 秒）还没完成时的提示；%1$d = 秒数。 -->
+    <string name="load_timeout_hint">加载超过 %1$d 秒还没完成，可能连不上这台服务器：换一台试试。</string>
+
     <!-- 关于 -->
     <string name="about_title">关于 Pixiko</string>
     <string name="about_message">Pixiko Android 外壳（cn.szu.bot.app）\n\n这就是网页控制台的全量功能：出图、对话、提示词、风格、LoRA、功能、聊天设置、系统、首次配置、日志、回执、帮助——全部栏目都在内置的 WebView 里，和电脑浏览器打开的是同一个界面（手机宽度下网页自己会变成单列堆叠）。\n\n原生新增的只有这些：服务器配置与局域网扫描、下拉刷新与原生错误页、长按图片保存到相册 / 分享、屏幕常亮、顶部加载进度。\n\n作者 loriko · 与网页控制台同版本号。</string>
