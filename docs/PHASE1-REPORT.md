@@ -32,3 +32,20 @@
 ## 4. 下一步
 - 补完 ④ 白名单（`.whitelist toggle/list/add/remove`、聊天不被拦、网页事件豁免、owner 豁免、持久化、5 组测试）→ **Phase 1 收口**；
 - 进 Phase 2（`docs/PHASE2-PLAN.md`）：领域类型 + `CommandRegistry`/`CommandDispatcher` + `Capability` 取代反射，`Bot` 作代理，每次只搬 3–5 条命令并逐字 pin 回执。
+## 5. ④ 白名单语义（已完成，2026-10-18）
+**文件**：`Bot.java`（`accept()` 分权、`.whitelist` 分支、聊天计划命令复用同一判据、`webui` 合成事件豁免、owner 隐式豁免）、`Settings.java`（白名单开关/成员读写与持久化）、新增 `WhitelistSemanticsTest`。
+
+**行为变化（按用户口径）**：
+- 白名单**关闭**：所有人可聊天、可用公共指令；管理指令仍按 owner/admin（不变）。
+- 白名单**开启**：**所有人仍可聊天**；**只有成员可执行机器人指令**；管理指令仍按 owner/admin。
+- **聊天计划生成的命令**在执行前过**同一道**白名单检查（不越权）。
+- **网页/控制台合成事件豁免**（修掉"`allowed_user_ids` 一非空，控制台与网页聊天全废"的隐患）。
+- **owner 隐式豁免**（不必把自己写进名单）。
+- 新增 `.whitelist toggle | list | add <号> | remove <号>`：toggle/add/remove **仅 owner**；`list` 编号展示，但 **remove 必须用号码**（不依赖临时编号）；`.help` 只加最少几行。
+- 开关与成员**持久化到 config.json**，缺键按"关闭 + 空名单"。
+
+**测试**：`WhitelistSemanticsTest` **exit 0 / 9 组断言**（关闭态 4 项、开启态含"非成员被拒且回执说明"、owner 豁免、聊天计划命令不越权、网页事件不被拦、四个子指令仅 owner、持久化重载、`.help`/`.mode` 不误伤、**号码掩码自检**）。
+
+**回归（我复跑）**：`GenerationQueueInvariantTest 174`、`GenerationQueueTest 344`、`WebAuthFilterTest 69`、`IsolationTest` 全 exit 0。
+
+**Phase 1 结论**：①WebAuth ②DeepSeek 传输 ③生成队列 ④白名单 —— **全部完成且测试绿**；生产 8787 **仍未部署**（冻结在 `df7e606`）。
