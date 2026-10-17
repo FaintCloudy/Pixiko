@@ -62,6 +62,15 @@ public final class CommandRegistryTest {
     /** 未登记指令 {@code .admin}（不带参数）的回执原文：原有的"用法"报错，一字不差。 */
     static final String ADMIN_USAGE_TEXT = "操作失败：用法：.admin add <@成员|QQ号|群名片>、"
             + ".admin remove <@成员|QQ号|群名片>、.admin list";
+    /** {@code .admin list} 回执原文（admin 名单为空时逐字稳定）。 */
+    static final String ADMIN_LIST_TEXT = "owner：" + OWNER + "\nadmin（0）：（无）\n"
+            + "admin 只能开关自己所在群聊的发言；其他管理指令仅 owner 可用。";
+    /** {@code .get}（没有待领取图片）回执原文。 */
+    static final String GET_TEXT = "暂无待领取图片，请先发送 .gen。";
+    /** {@code .size} 在 SD 连不上时的回执原文（夹具固定指向 127.0.0.1:0，逐字稳定）。 */
+    static final String SIZE_TEXT = "操作失败：Stable Diffusion 连接中断；操作结果未确认，请检查 WebUI。";
+    /** 原来就不认的写法得到的回执：注册表必须同样不认（门不通过 → 回落老路）。 */
+    static final String UNKNOWN_COMMAND_TEXT = "指令格式不正确，请发送 .help 查看用法。";
 
     public static void main(String[] args) throws Exception {
         Path work = Path.of(System.getProperty("bot.test.work", "work"));
@@ -80,9 +89,10 @@ public final class CommandRegistryTest {
         resultShapesAreDistinct();
         registryRejectsBadNames();
         registryIsSafeForConcurrentReaders();
-        check(assertions >= 8, "断言条数应 ≥ 8，实际 " + assertions);
+        check(assertions >= 50, "断言条数应 ≥ 50，实际 " + assertions);
         System.out.println("CommandRegistryTest: " + assertions + " assertions passed：.help/.mode/.imgmode 回执逐字与基线一致、"
-                + "未登记指令（.admin/.get/.size）仍走原来的 dispatch、注册表命中/未命中与并发只读。");
+                + "未登记指令（.admin/.get/.size）与原来不认的写法（.HELP/.modex）仍走原来的 dispatch、"
+                + "注册表命中/未命中/门不通过、handler 异常原样冒泡、上下文归一、并发只读。");
     }
 
     // ---------------------------------------------------------------- ① 三条迁移指令的回执（基线）
@@ -125,15 +135,24 @@ public final class CommandRegistryTest {
 
         String list = f.say("private", ".admin list").text();
         Evidence.print("admin-list", list);
-        check(list.contains("owner：" + OWNER), ".admin list 回执仍由原实现产生：" + firstLine(list));
+        check(ADMIN_LIST_TEXT.equals(list), ".admin list 回执与基线不一致：" + list);
 
         String get = f.say("private", ".get").text();
         Evidence.print("get", get);
-        check(get.contains("暂无待领取"), ".get 回执仍由原实现产生：" + firstLine(get));
+        check(GET_TEXT.equals(get), ".get 回执与基线不一致：" + get);
 
         String size = f.say("private", ".size").text();
         Evidence.print("size", size);
-        check(size.contains("当前图片尺寸：") || size.contains("操作失败："), ".size 回执仍由原实现产生：" + firstLine(size));
+        check(SIZE_TEXT.equals(size), ".size 回执与基线不一致：" + size);
+
+        // 注册表的门必须与原来的判据一模一样：这两条本来就不认，现在也还是不认（回落老路）。
+        String upper = f.say("private", ".HELP").text();
+        Evidence.print("upper-help", upper);
+        check(UNKNOWN_COMMAND_TEXT.equals(upper), ".HELP 仍然不认：" + upper);
+
+        String lookalike = f.say("private", ".modex").text();
+        Evidence.print("modex", lookalike);
+        check(UNKNOWN_COMMAND_TEXT.equals(lookalike), ".modex 仍然不认：" + lookalike);
     }
 
     // ---------------------------------------------------------------- ③ 注册表/派发器本体
