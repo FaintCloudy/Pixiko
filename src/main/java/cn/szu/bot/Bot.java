@@ -15,6 +15,8 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Consumer;
 import java.util.regex.*;
 import javax.imageio.ImageIO;
+import cn.szu.bot.application.generation.GenerationJobState;
+import cn.szu.bot.application.generation.GenerationSnapshot;
 import cn.szu.bot.chat.ChatActions;
 import cn.szu.bot.chat.ChatService;
 import cn.szu.bot.chat.DeepSeekPrompts;
@@ -6792,13 +6794,17 @@ public final class Bot implements AutoCloseable {
         final SdClient.GenerationRequest snapshot;
         BigInteger remaining, number, total, done = BigInteger.ZERO, failed = BigInteger.ZERO, images = BigInteger.ZERO;
         String lastError = "";
-        /** 挂起：不参与调度，插到队首也不会被取；已经在下发的那一张会跑完。 */
-        boolean suspended;
-        /** 取消：跑完当前这张就结算（已经生成的图片照常可领取）。 */
-        boolean cancelled;
-        /** 这一张正提交给 SD（工作线程在 sd.generate 里）：取消据此决定"要不要真去中断 SD"。 */
+        /**
+         * 生命周期状态（Phase 1）：取代 Phase 1 之前 {@code suspended}/{@code cancelled} 的自由组合。
+         * 只能经 {@link #transition} 迁移，计数也只在那里增减——「等待 -1」「挂起虚高」就是那两个布尔
+         * 各自改计数造成的。{@code null} = 刚创建、还没进任何计数池（构造到入队都在同一把锁里）。
+         */
+        GenerationJobState state;
+        /** 结算幂等标记：同一个任务只结算一次（二次结算会二次扣计数、二次留痕、二次发回执）。 */
+        boolean settled;
+        /** 这一张正提交给 SD（工作线程在 sd.generate 里）：取消据此决定"要不要真去中断 SD"。与状态正交。 */
         volatile boolean generating;
-        /** 这一张被取消从中途掐断了（SD 已确认停止）：半成品不发布、不发送，也不算"成功一次"。 */
+        /** 这一张被取消从中途掐断了（SD 已确认停止）：半成品不发布、不发送，也不算"成功一次"。与状态正交。 */
         volatile boolean interrupted;
         /** 出图前的 VAE 冲突检查只做一次（这一任务的第一张之前），不必每张都查。 */
         boolean vaeChecked;
@@ -6807,24 +6813,100 @@ public final class Bot implements AutoCloseable {
         GenerationJob(JsonObject event, SdClient.GenerationRequest snapshot, BigInteger remaining) {
             this.event = event; this.snapshot = snapshot; this.remaining = remaining; this.total = remaining;
         }
-        String status() {
-            if (cancelled) return "已取消";
-            if (suspended) return "已挂起";
-            return "等待中";
+        boolean is(GenerationJobState expected) { return state == expected; }
+        String status() { return state == null ? GenerationJobState.QUEUED.label() : state.label(); }
+    }
+    /**
+     * 唯一的状态转换入口（调用方必须持有 {@link #generationLock}）：{@code waitingGenerations} 与
+     * {@code suspendedGenerations} **只在这里**增减。Phase 1 之前这两笔账散在 12 处手工加减里，
+     * 每处都要自己判断"该从哪个池子扣"——cancel all 只清零全局计数不清 remaining，结算时又扣一次，
+     * 于是任务跑完还看到「等待 -1 个」。
+     *
+     * <p>口径：{@code waiting = Σ(QUEUED/RUNNING 任务的 remaining)}，{@code suspended = Σ(HELD 任务的
+     * remaining)}；正在 SD 里跑的那一张不在 remaining 里（它在状态行的「合计 +1」上），所以进入 RUNNING
+     * 时先把这一张从 remaining 里摘出去，于是 {@code .gen 21} 跑起来正好是「等待 20 个，合计 21 个」。
+     *
+     * <p>终态（CANCELLED/SUCCEEDED/FAILED）一律把该任务占的那一份还回去并把 remaining 清零；
+     * 同一状态重复迁移是空操作（{@code first} 对正在生成的任务、settle 的二次调用都靠它兜住）。
+     */
+    private void transition(GenerationJob job, GenerationJobState target, String reason) {
+        GenerationJobState from = job.state;
+        if (from == target) return;
+        // 1) 离开旧状态：把它在计数里占的那一份还回去（from == null 表示刚创建，还没占任何池子）
+        if (from != null) switch (from) {
+            case QUEUED, RUNNING -> waitingGenerations = waitingGenerations.subtract(job.remaining);
+            case HELD -> suspendedGenerations = suspendedGenerations.subtract(job.remaining);
+            default -> { }                       // 终态不占计数
         }
+        // 2) 进入 RUNNING：这一张从"等待"变成"在飞"，先从剩余次数里摘出去
+        if (target == GenerationJobState.RUNNING && job.remaining.signum() > 0)
+            job.remaining = job.remaining.subtract(BigInteger.ONE);
+        // 3) 进入新状态：把它现在占的那一份记进对应的池子
+        switch (target) {
+            case QUEUED, RUNNING -> waitingGenerations = waitingGenerations.add(job.remaining);
+            case HELD -> suspendedGenerations = suspendedGenerations.add(job.remaining);
+            default -> job.remaining = BigInteger.ZERO;   // 终态：剩余次数清零
+        }
+        job.state = target;
+        if (reason != null) Log.info("生成任务 #" + job.number + "：" + (from == null ? "新建" : from) + " → " + target + "（" + reason
+                + "，剩余 " + job.remaining + "，等待 " + waitingGenerations + "，挂起 " + suspendedGenerations + "）");
+    }
+    /**
+     * 唯一出队口：移出队列 + 迁到终态（终态会把 remaining 清零并把它占的计数还回去）。
+     *
+     * <p>重复调用安全：已经不在队列里 / 已经是终态的任务，这两步都是空操作。cancel all、pick 跳过已取消、
+     * 结算、停机清队列全部走这里，"移出队列"与"还计数"不会再各扣一次。
+     */
+    private void removeFromQueue(GenerationJob job, GenerationJobState target, String reason) {
+        generationJobs.remove(job);
+        transition(job, target, reason);
+    }
+    /** 结算原因 → 任务终态。 */
+    private static GenerationJobState terminalState(String reason) {
+        return switch (reason) {
+            case "已拒绝" -> GenerationJobState.FAILED;
+            case "已取消", "已停止" -> GenerationJobState.CANCELLED;
+            default -> GenerationJobState.SUCCEEDED;
+        };
+    }
+    /** 任务状态文案：在飞的那一张显示"生成中"（状态行与网页任务卡共用这一处，三份重复表达式收敛到这里）。 */
+    private static String generationJobStatus(GenerationJob job, boolean running) {
+        if (running) return switch (job.state) {
+            case CANCELLED -> "生成中（取消待生效）";
+            case HELD -> "生成中（挂起待生效）";
+            default -> "生成中";
+        };
+        return job.status();
+    }
+    /**
+     * 计数快照（调用方须持有 {@link #generationLock}）：状态行与 {@code /api/tasks} 的唯一读数口。
+     *
+     * <p>不变量：两个池子都不许为负。违规时**记日志并抛内部错**，不静默 clamp——计数越界说明有改动绕开了
+     * {@link #transition}，把 -1 显示成 0 只会让 bug 更难查。
+     */
+    private GenerationSnapshot generationSnapshot() {
+        GenerationSnapshot snapshot = GenerationSnapshot.of(waitingGenerations, suspendedGenerations, generationRunning);
+        if (!snapshot.consistent()) {
+            String detail = "生成队列计数越界（内部错误，计数点绕过了唯一转换入口）：" + snapshot
+                    + "；在飞任务 #" + (currentGeneration == null ? "无" : currentGeneration.number)
+                    + "，状态 " + (currentGeneration == null ? "无" : currentGeneration.state)
+                    + "，队列 " + generationJobs.size() + " 个";
+            Log.error(detail);
+            throw new IllegalStateException(detail);
+        }
+        return snapshot;
     }
     private String generationStatus() {
         synchronized (generationLock) {
-            StringBuilder status = new StringBuilder("生成队列：" + (generationRunning ? "运行中" : "空闲") + "，等待 " + waitingGenerations
-                    + " 个" + (suspendedGenerations.signum() > 0 ? "（另有挂起 " + suspendedGenerations + " 个）" : "")
-                    + "，合计 " + waitingGenerations.add(suspendedGenerations).add(generationRunning ? BigInteger.ONE : BigInteger.ZERO)
+            GenerationSnapshot counts = generationSnapshot();
+            StringBuilder status = new StringBuilder("生成队列：" + (generationRunning ? "运行中" : "空闲") + "，等待 " + counts.waiting()
+                    + " 个" + (counts.suspended().signum() > 0 ? "（另有挂起 " + counts.suspended() + " 个）" : "")
+                    + "，合计 " + counts.total()
                     + " 个。自动领取：" + (settings.autoGet() ? "开启" : "关闭") + "。");
             int slot = 0;
             for (GenerationJob job : generationJobs) status.append("\n#").append(++slot).append(" 任务 #").append(job.number).append("：")
                     .append(job.done).append("/").append(job.total)
-                    .append(job == currentGeneration
-                            ? (job.cancelled ? " 生成中（取消待生效）" : job.suspended ? " 生成中（挂起待生效）" : " 生成中")
-                            : " " + job.status())
+                    .append(job == currentGeneration ? " " + generationJobStatus(job, true) : " " + generationJobStatus(job, false))
                     .append("，失败 ").append(job.failed).append("，已生成 ").append(job.images).append(" 张")
                     .append("（" + describeConversation(job.event) + "）");
             for (GenerationJob job : finishedJobs) status.append("\n任务 #").append(job.number).append("：").append(job.done).append("/")
@@ -6838,13 +6920,27 @@ public final class Bot implements AutoCloseable {
         synchronized (generationLock) {
             if (action.equals("cancel") && (target.equalsIgnoreCase("all") || target.equals("全部") || target.isEmpty())) {
                 List<GenerationJob> cancelled = new ArrayList<>();
-                for (GenerationJob job : generationJobs) { job.cancelled = true; cancelled.add(job); }
+                List<GenerationJob> settledNow = new ArrayList<>();
                 BigInteger freed = waitingGenerations.add(suspendedGenerations);
-                waitingGenerations = BigInteger.ZERO; suspendedGenerations = BigInteger.ZERO;
+                for (GenerationJob job : List.copyOf(generationJobs)) {
+                    cancelled.add(job);
+                    if (job == currentGeneration) {
+                        // 正在下发的那一张：计数立刻结清（这一张跑完不会再生成），任务本身留在队列里，
+                        // 等这一张跑完由工作线程结算——取消回执、自动领取、收据窗口都走原来那条路。
+                        transition(job, GenerationJobState.CANCELLED, "取消全部");
+                        continue;
+                    }
+                    // 唯一出队口：出队 + 清账（remaining 清零、把占的等待/挂起还回去）+ 置终态。
+                    removeFromQueue(job, GenerationJobState.CANCELLED, "取消全部");
+                    settledNow.add(job);
+                }
                 Log.info("取消全部生成任务：" + cancelled.size() + " 个");
-                return "已取消队列里的全部任务（" + cancelled.size() + " 个，共 " + freed + " 次待生成）。"
+                String receipt = "已取消队列里的全部任务（" + cancelled.size() + " 个，共 " + freed + " 次待生成）。"
                         + stopCurrentGeneration()
                         + "\n其余不再生成；已经生成的图片照常可以领取（" + (settings.autoGet() ? "会自动领取" : "用 .get 领取") + "）。";
+                // 被直接摘掉的任务照旧各发一条"已取消"结算回执（文案、自动领取、收据窗口都不变）。
+                for (GenerationJob job : settledNow) noticeFinishedGeneration(job, "已取消");
+                return receipt;
             }
             if (target.isEmpty()) return "用法：.gen hold|resume|cancel|first #编号（.gen list 查看编号；取消全部用 .gen cancel all）";
             GenerationJob job = null;
@@ -6852,12 +6948,10 @@ public final class Bot implements AutoCloseable {
             if (job == null) return "没有这个任务：# " + target + "。用 .gen list 查看队列里的任务编号（刚完成的会出现在列表末尾）。";
             switch (action) {
                 case "hold" -> {
-                    if (job.cancelled) return "任务 #" + job.number + " 已经取消了。";
-                    if (job.suspended) return "任务 #" + job.number + " 本来就是挂起状态。";
-                    job.suspended = true;
+                    if (job.is(GenerationJobState.CANCELLED)) return "任务 #" + job.number + " 已经取消了。";
+                    if (job.is(GenerationJobState.HELD)) return "任务 #" + job.number + " 本来就是挂起状态。";
                     BigInteger held = job.remaining;
-                    suspendedGenerations = suspendedGenerations.add(held);
-                    waitingGenerations = waitingGenerations.subtract(held);
+                    transition(job, GenerationJobState.HELD, "已挂起");
                     Log.info("生成任务 #" + job.number + " 已挂起（剩余 " + held + " 次）");
                     return (job == currentGeneration
                             ? "任务 #" + job.number + " 已挂起：正在下发的这一张会先跑完，之后还剩 " + held + " 次不生成。"
@@ -6865,35 +6959,29 @@ public final class Bot implements AutoCloseable {
                             + "\n队列会先跑别的任务；继续用：.gen resume #" + job.number;
                 }
                 case "resume" -> {
-                    if (job.cancelled) return "任务 #" + job.number + " 已经取消了，无法继续。";
-                    if (!job.suspended) return "任务 #" + job.number + " 没有挂起，正在按顺序排队。";
-                    job.suspended = false;
-                    suspendedGenerations = suspendedGenerations.subtract(job.remaining);
-                    waitingGenerations = waitingGenerations.add(job.remaining);
+                    if (job.is(GenerationJobState.CANCELLED)) return "任务 #" + job.number + " 已经取消了，无法继续。";
+                    if (!job.is(GenerationJobState.HELD)) return "任务 #" + job.number + " 没有挂起，正在按顺序排队。";
+                    transition(job, GenerationJobState.QUEUED, "已继续");
                     ensureGenerationWorker();
                     Log.info("生成任务 #" + job.number + " 已继续（剩余 " + job.remaining + " 次）");
                     return "任务 #" + job.number + " 已继续，重新排进队列（剩余 " + job.remaining + " 次）。";
                 }
                 case "cancel" -> {
-                    if (job.cancelled) return "任务 #" + job.number + " 已经取消了。";
-                    job.cancelled = true;
+                    if (job.is(GenerationJobState.CANCELLED)) return "任务 #" + job.number + " 已经取消了。";
                     BigInteger freed = job.remaining.add(job == currentGeneration ? BigInteger.ONE : BigInteger.ZERO);
-                    waitingGenerations = waitingGenerations.subtract(job.remaining);
-                    if (job.suspended) suspendedGenerations = suspendedGenerations.subtract(job.remaining);
-                    job.remaining = BigInteger.ZERO;
+                    transition(job, GenerationJobState.CANCELLED, "已取消");
                     Log.info("生成任务 #" + job.number + " 已取消（" + (job == currentGeneration ? "当前这张已在 SD 那边处理" : "直接跳过") + "）");
                     return "任务 #" + job.number + " 已取消：不再生成剩下的 " + freed + " 次。"
                             + (job == currentGeneration ? stopCurrentGeneration() : "")
                             + "\n已经生成的 " + job.images + " 张照常保留，" + (settings.autoGet() ? "任务结算后自动领取。" : "用 .get 领取。");
                 }
                 case "first" -> {
-                    if (job.cancelled) return "任务 #" + job.number + " 已经取消了。";
-                    job.suspended = false;
+                    if (job.is(GenerationJobState.CANCELLED)) return "任务 #" + job.number + " 已经取消了。";
+                    // 挂起的任务置顶等于接着跑：剩余次数必须从挂起池搬回等待池（旧实现只清了标志，于是永久虚高）。
+                    if (job.is(GenerationJobState.HELD)) transition(job, GenerationJobState.QUEUED, "挂起任务置顶");
                     generationJobs.remove(job);
                     generationJobs.addFirst(job);
                     if (job == currentGeneration) return "任务 #" + job.number + " 本来就在生成中。";
-                    BigInteger resumed = job.remaining;
-                    if (resumed.signum() > 0) { /* 已在等待计数里，位置变化不影响计数 */ }
                     ensureGenerationWorker();
                     Log.info("生成任务 #" + job.number + " 已置顶为第一优先级");
                     return "任务 #" + job.number + " 已置顶：下一位生成（它就是第一优先级，队首）。";
@@ -6948,14 +7036,12 @@ public final class Bot implements AutoCloseable {
                 item.addProperty("images", job.images.toString());
                 item.addProperty("failed", job.failed.toString());
                 item.addProperty("running", job == currentGeneration);
-                item.addProperty("suspended", job.suspended);
-                item.addProperty("cancelled", job.cancelled);
+                item.addProperty("suspended", job.is(GenerationJobState.HELD));
+                item.addProperty("cancelled", job.is(GenerationJobState.CANCELLED));
                 // 进度百分比给网页画进度条：done/total 都是 BigInteger，按 double 估算即可。
                 item.addProperty("percent", job.total.signum() == 0 ? 0
                         : Math.min(100, (int) Math.round(100.0 * job.done.doubleValue() / job.total.doubleValue())));
-                item.addProperty("status", job == currentGeneration
-                        ? (job.cancelled ? "生成中（取消待生效）" : job.suspended ? "生成中（挂起待生效）" : "生成中")
-                        : job.status());
+                item.addProperty("status", generationJobStatus(job, job == currentGeneration));
                 tasks.add(item);
             }
             return tasks;
@@ -7102,7 +7188,8 @@ public final class Bot implements AutoCloseable {
                                 + "\n" + snapshot.parameters().describe()
                                 + "\n提示词来源：" + snapshot.prompts().source() + "\n参数来源：" + snapshot.settings().source());
                 generationJobs.addLast(submitted);
-                waitingGenerations = waitingGenerations.add(count);
+                // 排队 = 一个状态迁移：剩余次数由 transition 记进等待池（Phase 1 之前这里手工 add 一次）。
+                transition(submitted, GenerationJobState.QUEUED, "入队");
                 Log.info("生成任务 #" + submitted.number + " 入队：" + count + " 次，来自 " + describeConversation(event)
                         + "，采样 " + snapshot.settings().samplerName() + "，" + snapshot.settings().width() + "×" + snapshot.settings().height()
                         + "，步数 " + snapshot.parameters().steps() + "，CFG " + snapshot.parameters().cfgScale()
@@ -7111,7 +7198,8 @@ public final class Bot implements AutoCloseable {
                     generationWorkerActive = true;
                     try { generation.execute(this::runGenerationQueue); }
                     catch (RejectedExecutionException e) {
-                        generationWorkerActive = false; generationJobs.clear(); waitingGenerations = BigInteger.ZERO; suspendedGenerations = BigInteger.ZERO;
+                        generationWorkerActive = false;
+                        for (GenerationJob each : List.copyOf(generationJobs)) removeFromQueue(each, GenerationJobState.CANCELLED, "未启动");
                         releaseNormalWindow(submitted.event);   // 任务没起来：窗口只被任务占着，这里还回去
                         throw new IllegalStateException("机器人正在关闭，本次任务未启动。");
                     }
@@ -7126,8 +7214,8 @@ public final class Bot implements AutoCloseable {
             synchronized (generationLock) {
                 if (closed.get()) {
                     // 停机：静默清空队列（正在跑的那一个仍会走下面的结算回执），避免关机时刷一串"已停止"。
-                    for (GenerationJob each : generationJobs) { each.cancelled = true; each.remaining = BigInteger.ZERO; }
-                    generationJobs.clear(); waitingGenerations = BigInteger.ZERO; suspendedGenerations = BigInteger.ZERO;
+                    // 逐个走唯一出队口，计数随任务精确归零（Phase 1 之前是把两个全局计数一起清零）。
+                    for (GenerationJob each : List.copyOf(generationJobs)) removeFromQueue(each, GenerationJobState.CANCELLED, "停机");
                     generationWorkerActive = false; generationRunning = false; currentGeneration = null;
                     job = null;
                 } else {
@@ -7135,10 +7223,8 @@ public final class Bot implements AutoCloseable {
                     if (job == null) { generationWorkerActive = false; generationRunning = false; currentGeneration = null; }
                     else {
                         currentGeneration = job; generationRunning = true;
-                        if (job.remaining.signum() > 0) {
-                            job.remaining = job.remaining.subtract(BigInteger.ONE);
-                            waitingGenerations = waitingGenerations.subtract(BigInteger.ONE);
-                        }
+                        // 开始下发：这一张从"等待"移到"在飞"（等待计数 -1，remaining 也摘掉这一张）。
+                        transition(job, GenerationJobState.RUNNING, "开始生成");
                     }
                 }
             }
@@ -7170,7 +7256,7 @@ public final class Bot implements AutoCloseable {
                     // 于是取消只有两种结果——要么看得见牌子、真去中断 SD；要么它已经先置好 cancelled，这一张根本不提交。
                     job.generating = true;
                     boolean submit;
-                    synchronized (generationLock) { submit = !job.cancelled; }
+                    synchronized (generationLock) { submit = !job.is(GenerationJobState.CANCELLED); }
                     if (!submit) {
                         job.generating = false;
                         Log.info("生成任务 #" + job.number + " 在提交给 SD 之前已取消：这一次不提交（SD 不会被调用）");
@@ -7208,11 +7294,14 @@ public final class Bot implements AutoCloseable {
                 if (currentGeneration == job) currentGeneration = null;
                 // 取消优先：跑完手上这张就结算；挂起则留在队列里等 .gen resume。
                 if (job.refused != null) { settledReason = "已拒绝"; notice = settleGenerationJob(job, settledReason); }
-                else if (job.cancelled) { settledReason = "已取消"; notice = settleGenerationJob(job, settledReason); }
+                else if (job.is(GenerationJobState.CANCELLED)) { settledReason = "已取消"; notice = settleGenerationJob(job, settledReason); }
                 else if (job.remaining.signum() == 0 || closed.get()) {
                     settledReason = closed.get() ? "已停止" : "已完成";
                     notice = settleGenerationJob(job, settledReason);
                 }
+                // 这一张跑完了还有剩：RUNNING 只表示"有一张正在下发"，回到排队状态等下一次领取。
+                // 挂起的任务保持 HELD（它不参与调度，等 .gen resume）。
+                else if (!job.is(GenerationJobState.HELD)) transition(job, GenerationJobState.QUEUED, "这一张跑完，等下一张");
             }
             if (notice != null) {
                 Log.info(notice);
@@ -7224,28 +7313,34 @@ public final class Bot implements AutoCloseable {
     }
     /** 取下一个可跑的任务：队首优先，跳过并结算已取消的，跳过挂起的（挂起不占调度）。 */
     private GenerationJob pickGenerationJob(List<GenerationJob> settled) {
-        for (java.util.Iterator<GenerationJob> iterator = generationJobs.iterator(); iterator.hasNext(); ) {
-            GenerationJob next = iterator.next();
-            if (next.cancelled) {
-                iterator.remove();
-                waitingGenerations = waitingGenerations.subtract(next.remaining);
-                if (next.suspended) suspendedGenerations = suspendedGenerations.subtract(next.remaining);
-                next.remaining = BigInteger.ZERO;
+        // 遍历快照再出队：唯一出队口 removeFromQueue 会改队列，边迭代边删是不允许的。
+        for (GenerationJob next : List.copyOf(generationJobs)) {
+            if (next.is(GenerationJobState.CANCELLED)) {
+                // 已取消的任务在这里出队并结算（计数在取消那一刻已经结清，这里只是还队列）。
+                removeFromQueue(next, GenerationJobState.CANCELLED, "已取消（出队）");
                 settled.add(next);
-                finishedJobs.addFirst(next); while (finishedJobs.size() > 20) finishedJobs.removeLast();
                 continue;
             }
-            if (next.suspended) continue;
+            if (next.is(GenerationJobState.HELD)) continue;
             return next;
         }
         return null;
     }
-    /** 结算一个任务：移出队列、留痕、必要时补一条回执。 */
+    /**
+     * 结算一个任务：移出队列、结清计数、留痕、补一条回执。
+     *
+     * <p>幂等：同一个任务只结算一次——二次调用直接返回 {@code null} 并记一行日志，不会二次扣计数、
+     * 二次进"已完成"列表、二次发回执（Phase 1 之前 cancel all 与工作线程会双双走到这里）。
+     */
     private String settleGenerationJob(GenerationJob job, String reason) {
-        generationJobs.remove(job);
-        if (job.suspended) { suspendedGenerations = suspendedGenerations.subtract(job.remaining); job.suspended = false; }
-        waitingGenerations = waitingGenerations.subtract(job.remaining);
-        job.remaining = BigInteger.ZERO;
+        if (job.settled) {
+            Log.info("生成任务 #" + job.number + " 已经结算过了（本次原因：" + reason + "），忽略重复结算");
+            return null;
+        }
+        job.settled = true;
+        // 出队 + 迁到终态：终态会把这个任务占的 waiting/suspended 一次性还回去（不会像旧实现那样
+        // "cancel all 清零全局计数 + 结算时再按 remaining 扣一次"）。
+        removeFromQueue(job, terminalState(reason), reason);
         finishedJobs.addFirst(job); while (finishedJobs.size() > 20) finishedJobs.removeLast();
         // 被出图前防呆拒绝时没生成过任何图片：成功次数按 0 报（done 记的是"这次尝试"）。
         // 被取消中断的那一次同样不算成功：SD 只跑了几步就被掐断，Forge 回的那张半成品没有被发布。
@@ -7276,6 +7371,7 @@ public final class Bot implements AutoCloseable {
     private void noticeFinishedGeneration(GenerationJob job, String reason) {
         if (reason != null) {
             String notice = settleGenerationJob(job, reason);
+            if (notice == null) return;          // 已经结算过：计数、留痕、回执都不再做第二遍
             Log.info(notice);
             replySettleNotice(job, reason, notice);
         }
@@ -10638,7 +10734,11 @@ public final class Bot implements AutoCloseable {
             try { Thread.sleep(50); }
             catch (InterruptedException interrupted) { Thread.currentThread().interrupt(); break; }
         }
-        synchronized (generationLock) { generationJobs.clear(); waitingGenerations = BigInteger.ZERO; suspendedGenerations = BigInteger.ZERO; generation.shutdownNow(); }
+        synchronized (generationLock) {
+            // 关闭时也走唯一出队口：逐个把计数还回去（不再把两个全局计数一起清零）。
+            for (GenerationJob each : List.copyOf(generationJobs)) removeFromQueue(each, GenerationJobState.CANCELLED, "关闭");
+            generation.shutdownNow();
+        }
         chat.close();chatWorkflows.shutdownNow();chatWorkflowSteps.values().forEach(future->future.complete(false));chatWorkflowSteps.clear();
         loraIO.shutdownNow(); progenIO.shutdownNow(); outboxDelivery.shutdownNow(); drainingImages.set(false); imageIO.shutdownNow();
     }
