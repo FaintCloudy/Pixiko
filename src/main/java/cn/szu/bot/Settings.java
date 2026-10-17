@@ -382,6 +382,33 @@ public final class Settings {
         return host.isBlank() ? "0.0.0.0" : host;
     }
     public synchronized int webPort() { return Math.max(1, Math.min(65535, Json.num(Json.obj(data, "webui"), "port", 8787))); }
+    /**
+     * 是否信任 {@code X-Forwarded-For}（{@code webui.trust_forwarded_for}，**默认 false**）。
+     *
+     * <p>这个头谁都能往里面写字，默认一概不看：采信它等于让请求方自选限流身份。只有把控制台放在反向代理
+     * 后面、且代理**确实会覆盖**这个头时才打开；打开后也只认本机与 {@link #webTrustedProxies()} 里的代理。
+     */
+    public synchronized boolean webTrustForwardedFor() {
+        return Json.bool(Json.obj(data, "webui"), "trust_forwarded_for", false);
+    }
+    /**
+     * 受信反向代理白名单（{@code webui.trusted_proxies}）：只有这些地址发来的 {@code X-Forwarded-For} 才被采信。
+     * 回环地址（本机代理）永远受信、不用写进来；条目**精确匹配**（不做前缀匹配，免得被 127.0.0.1.evil 骗过）。
+     * 逐项做长度与字符校验，坏条目直接忽略（不写日志、不因为一条坏配置就读不出令牌）。
+     */
+    public synchronized java.util.List<String> webTrustedProxies() {
+        JsonElement value = Json.obj(data, "webui").get("trusted_proxies");
+        if (value == null || !value.isJsonArray()) return java.util.List.of();
+        java.util.List<String> entries = new java.util.ArrayList<>();
+        for (JsonElement item : value.getAsJsonArray()) {
+            if (entries.size() >= 32) break;
+            if (item == null || !item.isJsonPrimitive() || !item.getAsJsonPrimitive().isString()) continue;
+            String text = item.getAsString().strip();
+            if (text.isEmpty() || text.length() > 64 || !text.matches("[0-9A-Fa-f:.]+")) continue;
+            entries.add(text);
+        }
+        return java.util.List.copyOf(entries);
+    }
     /** 网页控制台自己的提示词归属：与 QQ 完全分开，不依赖、也不记录任何 QQ 号。 */
     public static final String WEB_SCOPE = "web";
     /**
@@ -399,13 +426,14 @@ public final class Settings {
         Log.info("网页控制台已改用独立的提示词归属「" + WEB_SCOPE + "」（原来跟着 QQ：" + (scope.isBlank() ? "未设置" : scope) + "）。");
         return WEB_SCOPE;
     }
-    /** 远程访问令牌；没有配置时自动生成并保存，日志里给出一次，之后从 config.json 读取。 */
+    /** 远程访问令牌；没有配置时自动生成并保存，日志里只留前 4 位（完整值去 config.json 看）。 */
     public synchronized String webToken() throws IOException {
         String token = Json.str(Json.obj(data, "webui"), "access_token", "").strip();
         if (!token.isBlank()) return token;
         token = java.util.UUID.randomUUID().toString().replace("-", "");
         webSetting("access_token", new JsonPrimitive(token));
-        Log.warn("WebUI 未配置访问令牌，已自动生成：" + token + "（保存在 config.json 的 webui.access_token）");
+        Log.warn("WebUI 未配置访问令牌，已自动生成（前 4 位 " + token.substring(0, 4)
+                + "…，完整值保存在 config.json 的 webui.access_token）");
         return token;
     }
     /** 修改 webui 段里的一个键，其余配置保持不变。 */
