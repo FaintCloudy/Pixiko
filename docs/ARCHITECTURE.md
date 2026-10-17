@@ -46,3 +46,37 @@
 | 4 | 提取 Prompt/LoRA/Style/Function/Civitai 服务 | 待开始 |
 | 5 | 拆分 `SdClient`、`DeepSeekPrompts`、`WebApiController` | 待开始 |
 | 6 | 构建（Gradle/Maven wrapper、JUnit5）、文档、观测、遗留文件归档 | 待开始 |
+## 6. 现状盘点（2026-10-18，供逐阶段对照）
+### 6.1 体量
+| 类 | 行数 | 主要职责（待拆出） |
+|---|---|---|
+| `Bot` | 10,745 | 消息解析、权限、编号选择、聊天规划、提示词、LoRA、Civitai、生成队列、图片发送、Web API、婚配、日志、生命周期 |
+| `SdClient` | 2,890 | SD HTTP、参数、VAE、预设、中断、图片落盘 |
+| `DeepSeekPrompts` | 2,589（已抽 `chat/deepseek` 8 类） | 传输、模板、规划、改写、检查、解析、重试、人格守卫 |
+| `CivitaiClient` | 1,220 | 搜索/下载/清单 |
+| `WebApiController` | 647 | 63 个 case 的单方法 switch |
+| `Settings` | 656 | 配置读写（含新加的 XFF 信任读口） |
+
+### 6.2 线程模型（拆 `TaskSupervisor` 的依据）
+- **11 个执行器**，其中 7 个单线程：`Bot` 的 generation / progenIO / chatWorkflows / outboxDelivery / imageIO(2) / loraIO(1,队列 1) / webIO(4)；`CivitaiClient` scheduled(1)；`QqClient` 两个单线程；**`ChatService` 唯一全局单线程 + 无界队列**。
+- **阻塞点**：`Bot:1126 completion.get(2 HOURS)`；无参 `get()` 永久阻塞 6 处（`Bot:3998/4012/7322`、`ChatService:318/322/358`）。
+- **ThreadLocal 业务状态 6 处**（`Bot:623/625/7868/10328`、`Log:33`、`DeepSeekPrompts` 的改写存档出口）。
+- 目标：会话保序 + 跨会话并行（striped/conversation queue）、有界池、忙/超时明确提示、`CompletionStage` 状态机 + deadline、显式上下文取代 ThreadLocal、统一关闭顺序。
+
+### 6.3 持久化（拆 Repository + journal 的依据）
+- `Json.atomicWrite` **53 处 / 20 文件**；跨文件操作无事务（LoRA 清单、展示图、outbox、样式、触发词）。
+- 两份聊天空档并存：`ChatLogStore` 与 `WebApiController.chatFile`（`data/webui/<scope>-chat.json`）。
+- 目标：每类数据一个 Repository、`PREPARING → COMMITTED → CLEANED` 轻量 journal、启动恢复、稳定 idempotency key、图片仅 QQ ACK 后从 outbox 删除。
+
+### 6.4 测试与构建
+- **89 个既有 `*Test`（main() 断言式）+ 本轮新增**：`WebAuthFilterTest`(69)、`DeepSeekTransportTest`、`GenerationQueueInvariantTest`(174)、`IsolationTest`(5 条)；**0 JUnit、无 wrapper**；`build.ps1 -Test` 逐类 `java -ea`。
+- 隔离（第十四节）已落地：`testsupport/TestEnvironment`+`TestRuntime`、`--Dbot.test.mode/home/web.port/onebot.port/sd.port`、假服务全绑 127.0.0.1 动态端口、5 条隔离回归。
+
+### 6.5 已知既有红灯（非本轮引入，需单独收敛）
+| 用例 | 症状 | 根因 | 处置 |
+|---|---|---|---|
+| `GenerationQueueTest.atomicFifoQueueWithCapturedSettings` | `dimension snapshot: expected=768, actual=512` | 2026-10-07「参数与 Forge 独立」后该 09-27 用例仍假设页面回写会改尺寸 | 优先改用**机器人侧**设置入口保留 FIFO 快照语义；不可行才改期望并注明新契约（**禁止删断言/恒真**） |
+
+### 6.6 生产部署冻结
+- **8787 冻结在 Phase 0 之前的版本**（jar 02:19:03）；已用 `df7e606` 源码重建并与 jar 内 `WebAuthFilter/Bot/DeepSeekPrompts/Settings/WebApiController` **逐字节一致**（5/5）证明。
+- 解冻条件：用户对具体版本明确批准；届时记录前后 jar 时间与 PID。
